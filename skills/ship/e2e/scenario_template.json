@@ -1,0 +1,27 @@
+[
+  {
+    "name": "场景名称",
+    "description": "验证什么功能/行为",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "repeat": 1,
+    "setup": {
+      "command": "echo 'optional setup command'"
+    },
+    "turns": [
+      {
+        "action": "POST /api/endpoint",
+        "body": {"key": "value"},
+        "delay": 1
+      },
+      {
+        "action": "GET /api/endpoint/result",
+        "delay": 1
+      }
+    ],
+    "teardown": {
+      "command": "echo 'optional cleanup'"
+    }
+  }
+]

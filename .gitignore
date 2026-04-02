@@ -1,0 +1,5 @@
+# State data (seen articles etc.)
+.data/
+
+# Ship verify state
+.claude/.ship-verify-state.json
