@@ -11,3 +11,4 @@ skills/price-alert/price_alert.log
 
 # HL trader runtime data
 skills/hl-trader/.env
+skills/hl-trader/hl_bot.log

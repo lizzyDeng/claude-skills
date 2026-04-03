@@ -144,6 +144,10 @@ def init_exchange(config):
         print("ERROR: 无法连接 Hyperliquid API")
         sys.exit(1)
 
+    spot_meta = curl_post(f"{base_url}/info", {"type": "spotMeta"})
+    if not spot_meta:
+        spot_meta = {"tokens": [], "universe": []}
+
     account_address = config["account_address"] if config["account_address"] else None
 
     exchange = Exchange(
@@ -151,6 +155,7 @@ def init_exchange(config):
         base_url=base_url,
         account_address=account_address,
         meta=meta,
+        spot_meta=spot_meta,
     )
 
     address = account_address or wallet.address
