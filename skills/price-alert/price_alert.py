@@ -50,7 +50,7 @@ def load_config():
         "telegram_chat_id": config.get("TELEGRAM_CHAT_ID", ""),
         "xau_threshold_pct": float(config.get("XAU_THRESHOLD_PCT", "2.0")),
         "btc_threshold_pct": float(config.get("BTC_THRESHOLD_PCT", "5.0")),
-        "window_minutes": int(config.get("WINDOW_MINUTES", "60")),
+        "window_minutes": int(config.get("WINDOW_MINUTES", "1440")),
     }
 
 
@@ -73,13 +73,13 @@ def save_history(history):
 
 
 def add_price(history, asset, price, ts=None):
-    """添加价格记录，保留最近 2 小时的数据"""
+    """添加价格记录，保留最近 25 小时的数据"""
     if ts is None:
         ts = datetime.utcnow().isoformat()
     history.setdefault(asset, []).append({"price": price, "ts": ts})
 
-    # 清理超过 2 小时的旧数据
-    cutoff = (datetime.utcnow() - timedelta(hours=2)).isoformat()
+    # 清理超过 25 小时的旧数据
+    cutoff = (datetime.utcnow() - timedelta(hours=25)).isoformat()
     history[asset] = [r for r in history[asset] if r["ts"] >= cutoff]
 
 
