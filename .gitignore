@@ -8,3 +8,6 @@
 skills/price-alert/.env
 skills/price-alert/.price_history.json
 skills/price-alert/price_alert.log
+
+# HL trader runtime data
+skills/hl-trader/.env
