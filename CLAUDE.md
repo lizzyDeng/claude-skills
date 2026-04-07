@@ -14,3 +14,4 @@
 - `price-alert` — 监控黄金 (XAU/USD) 和 BTC 价格，大幅波动时通过 Telegram 通知
 - `hl-trader` — Hyperliquid 交易工具（限价单、查询持仓、Telegram 通知）
 - `project-viewer` — 启动本地 Web 服务浏览项目目录结构和渲染 Markdown 文件
+- `/chunbing` — 安装春饼 statusline，让春饼常驻终端底部陪你写代码
