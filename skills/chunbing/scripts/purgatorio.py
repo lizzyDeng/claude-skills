@@ -3,8 +3,8 @@
 春饼·神曲 — 炼狱篇 + 天堂篇
 
 基于但丁《神曲》：
-- 炼狱篇：感知七宗罪情绪时，温柔提醒用户冷静
-- 天堂篇：连续多条消息情绪稳定时，祝福用户升入天堂
+- 炼狱篇：邪恶金猫（Virgilio d'Oro）陪伴用户穿越炼狱，感知七宗罪情绪
+- 天堂篇：贝德丽采·春饼（Beatrice·春饼）接引用户升入天堂
 
 炼狱山七层（自下而上）：
   第1层 傲慢 Superbia — 轻视 AI / 居高临下
@@ -50,7 +50,7 @@ SINS = {
         ],
         "quote": "记住，愤怒是一团遮蔽理智的浓烟。",
         "source": "Purgatorio XVI",
-        "reminder": "春饼蹭了蹭你的手...深呼吸，把问题说清楚，我们一起解决。",
+        "reminder": "金猫甩了甩尾巴...深呼吸，把问题说清楚，我们一起解决。",
     },
     "superbia": {
         "name": "傲慢",
@@ -64,7 +64,7 @@ SINS = {
         ],
         "quote": "行走时低头看看脚下的石刻，那是倒下的傲慢者。",
         "source": "Purgatorio XII",
-        "reminder": "春饼歪头看着你...试着描述你期望的结果，而不是预设对方的能力。",
+        "reminder": "金猫歪头看着你，金色眼睛里映出你的倒影...试着描述你期望的结果。",
     },
     "acedia": {
         "name": "懒惰",
@@ -78,7 +78,7 @@ SINS = {
         ],
         "quote": "在炼狱第四层，怠惰的灵魂必须不停地奔跑。",
         "source": "Purgatorio XVIII",
-        "reminder": "春饼用爪子戳了戳你...花一分钟描述清楚需求，能省下十分钟的返工。",
+        "reminder": "金猫用爪子戳了戳你...花一分钟描述清楚需求，能省下十分钟的返工。",
     },
     "avaritia": {
         "name": "贪婪",
@@ -91,7 +91,7 @@ SINS = {
         ],
         "quote": "俯卧在地的灵魂们学会了：紧握一切，反而失去一切。",
         "source": "Purgatorio XIX",
-        "reminder": "春饼慢慢眨了眨眼...一次做好一件事，比同时做三件事快。",
+        "reminder": "金猫慢慢眨了眨金色的眼...一次做好一件事，比同时做三件事快。",
     },
     "gula": {
         "name": "暴食",
@@ -104,7 +104,7 @@ SINS = {
         ],
         "quote": "果树旁的灵魂们学会了：先品味，再索取。",
         "source": "Purgatorio XXIV",
-        "reminder": "春饼打了个哈欠...停下来看看刚才的结果，消化了再继续。",
+        "reminder": "金猫打了个哈欠，露出尖牙...停下来看看刚才的结果，消化了再继续。",
     },
     "luxuria": {
         "name": "色欲",
@@ -118,7 +118,7 @@ SINS = {
         ],
         "quote": "穿越火墙的灵魂们明白了：追求完美本身可以是一种燃烧。",
         "source": "Purgatorio XXVI",
-        "reminder": "春饼轻轻叫了一声...够好就是好。先交付，再迭代。",
+        "reminder": "金猫用尾巴卷住你的手腕...够好就是好。先交付，再迭代。",
     },
     "invidia": {
         "name": "嫉妒",
@@ -131,7 +131,7 @@ SINS = {
         ],
         "quote": "缝合双眼的灵魂们终于看见：每条路都有自己的风景。",
         "source": "Purgatorio XIII",
-        "reminder": "春饼靠在你腿上...专注眼前的问题，走自己的路。",
+        "reminder": "金猫蹲在你面前挡住去路...专注眼前的问题，走自己的路。",
     },
 }
 
@@ -142,15 +142,15 @@ STATE_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"), "chunbing_paradiso.j
 
 # 连续稳定消息数 -> 天堂层级
 PARADISO = [
-    (10, "月天",   "Cielo della Luna",     "Paradiso III",   "信仰的微光在月亮的阴影中闪烁。",        "春饼安静地蜷在你脚边...你的心很平静，继续保持。"),
+    (10, "月天",   "Cielo della Luna",     "Paradiso III",   "信仰的微光在月亮的阴影中闪烁。",        "春饼从远处走来，蓝眼睛闪着微光...你的心很平静，继续保持。"),
     (20, "水星天", "Cielo di Mercurio",    "Paradiso VI",    "在水星的光芒中，志向变得清晰而纯粹。",  "春饼仰头看着你，眼里有光...你的思路很清晰。"),
-    (30, "金星天", "Cielo di Venere",      "Paradiso VIII",  "金星的温暖照亮了每一份真挚的爱。",      "春饼发出了满足的呼噜声...你的状态真好。"),
-    (40, "太阳天", "Cielo del Sole",       "Paradiso X",     "智慧的灵魂们在太阳中组成光之花环。",    "春饼在你键盘旁打盹...智慧正与你同行。"),
-    (55, "火星天", "Cielo di Marte",       "Paradiso XIV",   "火星的十字架上闪耀着勇者的荣光。",      "春饼竖起了尾巴...你的专注如同勇士。"),
-    (70, "木星天", "Cielo di Giove",       "Paradiso XVIII",  "正义的灵魂们在木星上拼成神圣的文字。",  "春饼慢慢眨眼...你的判断清明而公正。"),
-    (85, "土星天", "Cielo di Saturno",     "Paradiso XXI",   "金色的阶梯从土星延伸至无穷高处。",      "春饼安详地望向远方...沉思让你离真理更近。"),
-    (100, "恒星天", "Cielo delle Stelle Fisse", "Paradiso XXII", "回望来路，大地渺小如尘——而你已身在群星之间。", "春饼轻轻踩了踩你的肩膀...你已经走了很远。"),
-    (120, "至高天", "Empyreo",              "Paradiso XXXIII", "永恒之光中，爱推动着太阳和其他群星。",  "春饼闭上眼，发出最温柔的呼噜...你已抵达天堂。"),
+    (30, "金星天", "Cielo di Venere",      "Paradiso VIII",  "金星的温暖照亮了每一份真挚的爱。",      "春饼发出了满足的呼噜声，靠在你身边...你的状态真好。"),
+    (40, "太阳天", "Cielo del Sole",       "Paradiso X",     "智慧的灵魂们在太阳中组成光之花环。",    "春饼在你键盘旁打盹，毛发泛着金光...智慧正与你同行。"),
+    (55, "火星天", "Cielo di Marte",       "Paradiso XIV",   "火星的十字架上闪耀着勇者的荣光。",      "春饼竖起了尾巴，像一面小旗帜...你的专注如同勇士。"),
+    (70, "木星天", "Cielo di Giove",       "Paradiso XVIII",  "正义的灵魂们在木星上拼成神圣的文字。",  "春饼慢慢眨眼，仿佛在说「我知道」...你的判断清明而公正。"),
+    (85, "土星天", "Cielo di Saturno",     "Paradiso XXI",   "金色的阶梯从土星延伸至无穷高处。",      "春饼安详地望向远方，尾巴轻轻摆动...沉思让你离真理更近。"),
+    (100, "恒星天", "Cielo delle Stelle Fisse", "Paradiso XXII", "回望来路，大地渺小如尘——而你已身在群星之间。", "春饼轻轻踩了踩你的肩膀，像加冕一样...你已经走了很远。"),
+    (120, "至高天", "Empyreo",              "Paradiso XXXIII", "永恒之光中，爱推动着太阳和其他群星。",  "春饼闭上眼，发出最温柔的呼噜...Beatrice·春饼接引你抵达了天堂。"),
 ]
 
 
@@ -192,13 +192,11 @@ def format_paradiso(heaven):
     """格式化天堂祝福"""
     lines = [
         "",
-        "  ✨ 春饼感知到了宁静的光芒...",
-        "",
+        "  ✨ Beatrice·春饼感知到了宁静的光芒...",
         f"  ── {heaven['name']} · {heaven['latin']} ──",
-        f"  「{heaven['quote']}」",
-        f"    — {heaven['source']}",
         "",
         f"  {heaven['reminder']}",
+        f"  「{heaven['quote']}」 — {heaven['source']}",
         f"  🐾 连续 {heaven['threshold']} 条平静的消息",
         "",
     ]
@@ -239,7 +237,7 @@ def format_status_line(state):
 
     if last_paradiso > 0:
         heaven_name = get_current_heaven_name(last_paradiso)
-        return f"  📍 你从 {heaven_name} 跌落了...连胜 {streak} 归零"
+        return f"  📍 你从 {heaven_name} 跌落了...春饼退回了远方，金猫接管了你的旅程"
     elif streak > 0:
         # 找到下一个天堂层
         next_heaven = None
@@ -255,16 +253,14 @@ def format_status_line(state):
 
 
 def format_reminder(sin, state=None):
-    """格式化一条提醒"""
+    """格式化一条提醒（邪恶金猫视角）"""
     lines = [
         "",
-        f"  🐱 春饼感知到了「{sin['name']}」的气息...",
-        "",
+        f"  😼 邪恶金猫感知到了「{sin['name']}」的气息...",
         f"  ── 炼狱山 第{sin['layer']}层 · {sin['latin']} ──",
-        f"  「{sin['quote']}」",
-        f"    — {sin['source']}",
         "",
         f"  {sin['reminder']}",
+        f"  「{sin['quote']}」 — {sin['source']}",
     ]
     if state is not None:
         lines.append(format_status_line(state))
