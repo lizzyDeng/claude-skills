@@ -78,8 +78,8 @@ def add_price(history, asset, price, ts=None):
         ts = datetime.utcnow().isoformat()
     history.setdefault(asset, []).append({"price": price, "ts": ts})
 
-    # 清理超过 25 小时的旧数据
-    cutoff = (datetime.utcnow() - timedelta(hours=25)).isoformat()
+    # 清理超过 72 小时的旧数据（覆盖 Mac 睡眠导致的数据断层）
+    cutoff = (datetime.utcnow() - timedelta(hours=72)).isoformat()
     history[asset] = [r for r in history[asset] if r["ts"] >= cutoff]
 
 
@@ -127,7 +127,8 @@ def fetch_xau_price(api_key):
 def check_volatility(history, asset, threshold_pct, window_minutes):
     """
     检查指定资产在时间窗口内的波动幅度。
-    返回 (triggered, change_pct, old_price, new_price) 或 (False, None, None, None)
+    比较窗口内最高价与最低价，检测极值波动。
+    返回 (triggered, change_pct, low_price, high_price) 或 (False, None, None, None)
     """
     records = history.get(asset, [])
     if len(records) < 2:
@@ -136,26 +137,33 @@ def check_volatility(history, asset, threshold_pct, window_minutes):
     now = datetime.utcnow()
     window_start = (now - timedelta(minutes=window_minutes)).isoformat()
 
-    # 找到窗口内最早的记录
+    # 找到窗口内的记录
     window_records = [r for r in records if r["ts"] >= window_start]
-    if not window_records:
+    if len(window_records) < 2:
         return False, None, None, None
 
-    oldest = window_records[0]
-    newest = records[-1]
+    prices = [r["price"] for r in window_records]
+    high_price = max(prices)
+    low_price = min(prices)
 
-    old_price = oldest["price"]
-    new_price = newest["price"]
-
-    if old_price == 0:
+    if low_price == 0:
         return False, None, None, None
 
-    change_pct = ((new_price - old_price) / old_price) * 100
+    change_pct = ((high_price - low_price) / low_price) * 100
 
-    if abs(change_pct) >= threshold_pct:
-        return True, change_pct, old_price, new_price
+    # 判断方向：最新价格更接近高点还是低点
+    newest_price = prices[-1]
+    if newest_price >= (high_price + low_price) / 2:
+        # 当前偏高，视为上涨
+        signed_change = change_pct
+    else:
+        # 当前偏低，视为下跌
+        signed_change = -change_pct
 
-    return False, change_pct, old_price, new_price
+    if change_pct >= threshold_pct:
+        return True, signed_change, low_price, high_price
+
+    return False, signed_change, low_price, high_price
 
 
 # ---------- 通知 ----------
