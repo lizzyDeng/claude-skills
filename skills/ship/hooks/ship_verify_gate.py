@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-ship_verify_gate.py — /ship E2E 验证硬性 Gate（通用版）
+ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 
-保证 /ship 阶段 3 的测试流程不能被跳过。
-仅在 ship/* 或 worktree-ship-* 分支上激活，其他分支无任何影响。
+保证任何需求的测试 + E2E 验证流程不能被跳过。
+所有分支均生效（包括 main），不再局限于 ship/* 分支。
 
 动作:
   post_bash  — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
-  pre_bash   — PreToolUse: Bash → 检测 git merge，stamp 不全则阻断（exit 1）
+  pre_bash   — PreToolUse: Bash → 检测 git merge/push，stamp 不全则阻断（exit 1）
   pre_edit   — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
   status     — 查看当前验证状态
+  reset      — 手动重置状态（新需求开始时）
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -48,12 +49,9 @@ def get_current_branch():
         return None
 
 
-def is_ship_branch(branch):
-    """ship/ 分支 或 EnterWorktree 创建的 worktree-ship-* 分支"""
-    return bool(branch and (
-        branch.startswith("ship/") or
-        branch.startswith("worktree-ship-")
-    ))
+def is_main_branch(branch):
+    """检测是否在 main/master 分支"""
+    return branch in ("main", "master")
 
 
 def state_path():
@@ -223,10 +221,8 @@ def gate_pre_edit():
 
 
 def gate_post_bash():
-    """PostToolUse: Bash — 检测测试/E2E 执行结果，写入 stamp"""
+    """PostToolUse: Bash — 检测测试/E2E 执行结果，写入 stamp（所有分支生效）"""
     branch = get_current_branch()
-    if not is_ship_branch(branch):
-        return 0
 
     data = read_stdin()
     cmd = data.get("tool_input", {}).get("command", "")
@@ -244,16 +240,16 @@ def gate_post_bash():
             st["test_ts"] = now
             st["test_tool"] = stack
             changed = True
-            print(f"✅ Ship Gate: {stack} test 通过，已记录")
+            print(f"✅ Gate: {stack} test 通过，已记录")
         else:
-            print(f"⚠️ Ship Gate: {stack} test 已执行，但未检测到通过标志")
+            print(f"⚠️ Gate: {stack} test 已执行，但未检测到通过标志")
 
     # 检测 E2E 验证
     if is_e2e_cmd(cmd):
         st["e2e_executed"] = True
         st["e2e_ts"] = now
         changed = True
-        print("✅ Ship Gate: E2E 验证已执行，已记录")
+        print("✅ Gate: E2E 验证已执行，已记录")
 
     if changed:
         save_state(st)
@@ -266,45 +262,52 @@ def gate_post_bash():
     if not st.get("e2e_executed"):
         missing.append("E2E 验证")
     if missing:
-        print(f"⚠️ Ship Gate 提醒: 合入前仍需完成 → {', '.join(missing)}")
+        print(f"⚠️ Gate 提醒: 合入/推送前仍需完成 → {', '.join(missing)}")
 
     return 0
 
 
+def is_push_cmd(cmd):
+    """检测 git push 命令"""
+    if not cmd:
+        return False
+    return bool(re.search(r'\bgit\s+push\b', cmd))
+
+
 def gate_pre_bash():
-    """PreToolUse: Bash — 合入 main 前检查验证 stamp，不全则阻断"""
+    """PreToolUse: Bash — 合入/推送前检查验证 stamp，不全则阻断（所有分支生效）"""
     branch = get_current_branch()
-    if not is_ship_branch(branch):
-        return 0
 
     data = read_stdin()
     cmd = data.get("tool_input", {}).get("command", "")
-    if not is_merge_cmd(cmd):
+
+    # 拦截 merge 和 push
+    if not is_merge_cmd(cmd) and not is_push_cmd(cmd):
         return 0
 
     st = ensure_branch_state(load_state(), branch)
 
     blocks = []
     if not st.get("test_passed"):
-        blocks.append("项目测试未通过（/ship 阶段3 Step 1）")
+        blocks.append("项目测试未通过")
     if not st.get("e2e_executed"):
-        blocks.append("E2E 验证未执行（/ship 阶段3 Step 2）")
+        blocks.append("E2E 验证未执行")
 
     if blocks:
+        action = "推送" if is_push_cmd(cmd) else "合入"
         lines = [
-            "🔴 BLOCKED: /ship 验证未完成，禁止合入 main",
+            f"🔴 BLOCKED: 验证未完成，禁止{action}",
         ]
         for b in blocks:
             lines.append(f"   ❌ {b}")
         lines.append("")
-        lines.append("请先完成 /ship 阶段 3 验证流程：")
+        lines.append("请先完成验证流程：")
         lines.append("   1. 项目测试（全量）")
-        lines.append("   2. E2E 验证（按阶段 1 定义的方案）")
-        lines.append("   3. 回归检查")
+        lines.append("   2. E2E 验证")
         print("\n".join(lines))
         return 1
 
-    print("✅ Ship Gate: 验证已完成，允许合入")
+    print("✅ Gate: 验证已完成，允许操作")
     return 0
 
 
@@ -313,7 +316,7 @@ def gate_status():
     branch = get_current_branch()
     st = load_state()
     stacks = detect_stack()
-    print(f"Branch:     {branch} ({'ship' if is_ship_branch(branch) else 'non-ship'})")
+    print(f"Branch:     {branch}")
     print(f"State for:  {st.get('branch', '-')}")
     print(f"Stack:      {', '.join(stacks) if stacks else 'unknown'}")
     t = "✅" if st.get("test_passed") else "❌"
@@ -321,6 +324,15 @@ def gate_status():
     tool = st.get("test_tool", "-")
     print(f"Test:       {t}  ({tool}) ({st.get('test_ts', '-')})")
     print(f"E2E:        {e}  ({st.get('e2e_ts', '-')})")
+    return 0
+
+
+def gate_reset():
+    """手动重置验证状态（新需求开始时调用）"""
+    branch = get_current_branch()
+    st = empty_state(branch)
+    save_state(st)
+    print(f"✅ Gate: 验证状态已重置 (branch: {branch})")
     return 0
 
 
@@ -336,6 +348,7 @@ def main():
         "pre_bash": gate_pre_bash,
         "pre_edit": gate_pre_edit,
         "status": gate_status,
+        "reset": gate_reset,
     }
     handler = handlers.get(sys.argv[1])
     if handler:
