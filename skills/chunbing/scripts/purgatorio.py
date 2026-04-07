@@ -35,6 +35,9 @@ import json
 import re
 import os
 import random
+import time
+import shutil
+import subprocess
 
 # ---------- 七宗罪检测规则 ----------
 
@@ -154,13 +157,35 @@ PARADISO = [
 ]
 
 
+# 通知冷却时间（秒）— 一次通知后 5 分钟内不再弹
+NOTIFY_COOLDOWN = 300
+
+
 def load_state():
-    """加载连续稳定消息计数"""
+    """加载状态"""
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"streak": 0, "last_paradiso": 0}
+        return {"streak": 0, "last_paradiso": 0, "last_notify_time": 0}
+
+
+def notify(title, subtitle, message):
+    """发送 macOS 通知"""
+    notifier = shutil.which("terminal-notifier")
+    if notifier:
+        subprocess.Popen(
+            [notifier, "-title", title, "-subtitle", subtitle,
+             "-message", message, "-sound", "Purr"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        # fallback: osascript
+        script = f'display notification "{message}" with title "{title}" subtitle "{subtitle}"'
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def save_state(state):
@@ -192,12 +217,12 @@ def format_paradiso(heaven):
     """格式化天堂祝福"""
     lines = [
         "",
-        "  ✨ Beatrice·春饼感知到了宁静的光芒...",
-        f"  ── {heaven['name']} · {heaven['latin']} ──",
+        f"✨ Beatrice·春饼感知到了宁静的光芒...",
+        f"── {heaven['name']} · {heaven['latin']} ──",
         "",
-        f"  {heaven['reminder']}",
-        f"  「{heaven['quote']}」 — {heaven['source']}",
-        f"  🐾 连续 {heaven['threshold']} 条平静的消息",
+        f"{heaven['reminder']}",
+        f"「{heaven['quote']}」 — {heaven['source']}",
+        f"🐾 连续 {heaven['threshold']} 条平静的消息",
         "",
     ]
     return "\n".join(lines)
@@ -237,7 +262,7 @@ def format_status_line(state):
 
     if last_paradiso > 0:
         heaven_name = get_current_heaven_name(last_paradiso)
-        return f"  📍 你从 {heaven_name} 跌落了...春饼退回了远方，金猫接管了你的旅程"
+        return f"📍 你从 {heaven_name} 跌落了...春饼退回了远方，金猫接管了你的旅程"
     elif streak > 0:
         # 找到下一个天堂层
         next_heaven = None
@@ -246,24 +271,24 @@ def format_status_line(state):
                 next_heaven = (threshold, name)
                 break
         if next_heaven:
-            return f"  📍 连胜 {streak} 中断，距离{next_heaven[1]}还差 {next_heaven[0] - streak} 条"
-        return f"  📍 连胜 {streak} 中断"
+            return f"📍 连胜 {streak} 中断，距离{next_heaven[1]}还差 {next_heaven[0] - streak} 条"
+        return f"📍 连胜 {streak} 中断"
     else:
-        return "  📍 炼狱山脚，重新开始攀登"
+        return "📍 炼狱山脚，重新开始攀登"
 
 
 def format_reminder(sin, state=None):
     """格式化一条提醒（邪恶金猫视角）"""
     lines = [
         "",
-        f"  😼 邪恶金猫感知到了「{sin['name']}」的气息...",
-        f"  ── 炼狱山 第{sin['layer']}层 · {sin['latin']} ──",
+        f"😼 邪恶金猫感知到了「{sin['name']}」的气息...",
+        f"── 炼狱山 第{sin['layer']}层 · {sin['latin']} ──",
         "",
-        f"  {sin['reminder']}",
-        f"  「{sin['quote']}」 — {sin['source']}",
+        f"{sin['reminder']}",
+        f"「{sin['quote']}」 — {sin['source']}",
     ]
     if state is not None:
-        lines.append(format_status_line(state))
+        lines.append(format_status_line(state).strip())
     lines.append("")
     return "\n".join(lines)
 
@@ -292,25 +317,38 @@ def main():
 
     detected = detect_sins(user_message)
     state = load_state()
+    now = time.time()
 
     if detected:
-        # 先用当前状态生成提醒（包含跌落信息），再重置
-        reminder = format_reminder(detected[0], state)
+        sin = detected[0]
         state["streak"] = 0
         state["last_paradiso"] = 0
+
+        # 冷却期内不弹通知
+        last_notify = state.get("last_notify_time", 0)
+        if now - last_notify >= NOTIFY_COOLDOWN:
+            state["last_notify_time"] = now
+            notify(
+                f"😼 邪恶金猫 · {sin['name']}",
+                f"炼狱山 第{sin['layer']}层 · {sin['latin']}",
+                f"{sin['reminder']}\n「{sin['quote']}」",
+            )
+
         save_state(state)
-        # 只提醒最严重的一条（避免刷屏）
-        print(reminder)
     else:
         # 情绪稳定：连胜 +1，检查是否升入新的天堂层
         state["streak"] += 1
         heaven = check_paradiso(state["streak"])
         if heaven:
             state["last_paradiso"] = heaven["threshold"]
-            print(format_paradiso(heaven))
+            state["last_notify_time"] = now
+            notify(
+                f"✨ Beatrice·春饼 · {heaven['name']}",
+                heaven["latin"],
+                f"{heaven['reminder']}\n「{heaven['quote']}」",
+            )
         save_state(state)
 
-    # 不阻断用户操作
     return 0
 
 
