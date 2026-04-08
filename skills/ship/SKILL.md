@@ -23,17 +23,21 @@ description: "Result-driven development skill. Brainstorm with user to define re
 
 ## 阶段 1：Brainstorm
 
-### 1.1 项目上下文注入（自动，在与用户讨论前完成）
+### 1.1 项目上下文注入（🔴 强制，必须在回复用户之前完成）
+
+**在说任何话之前**，立即用 Glob + Read 工具读取以下文件。不要跳过，不要先和用户讨论再读，不要用"我来看看代码"代替读架构文档。先读文档，再开口。
 
 ```
-必读文件（按顺序，存在即读）：
-├── ARCHITECTURE.md → 模块全貌 + 关键约束
-│   搜索路径：项目根目录 / docs/ / docs/architecture/
+必读文件（按顺序，用 Glob 搜索，存在即 Read 全文）：
+├── ARCHITECTURE.md → 模块全貌 + 关键约束（🔴 最重要，有它就不需要大面积读代码）
+│   搜索路径：**/ARCHITECTURE.md
 ├── KNOWLEDGE.md → 踩坑记录
-│   搜索路径：项目根目录 / docs/
-├── CLAUDE.md → 项目约定
+│   搜索路径：**/KNOWLEDGE.md
+├── CLAUDE.md → 项目约定（通常已自动加载，确认即可）
 └── git log --oneline -15 → 最近变更上下文
 ```
+
+**为什么必须先读 ARCHITECTURE.md**：它包含模块边界、关键约束、数据流，读完就知道改哪里、不能碰哪里。跳过它直接读代码 = 盲人摸象，浪费时间且容易踩坑。
 
 读完后，识别用户需求可能涉及的模块，重点关注：
 - **关键约束**（架构文档中标注的限制）
