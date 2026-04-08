@@ -6,12 +6,14 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 所有分支均生效（包括 main），不再局限于 ship/* 分支。
 
 动作:
-  post_bash   — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
-  pre_bash    — PreToolUse: Bash → 检测 git merge/push，stamp 不全则阻断（exit 1）
-  pre_edit    — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
-  pre_phase3  — Phase 2→3 Gate: 检查项目测试 + E2E 是否已通过，未通过则阻断（exit 1）
-  status      — 查看当前验证状态
-  reset       — 手动重置状态（新需求开始时）
+  post_bash  — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
+  pre_bash   — PreToolUse: Bash → 三层自动 Gate:
+               Gate 1: E2E 命令 → 必须先跑通项目测试
+               Gate 2: E2E Gate 脚本 → 必须测试 + E2E Runner 都完成
+               Gate 3: merge/push → 必须全部验证完成
+  pre_edit   — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
+  status     — 查看当前验证状态
+  reset      — 手动重置状态（新需求开始时）
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -197,6 +199,13 @@ def is_e2e_cmd(cmd):
     return any(re.search(p, cmd, re.IGNORECASE) for p in pats)
 
 
+def is_e2e_gate_cmd(cmd):
+    """检测 E2E Gate 脚本命令"""
+    if not cmd:
+        return False
+    return bool(re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE))
+
+
 def is_merge_cmd(cmd):
     """检测合入/切回 main 的命令"""
     if not cmd:
@@ -276,39 +285,79 @@ def is_push_cmd(cmd):
 
 
 def gate_pre_bash():
-    """PreToolUse: Bash — 合入/推送前检查验证 stamp，不全则阻断（所有分支生效）"""
+    """PreToolUse: Bash — 自动拦截，三层 Gate（所有分支生效）
+
+    Gate 1: E2E 命令 → 必须先跑通项目测试（单测）
+    Gate 2: E2E Gate 脚本 → 必须项目测试 + E2E Runner 都完成
+    Gate 3: merge/push → 必须项目测试 + E2E 都完成（已有逻辑）
+    """
     branch = get_current_branch()
 
     data = read_stdin()
     cmd = data.get("tool_input", {}).get("command", "")
 
-    # 拦截 merge 和 push
-    if not is_merge_cmd(cmd) and not is_push_cmd(cmd):
-        return 0
-
     st = ensure_branch_state(load_state(), branch)
 
-    blocks = []
-    if not st.get("test_passed"):
-        blocks.append("项目测试未通过")
-    if not st.get("e2e_executed"):
-        blocks.append("E2E 验证未执行")
+    # --- Gate 2: 跑 E2E Gate 前必须测试 + E2E Runner 都完成 ---
+    # （必须在 Gate 1 之前，因为 e2e_gate 也匹配 is_e2e_cmd）
+    if is_e2e_gate_cmd(cmd):
+        blocks = []
+        if not st.get("test_passed"):
+            blocks.append("项目测试未通过")
+        if not st.get("e2e_executed"):
+            blocks.append("E2E Runner 未执行")
+        if blocks:
+            lines = ["🔴 BLOCKED: 验证未完成，禁止执行 E2E Gate"]
+            for b in blocks:
+                lines.append(f"   ❌ {b}")
+            print("\n".join(lines))
+            return 1
+        return 0  # Gate 2 passed, skip Gate 1
 
-    if blocks:
-        action = "推送" if is_push_cmd(cmd) else "合入"
+    # --- Gate 1: 跑 E2E 前必须先通过项目测试 ---
+    if is_e2e_cmd(cmd) and not st.get("test_passed"):
+        stacks = detect_stack()
+        stack_hint = stacks[0] if stacks else "unknown"
+        test_cmds = {
+            "rust": "cargo test",
+            "node": "npm test",
+            "python": "pytest",
+            "go": "go test ./...",
+        }
+        hint = test_cmds.get(stack_hint, "项目测试命令")
         lines = [
-            f"🔴 BLOCKED: 验证未完成，禁止{action}",
+            "🔴 BLOCKED: 项目测试未通过，禁止执行 E2E",
+            "",
+            f"   请先运行项目测试: {hint}",
+            "   测试通过后 Gate 自动放行 E2E",
         ]
-        for b in blocks:
-            lines.append(f"   ❌ {b}")
-        lines.append("")
-        lines.append("请先完成验证流程：")
-        lines.append("   1. 项目测试（全量）")
-        lines.append("   2. E2E 验证")
         print("\n".join(lines))
         return 1
 
-    print("✅ Gate: 验证已完成，允许操作")
+    # --- Gate 3: merge/push 前必须全部完成 ---
+    if is_merge_cmd(cmd) or is_push_cmd(cmd):
+        blocks = []
+        if not st.get("test_passed"):
+            blocks.append("项目测试未通过")
+        if not st.get("e2e_executed"):
+            blocks.append("E2E 验证未执行")
+
+        if blocks:
+            action = "推送" if is_push_cmd(cmd) else "合入"
+            lines = [
+                f"🔴 BLOCKED: 验证未完成，禁止{action}",
+            ]
+            for b in blocks:
+                lines.append(f"   ❌ {b}")
+            lines.append("")
+            lines.append("请先完成验证流程：")
+            lines.append("   1. 项目测试（全量）")
+            lines.append("   2. E2E 验证")
+            print("\n".join(lines))
+            return 1
+
+        print("✅ Gate: 验证已完成，允许操作")
+
     return 0
 
 
@@ -325,48 +374,6 @@ def gate_status():
     tool = st.get("test_tool", "-")
     print(f"Test:       {t}  ({tool}) ({st.get('test_ts', '-')})")
     print(f"E2E:        {e}  ({st.get('e2e_ts', '-')})")
-    return 0
-
-
-def gate_pre_phase3():
-    """Phase 2 → Phase 3 Gate: 必须跑通项目测试 + E2E 才能进入验证阶段"""
-    branch = get_current_branch()
-    st = ensure_branch_state(load_state(), branch)
-    stacks = detect_stack()
-
-    blocks = []
-    if not st.get("test_passed"):
-        stack_hint = stacks[0] if stacks else "unknown"
-        test_cmds = {
-            "rust": "cargo test",
-            "node": "npm test",
-            "python": "pytest",
-            "go": "go test ./...",
-        }
-        hint = test_cmds.get(stack_hint, "项目测试命令")
-        blocks.append(f"项目测试未通过（请先运行: {hint}）")
-
-    if not st.get("e2e_executed"):
-        blocks.append("E2E 验证未执行（请先运行 E2E 测试）")
-
-    if blocks:
-        lines = [
-            "🔴 BLOCKED: 不能进入阶段 3（Verification Loop）",
-            "",
-            "以下验证未完成：",
-        ]
-        for b in blocks:
-            lines.append(f"   ❌ {b}")
-        lines.append("")
-        lines.append("请在阶段 2 中完成所有验证后再调用此 Gate。")
-        print("\n".join(lines))
-        return 1
-
-    print("✅ Phase 2 → Phase 3 Gate PASSED")
-    print(f"   测试: ✅ ({st.get('test_tool', '-')}) @ {st.get('test_ts', '-')}")
-    print(f"   E2E:  ✅ @ {st.get('e2e_ts', '-')}")
-    print("")
-    print("可以进入阶段 3: Verification Loop")
     return 0
 
 
@@ -390,7 +397,6 @@ def main():
         "post_bash": gate_post_bash,
         "pre_bash": gate_pre_bash,
         "pre_edit": gate_pre_edit,
-        "pre_phase3": gate_pre_phase3,
         "status": gate_status,
         "reset": gate_reset,
     }
