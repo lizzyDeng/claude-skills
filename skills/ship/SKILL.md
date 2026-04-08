@@ -139,9 +139,30 @@ scenarios = [
 └── 变更感知 — 编辑核心模块时，查看该文件最近 commit 上下文
 ```
 
-### 2.4 执行完成信号
+### 2.4 🔴 Phase 2 → Phase 3 Gate（代码层强制）
 
-代码改完后进入阶段 3，不需要用户确认。
+代码改完后，**必须通过以下 Gate 才能进入阶段 3**。不需要用户确认，但必须通过代码检查。
+
+```
+🔴 进入阶段 3 前必须执行：
+
+Step 1: 跑全量项目测试（单元测试 + 集成测试）
+  ├── 根据技术栈自动选择：cargo test / npm test / pytest / go test
+  ├── 全部通过 → 继续
+  └── 失败 → 修复后重跑，禁止跳过直接进阶段 3
+
+Step 2: 调用 Gate 检查脚本
+  python3 .claude/hooks/ship_verify_gate.py pre_phase3
+  ├── ✅ PASS → 进入阶段 3
+  └── 🔴 FAIL → 阻断，必须先完成缺失项
+
+Step 3: 如果阶段 1 的 E2E 方案包含自动化 E2E 测试脚本（非手动验证），也在此时执行
+  ├── E2E Runner 数据采集
+  ├── python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
+  └── Gate PASS → 进入阶段 3
+```
+
+**禁止绕过**：不能因为"改动很小"或"只是 bugfix"就跳过此 Gate。所有需求一视同仁。
 
 ---
 
@@ -313,6 +334,8 @@ Gate FAIL → 禁止合入。
 **禁止：**
 - 未读项目上下文文件就进入 brainstorm
 - 未与用户确认 AC + E2E 方案就进入 execution
+- 🔴 未跑通项目测试就进入阶段 3（必须调用 `ship_verify_gate.py pre_phase3` 并 PASS）
+- 🔴 未跑 E2E 验证就进入阶段 3（自动化 E2E 场景必须在 Phase 2 Gate 中执行）
 - 在 execution 中修改带保护标记的代码
 - E2E 失败后不做根因分析直接重试第 3 次
 - 自我声称"已验证通过"而不实际执行 E2E

@@ -6,11 +6,12 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 所有分支均生效（包括 main），不再局限于 ship/* 分支。
 
 动作:
-  post_bash  — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
-  pre_bash   — PreToolUse: Bash → 检测 git merge/push，stamp 不全则阻断（exit 1）
-  pre_edit   — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
-  status     — 查看当前验证状态
-  reset      — 手动重置状态（新需求开始时）
+  post_bash   — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
+  pre_bash    — PreToolUse: Bash → 检测 git merge/push，stamp 不全则阻断（exit 1）
+  pre_edit    — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
+  pre_phase3  — Phase 2→3 Gate: 检查项目测试 + E2E 是否已通过，未通过则阻断（exit 1）
+  status      — 查看当前验证状态
+  reset       — 手动重置状态（新需求开始时）
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -327,6 +328,48 @@ def gate_status():
     return 0
 
 
+def gate_pre_phase3():
+    """Phase 2 → Phase 3 Gate: 必须跑通项目测试 + E2E 才能进入验证阶段"""
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    stacks = detect_stack()
+
+    blocks = []
+    if not st.get("test_passed"):
+        stack_hint = stacks[0] if stacks else "unknown"
+        test_cmds = {
+            "rust": "cargo test",
+            "node": "npm test",
+            "python": "pytest",
+            "go": "go test ./...",
+        }
+        hint = test_cmds.get(stack_hint, "项目测试命令")
+        blocks.append(f"项目测试未通过（请先运行: {hint}）")
+
+    if not st.get("e2e_executed"):
+        blocks.append("E2E 验证未执行（请先运行 E2E 测试）")
+
+    if blocks:
+        lines = [
+            "🔴 BLOCKED: 不能进入阶段 3（Verification Loop）",
+            "",
+            "以下验证未完成：",
+        ]
+        for b in blocks:
+            lines.append(f"   ❌ {b}")
+        lines.append("")
+        lines.append("请在阶段 2 中完成所有验证后再调用此 Gate。")
+        print("\n".join(lines))
+        return 1
+
+    print("✅ Phase 2 → Phase 3 Gate PASSED")
+    print(f"   测试: ✅ ({st.get('test_tool', '-')}) @ {st.get('test_ts', '-')}")
+    print(f"   E2E:  ✅ @ {st.get('e2e_ts', '-')}")
+    print("")
+    print("可以进入阶段 3: Verification Loop")
+    return 0
+
+
 def gate_reset():
     """手动重置验证状态（新需求开始时调用）"""
     branch = get_current_branch()
@@ -347,6 +390,7 @@ def main():
         "post_bash": gate_post_bash,
         "pre_bash": gate_pre_bash,
         "pre_edit": gate_pre_edit,
+        "pre_phase3": gate_pre_phase3,
         "status": gate_status,
         "reset": gate_reset,
     }
