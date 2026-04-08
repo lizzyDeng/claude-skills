@@ -51,12 +51,17 @@ def load_config():
         "xau_threshold_pct": float(config.get("XAU_THRESHOLD_PCT", "2.0")),
         "btc_threshold_pct": float(config.get("BTC_THRESHOLD_PCT", "5.0")),
         "window_minutes": int(config.get("WINDOW_MINUTES", "1440")),
+        "alert_step_pct": float(config.get("ALERT_STEP_PCT", str(DEFAULT_ALERT_STEP_PCT))),
     }
 
 
 # ---------- 价格历史 ----------
 
 HISTORY_FILE = Path(__file__).parent / ".price_history.json"
+ALERT_STATE_FILE = Path(__file__).parent / ".alert_state.json"
+
+# 告警升级步长默认值（百分点）— 波动率比上次告警高出这么多才再次告警
+DEFAULT_ALERT_STEP_PCT = 3.0
 
 
 def load_history():
@@ -278,8 +283,35 @@ def cmd_status(config):
             print(f"  {window}分钟波动: {change:+.2f}% (阈值: ±{threshold}%) {status}")
 
 
+def load_alert_state():
+    """加载告警冷却状态"""
+    if ALERT_STATE_FILE.exists():
+        try:
+            return json.loads(ALERT_STATE_FILE.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def save_alert_state(state):
+    ALERT_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def should_alert(alert_state, asset, current_pct, step_pct):
+    """
+    判断是否应该告警。逻辑：
+    - 首次超阈值：告警，记录当前波动率
+    - 后续：只有波动率比上次告警高出 step_pct 才再次告警
+    - 波动回落到阈值以下时：自动重置（由调用方处理）
+    """
+    last_pct = alert_state.get(f"{asset}_last_pct", 0)
+    if last_pct == 0:
+        return True  # 首次告警
+    return abs(current_pct) >= last_pct + step_pct
+
+
 def cmd_run(config):
-    """正常运行：获取价格 → 检测波动 → 触发告警"""
+    """正常运行：获取价格 → 检测波动 → 触发告警（含冷却）"""
     btc = fetch_btc_price()
     xau = fetch_xau_price(config["twelve_data_api_key"])
 
@@ -296,18 +328,31 @@ def cmd_run(config):
     # 检测波动
     window = config["window_minutes"]
     alerts = []
+    alert_state = load_alert_state()
+
+    step_pct = config["alert_step_pct"]
+    state_changed = False
 
     for asset, threshold_key in [("btc", "btc_threshold_pct"), ("xau", "xau_threshold_pct")]:
         triggered, change, old_p, new_p = check_volatility(
             history, asset, config[threshold_key], window
         )
-        if triggered:
+        if triggered and should_alert(alert_state, asset, change, step_pct):
             msg = format_alert(asset, change, old_p, new_p, window)
-            alerts.append(msg)
+            alerts.append((asset, msg, change))
+        elif not triggered and alert_state.get(f"{asset}_last_pct", 0) > 0:
+            # 波动回落到阈值以下，重置状态
+            alert_state[f"{asset}_last_pct"] = 0
+            state_changed = True
 
     # 发送告警
-    for msg in alerts:
-        send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg)
+    for asset, msg, change in alerts:
+        if send_telegram(config["telegram_bot_token"], config["telegram_chat_id"], msg):
+            alert_state[f"{asset}_last_pct"] = abs(change)
+            state_changed = True
+
+    if state_changed or alerts:
+        save_alert_state(alert_state)
 
     # 静默日志
     ts = datetime.utcnow().strftime("%H:%M:%S")
