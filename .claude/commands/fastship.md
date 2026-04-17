@@ -1,9 +1,9 @@
 ---
-name: ship
+name: fastship
 description: "Result-driven development skill. Brainstorm with user to define requirements and E2E verification, then execute autonomously in git worktree with verification loop. Use for any feature, bugfix, or refactor regardless of complexity."
 ---
 
-# /ship — 结果驱动开发
+# /fastship — 结果驱动开发
 
 以 E2E 验证通过为唯一交付标准。Brainstorm 对齐目标 → 自主执行 → 验证结果 → 不对就重来。
 
@@ -111,7 +111,7 @@ scenarios = [
 根据需求规模选择开发方式（不强制 worktree）：
 
 ```
-├── 大特性 / 高风险改动 → 推荐 worktree 隔离（分支命名：ship/{feature-short-name}）
+├── 大特性 / 高风险改动 → 推荐 worktree 隔离（分支命名：fastship/{feature-short-name}）
 ├── 中等改动 → 新分支即可
 └── 小改动 / bugfix → 当前分支直接开发也可以
 ```
@@ -324,7 +324,7 @@ Gate FAIL → 禁止合入。
 每次回复末尾包含：
 
 ```
-🚀 /ship | {需求简述} | 阶段：{1-Brainstorm / 2-Execution / 3-Verification} | Loop: {0/3}
+🚀 /fastship | {需求简述} | 阶段：{1-Brainstorm / 2-Execution / 3-Verification} | Loop: {0/3}
 ```
 
 ---

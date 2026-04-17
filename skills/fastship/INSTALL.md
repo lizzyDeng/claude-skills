@@ -1,23 +1,28 @@
-# /ship skill 安装指南
+# /fastship skill 安装指南
 
-## 1. 复制 SKILL.md 到全局 skills 目录
+推荐使用 `/fastship-setup` 一键安装。以下是手动安装步骤：
 
-```bash
-mkdir -p ~/.claude/skills/ship
-cp skills/ship/SKILL.md ~/.claude/skills/ship/SKILL.md
-```
-
-## 2. 复制 hooks 脚本到目标项目
+## 1. 复制 skill 定义到目标项目
 
 ```bash
 # 进入目标项目
 cd /path/to/your/project
 
+# 创建 commands 目录
+mkdir -p .claude/commands
+
+# 复制 skill 定义
+cp /path/to/claude-skills/skills/fastship/SKILL.md .claude/commands/fastship.md
+```
+
+## 2. 复制 hooks 脚本到目标项目
+
+```bash
 # 创建 hooks 目录
 mkdir -p .claude/hooks
 
 # 复制 gate 脚本
-cp /path/to/claude-skills/skills/ship/hooks/ship_verify_gate.py .claude/hooks/
+cp /path/to/claude-skills/skills/fastship/hooks/ship_verify_gate.py .claude/hooks/
 ```
 
 ## 3. 配置 hooks
@@ -84,14 +89,14 @@ cp /path/to/claude-skills/skills/ship/hooks/ship_verify_gate.py .claude/hooks/
 ```bash
 # 复制 E2E runner 和 gate
 mkdir -p tests
-cp /path/to/claude-skills/skills/ship/e2e/e2e_runner.py tests/
-cp /path/to/claude-skills/skills/ship/e2e/e2e_gate.py tests/
+cp /path/to/claude-skills/skills/fastship/e2e/e2e_runner.py tests/
+cp /path/to/claude-skills/skills/fastship/e2e/e2e_gate.py tests/
 
 # 创建场景目录
 mkdir -p tests/e2e_scenarios
 
 # 可选：复制场景模板
-cp /path/to/claude-skills/skills/ship/e2e/scenario_template.json tests/e2e_scenarios/
+cp /path/to/claude-skills/skills/fastship/e2e/scenario_template.json tests/e2e_scenarios/
 
 # 安装依赖
 pip install requests
