@@ -69,32 +69,42 @@ description: "Result-driven development skill. Brainstorm with user to define re
 
 ### 1.3 E2E 验证方案格式
 
-根据项目类型选择验证方式。以下是通用模板：
+🔴 **E2E = 冒烟测试。用当前环境的真实数据，零构造，看输出。**
+
+每个 E2E 场景必须声明以下 4 项，**用户审批时重点看 data_source**：
 
 ```python
 scenarios = [
     {
         "name": "场景名称",
         "description": "验证什么",
-        "setup": { ... },              # 可选：前置状态/环境准备
+        "data_source": "当前环境",     # 🔴 必填。只允许：
+                                       #   "当前环境" — 用 DB 里已有的真实数据
+                                       #   "API 创建" — 通过 API 调用产生前置数据（如发 5 条消息触发 extraction）
+                                       #   🔴 禁止写 "手动 INSERT" / "SQL 构造" / "mock 数据"
         "steps": [
             {
-                "action": "描述操作",   # API 调用 / CLI 命令 / UI 操作
+                "action": "描述操作",   # 只能是 API 调用 / CLI 命令 / UI 操作
                 "input": { ... },
                 "expect": {
                     "status": "success",
                     "output_contains": ["..."],
                     "output_not_contains": ["..."],
+                    "db_check": "..."   # 可选：查 DB 验证副作用（只 SELECT，不 INSERT）
                 }
             },
-            # 后续步骤...
         ],
-        "teardown": { ... },           # 可选：清理
         "repeat": 1,                   # LLM 相关场景建议 ≥2 次
         "pass_criteria": "1/1"
     }
 ]
 ```
+
+🔴 **E2E 数据红线**：
+- 验证过程中禁止直接操作 DB（INSERT / UPDATE / DELETE）来构造测试前提
+- 如果需要前置状态，只能通过 API 调用产生（如发消息触发 extraction）
+- DB 查询仅用于验证副作用（SELECT），不用于构造数据
+- 违反此规则的 E2E 结果视为无效，hook 会拦截并警告
 
 ### 1.4 ⏸️ 用户确认
 
@@ -171,6 +181,14 @@ Gate 3: 想 merge/push？→ hook 自动检查全部验证完成
 ### 3.1 验证执行
 
 ```
+Step 0: 冒烟测试（🔴 强制，在 E2E 场景之前）
+  ├── 零 setup：不 INSERT，不 UPDATE，不手动构造数据
+  ├── 启动服务 → 通过 API 发一条真实请求
+  ├── 等 async 处理完成（extraction / webhook / queue 等）
+  ├── 查 DB（SELECT）验证每个中间产物：存在？格式正确？
+  ├── 任一环节失败 → 停下修，禁止进入 E2E
+  └── 🔴 冒烟测试过程中执行 DB 写入 → hook 拦截
+
 Step 1: 项目测试（全量）
   ├── 通过 → 继续
   └── 失败 → 修复后重跑（不算 loop 次数）
@@ -342,3 +360,5 @@ Gate FAIL → 禁止合入。
 - 跳过项目测试直接跑 E2E
 - 通过验证后不更新文档
 - 🔴 任何需求都必须经过 E2E 验证，无论是否使用 worktree、无论改动大小
+- 🔴 E2E 阶段禁止通过 psql / SQL 直接写入数据库来构造测试前提（hook 自动拦截）
+- 🔴 E2E 方案中未声明 data_source 或 data_source 为手动构造 → 用户应拒绝确认

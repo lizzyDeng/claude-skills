@@ -218,6 +218,24 @@ def is_merge_cmd(cmd):
     return any(re.search(p, cmd) for p in pats)
 
 
+def is_db_write_cmd(cmd):
+    """检测直接操作数据库的写入命令（INSERT/UPDATE/DELETE via psql/docker exec psql）。
+    用于 E2E 阶段拦截——防止 LLM 通过手动构造数据来 fake 测试结果。
+    SELECT 不拦截（用于验证副作用）。"""
+    if not cmd:
+        return False
+    # Must involve psql or similar DB CLI
+    db_cli = re.search(r'\bpsql\b|\bsqlite3\b|\bmongo\b|\bmysql\b', cmd, re.IGNORECASE)
+    if not db_cli:
+        return False
+    # Must contain write operations
+    write_ops = re.search(
+        r'\bINSERT\s+INTO\b|\bUPDATE\s+\w+\s+SET\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bDROP\b|\bALTER\b',
+        cmd, re.IGNORECASE
+    )
+    return bool(write_ops)
+
+
 # ---------- Gate 动作 ----------
 
 def gate_pre_edit():
@@ -285,8 +303,9 @@ def is_push_cmd(cmd):
 
 
 def gate_pre_bash():
-    """PreToolUse: Bash — 自动拦截，三层 Gate（所有分支生效）
+    """PreToolUse: Bash — 自动拦截，四层 Gate（所有分支生效）
 
+    Gate 0: E2E 阶段 DB 写入 → 禁止（防止 fake 数据构造）
     Gate 1: E2E 命令 → 必须先跑通项目测试（单测）
     Gate 2: E2E Gate 脚本 → 必须项目测试 + E2E Runner 都完成
     Gate 3: merge/push → 必须项目测试 + E2E 都完成（已有逻辑）
@@ -297,6 +316,21 @@ def gate_pre_bash():
     cmd = data.get("tool_input", {}).get("command", "")
 
     st = ensure_branch_state(load_state(), branch)
+
+    # --- Gate 0: E2E 阶段禁止直接 DB 写入 ---
+    # 条件：项目测试已通过（说明进入了验证阶段），且检测到 DB 写入命令
+    if st.get("test_passed") and is_db_write_cmd(cmd):
+        lines = [
+            "🔴 BLOCKED: E2E 阶段禁止直接操作数据库",
+            "",
+            "   检测到 DB 写入命令（INSERT/UPDATE/DELETE via psql）",
+            "   E2E 验证必须使用当前环境的真实数据，不能手动构造",
+            "",
+            "   如果需要前置数据，请通过 API 调用产生",
+            "   如果需要查询验证，请使用 SELECT（不会被拦截）",
+        ]
+        print("\n".join(lines))
+        return 1
 
     # --- Gate 2: 跑 E2E Gate 前必须测试 + E2E Runner 都完成 ---
     # （必须在 Gate 1 之前，因为 e2e_gate 也匹配 is_e2e_cmd）
