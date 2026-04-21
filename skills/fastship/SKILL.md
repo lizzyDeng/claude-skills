@@ -14,10 +14,14 @@ description: "Result-driven development skill. Brainstorm with user to define re
 ## 三阶段流程
 
 ```
-阶段 1：Brainstorm（与用户共创，⏸️ 必须用户确认后才进入阶段 2）
-阶段 2：Execution（自主闭环，git worktree 隔离）
+阶段 1：Brainstorm + Plan
+  └── 1.1~1.4: 读上下文 → 讨论 AC/E2E → ⏸️ 用户确认
+  └── 1.5:    writing-plans 写实施计划 → ⏸️ 用户再次确认
+阶段 2：Execution（executing-plans 按计划执行，禁止主线程自由拆步骤）
 阶段 3：Verification Loop（E2E 验证，失败则根因分析 → 重试或回阶段 1）
 ```
+
+🔴 **计划强制由 superpowers 的 skill 产出**，不让主线程自己拍脑袋拆步骤 —— 写用 `writing-plans`，执行用 `executing-plans`（有 subagent 时换成 `subagent-driven-development`）。
 
 ---
 
@@ -106,11 +110,39 @@ scenarios = [
 - DB 查询仅用于验证副作用（SELECT），不用于构造数据
 - 违反此规则的 E2E 结果视为无效，hook 会拦截并警告
 
-### 1.4 ⏸️ 用户确认
+### 1.4 ⏸️ 用户确认（AC + E2E）
 
 输出 AC 清单 + E2E 验证方案 + 影响范围，等待用户明确确认。
 
-**未经用户确认，禁止进入阶段 2。**
+**未经用户确认，禁止进入 1.5。**
+
+### 1.5 Plan Writing（🔴 强制，不能由主线程自由发挥）
+
+用户确认 AC + E2E 之后，**必须通过 Skill 工具调用 superpowers 的 `writing-plans`** 来写实施计划，不要由主线程直接拆步骤/写 todo 开干。
+
+```
+调用方式：
+  Skill(skill="writing-plans")
+    └── 若当前环境未暴露 writing-plans，先 Skill(skill="using-superpowers")
+        按其引导加载 writing-plans
+
+产物：
+  docs/superpowers/plans/YYYY-MM-DD-{feature-name}.md
+
+计划必须包含（由 writing-plans 模板强制）：
+  ├── Header: Goal / Architecture / Tech Stack
+  ├── File Structure: 哪些文件 create / modify
+  ├── Bite-sized Tasks: 每步 2-5 分钟（写失败测试 → 跑测试 → 最小实现 → 跑通 → commit）
+  └── 每个任务的 Files + 测试命令 + 预期输出 + commit 信息
+
+🔴 计划中必须引用阶段 1 确认的 AC 清单和 E2E 方案，作为验收依据。
+```
+
+### 1.6 ⏸️ 用户确认（Plan）
+
+计划写完后，告诉用户落盘路径 + 任务摘要，等待用户明确确认。
+
+**未经用户确认计划，禁止进入阶段 2。**
 
 ---
 
@@ -128,16 +160,29 @@ scenarios = [
 
 用户可以指定，如果没指定则由你根据影响范围判断。
 
-### 2.2 自主执行
+### 2.2 按计划执行（🔴 强制走 superpowers skill）
 
-自由决定实现方式：
-- 自己分析代码和数据流
-- 自己拆分子任务
-- 使用 subagent 并行执行
-- 直接写代码
-- 写测试（TDD 或后补都行）
+执行阶段 **必须通过 Skill 工具调用 superpowers 的执行 skill**，禁止主线程凭直觉直接写代码：
 
-**不规定步骤、不规定角色、不规定文档模板。**
+```
+有 subagent 环境（Claude Code 等）：
+  Skill(skill="subagent-driven-development")
+    └── 每个任务派发独立 subagent + 两段式 review
+
+无 subagent 环境：
+  Skill(skill="executing-plans")
+    └── 加载 1.5 产出的计划文件
+    └── 逐个任务按 bite-sized 步骤执行（写测试 → 跑失败 → 实现 → 跑通 → commit）
+    └── 每步都跑计划里声明的 verification 命令
+```
+
+执行时遵循的原则由计划和 superpowers skill 共同决定，fastship 不再重复规定。
+
+**遇到以下情况必须停下**（executing-plans 的约束）：
+- 计划有关键缺口
+- 连续验证失败
+- 指令含糊无法判断
+- → 回到阶段 1 与用户对齐，而不是猜着改计划
 
 ### 2.3 底线 Gate（自动检测）
 
@@ -351,7 +396,10 @@ Gate FAIL → 禁止合入。
 
 **禁止：**
 - 未读项目上下文文件就进入 brainstorm
-- 未与用户确认 AC + E2E 方案就进入 execution
+- 未与用户确认 AC + E2E 方案就进入 1.5 写计划
+- 🔴 未调用 `writing-plans` 就进入阶段 2（主线程自由拆步骤 = 违规）
+- 🔴 未经用户确认计划就进入阶段 2
+- 🔴 阶段 2 不走 `executing-plans` / `subagent-driven-development`，凭直觉直接写代码
 - 🔴 未跑通项目测试就执行 E2E（hook 自动阻断，无法绕过）
 - 🔴 未完成 E2E Runner 就执行 E2E Gate（hook 自动阻断，无法绕过）
 - 在 execution 中修改带保护标记的代码
