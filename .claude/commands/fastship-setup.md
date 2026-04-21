@@ -4,6 +4,26 @@ description: 在当前项目中安装 /fastship skill 的完整工具链（skill
 
 你需要在当前项目中安装 /fastship skill 的完整工具链。按以下步骤执行：
 
+## Step 0: 检测 superpowers 插件（🔴 前置依赖）
+
+fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-plans` / `executing-plans`）。
+
+1. 检查插件是否已装：`ls ~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/ 2>/dev/null`
+2. 找得到 `writing-plans` 和 `executing-plans` 目录 → ✅ 继续
+3. 找不到 → ⚠️ 告诉用户：
+
+   ```
+   未检测到 superpowers 插件。fastship 的 Plan Gate 会在你第一次编辑代码时卡住，
+   因为 writing-plans / executing-plans skill 不可用。
+
+   请先在 Claude Code 里安装：
+     /plugin install superpowers@claude-plugins-official
+
+   装完后重新执行 /fastship-setup。
+   ```
+
+   问用户是否继续（用户明确表示"继续"才往下走，否则停在这一步）。
+
 ## Step 1: 检测项目
 
 1. 确认当前目录是一个 git 仓库（`git rev-parse --show-toplevel`）
@@ -45,6 +65,28 @@ description: 在当前项目中安装 /fastship skill 的完整工具链（skill
             "statusMessage": "Tracking verification..."
           }
         ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
+            "timeout": 5,
+            "statusMessage": "Checking for plan file..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
+            "timeout": 5,
+            "statusMessage": "Checking for plan file..."
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -55,7 +97,7 @@ description: 在当前项目中安装 /fastship skill 的完整工具链（skill
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
             "timeout": 5,
-            "statusMessage": "Checking state file protection..."
+            "statusMessage": "Checking plan gate + state file protection..."
           }
         ]
       },
@@ -66,7 +108,7 @@ description: 在当前项目中安装 /fastship skill 的完整工具链（skill
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
             "timeout": 5,
-            "statusMessage": "Checking state file protection..."
+            "statusMessage": "Checking plan gate + state file protection..."
           }
         ]
       },

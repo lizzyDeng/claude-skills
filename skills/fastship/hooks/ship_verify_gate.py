@@ -6,14 +6,19 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 所有分支均生效（包括 main），不再局限于 ship/* 分支。
 
 动作:
-  post_bash  — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
-  pre_bash   — PreToolUse: Bash → 三层自动 Gate:
-               Gate 1: E2E 命令 → 必须先跑通项目测试
-               Gate 2: E2E Gate 脚本 → 必须测试 + E2E Runner 都完成
-               Gate 3: merge/push → 必须全部验证完成
-  pre_edit   — PreToolUse: Edit/Write → 禁止 LLM 篡改验证状态文件
-  status     — 查看当前验证状态
-  reset      — 手动重置状态（新需求开始时）
+  post_bash    — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
+  post_edit    — PostToolUse: Edit/Write → 检测是否写了 Plan 文件，置 plan_ready
+  pre_bash     — PreToolUse: Bash → 四层自动 Gate:
+                 Gate 0: E2E 阶段禁止直接 DB 写入
+                 Gate 1: E2E 命令 → 必须先跑通项目测试
+                 Gate 2: E2E Gate 脚本 → 必须测试 + E2E Runner 都完成
+                 Gate 3: merge/push → 必须全部验证完成
+  pre_edit     — PreToolUse: Edit/Write → 双层自动 Gate:
+                 Gate A: 禁止 LLM 篡改验证状态文件
+                 Gate B: 编辑代码前必须有 plan 文件（Phase 2 前置条件）
+  status       — 查看当前验证状态
+  reset        — 手动重置状态（新需求开始时）
+  plan_bypass  — 在当前分支放行 Plan Gate（非 fastship 流程下的兜底）
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -69,6 +74,10 @@ def empty_state(branch=None):
         "test_tool": None,
         "e2e_executed": False,
         "e2e_ts": None,
+        "plan_ready": False,
+        "plan_file": None,
+        "plan_ts": None,
+        "plan_bypass": False,
         "branch": branch,
     }
 
@@ -218,6 +227,47 @@ def is_merge_cmd(cmd):
     return any(re.search(p, cmd) for p in pats)
 
 
+PLAN_DIR_MARKER = "docs/superpowers/plans/"
+
+# 必须先有 plan 才能编辑的代码文件扩展名（明显的实现代码）
+# 配置类（.json/.yml/.toml）和文档类（.md）不在此列，允许自由编辑
+CODE_EXTENSIONS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".kt", ".scala",
+    ".rb", ".php", ".swift", ".m", ".mm",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
+    ".cs", ".vb",
+    ".sh", ".bash", ".zsh",
+    ".vue", ".svelte",
+    ".html", ".css", ".scss", ".less",
+}
+
+
+def normalize_path(path):
+    """统一分隔符，方便匹配"""
+    return (path or "").replace("\\", "/")
+
+
+def is_plan_file(path):
+    """判断是否是 superpowers writing-plans 产出的计划文件"""
+    p = normalize_path(path)
+    return PLAN_DIR_MARKER in p and p.endswith(".md")
+
+
+def is_code_file(path):
+    """判断是否是需要 plan 才能编辑的代码文件"""
+    p = normalize_path(path)
+    if not p:
+        return False
+    # 明确放行：.claude/ 配置目录、docs/ 文档目录
+    if "/.claude/" in p or p.startswith(".claude/"):
+        return False
+    if p.startswith("docs/") or "/docs/" in p:
+        return False
+    _, ext = os.path.splitext(p)
+    return ext.lower() in CODE_EXTENSIONS
+
+
 def is_db_write_cmd(cmd):
     """检测直接操作数据库的写入命令（INSERT/UPDATE/DELETE via psql/docker exec psql）。
     用于 E2E 阶段拦截——防止 LLM 通过手动构造数据来 fake 测试结果。
@@ -239,12 +289,79 @@ def is_db_write_cmd(cmd):
 # ---------- Gate 动作 ----------
 
 def gate_pre_edit():
-    """PreToolUse: Edit/Write — 禁止 LLM 直接修改 state file"""
+    """PreToolUse: Edit/Write — 双层 Gate:
+       Gate A: 禁止 LLM 直接修改 state file
+       Gate B: 编辑代码前必须有 plan 文件（Phase 2 前置条件）
+    """
     data = read_stdin()
     file_path = data.get("tool_input", {}).get("file_path", "")
+
+    # --- Gate A: 保护 state file ---
     if file_path and ".ship-verify-state.json" in file_path:
         print("🔴 BLOCKED: .ship-verify-state.json 由 hook 自动管理，禁止手动编辑")
         return 1
+
+    # --- Gate B: 代码编辑前必须有 plan ---
+    if is_code_file(file_path):
+        branch = get_current_branch()
+        st = ensure_branch_state(load_state(), branch)
+
+        # 环境变量兜底（便于 CI / 临时绕过）
+        if os.environ.get("FASTSHIP_SKIP_PLAN_GATE") == "1":
+            return 0
+        if st.get("plan_bypass"):
+            return 0
+        if st.get("plan_ready"):
+            return 0
+
+        lines = [
+            "🔴 BLOCKED: 进入阶段 2 前必须先写计划",
+            "",
+            f"   目标文件：{file_path}",
+            "   当前状态：未检测到 plan 文件（plan_ready=false）",
+            "",
+            "   请先通过 Skill 工具调用 superpowers 的 writing-plans：",
+            "     Skill(skill=\"writing-plans\")",
+            "   并把计划落盘到：",
+            f"     {PLAN_DIR_MARKER}YYYY-MM-DD-<feature>.md",
+            "",
+            "   Plan 文件写入后 Gate 自动放行。",
+            "",
+            "   如果你不是在跑 /fastship 流程，可临时放行：",
+            "     python3 .claude/hooks/ship_verify_gate.py plan_bypass",
+        ]
+        print("\n".join(lines))
+        return 1
+
+    return 0
+
+
+def gate_post_edit():
+    """PostToolUse: Edit/Write — 检测是否写了 plan 文件，置 plan_ready"""
+    data = read_stdin()
+    file_path = data.get("tool_input", {}).get("file_path", "")
+    if not is_plan_file(file_path):
+        return 0
+
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    now = datetime.now().isoformat()
+    st["plan_ready"] = True
+    st["plan_file"] = normalize_path(file_path)
+    st["plan_ts"] = now
+    save_state(st)
+    print(f"✅ Gate: 检测到 plan 文件已写入，plan_ready=true ({file_path})")
+    return 0
+
+
+def gate_plan_bypass():
+    """手动放行 Plan Gate（当前分支生效，用于非 fastship 场景）"""
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    st["plan_bypass"] = True
+    save_state(st)
+    print(f"⚠️ Gate: 已为当前分支 ({branch}) 放行 Plan Gate")
+    print("   — 如果你原本在跑 /fastship，请立即 reset 并补写计划")
     return 0
 
 
@@ -405,7 +522,9 @@ def gate_status():
     print(f"Stack:      {', '.join(stacks) if stacks else 'unknown'}")
     t = "✅" if st.get("test_passed") else "❌"
     e = "✅" if st.get("e2e_executed") else "❌"
+    p = "✅" if st.get("plan_ready") else ("⚠️ bypass" if st.get("plan_bypass") else "❌")
     tool = st.get("test_tool", "-")
+    print(f"Plan:       {p}  ({st.get('plan_file', '-')}) ({st.get('plan_ts', '-')})")
     print(f"Test:       {t}  ({tool}) ({st.get('test_ts', '-')})")
     print(f"E2E:        {e}  ({st.get('e2e_ts', '-')})")
     return 0
@@ -424,15 +543,17 @@ def gate_reset():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ship_verify_gate.py <post_bash|pre_bash|pre_edit|status>")
+        print("Usage: ship_verify_gate.py <post_bash|post_edit|pre_bash|pre_edit|status|reset|plan_bypass>")
         sys.exit(1)
 
     handlers = {
         "post_bash": gate_post_bash,
+        "post_edit": gate_post_edit,
         "pre_bash": gate_pre_bash,
         "pre_edit": gate_pre_edit,
         "status": gate_status,
         "reset": gate_reset,
+        "plan_bypass": gate_plan_bypass,
     }
     handler = handlers.get(sys.argv[1])
     if handler:
