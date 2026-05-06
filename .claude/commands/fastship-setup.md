@@ -4,9 +4,11 @@ description: 在当前项目中安装 /fastship skill 的完整工具链（skill
 
 你需要在当前项目中安装 /fastship skill 的完整工具链。按以下步骤执行：
 
-## Step 0: 检测 superpowers 插件（🔴 前置依赖）
+## Step 0: 检测前置依赖（🔴 必需）
 
-fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-plans` / `executing-plans`）。
+### 0.1 superpowers 插件
+
+fastship 的阶段 1.4 / 阶段 2 强制调用 superpowers 的 skill（`writing-plans` / `executing-plans`）。
 
 1. 检查插件是否已装：`ls ~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/ 2>/dev/null`
 2. 找得到 `writing-plans` 和 `executing-plans` 目录 → ✅ 继续
@@ -20,6 +22,24 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
      /plugin install superpowers@claude-plugins-official
 
    装完后重新执行 /fastship-setup。
+   ```
+
+   问用户是否继续（用户明确表示"继续"才往下走，否则停在这一步）。
+
+### 0.2 全局 grill-me skill
+
+fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问。
+
+1. 检查 skill 是否可用：`ls ~/.claude/skills/grill-me 2>/dev/null || find ~/.claude -maxdepth 5 -type d -name "grill-me" 2>/dev/null | head -3`
+2. 找得到 → ✅ 继续
+3. 找不到 → ⚠️ 告诉用户：
+
+   ```
+   未检测到全局 grill-me skill。fastship 的阶段 1.5 会卡住，
+   因为 Plan Grilling 关卡需要它来对 plan 做结构化拷问。
+
+   请把 grill-me skill 安装到 ~/.claude/skills/grill-me/，
+   或确保你常用的 skills 集合里包含它（在当前会话能 Skill(skill="grill-me") 调用即可）。
    ```
 
    问用户是否继续（用户明确表示"继续"才往下走，否则停在这一步）。
@@ -73,7 +93,7 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
             "timeout": 5,
-            "statusMessage": "Checking for plan file..."
+            "statusMessage": "Detecting plan / KNOWLEDGE.md writes..."
           }
         ]
       },
@@ -84,7 +104,7 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
             "timeout": 5,
-            "statusMessage": "Checking for plan file..."
+            "statusMessage": "Detecting plan / KNOWLEDGE.md writes..."
           }
         ]
       }
@@ -97,7 +117,7 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
             "timeout": 5,
-            "statusMessage": "Checking plan gate + state file protection..."
+            "statusMessage": "Gate B: plan + knowledge_recall + state protection..."
           }
         ]
       },
@@ -108,7 +128,7 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
             "timeout": 5,
-            "statusMessage": "Checking plan gate + state file protection..."
+            "statusMessage": "Gate B: plan + knowledge_recall + state protection..."
           }
         ]
       },
@@ -119,7 +139,7 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
             "type": "command",
             "command": "python3 .claude/hooks/ship_verify_gate.py pre_bash",
             "timeout": 10,
-            "statusMessage": "Checking verification gate..."
+            "statusMessage": "Gates 0-5: DB / E2E / merge-push / KNOWLEDGE / Reflection..."
           }
         ]
       }
@@ -146,11 +166,30 @@ fastship 的阶段 1.5 / 阶段 2 强制调用 superpowers 的 skill（`writing-
 
 运行 `python3 .claude/hooks/ship_verify_gate.py status` 确认安装成功。
 
+输出应包含 `Recall / Plan / Test / E2E / Knowledge / Loop` 六行状态：
+
+- `Recall` 未通过 → 1.1a-recall 没跑过；`knowledge_recall --query "..."` 跑一次即可。Gate B 拦着不让编辑代码。
+
+- `Knowledge` 未通过 → 编辑 `KNOWLEDGE.md` 或 `knowledge_skip --reason "..."` 表态。
+- `Loop` 显示已记录的 loop 历史；E2E 跑完未 `loop_record` 会显示 `⏳`，下次 E2E 会被 Gate 5 拦。
+
 ## Step 8: 输出总结
 
 告诉用户：
+
 1. 检测到的技术栈
 2. 安装了哪些文件（包括 `.claude/commands/fastship.md` skill 定义）
-3. 配置了哪些 hooks
-4. 提醒：`/fastship` 即可开始使用
-5. 提醒：`e2e_runner.py` 是通用模板，如项目有特殊需求（如 SSE 流式、日志 pipeline 提取），可按需定制
+3. 配置了哪些 hooks（6 个 Gate 自动生效）：
+   - **Gate B (pre_edit)** — 编辑代码前必须有 plan + 已 `knowledge_recall`
+   - **Gate 0-3 (pre_bash)** — DB 写入拦截 / E2E 前置 / E2E Gate 前置 / merge-push 前置
+   - **Gate 4 (pre_bash)** — merge/push 必须 KNOWLEDGE.md 已表态
+   - **Gate 5 (pre_bash)** — 重跑 E2E 必须先 loop_record；loop_count==3 锁死
+4. 用户需手动调用的 CLI（hook 不强代理的部分）：
+   - `python3 .claude/hooks/ship_verify_gate.py knowledge_recall --query "<需求>"` — 1.1a-recall 跨 session 学习
+   - `python3 .claude/hooks/ship_verify_gate.py loop_record --outcome pass|fail [--reflection <p>]` — 每轮 E2E 跑完必调
+   - `python3 .claude/hooks/ship_verify_gate.py knowledge_skip --reason "<≥10字>"` — 确实无新教训时
+   - `python3 .claude/hooks/ship_verify_gate.py status` — 任何时候查 6 行状态
+   - `python3 .claude/hooks/ship_verify_gate.py reset` — 新需求开始时
+5. 提醒：`/fastship` 即可开始使用，全流程会自动走 superpowers `writing-plans` + 全局 `grill-me`
+6. 提醒：`e2e_runner.py` 是通用模板，如项目有特殊需求（SSE 流式、日志 pipeline 提取），可按需定制
+7. 提醒：项目根没有 `KNOWLEDGE.md` 也 OK —— `knowledge_recall` 会返回 0 hits 但仍合规；第一次 success 时 Gate 4 会引导创建

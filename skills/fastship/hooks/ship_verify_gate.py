@@ -6,19 +6,28 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 所有分支均生效（包括 main），不再局限于 ship/* 分支。
 
 动作:
-  post_bash    — PostToolUse: Bash → 检测测试/E2E 执行，写入验证 stamp
-  post_edit    — PostToolUse: Edit/Write → 检测是否写了 Plan 文件，置 plan_ready
-  pre_bash     — PreToolUse: Bash → 四层自动 Gate:
-                 Gate 0: E2E 阶段禁止直接 DB 写入
-                 Gate 1: E2E 命令 → 必须先跑通项目测试
-                 Gate 2: E2E Gate 脚本 → 必须测试 + E2E Runner 都完成
-                 Gate 3: merge/push → 必须全部验证完成
-  pre_edit     — PreToolUse: Edit/Write → 双层自动 Gate:
-                 Gate A: 禁止 LLM 篡改验证状态文件
-                 Gate B: 编辑代码前必须有 plan 文件（Phase 2 前置条件）
-  status       — 查看当前验证状态
-  reset        — 手动重置状态（新需求开始时）
-  plan_bypass  — 在当前分支放行 Plan Gate（非 fastship 流程下的兜底）
+  post_bash       — PostToolUse: Bash → 检测测试/E2E 执行，更新 loop 计数器
+  post_edit       — PostToolUse: Edit/Write → 检测 Plan/KNOWLEDGE.md 写入
+  pre_bash        — PreToolUse: Bash → 六层自动 Gate:
+                    Gate 0: E2E 阶段禁止直接 DB 写入
+                    Gate 1: E2E 命令 → 必须先跑通项目测试
+                    Gate 2: E2E Gate 脚本 → 必须测试 + E2E Runner 都完成
+                    Gate 3: merge/push → 必须全部验证完成
+                    Gate 4: merge/push → 必须 KNOWLEDGE.md 已更新或显式声明跳过
+                    Gate 5: 重跑 E2E → 上一轮必须已 loop_record，失败时必须有 reflection
+  pre_edit        — PreToolUse: Edit/Write → 双层自动 Gate:
+                    Gate A: 禁止 LLM 篡改验证状态文件
+                    Gate B: 编辑代码前必须有 plan 文件（Phase 2 前置条件）
+  status          — 查看当前验证状态
+  reset           — 手动重置状态（新需求开始时）
+  plan_bypass     — 在当前分支放行 Plan Gate（非 fastship 流程下的兜底）
+  knowledge_skip  — 显式声明本次无新教训需要写入 KNOWLEDGE.md（必须给 --reason）
+  knowledge_recall — 跨 session 学习：检索所有 KNOWLEDGE.md，返回与 --query 相关的 top-N
+                     条目原文。必须在 1.1 执行（编辑代码前 Gate B 强制）。
+  loop_record     — 记录本轮 loop 结果：
+                    sequential: --outcome pass | fail [--reflection <path>]
+                    parallel:   --outcome pass | fail --reflection-dir <dir>
+                                                       [--winner <key>]   (pass 必填)
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -67,6 +76,9 @@ def state_path():
     return os.path.join(root, ".claude", ".ship-verify-state.json") if root else None
 
 
+LOOP_LIMIT = 3
+
+
 def empty_state(branch=None):
     return {
         "test_passed": False,
@@ -78,6 +90,21 @@ def empty_state(branch=None):
         "plan_file": None,
         "plan_ts": None,
         "plan_bypass": False,
+        "knowledge_acknowledged": False,
+        "knowledge_file": None,
+        "knowledge_ts": None,
+        "knowledge_skip_reason": None,
+        # 跨 session 学习：1.1 阶段必须跑过 knowledge_recall
+        "knowledge_recall_done": False,
+        "knowledge_recall_query": None,
+        "knowledge_recall_count": None,
+        "knowledge_recall_ts": None,
+        # Reflection in Loop
+        "loop_count": 0,                       # 已记录的 loop 数（loop_record 调用次数）
+        "e2e_runs_since_last_record": 0,       # 自上次 loop_record 后跑了几次 E2E（>=1 时再跑会被拦）
+        "last_loop_outcome": None,             # "pass" | "fail" | None
+        "last_loop_reflection": None,          # 失败时 reflection 文件绝对/相对路径
+        "loop_history": [],                    # [{"loop": N, "outcome": "...", "reflection": "...", "ts": "..."}]
         "branch": branch,
     }
 
@@ -254,6 +281,14 @@ def is_plan_file(path):
     return PLAN_DIR_MARKER in p and p.endswith(".md")
 
 
+def is_knowledge_file(path):
+    """判断是否是项目 KNOWLEDGE.md（任意层级，文件名严格匹配）"""
+    p = normalize_path(path)
+    if not p:
+        return False
+    return os.path.basename(p).upper() == "KNOWLEDGE.MD"
+
+
 def is_code_file(path):
     """判断是否是需要 plan 才能编辑的代码文件"""
     p = normalize_path(path)
@@ -301,7 +336,7 @@ def gate_pre_edit():
         print("🔴 BLOCKED: .ship-verify-state.json 由 hook 自动管理，禁止手动编辑")
         return 1
 
-    # --- Gate B: 代码编辑前必须有 plan ---
+    # --- Gate B: 代码编辑前必须有 plan + 已 knowledge_recall ---
     if is_code_file(file_path):
         branch = get_current_branch()
         st = ensure_branch_state(load_state(), branch)
@@ -311,23 +346,43 @@ def gate_pre_edit():
             return 0
         if st.get("plan_bypass"):
             return 0
-        if st.get("plan_ready"):
+
+        problems = []
+        if not st.get("plan_ready"):
+            problems.append("plan_ready=false（未检测到 plan 文件）")
+        if not st.get("knowledge_recall_done"):
+            problems.append("knowledge_recall_done=false（1.1 阶段未跑跨 session 检索）")
+
+        if not problems:
             return 0
 
         lines = [
-            "🔴 BLOCKED: 进入阶段 2 前必须先写计划",
+            "🔴 BLOCKED: 进入阶段 2 前置条件未满足",
             "",
             f"   目标文件：{file_path}",
-            "   当前状态：未检测到 plan 文件（plan_ready=false）",
+        ]
+        for p in problems:
+            lines.append(f"   ❌ {p}")
+        lines.append("")
+        if not st.get("knowledge_recall_done"):
+            lines += [
+                "   先跑 knowledge_recall（1.1 阶段必做，跨 session 学习）：",
+                "     python3 .claude/hooks/ship_verify_gate.py knowledge_recall \\",
+                "       --query \"<需求一句话>\"",
+                "",
+            ]
+        if not st.get("plan_ready"):
+            lines += [
+                "   再通过 Skill 工具调用 superpowers 的 writing-plans：",
+                "     Skill(skill=\"writing-plans\")",
+                "   把计划落盘到：",
+                f"     {PLAN_DIR_MARKER}YYYY-MM-DD-<feature>.md",
+                "",
+            ]
+        lines += [
+            "   全部就绪后 Gate 自动放行。",
             "",
-            "   请先通过 Skill 工具调用 superpowers 的 writing-plans：",
-            "     Skill(skill=\"writing-plans\")",
-            "   并把计划落盘到：",
-            f"     {PLAN_DIR_MARKER}YYYY-MM-DD-<feature>.md",
-            "",
-            "   Plan 文件写入后 Gate 自动放行。",
-            "",
-            "   如果你不是在跑 /fastship 流程，可临时放行：",
+            "   非 /fastship 流程可临时放行 Plan Gate：",
             "     python3 .claude/hooks/ship_verify_gate.py plan_bypass",
         ]
         print("\n".join(lines))
@@ -337,20 +392,32 @@ def gate_pre_edit():
 
 
 def gate_post_edit():
-    """PostToolUse: Edit/Write — 检测是否写了 plan 文件，置 plan_ready"""
+    """PostToolUse: Edit/Write — 检测 plan 文件 / KNOWLEDGE.md 写入"""
     data = read_stdin()
     file_path = data.get("tool_input", {}).get("file_path", "")
-    if not is_plan_file(file_path):
-        return 0
 
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
     now = datetime.now().isoformat()
-    st["plan_ready"] = True
-    st["plan_file"] = normalize_path(file_path)
-    st["plan_ts"] = now
-    save_state(st)
-    print(f"✅ Gate: 检测到 plan 文件已写入，plan_ready=true ({file_path})")
+    changed = False
+
+    if is_plan_file(file_path):
+        st["plan_ready"] = True
+        st["plan_file"] = normalize_path(file_path)
+        st["plan_ts"] = now
+        changed = True
+        print(f"✅ Gate: 检测到 plan 文件已写入，plan_ready=true ({file_path})")
+
+    if is_knowledge_file(file_path):
+        st["knowledge_acknowledged"] = True
+        st["knowledge_file"] = normalize_path(file_path)
+        st["knowledge_ts"] = now
+        st["knowledge_skip_reason"] = None
+        changed = True
+        print(f"✅ Gate: 检测到 KNOWLEDGE.md 更新，knowledge_acknowledged=true ({file_path})")
+
+    if changed:
+        save_state(st)
     return 0
 
 
@@ -362,6 +429,338 @@ def gate_plan_bypass():
     save_state(st)
     print(f"⚠️ Gate: 已为当前分支 ({branch}) 放行 Plan Gate")
     print("   — 如果你原本在跑 /fastship，请立即 reset 并补写计划")
+    return 0
+
+
+def _resolve_path(path):
+    """相对路径相对 repo_root 解析；返回存在的路径或 None"""
+    if not path:
+        return None
+    candidates = [path]
+    if not os.path.isabs(path):
+        repo_root = get_repo_root() or os.getcwd()
+        candidates.append(os.path.join(repo_root, path))
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def _validate_reflection_file(path):
+    """校验 reflection markdown 文件存在 + 体积 ≥200B；返回 (resolved_path, error_msg|None)"""
+    resolved = _resolve_path(path)
+    if not resolved:
+        return None, f"🔴 reflection 文件不存在：{path}"
+    try:
+        size = os.path.getsize(resolved)
+    except OSError:
+        size = 0
+    if size < 200:
+        return None, f"🔴 reflection 文件太小（{size}B < 200B）：{path}"
+    return resolved, None
+
+
+def gate_loop_record():
+    """记录本轮 loop 结果：
+       sequential：
+         --outcome pass                        → 直接通过
+         --outcome fail --reflection <path>    → 一份反思
+       parallel（一次并行探索 = 1 次 loop_record，不是 N 次）：
+         --outcome pass --reflection-dir <dir> --winner <key>
+                                               → ≥2 份反思，winner 必填
+         --outcome fail --reflection-dir <dir> → ≥2 份反思（全失败）
+    """
+    args = sys.argv[2:]
+    outcome = None
+    reflection = None
+    reflection_dir = None
+    winner = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--outcome",) and i + 1 < len(args):
+            outcome = args[i + 1]; i += 2; continue
+        if a.startswith("--outcome="):
+            outcome = a.split("=", 1)[1]; i += 1; continue
+        if a == "--reflection" and i + 1 < len(args):
+            reflection = args[i + 1]; i += 2; continue
+        if a.startswith("--reflection="):
+            reflection = a.split("=", 1)[1]; i += 1; continue
+        if a == "--reflection-dir" and i + 1 < len(args):
+            reflection_dir = args[i + 1]; i += 2; continue
+        if a.startswith("--reflection-dir="):
+            reflection_dir = a.split("=", 1)[1]; i += 1; continue
+        if a == "--winner" and i + 1 < len(args):
+            winner = args[i + 1]; i += 2; continue
+        if a.startswith("--winner="):
+            winner = a.split("=", 1)[1]; i += 1; continue
+        i += 1
+
+    if outcome not in ("pass", "fail"):
+        print("🔴 必须给 --outcome pass | fail")
+        return 1
+    if reflection and reflection_dir:
+        print("🔴 --reflection 与 --reflection-dir 互斥（前者 sequential，后者 parallel）")
+        return 1
+
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+
+    if not st.get("e2e_executed") or st.get("e2e_runs_since_last_record", 0) < 1:
+        print("🔴 当前没有未记录的 E2E 运行可供 loop_record（先跑 E2E Runner）")
+        return 1
+
+    mode = "sequential"
+    parallel_files = []
+    parallel_winner_path = None
+
+    if reflection_dir:
+        mode = "parallel"
+        resolved_dir = _resolve_path(reflection_dir)
+        if not resolved_dir or not os.path.isdir(resolved_dir):
+            print(f"🔴 reflection-dir 不是已存在的目录：{reflection_dir}")
+            return 1
+        md_files = sorted(
+            os.path.join(resolved_dir, f)
+            for f in os.listdir(resolved_dir)
+            if f.endswith(".md")
+        )
+        if len(md_files) < 2:
+            print(f"🔴 parallel 模式需要 ≥2 份反思 .md，目录里只有 {len(md_files)} 份")
+            return 1
+        for f in md_files:
+            _, err = _validate_reflection_file(f)
+            if err:
+                print(err)
+                return 1
+        parallel_files = [normalize_path(f) for f in md_files]
+
+        if outcome == "pass":
+            if not winner:
+                print("🔴 parallel 模式 outcome=pass 必须给 --winner <key>")
+                print("   key = reflection 文件名去掉 .md，例：--winner hypothesis-a")
+                return 1
+            winner_basenames = [os.path.splitext(os.path.basename(f))[0] for f in md_files]
+            if winner not in winner_basenames:
+                print(f"🔴 winner '{winner}' 不在反思集合里。已知 keys: {winner_basenames}")
+                return 1
+            parallel_winner_path = next(
+                f for f in md_files
+                if os.path.splitext(os.path.basename(f))[0] == winner
+            )
+            parallel_winner_path = normalize_path(parallel_winner_path)
+
+    elif outcome == "fail":
+        if not reflection:
+            print("🔴 outcome=fail 必须给 --reflection <path>（sequential）或 --reflection-dir <dir>（parallel）")
+            print("   sequential 推荐路径：docs/superpowers/plans/<plan>.reflections/loop-N.md")
+            print("   parallel   推荐目录：docs/superpowers/plans/<plan>.reflections/loop-N.parallel/")
+            return 1
+        resolved, err = _validate_reflection_file(reflection)
+        if err:
+            print(err)
+            print("   至少要包含：Hypothesis / Observed / Invalidation / Next Hypothesis / Decision")
+            return 1
+        reflection = normalize_path(resolved)
+
+    now = datetime.now().isoformat()
+    next_loop = st.get("loop_count", 0) + 1
+    history = st.get("loop_history") or []
+    entry = {
+        "loop": next_loop,
+        "outcome": outcome,
+        "mode": mode,
+        "ts": now,
+    }
+    if mode == "sequential":
+        entry["reflection"] = reflection
+    else:
+        entry["reflection_dir"] = normalize_path(_resolve_path(reflection_dir))
+        entry["reflections"] = parallel_files
+        entry["winner"] = parallel_winner_path
+    history.append(entry)
+
+    st["loop_count"] = next_loop
+    st["last_loop_outcome"] = outcome
+    if mode == "sequential":
+        st["last_loop_reflection"] = reflection
+    else:
+        st["last_loop_reflection"] = parallel_winner_path or entry["reflection_dir"]
+    st["loop_history"] = history
+    st["e2e_runs_since_last_record"] = 0
+    save_state(st)
+
+    if outcome == "pass":
+        if mode == "parallel":
+            print(f"✅ Loop {next_loop} (parallel) PASS — winner: {winner}")
+            print(f"   {len(parallel_files)} 份反思保留在 {entry['reflection_dir']}")
+        else:
+            print(f"✅ Loop {next_loop} 记录为 PASS")
+    else:
+        if mode == "parallel":
+            print(f"📝 Loop {next_loop} (parallel) FAIL — 全部 {len(parallel_files)} 个 hypothesis 都没过")
+            print(f"   反思目录: {entry['reflection_dir']}")
+        else:
+            print(f"📝 Loop {next_loop} 记录为 FAIL（reflection: {reflection}）")
+        if next_loop >= LOOP_LIMIT:
+            print(f"🔴 已达 loop 上限 ({LOOP_LIMIT})，禁止继续重试 E2E。请向用户输出聚合分析。")
+        elif next_loop >= 2:
+            print("⚠️  下一轮反思必须包含 Circle Check（sequential：纵向对照；parallel：横向对照）。")
+    return 0
+
+
+def _tokenize_for_recall(text):
+    """简易分词：英文取 ≥3 char word，中文取 bigram。"""
+    if not text:
+        return set()
+    text = text.lower()
+    word_tokens = re.findall(r'[a-z0-9]{3,}', text)
+    cjk_runs = re.findall(r'[一-鿿]+', text)
+    bigrams = []
+    for run in cjk_runs:
+        for i in range(len(run) - 1):
+            bigrams.append(run[i:i+2])
+    return set(word_tokens) | set(bigrams)
+
+
+def _find_knowledge_files(repo_root):
+    """递归查找所有 KNOWLEDGE.md（大小写不敏感），跳过常见的 vendor / build 目录。"""
+    skip_dirs = {".git", "node_modules", "target", "dist", "build", ".venv", "venv", "__pycache__"}
+    found = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".cache")]
+        for fn in filenames:
+            if fn.upper() == "KNOWLEDGE.MD":
+                found.append(os.path.join(dirpath, fn))
+    return sorted(found)
+
+
+def _parse_knowledge_entries(file_path):
+    """把 KNOWLEDGE.md 拆成 entry 列表。每个 entry = `## ...` 标题到下个 `## ` 之间。
+    返回 [{"file": path, "line": N, "title": str, "body": str}]
+    """
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    entries = []
+    cur_start = None
+    cur_title = None
+    cur_buf = []
+    for idx, line in enumerate(lines, start=1):
+        if line.startswith("## "):
+            if cur_start is not None:
+                entries.append({
+                    "file": file_path, "line": cur_start,
+                    "title": cur_title, "body": "".join(cur_buf).rstrip(),
+                })
+            cur_start = idx
+            cur_title = line.rstrip("\n")
+            cur_buf = [line]
+        elif cur_start is not None:
+            cur_buf.append(line)
+    if cur_start is not None:
+        entries.append({
+            "file": file_path, "line": cur_start,
+            "title": cur_title, "body": "".join(cur_buf).rstrip(),
+        })
+    return entries
+
+
+def gate_knowledge_recall():
+    """跨 session 学习：检索所有 KNOWLEDGE.md，返回与 query 相关的 top-N 条目原文。"""
+    args = sys.argv[2:]
+    query = None
+    top = 5
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--query" and i + 1 < len(args):
+            query = args[i + 1]; i += 2; continue
+        if a.startswith("--query="):
+            query = a.split("=", 1)[1]; i += 1; continue
+        if a == "--top" and i + 1 < len(args):
+            try: top = max(1, int(args[i + 1]))
+            except ValueError: pass
+            i += 2; continue
+        if a.startswith("--top="):
+            try: top = max(1, int(a.split("=", 1)[1]))
+            except ValueError: pass
+            i += 1; continue
+        i += 1
+
+    if not query or len(query.strip()) < 4:
+        print("🔴 必须给 --query <需求一句话>（≥4 字符）")
+        print('   例：knowledge_recall --query "Webhook 重发去重"')
+        return 1
+
+    repo_root = get_repo_root() or os.getcwd()
+    files = _find_knowledge_files(repo_root)
+    all_entries = []
+    for f in files:
+        all_entries.extend(_parse_knowledge_entries(f))
+
+    q_tokens = _tokenize_for_recall(query)
+    scored = []
+    for entry in all_entries:
+        e_tokens = _tokenize_for_recall(entry["title"] + "\n" + entry["body"])
+        overlap = q_tokens & e_tokens
+        if not overlap:
+            continue
+        score = len(overlap) / max(1, len(q_tokens))
+        scored.append((score, len(overlap), entry))
+
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    matched = scored[:top]
+
+    print(f"🧠 KNOWLEDGE Recall — query: \"{query}\"")
+    print(f"   扫描 {len(files)} 个 KNOWLEDGE.md，共 {len(all_entries)} 条条目，命中 {len(scored)}")
+    print()
+    if matched:
+        for score, _, entry in matched:
+            rel = os.path.relpath(entry["file"], repo_root)
+            print(f"──── {rel}:{entry['line']}  (score={score:.2f}) ────")
+            print(entry["body"])
+            print()
+    else:
+        print("（未找到相关条目——新项目或新方向是正常情况。仍标记 knowledge_recall_done=true）")
+
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    st["knowledge_recall_done"] = True
+    st["knowledge_recall_query"] = query.strip()
+    st["knowledge_recall_count"] = len(matched)
+    st["knowledge_recall_ts"] = datetime.now().isoformat()
+    save_state(st)
+    print(f"✅ knowledge_recall_done=true（命中 {len(matched)} 条，已记入 state）")
+    return 0
+
+
+def gate_knowledge_skip():
+    """显式声明本次无新教训，跳过 KNOWLEDGE.md 更新（必须给 --reason）"""
+    args = sys.argv[2:]
+    reason = None
+    for i, a in enumerate(args):
+        if a == "--reason" and i + 1 < len(args):
+            reason = args[i + 1]
+            break
+        if a.startswith("--reason="):
+            reason = a.split("=", 1)[1]
+            break
+    if not reason or not reason.strip():
+        print("🔴 必须给一个非空 --reason 才能跳过 KNOWLEDGE.md 更新")
+        print("   例：python3 .claude/hooks/ship_verify_gate.py knowledge_skip \\")
+        print("         --reason '纯文档改动，未触及代码或行为'")
+        return 1
+    if len(reason.strip()) < 10:
+        print("🔴 --reason 太短（<10 字），请说人话")
+        return 1
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    now = datetime.now().isoformat()
+    st["knowledge_acknowledged"] = True
+    st["knowledge_skip_reason"] = reason.strip()
+    st["knowledge_ts"] = now
+    save_state(st)
+    print(f"✅ Gate: 已记录跳过 KNOWLEDGE.md，原因：{reason.strip()}")
     return 0
 
 
@@ -390,11 +789,12 @@ def gate_post_bash():
             print(f"⚠️ Gate: {stack} test 已执行，但未检测到通过标志")
 
     # 检测 E2E 验证
-    if is_e2e_cmd(cmd):
+    if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd):
         st["e2e_executed"] = True
         st["e2e_ts"] = now
+        st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
         changed = True
-        print("✅ Gate: E2E 验证已执行，已记录")
+        print(f"✅ Gate: E2E 验证已执行（loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record）")
 
     if changed:
         save_state(st)
@@ -466,7 +866,7 @@ def gate_pre_bash():
         return 0  # Gate 2 passed, skip Gate 1
 
     # --- Gate 1: 跑 E2E 前必须先通过项目测试 ---
-    if is_e2e_cmd(cmd) and not st.get("test_passed"):
+    if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd) and not st.get("test_passed"):
         stacks = detect_stack()
         stack_hint = stacks[0] if stacks else "unknown"
         test_cmds = {
@@ -485,13 +885,50 @@ def gate_pre_bash():
         print("\n".join(lines))
         return 1
 
-    # --- Gate 3: merge/push 前必须全部完成 ---
+    # --- Gate 5: 重跑 E2E 前必须先 loop_record，失败时必须有 reflection ---
+    if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd):
+        unrecorded = st.get("e2e_runs_since_last_record", 0) >= 1
+        loop_count = st.get("loop_count", 0)
+        last_outcome = st.get("last_loop_outcome")
+
+        if unrecorded:
+            lines = [
+                f"🔴 BLOCKED: 上一轮 E2E 未 loop_record，禁止再跑 E2E",
+                "",
+                "   先调用：",
+                "     python3 .claude/hooks/ship_verify_gate.py loop_record \\",
+                "       --outcome pass | fail [--reflection <path>]",
+                "",
+                "   失败时 reflection 路径推荐：",
+                "     docs/superpowers/plans/<plan-name>.reflections/loop-N.md",
+            ]
+            print("\n".join(lines))
+            return 1
+
+        if last_outcome == "fail" and loop_count >= LOOP_LIMIT:
+            lines = [
+                f"🔴 BLOCKED: 已达 loop 上限 ({LOOP_LIMIT})，禁止继续重试 E2E",
+                "",
+                "   按 SKILL 3.2 — 第 3 次失败必须停下，输出聚合报告给用户：",
+                "     - 3 次反思的根因对照",
+                "     - 是否在原地打转（Circle Check 总结）",
+                "     - 建议（方向调整 / 需要用户决策的问题）",
+                "",
+                "   如用户决定换方向、回阶段 1，先 reset：",
+                "     python3 .claude/hooks/ship_verify_gate.py reset",
+            ]
+            print("\n".join(lines))
+            return 1
+
+    # --- Gate 3 + 4: merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
     if is_merge_cmd(cmd) or is_push_cmd(cmd):
         blocks = []
         if not st.get("test_passed"):
             blocks.append("项目测试未通过")
         if not st.get("e2e_executed"):
             blocks.append("E2E 验证未执行")
+        if not st.get("knowledge_acknowledged"):
+            blocks.append("KNOWLEDGE.md 未更新且未声明跳过")
 
         if blocks:
             action = "推送" if is_push_cmd(cmd) else "合入"
@@ -504,6 +941,11 @@ def gate_pre_bash():
             lines.append("请先完成验证流程：")
             lines.append("   1. 项目测试（全量）")
             lines.append("   2. E2E 验证")
+            lines.append("   3. KNOWLEDGE.md：")
+            lines.append("      - 有新教训 → 编辑 KNOWLEDGE.md（hook 自动检测）")
+            lines.append("      - 确实无新教训 → 显式声明跳过：")
+            lines.append("          python3 .claude/hooks/ship_verify_gate.py knowledge_skip \\")
+            lines.append("            --reason '<≥10 字的原因，例：纯文档改动，未触及代码或行为>'")
             print("\n".join(lines))
             return 1
 
@@ -524,9 +966,52 @@ def gate_status():
     e = "✅" if st.get("e2e_executed") else "❌"
     p = "✅" if st.get("plan_ready") else ("⚠️ bypass" if st.get("plan_bypass") else "❌")
     tool = st.get("test_tool", "-")
+    if st.get("knowledge_recall_done"):
+        kr_line = f"✅  query=\"{st.get('knowledge_recall_query','-')}\"  hits={st.get('knowledge_recall_count',0)}  ({st.get('knowledge_recall_ts','-')})"
+    else:
+        kr_line = "❌  (1.1 未跑 knowledge_recall — 编辑代码会被 Gate B 拦)"
+    print(f"Recall:     {kr_line}")
     print(f"Plan:       {p}  ({st.get('plan_file', '-')}) ({st.get('plan_ts', '-')})")
     print(f"Test:       {t}  ({tool}) ({st.get('test_ts', '-')})")
     print(f"E2E:        {e}  ({st.get('e2e_ts', '-')})")
+    if st.get("knowledge_acknowledged"):
+        if st.get("knowledge_file"):
+            k_detail = f"updated: {st.get('knowledge_file')}"
+        else:
+            k_detail = f"skipped: {st.get('knowledge_skip_reason', '-')}"
+        print(f"Knowledge:  ✅  ({k_detail}) ({st.get('knowledge_ts', '-')})")
+    else:
+        print(f"Knowledge:  ❌  (未更新 KNOWLEDGE.md，也未显式 knowledge_skip)")
+
+    loop_count = st.get("loop_count", 0)
+    last_outcome = st.get("last_loop_outcome")
+    unrecorded = st.get("e2e_runs_since_last_record", 0)
+    if loop_count == 0 and unrecorded == 0:
+        loop_line = "—  (无 E2E 运行)"
+    elif unrecorded:
+        loop_line = f"⏳  ({unrecorded} 次 E2E 未 loop_record，下次 E2E 会被拦)"
+    elif last_outcome == "pass":
+        loop_line = f"✅  loop {loop_count} PASS"
+    elif last_outcome == "fail":
+        marker = "🔴 已达上限" if loop_count >= LOOP_LIMIT else "⚠️  可重试"
+        loop_line = f"❌  loop {loop_count} FAIL ({marker})  reflection={st.get('last_loop_reflection', '-')}"
+    else:
+        loop_line = f"-   ({loop_count} 个已记录 loop)"
+    print(f"Loop:       {loop_line}")
+    history = st.get("loop_history") or []
+    if history:
+        for h in history:
+            mode = h.get("mode", "sequential")
+            if mode == "parallel":
+                hypotheses = h.get("reflections") or []
+                winner = h.get("winner")
+                marker = f"winner={os.path.basename(winner)}" if winner else f"all-fail ({len(hypotheses)})"
+                print(f"            └ loop {h.get('loop')} [parallel]: {h.get('outcome')}  {marker}  {h.get('ts','')}")
+                for r in hypotheses:
+                    tag = "★" if winner and r == winner else " "
+                    print(f"               {tag} {r}")
+            else:
+                print(f"            └ loop {h.get('loop')} [sequential]: {h.get('outcome')}  ({h.get('reflection') or '-'})  {h.get('ts','')}")
     return 0
 
 
@@ -543,7 +1028,7 @@ def gate_reset():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ship_verify_gate.py <post_bash|post_edit|pre_bash|pre_edit|status|reset|plan_bypass>")
+        print("Usage: ship_verify_gate.py <post_bash|post_edit|pre_bash|pre_edit|status|reset|plan_bypass|knowledge_skip|knowledge_recall|loop_record>")
         sys.exit(1)
 
     handlers = {
@@ -554,6 +1039,9 @@ def main():
         "status": gate_status,
         "reset": gate_reset,
         "plan_bypass": gate_plan_bypass,
+        "knowledge_skip": gate_knowledge_skip,
+        "knowledge_recall": gate_knowledge_recall,
+        "loop_record": gate_loop_record,
     }
     handler = handlers.get(sys.argv[1])
     if handler:
