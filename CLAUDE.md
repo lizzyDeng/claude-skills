@@ -17,3 +17,4 @@
 - `/viewer-setup` — 将 /project-viewer 安装为全局 skill，任何项目可用
 - `/chunbing` — 安装春饼 statusline，让春饼常驻终端底部陪你写代码
 - `/deeplearn` — 苏格拉底式技术文章学习：输入 URL 或文件路径，通过提问引导深度理解
+- `/deeplearn-setup` — 将 /deeplearn 安装为全局或项目级 skill
