@@ -57,12 +57,12 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 | Gate | Transition | Required Artifact |
 |------|------------|-------------------|
-| G1 | → draft | `metric.json` exists and valid: metric_name, baseline, target, event_name, harvest_days, data_source |
+| G1 | (none) → draft | `metric.json` exists and valid: metric_name, baseline, target, event_name, harvest_days, data_source |
 | G2 | draft → planned | fastship Phase 1 complete: plan file committed + grill passed + user sign-off |
-| G3 | planned → in_progress | Automatic: triggered when entering fastship Phase 2 |
-| G4 | → shipped | fastship Phase 3 complete: E2E pass + KNOWLEDGE.md closure |
-| G5 | → measuring | Automatic: immediately after shipped, records ship timestamp, calculates harvest due date |
-| G6 | → concluded | `harvest.json` exists and valid: actual data, baseline vs actual comparison, verdict, next_action |
+| G3 | planned → in_progress | Automatic: triggered when `/forge dev` is invoked (precondition: G2 passed) |
+| G4 | in_progress → shipped | fastship Phase 3 complete: E2E pass + KNOWLEDGE.md closure (checked as precondition by `/forge ship`) |
+| G5 | shipped → measuring | Automatic: immediately after G4 passes within the same `/forge ship` invocation |
+| G6 | measuring → concluded | `harvest.json` exists and valid: actual data, baseline vs actual comparison, verdict, next_action |
 
 ### Integration Points with Fastship
 
@@ -75,11 +75,14 @@ When user runs `/forge plan <feature>`:
 **2. During fastship (no intervention)**:
 Forge does not interfere with fastship Phase 2/3. It passively reads `.ship-verify-state.json` to track progress.
 
-**3. After fastship (state harvesting)**:
-When fastship completes (test_passed + e2e_executed + knowledge_acknowledged all true):
-- Forge transitions feature to `shipped → measuring`
-- Records ship timestamp
-- Calculates harvest due date
+**3. After fastship (explicit ship command)**:
+User runs `/forge ship <feature>`, which checks `.ship-verify-state.json` as a precondition:
+- Reads `test_passed`, `e2e_executed`, `knowledge_acknowledged` — all must be true
+- If any are false → rejects with specific message ("E2E not yet passed", etc.)
+- If all true → transitions feature through `shipped → measuring` in one operation
+- Records ship timestamp, calculates harvest due date
+
+This is an **explicit** command, not an automatic hook. The user decides when to mark a feature as shipped. This avoids the complexity of hook-based detection across sessions.
 
 ## Data Structures
 
@@ -94,7 +97,6 @@ project-roadmap/
 │   │   ├── metric.json   # Instrumentation definition (pre-dev)
 │   │   └── harvest.json  # Benefit harvest results (post-ship)
 │   └── ...
-└── retrospectives/       # Periodic cross-feature retrospectives
 ```
 
 ### roadmap.json
@@ -125,7 +127,8 @@ project-roadmap/
       "shipped_at": null,
       "harvest_due": null,
       "concluded_at": null,
-      "previous_feature": null
+      "previous_feature": null,
+      "next_feature": null
     }
   ]
 }
@@ -133,7 +136,7 @@ project-roadmap/
 
 Feature detail data (metric, harvest) lives in `features/<slug>/` directories. roadmap.json stores only index and status.
 
-`previous_feature` records the iteration chain when a feature is created via iterate.
+`previous_feature` and `next_feature` form a bidirectional iteration chain. When `/forge harvest` creates a successor via iterate, both fields are populated: the new feature gets `previous_feature` set, and the old feature gets `next_feature` set.
 
 ### metric.json
 
@@ -144,14 +147,13 @@ Feature detail data (metric, harvest) lives in `features/<slug>/` directories. r
   "baseline": 0.32,
   "target": 0.45,
   "harvest_days": 7,
-  "data_source": "api|manual",
-  "data_endpoint": "/api/analytics/endpoint"
+  "data_source": "manual",
+  "data_query_hint": "SELECT count(*) FROM events WHERE name = 'conversation_first_complete' AND created_at > '{{shipped_at}}'"
 }
 ```
 
-- `data_source: "api"` — forge can auto-fetch data via endpoint
-- `data_source: "manual"` — user manually provides data from third-party platforms (GA, Mixpanel, etc.)
-- `data_endpoint` — only required when data_source is "api"
+- `data_source` — always `"manual"` in v1. User provides the actual value during `/forge harvest`. Automated API fetching is deferred to a future version.
+- `data_query_hint` — optional. A hint (SQL query, dashboard URL, or CLI command) that tells the user where/how to get the data. Not executed by forge, only displayed as guidance during harvest.
 
 ### harvest.json
 
@@ -187,13 +189,11 @@ Every time `/forge` is invoked, it scans all features in `measuring` status:
 
 No cron or external scheduler. Pure data-state + current-time calculation.
 
-### Manual Harvest Flow: `/forge harvest <feature>`
+### Harvest Flow: `/forge harvest <feature>`
 
 ```
-1. Read metric.json → get data_source and data_endpoint
-2. Based on data_source:
-   ├── "api" → auto-call endpoint, populate harvest.json
-   └── "manual" → prompt user to provide data from third-party platform
+1. Read metric.json → display metric_name, baseline, target, data_query_hint
+2. User provides actual value (guided by data_query_hint — a SQL query, dashboard URL, or CLI command)
 3. Calculate baseline vs actual
 4. Guide user to determine verdict (achieved/partial/missed)
 5. Guide user to decide next_action:
@@ -222,13 +222,17 @@ Each iteration inherits context and narrows the gap. The `previous_feature` chai
 
 ### State File: `.claude/.forge-state.json`
 
+This file is a **derived cache**, not a source of truth. On every forge CLI invocation, it is re-derived from `roadmap.json` + filesystem checks (does `metric.json` exist? does `harvest.json` exist? what does `.ship-verify-state.json` say?). `roadmap.json` is always authoritative.
+
 ```json
 {
   "active_feature": "feature-slug-a",
   "phase": "planning|developing|harvesting",
   "g1_metric_defined": true,
   "g2_plan_ready": false,
+  "g3_dev_started": false,
   "g4_shipped": false,
+  "g5_measuring": false,
   "g6_harvested": false
 }
 ```
@@ -237,20 +241,23 @@ Each iteration inherits context and narrows the gap. The `previous_feature` chai
 
 | Hook | Check |
 |------|-------|
-| pre_edit | Protect `.forge-state.json` and `roadmap.json` from manual tampering |
-| post_edit | Detect `metric.json` write → validate structure → set g1_metric_defined=true |
-| post_edit | Detect `harvest.json` write → validate required fields → set g6_harvested=true |
+| pre_edit | Protect `.forge-state.json` from manual tampering (roadmap.json edits allowed only via forge CLI) |
+| post_edit | Detect `metric.json` write → validate structure → re-derive state |
+| post_edit | Detect `harvest.json` write → validate required fields → re-derive state |
 | post_edit | Detect `roadmap.json` change → auto-regenerate roadmap.md |
+| post_bash | Check overdue harvests (cheap: read roadmap.json + compare dates) → print one-line reminder if any |
 
-### CLI Commands
+### Internal CLI (gate script)
+
+These are internal commands invoked via `python3 .claude/hooks/forge_gate.py <action>`. They are called by the `/forge` skill definition, not directly by users:
 
 | Command | Action |
 |---------|--------|
-| `forge status` | Print global roadmap status + overdue harvest reminders |
-| `forge activate <slug>` | Set active feature, subsequent fastship operations associate to this feature |
-| `forge transition <slug> <status>` | Attempt state transition, reject with reason if gate check fails |
-| `forge generate-view` | Manually trigger roadmap.md regeneration |
-| `forge reset` | Clear active feature state (does not affect roadmap data) |
+| `status` | Print global roadmap status + overdue harvest reminders |
+| `activate <slug>` | Set active feature, subsequent fastship operations associate to this feature |
+| `transition <slug> <status>` | Attempt state transition, reject with reason if gate check fails |
+| `generate-view` | Trigger roadmap.md regeneration |
+| `reset` | Clear active feature state (does not affect roadmap data) |
 
 ### Coordination with ship_verify_gate.py
 
@@ -260,18 +267,40 @@ Two independent gate scripts coordinating through shared state files:
 - ship_verify_gate.py writes `.ship-verify-state.json`, does not read `.forge-state.json`
 - Unidirectional: forge depends on fastship state, not vice versa
 
-## Commands
+### Hook Configuration
 
-| Command | Action | State Transition |
-|---------|--------|-----------------|
-| `/forge init` | Define North Star + objectives | Creates roadmap.json |
-| `/forge add <feature>` | Add feature with AC + instrumentation | → draft |
-| `/forge plan <feature>` | Enter fastship Phase 1 (with metric context injection) | draft → planned |
-| `/forge dev <feature>` | Enter fastship Phase 2+3 | planned → in_progress |
-| `/forge ship <feature>` | Mark as shipped, start harvest countdown | in_progress → shipped → measuring |
-| `/forge harvest <feature>` | Execute benefit harvesting | measuring → concluded |
-| `/forge status` | Print global roadmap state | None |
-| `/forge retro` | Cross-feature retrospective (pattern recognition) | None |
+Both scripts coexist in `settings.local.json`. Claude Code executes all matching hooks in array order; both must pass (logical AND) for the operation to proceed. Forge hooks run first:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Edit|Write", "command": "python3 .claude/hooks/forge_gate.py pre_edit" },
+      { "matcher": "Edit|Write", "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit" }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "command": "python3 .claude/hooks/forge_gate.py post_edit" },
+      { "matcher": "Edit|Write", "command": "python3 .claude/hooks/ship_verify_gate.py post_edit" },
+      { "matcher": "Bash", "command": "python3 .claude/hooks/forge_gate.py post_bash" },
+      { "matcher": "Bash", "command": "python3 .claude/hooks/ship_verify_gate.py post_bash" }
+    ]
+  }
+}
+```
+
+## Commands (User-Facing)
+
+Each command documents: (1) precondition gate, (2) what it does, (3) resulting state transition.
+
+| Command | Precondition | Action | State Transition |
+|---------|-------------|--------|-----------------|
+| `/forge init` | No roadmap.json exists | Guided workflow: define North Star + objectives interactively → write roadmap.json | Creates roadmap.json |
+| `/forge add <feature>` | roadmap.json exists | Guided workflow: define feature name + objective association → interactively create `metric.json` (metric_name, baseline, target, event_name, harvest_days, data_query_hint) → G1 validates → write to roadmap.json | (none) → draft |
+| `/forge plan <feature>` | G1 passed (feature in `draft`) | Activate feature → inject metric.json + objective context → invoke fastship Phase 1. When Phase 1 completes (plan committed + grill passed + user sign-off), G2 validates → transition | draft → planned |
+| `/forge dev <feature>` | G2 passed (feature in `planned`) | Activate feature → invoke fastship Phase 2+3. G3 transitions automatically on entry | planned → in_progress |
+| `/forge ship <feature>` | G4 check: reads `.ship-verify-state.json`, requires test_passed + e2e_executed + knowledge_acknowledged all true | Records ship timestamp, calculates harvest due date. G5 transitions automatically | in_progress → shipped → measuring |
+| `/forge harvest <feature>` | Feature in `measuring` | Guided workflow: display data_query_hint → user provides actual value → calculate baseline vs actual → guide verdict + next_action → write harvest.json → G6 validates | measuring → concluded |
+| `/forge status` | None | Print global roadmap state + overdue harvest reminders (calls internal `status` CLI) | None |
 
 ## Auto-Generated View: roadmap.md
 
@@ -349,7 +378,7 @@ Provided via `/forge-setup` (same pattern as `/fastship-setup`):
 - Roadmap definition and tracking (North Star → objectives → features)
 - Feature state machine with gate enforcement
 - Instrumentation requirement as a gate before development
-- Benefit harvesting with auto-fetch (API) and manual input
+- Benefit harvesting with manual data input (automated API fetching deferred to future version)
 - Iterate loop for continuous improvement toward objectives
 - Auto-generated roadmap view
 
@@ -359,3 +388,9 @@ Provided via `/forge-setup` (same pattern as `/fastship-setup`):
 - Automated A/B testing orchestration
 - Code-level entropy management (scheduled cleanup agents)
 - Dashboard or web UI for roadmap visualization
+- Automated API data fetching for harvest (v1 is manual-only; `data_query_hint` provides guidance)
+- `/forge retro` cross-feature retrospective (deferred until core loop is validated)
+
+**Known limitations (v1)**:
+- **Single-user assumption**: `roadmap.json` is git-tracked for visibility, but `.forge-state.json` is local. In multi-developer scenarios, coordinate `/forge` operations or designate a single roadmap owner.
+- **Harvest reminders are passive**: overdue harvests are surfaced when `/forge` is invoked or via post_bash hook one-liner. No external push notifications.
