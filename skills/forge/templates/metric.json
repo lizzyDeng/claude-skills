@@ -1,0 +1,9 @@
+{
+  "metric_name": "",
+  "event_name": "",
+  "baseline": null,
+  "target": null,
+  "harvest_days": 7,
+  "data_source": "manual",
+  "data_query_hint": ""
+}

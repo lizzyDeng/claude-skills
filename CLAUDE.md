@@ -16,3 +16,7 @@
 - `/project-viewer` — 启动本地 Web 服务浏览项目目录结构和渲染 Markdown 文件
 - `/viewer-setup` — 将 /project-viewer 安装为全局 skill，任何项目可用
 - `/chunbing` — 安装春饼 statusline，让春饼常驻终端底部陪你写代码
+- `/deeplearn` — 苏格拉底式技术文章学习：输入 URL 或文件路径，通过提问引导深度理解
+- `/deeplearn-setup` — 将 /deeplearn 安装为全局或项目级 skill
+- `/forge` — 项目级 Harness：roadmap 管理 + /fastship 交付 + 收益回收闭环（含 hooks Gate 脚本）
+- `/forge-setup` — 在当前项目一键安装 /forge 所需的 hooks、Gate 脚本和 skill 定义
