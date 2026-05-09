@@ -28,6 +28,12 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
                     sequential: --outcome pass | fail [--reflection <path>]
                     parallel:   --outcome pass | fail --reflection-dir <dir>
                                                        [--winner <key>]   (pass 必填)
+  bug_diagnosis   — Bug 诊断 Gate（1.1d，Bugfix 场景强制）：
+                    mark_bugfix                  — 标记为 Bugfix（激活诊断 Gate）
+                    reproduce --cmd "..."        — D1 完成，记录实际复现命令
+                    root_cause --cause "..."     — D2 完成，记录根因（须基于 D1 输出）
+                    fix_verified                 — D3 完成，修复假设已验证
+                    skip --reason "..."          — 非 Bugfix，跳过诊断 Gate
 
 状态文件: {repo_root}/.claude/.ship-verify-state.json
 
@@ -99,6 +105,13 @@ def empty_state(branch=None):
         "knowledge_recall_query": None,
         "knowledge_recall_count": None,
         "knowledge_recall_ts": None,
+        # Bug 诊断 Gate（1.1d，Bugfix 场景强制）
+        "bug_diagnosis_done": False,
+        "bug_diagnosis_ts": None,
+        "bug_diagnosis_reproduce": None,       # D1 复现命令
+        "bug_diagnosis_root_cause": None,      # D2 根因一句话
+        "bug_diagnosis_fix_verified": False,   # D3 修复假设验证
+        "bug_is_bugfix": False,                # 当前需求是否为 Bugfix
         # Reflection in Loop
         "loop_count": 0,                       # 已记录的 loop 数（loop_record 调用次数）
         "e2e_runs_since_last_record": 0,       # 自上次 loop_record 后跑了几次 E2E（>=1 时再跑会被拦）
@@ -352,6 +365,15 @@ def gate_pre_edit():
             problems.append("plan_ready=false（未检测到 plan 文件）")
         if not st.get("knowledge_recall_done"):
             problems.append("knowledge_recall_done=false（1.1 阶段未跑跨 session 检索）")
+        if st.get("bug_is_bugfix") and not st.get("bug_diagnosis_done"):
+            diag_missing = []
+            if not st.get("bug_diagnosis_reproduce"):
+                diag_missing.append("D1 复现")
+            if not st.get("bug_diagnosis_root_cause"):
+                diag_missing.append("D2 根因")
+            if not st.get("bug_diagnosis_fix_verified"):
+                diag_missing.append("D3 修复验证")
+            problems.append(f"bug_diagnosis_done=false（Bugfix 未完成诊断：{' → '.join(diag_missing)}）")
 
         if not problems:
             return 0
@@ -369,6 +391,19 @@ def gate_pre_edit():
                 "   先跑 knowledge_recall（1.1 阶段必做，跨 session 学习）：",
                 "     python3 .claude/hooks/ship_verify_gate.py knowledge_recall \\",
                 "       --query \"<需求一句话>\"",
+                "",
+            ]
+        if st.get("bug_is_bugfix") and not st.get("bug_diagnosis_done"):
+            lines += [
+                "   🐛 Bugfix 诊断 Gate 未完成，按顺序执行：",
+                "     D1 复现：跑测试/curl 拿到实际报错，然后：",
+                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis reproduce \\",
+                "         --cmd '<你实际执行的复现命令>'",
+                "     D2 根因：基于 D1 输出追踪到 file:line，然后：",
+                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis root_cause \\",
+                "         --cause '<根因一句话>'",
+                "     D3 验证：最小改动验证修复方向，然后：",
+                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis fix_verified",
                 "",
             ]
         if not st.get("plan_ready"):
@@ -734,6 +769,112 @@ def gate_knowledge_recall():
     return 0
 
 
+def gate_bug_diagnosis():
+    """记录 Bug 诊断 Gate 三步完成（1.1d）。
+    Bugfix 场景下，编辑代码前必须先完成 D1 复现 + D2 根因 + D3 修复验证。
+
+    子命令：
+      bug_diagnosis mark_bugfix           → 标记当前需求为 Bugfix（激活诊断 Gate）
+      bug_diagnosis reproduce --cmd "..." → D1 完成，记录复现命令
+      bug_diagnosis root_cause --cause "..." → D2 完成，记录根因
+      bug_diagnosis fix_verified          → D3 完成，修复假设已验证
+      bug_diagnosis skip --reason "..."   → 非 Bugfix 场景显式跳过
+    """
+    args = sys.argv[2:]
+    if not args:
+        print("🔴 用法：bug_diagnosis <mark_bugfix|reproduce|root_cause|fix_verified|skip> [--cmd/--cause/--reason ...]")
+        return 1
+
+    subcmd = args[0]
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    now = datetime.now().isoformat()
+
+    if subcmd == "mark_bugfix":
+        st["bug_is_bugfix"] = True
+        st["bug_diagnosis_done"] = False
+        save_state(st)
+        print("🐛 已标记当前需求为 Bugfix — 编辑代码前必须完成 Bug 诊断 Gate（D1→D2→D3）")
+        return 0
+
+    if subcmd == "reproduce":
+        cmd_val = _extract_arg(args[1:], "--cmd")
+        if not cmd_val or len(cmd_val.strip()) < 10:
+            print("🔴 必须给 --cmd '<实际执行的复现命令>'（≥10 字符）")
+            print("   不能是'我读了代码觉得会报错'——必须是你实际跑过的命令")
+            return 1
+        st["bug_diagnosis_reproduce"] = cmd_val.strip()
+        st["bug_diagnosis_ts"] = now
+        save_state(st)
+        print(f"✅ D1 复现已记录：{cmd_val.strip()[:80]}...")
+        _check_diagnosis_complete(st)
+        return 0
+
+    if subcmd == "root_cause":
+        cause = _extract_arg(args[1:], "--cause")
+        if not cause or len(cause.strip()) < 15:
+            print("🔴 必须给 --cause '<根因一句话>'（≥15 字符）")
+            print("   必须基于 D1 的实际执行输出，不能只凭读代码推断")
+            return 1
+        st["bug_diagnosis_root_cause"] = cause.strip()
+        st["bug_diagnosis_ts"] = now
+        save_state(st)
+        print(f"✅ D2 根因已记录：{cause.strip()[:80]}...")
+        _check_diagnosis_complete(st)
+        return 0
+
+    if subcmd == "fix_verified":
+        if not st.get("bug_diagnosis_reproduce"):
+            print("🔴 D3 前必须先完成 D1（复现）")
+            return 1
+        if not st.get("bug_diagnosis_root_cause"):
+            print("🔴 D3 前必须先完成 D2（根因）")
+            return 1
+        st["bug_diagnosis_fix_verified"] = True
+        st["bug_diagnosis_done"] = True
+        st["bug_diagnosis_ts"] = now
+        save_state(st)
+        print("✅ D3 修复假设验证已完成 — Bug 诊断 Gate 全部通过")
+        return 0
+
+    if subcmd == "skip":
+        reason = _extract_arg(args[1:], "--reason")
+        if not reason or len(reason.strip()) < 10:
+            print("🔴 必须给 --reason '<≥10 字的原因>'")
+            return 1
+        st["bug_is_bugfix"] = False
+        st["bug_diagnosis_done"] = True
+        save_state(st)
+        print(f"✅ Bug 诊断 Gate 跳过（非 Bugfix）：{reason.strip()}")
+        return 0
+
+    print(f"🔴 未知子命令：{subcmd}")
+    print("   可用：mark_bugfix | reproduce | root_cause | fix_verified | skip")
+    return 1
+
+
+def _extract_arg(args, flag):
+    """从 args 中提取 --flag value 或 --flag=value"""
+    for i, a in enumerate(args):
+        if a == flag and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(f"{flag}="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _check_diagnosis_complete(st):
+    """检查 D1+D2+D3 是否全部完成"""
+    d1 = bool(st.get("bug_diagnosis_reproduce"))
+    d2 = bool(st.get("bug_diagnosis_root_cause"))
+    d3 = st.get("bug_diagnosis_fix_verified", False)
+    done = [d1, d2, d3]
+    labels = ["D1 复现", "D2 根因", "D3 修复验证"]
+    remaining = [l for l, d in zip(labels, done) if not d]
+    if remaining:
+        print(f"   剩余步骤：{' → '.join(remaining)}")
+
+
 def gate_knowledge_skip():
     """显式声明本次无新教训，跳过 KNOWLEDGE.md 更新（必须给 --reason）"""
     args = sys.argv[2:]
@@ -970,6 +1111,18 @@ def gate_status():
         kr_line = f"✅  query=\"{st.get('knowledge_recall_query','-')}\"  hits={st.get('knowledge_recall_count',0)}  ({st.get('knowledge_recall_ts','-')})"
     else:
         kr_line = "❌  (1.1 未跑 knowledge_recall — 编辑代码会被 Gate B 拦)"
+    if st.get("bug_is_bugfix"):
+        d1 = "✅" if st.get("bug_diagnosis_reproduce") else "❌"
+        d2 = "✅" if st.get("bug_diagnosis_root_cause") else "❌"
+        d3 = "✅" if st.get("bug_diagnosis_fix_verified") else "❌"
+        bd = "✅" if st.get("bug_diagnosis_done") else "❌"
+        print(f"BugDiag:    {bd}  D1={d1} D2={d2} D3={d3}  ({st.get('bug_diagnosis_ts', '-')})")
+        if st.get("bug_diagnosis_reproduce"):
+            print(f"            D1 cmd: {st.get('bug_diagnosis_reproduce', '-')[:60]}...")
+        if st.get("bug_diagnosis_root_cause"):
+            print(f"            D2 cause: {st.get('bug_diagnosis_root_cause', '-')[:60]}...")
+    else:
+        print("BugDiag:    —  (非 Bugfix 或未标记)")
     print(f"Recall:     {kr_line}")
     print(f"Plan:       {p}  ({st.get('plan_file', '-')}) ({st.get('plan_ts', '-')})")
     print(f"Test:       {t}  ({tool}) ({st.get('test_ts', '-')})")
@@ -1042,6 +1195,7 @@ def main():
         "knowledge_skip": gate_knowledge_skip,
         "knowledge_recall": gate_knowledge_recall,
         "loop_record": gate_loop_record,
+        "bug_diagnosis": gate_bug_diagnosis,
     }
     handler = handlers.get(sys.argv[1])
     if handler:
