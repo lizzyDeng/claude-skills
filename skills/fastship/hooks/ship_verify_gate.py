@@ -28,6 +28,8 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
                     sequential: --outcome pass | fail [--reflection <path>]
                     parallel:   --outcome pass | fail --reflection-dir <dir>
                                                        [--winner <key>]   (pass 必填)
+  classify        — 1.0 需求分类（强制第一步，bugfix 自动激活诊断 Gate）：
+                    --type bugfix|feature|refactor|optimize
   bug_diagnosis   — Bug 诊断 Gate（1.1d，Bugfix 场景强制）：
                     mark_bugfix                  — 标记为 Bugfix（激活诊断 Gate）
                     reproduce --cmd "..."        — D1 完成，记录实际复现命令
@@ -105,7 +107,11 @@ def empty_state(branch=None):
         "knowledge_recall_query": None,
         "knowledge_recall_count": None,
         "knowledge_recall_ts": None,
-        # Bug 诊断 Gate（1.1d，Bugfix 场景强制）
+        # 1.0 需求分类（强制第一步）
+        "request_classified": False,
+        "request_type": None,                  # bugfix | feature | refactor | optimize
+        "request_classified_ts": None,
+        # Bug 诊断 Gate（1.1d，Bugfix 场景强制，classify --type bugfix 自动激活）
         "bug_diagnosis_done": False,
         "bug_diagnosis_ts": None,
         "bug_diagnosis_reproduce": None,       # D1 复现命令
@@ -361,6 +367,8 @@ def gate_pre_edit():
             return 0
 
         problems = []
+        if not st.get("request_classified"):
+            problems.append("request_classified=false（1.0 需求分类未完成）")
         if not st.get("plan_ready"):
             problems.append("plan_ready=false（未检测到 plan 文件）")
         if not st.get("knowledge_recall_done"):
@@ -386,6 +394,13 @@ def gate_pre_edit():
         for p in problems:
             lines.append(f"   ❌ {p}")
         lines.append("")
+        if not st.get("request_classified"):
+            lines += [
+                "   先分类需求类型（1.0 强制第一步）：",
+                "     python3 .claude/hooks/ship_verify_gate.py classify \\",
+                "       --type bugfix|feature|refactor|optimize",
+                "",
+            ]
         if not st.get("knowledge_recall_done"):
             lines += [
                 "   先跑 knowledge_recall（1.1 阶段必做，跨 session 学习）：",
@@ -769,6 +784,47 @@ def gate_knowledge_recall():
     return 0
 
 
+VALID_REQUEST_TYPES = {"bugfix", "feature", "refactor", "optimize"}
+
+
+def gate_classify():
+    """1.0 需求分类 — 强制第一步。bugfix 自动激活 Bug 诊断 Gate。
+
+    用法：classify --type bugfix|feature|refactor|optimize
+    """
+    args = sys.argv[2:]
+    req_type = _extract_arg(args, "--type")
+    if not req_type or req_type.lower() not in VALID_REQUEST_TYPES:
+        print(f"🔴 必须给 --type <{'|'.join(sorted(VALID_REQUEST_TYPES))}>")
+        print("   bugfix = 用户报告预期外行为/报错/数据不对/线上问题")
+        print("   feature = 新增功能/页面/端点")
+        print("   refactor = 重构/规范统一")
+        print("   optimize = 性能/体验优化")
+        return 1
+
+    req_type = req_type.lower()
+    branch = get_current_branch()
+    st = ensure_branch_state(load_state(), branch)
+    now = datetime.now().isoformat()
+
+    st["request_classified"] = True
+    st["request_type"] = req_type
+    st["request_classified_ts"] = now
+
+    if req_type == "bugfix":
+        st["bug_is_bugfix"] = True
+        st["bug_diagnosis_done"] = False
+        save_state(st)
+        print(f"🐛 需求分类：bugfix — Bug 诊断 Gate 已激活（编辑代码前必须完成 D1→D2→D3）")
+    else:
+        st["bug_is_bugfix"] = False
+        st["bug_diagnosis_done"] = True  # 非 bugfix 自动通过
+        save_state(st)
+        print(f"📋 需求分类：{req_type} — 正常流程（无 Bug 诊断 Gate）")
+
+    return 0
+
+
 def gate_bug_diagnosis():
     """记录 Bug 诊断 Gate 三步完成（1.1d）。
     Bugfix 场景下，编辑代码前必须先完成 D1 复现 + D2 根因 + D3 修复验证。
@@ -1103,6 +1159,10 @@ def gate_status():
     print(f"Branch:     {branch}")
     print(f"State for:  {st.get('branch', '-')}")
     print(f"Stack:      {', '.join(stacks) if stacks else 'unknown'}")
+    if st.get("request_classified"):
+        print(f"Type:       📋 {st.get('request_type', '-')}  ({st.get('request_classified_ts', '-')})")
+    else:
+        print("Type:       ❌  (1.0 需求分类未完成 — 编辑代码会被 Gate B 拦)")
     t = "✅" if st.get("test_passed") else "❌"
     e = "✅" if st.get("e2e_executed") else "❌"
     p = "✅" if st.get("plan_ready") else ("⚠️ bypass" if st.get("plan_bypass") else "❌")
@@ -1196,6 +1256,7 @@ def main():
         "knowledge_recall": gate_knowledge_recall,
         "loop_record": gate_loop_record,
         "bug_diagnosis": gate_bug_diagnosis,
+        "classify": gate_classify,
     }
     handler = handlers.get(sys.argv[1])
     if handler:

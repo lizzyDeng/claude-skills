@@ -15,6 +15,7 @@ description: "Result-driven development skill. Brainstorm with user to define re
 
 ```
 阶段 1：Brainstorm + Plan + Grill
+  └── 1.0:         🔴 需求分类（classify --type bugfix|feature|refactor|optimize）→ bugfix 自动激活诊断 Gate
   └── 1.1a:        读静态上下文（ARCHITECTURE / CLAUDE / git log）
   └── 1.1a-recall: 🔴 跨 session 学习 — knowledge_recall CLI 检索所有 KNOWLEDGE.md
   └── 1.1b:        🔴 并行派 ≥3 个 Explore subagent（涉及模块 / 测试 / 历史变更）
@@ -40,13 +41,32 @@ description: "Result-driven development skill. Brainstorm with user to define re
 
 ## 阶段 1：Brainstorm + Plan + Grill
 
+### 1.0 需求分类（🔴 强制第一步，Gate 拦未分类）
+
+**收到用户需求后，做任何事之前**，必须先分类需求类型并调用 CLI 注册：
+
+```bash
+python3 .claude/hooks/ship_verify_gate.py classify --type <bugfix|feature|refactor|optimize>
+```
+
+| 类型 | 信号 | 后续影响 |
+|------|------|----------|
+| bugfix | 用户报告预期外行为、报错、数据不对、线上问题、403/500 | 🔴 自动激活 Bug 诊断 Gate（1.1d），编辑代码前必须完成 D1→D2→D3 |
+| feature | 新增功能、新页面、新端点 | 正常流程 |
+| refactor | 重构、优化结构、统一规范 | 正常流程 |
+| optimize | 性能优化、体验优化 | 正常流程 |
+
+🔴 **未分类就进入 1.1a → Gate 拦截编辑代码**（hook 检测 `request_classified=false` → BLOCK）。
+🔴 **分类为 bugfix 后不走 1.1d 诊断 → Gate 拦截编辑代码**（hook 检测 `bug_diagnosis_done=false` → BLOCK）。
+🔴 **禁止把 bugfix 标为 feature 来绕过诊断 Gate**。用户说"报错/不对/403/数据错误"= bugfix，不能降级。
+
 ### 1.1 项目上下文注入（🔴 强制，必须在回复用户之前完成）
 
 不靠主线程一边和用户聊一边 grep 摸鱼。这一步必须**先读静态上下文 → 再并行派 Explore subagent → 最后聚合成 Context Brief**，三步都做完才开口和用户讨论 AC/E2E。
 
 #### 1.1a 静态上下文（serial Read，主线程亲自读）
 
-**在说任何话之前**，立即用 Glob + Read 工具读取以下文件。不要跳过，不要先和用户讨论再读，不要用"我来看看代码"代替读架构文档。
+**在说任何话之前**（1.0 分类除外），立即用 Glob + Read 工具读取以下文件。不要跳过，不要先和用户讨论再读，不要用"我来看看代码"代替读架构文档。
 
 ```
 必读文件（按顺序，用 Glob 搜索，存在即 Read 全文）：
@@ -795,6 +815,8 @@ E2E 通过后，**merge / push 前必须明确表态**：要么向 KNOWLEDGE.md 
 ## Red Flags
 
 **禁止：**
+- 🔴 未调用 `classify --type` 就进入 1.1a 或后续步骤（Gate 自动拦截编辑代码）
+- 🔴 用户描述明显是 bugfix（报错/数据不对/403/线上问题）却 classify 为 feature 来绕诊断 Gate
 - 未读项目上下文文件就进入 brainstorm
 - 🔴 跳过 1.1a-recall（knowledge_recall CLI）就进入 1.1b / 1.2（编辑代码会被 Gate B 拦）
 - 🔴 1.1b 用串行 Read/Grep 代替并行 Explore subagent（必须在同一条消息里派 ≥3 个 Agent 工具调用）
