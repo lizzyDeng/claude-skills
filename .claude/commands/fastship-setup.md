@@ -55,10 +55,12 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
 1. 创建 `.claude/commands/` 目录
 2. 将 `/Users/apple/works/claude-skills/skills/fastship/SKILL.md` 复制到 `.claude/commands/fastship.md`
 
-## Step 3: 安装 hooks
+## Step 3: 安装 hooks + orchestrator
 
 1. 创建 `.claude/hooks/` 目录
 2. 将 `/Users/apple/works/claude-skills/skills/fastship/hooks/ship_verify_gate.py` 复制到 `.claude/hooks/ship_verify_gate.py`
+3. 创建 `.claude/tools/` 目录
+4. 将 `/Users/apple/works/claude-skills/skills/fastship/orchestrator.py` 复制到 `.claude/tools/fastship_orchestrator.py`
 
 ## Step 4: 安装 E2E 工具
 
@@ -69,55 +71,22 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
 
 ## Step 5: 配置 hooks
 
+hooks 指向 orchestrator（orchestrator 内部 subprocess 调用 ship_verify_gate）。
+
 读取当前项目的 `.claude/settings.local.json`（如果存在），将以下 hooks 配置**合并**进去（不覆盖已有配置）：
 
 ```json
 {
   "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py post_bash",
-            "timeout": 10,
-            "statusMessage": "Tracking verification..."
-          }
-        ]
-      },
-      {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
-            "timeout": 5,
-            "statusMessage": "Detecting plan / KNOWLEDGE.md writes..."
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py post_edit",
-            "timeout": 5,
-            "statusMessage": "Detecting plan / KNOWLEDGE.md writes..."
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
-            "timeout": 5,
-            "statusMessage": "Gate B: plan + knowledge_recall + state protection..."
+            "command": "python3 .claude/tools/fastship_orchestrator.py pre_edit",
+            "timeout": 10,
+            "statusMessage": "Orchestrator: phase check + plan gate..."
           }
         ]
       },
@@ -126,9 +95,9 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py pre_edit",
-            "timeout": 5,
-            "statusMessage": "Gate B: plan + knowledge_recall + state protection..."
+            "command": "python3 .claude/tools/fastship_orchestrator.py pre_edit",
+            "timeout": 10,
+            "statusMessage": "Orchestrator: phase check + plan gate..."
           }
         ]
       },
@@ -137,9 +106,44 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/ship_verify_gate.py pre_bash",
+            "command": "python3 .claude/tools/fastship_orchestrator.py pre_bash",
             "timeout": 10,
-            "statusMessage": "Gates 0-5: DB / E2E / merge-push / KNOWLEDGE / Reflection..."
+            "statusMessage": "Orchestrator: gates 0-5..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/tools/fastship_orchestrator.py post_bash",
+            "timeout": 10,
+            "statusMessage": "Orchestrator: auto-detect step completion..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/tools/fastship_orchestrator.py post_edit",
+            "timeout": 10,
+            "statusMessage": "Orchestrator: auto-detect file writes..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/tools/fastship_orchestrator.py post_edit",
+            "timeout": 10,
+            "statusMessage": "Orchestrator: auto-detect file writes..."
           }
         ]
       }
@@ -151,7 +155,7 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
 **合并规则**：
 - 如果 `.claude/settings.local.json` 不存在，直接创建
 - 如果存在，读取现有内容，将 hooks 配置合并到 `hooks.PostToolUse` 和 `hooks.PreToolUse` 数组中
-- 不要重复添加（检查 command 字段是否已包含 `ship_verify_gate.py`）
+- 不要重复添加（检查 command 字段是否已包含 `fastship_orchestrator.py`）
 - 保留所有已有的 permissions 和其他配置
 
 ## Step 6: 更新 .gitignore
@@ -160,18 +164,23 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
 
 ```
 .claude/.ship-verify-state.json
+.claude/.fastship-orchestrator-state.json
+.claude/.fastship-brief.md
+.claude/.fastship-grill-result.md
 ```
 
 ## Step 7: 验证
 
-运行 `python3 .claude/hooks/ship_verify_gate.py status` 确认安装成功。
+```bash
+# Hook gate 状态
+python3 .claude/hooks/ship_verify_gate.py status
 
-输出应包含 `Recall / Plan / Test / E2E / Knowledge / Loop` 六行状态：
+# Orchestrator 状态（应显示"没有活跃 session"）
+python3 .claude/tools/fastship_orchestrator.py status
+```
 
-- `Recall` 未通过 → 1.1a-recall 没跑过；`knowledge_recall --query "..."` 跑一次即可。Gate B 拦着不让编辑代码。
-
-- `Knowledge` 未通过 → 编辑 `KNOWLEDGE.md` 或 `knowledge_skip --reason "..."` 表态。
-- `Loop` 显示已记录的 loop 历史；E2E 跑完未 `loop_record` 会显示 `⏳`，下次 E2E 会被 Gate 5 拦。
+hook gate 输出应包含 `Recall / Plan / Test / E2E / Knowledge / Loop` 六行状态。
+orchestrator 输出应为 "❌ 没有活跃 session。"（正常，start 后才有）。
 
 ## Step 8: 输出总结
 
@@ -184,12 +193,13 @@ fastship 的阶段 1.5 强制调用全局 `grill-me` 对 plan 做结构化拷问
    - **Gate 0-3 (pre_bash)** — DB 写入拦截 / E2E 前置 / E2E Gate 前置 / merge-push 前置
    - **Gate 4 (pre_bash)** — merge/push 必须 KNOWLEDGE.md 已表态
    - **Gate 5 (pre_bash)** — 重跑 E2E 必须先 loop_record；loop_count==3 锁死
-4. 用户需手动调用的 CLI（hook 不强代理的部分）：
-   - `python3 .claude/hooks/ship_verify_gate.py knowledge_recall --query "<需求>"` — 1.1a-recall 跨 session 学习
-   - `python3 .claude/hooks/ship_verify_gate.py loop_record --outcome pass|fail [--reflection <p>]` — 每轮 E2E 跑完必调
-   - `python3 .claude/hooks/ship_verify_gate.py knowledge_skip --reason "<≥10字>"` — 确实无新教训时
-   - `python3 .claude/hooks/ship_verify_gate.py status` — 任何时候查 6 行状态
-   - `python3 .claude/hooks/ship_verify_gate.py reset` — 新需求开始时
-5. 提醒：`/fastship` 即可开始使用，全流程会自动走 superpowers `writing-plans` + 全局 `grill-me`
-6. 提醒：`e2e_runner.py` 是通用模板，如项目有特殊需求（SSE 流式、日志 pipeline 提取），可按需定制
-7. 提醒：项目根没有 `KNOWLEDGE.md` 也 OK —— `knowledge_recall` 会返回 0 hits 但仍合规；第一次 success 时 Gate 4 会引导创建
+4. **Orchestrator 是 hook 入口**：每次 Edit/Write/Bash 自动触发 orchestrator，orchestrator 内部委托 ship_verify_gate
+5. orchestrator CLI 命令：
+   - `python3 .claude/tools/fastship_orchestrator.py start "<需求>"` — 启动 session
+   - `python3 .claude/tools/fastship_orchestrator.py next` — 查看当前步骤
+   - `python3 .claude/tools/fastship_orchestrator.py done [--flags]` — 完成步骤 + 验证
+   - `python3 .claude/tools/fastship_orchestrator.py status` — 查看全部步骤状态
+   - `python3 .claude/tools/fastship_orchestrator.py reset` — 重置（同时清除 hook state）
+6. 提醒：`/fastship` 即可开始使用，orchestrator 驱动全流程，16 步中 12 步自动推进
+7. 提醒：`e2e_runner.py` 是通用模板，如项目有特殊需求可按需定制
+8. 提醒：Codex / 其他 agent 也可用（CLI 模式，15 步全部手动 done，但仍有 artifact 硬验证）

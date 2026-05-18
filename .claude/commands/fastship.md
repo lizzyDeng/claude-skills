@@ -1,344 +1,90 @@
 ---
 name: fastship
-description: "Result-driven development skill. Brainstorm with user to define requirements and E2E verification, then execute autonomously in git worktree with verification loop. Use for any feature, bugfix, or refactor regardless of complexity."
+description: "Result-driven development skill. Python orchestrator drives every step with hard validation. Works in Claude Code (hook mode) and Codex/other agents (CLI mode)."
 ---
 
-# /fastship — 结果驱动开发
+# /fastship — 结果驱动开发（Python 编排版）
 
-以 E2E 验证通过为唯一交付标准。Brainstorm 对齐目标 → 自主执行 → 验证结果 → 不对就重来。
+E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifact 硬验证，不能跳步。
 
-## 适用场景
+## 启动
 
-任何目标可定义的开发需求，不限复杂度：Feature / Bugfix / 重构 / 优化。
+收到需求后立即运行：
+  python3 .claude/tools/fastship_orchestrator.py start "<需求>"
 
-## 三阶段流程
+## 双模工作方式
 
-```
-阶段 1：Brainstorm（与用户共创，⏸️ 必须用户确认后才进入阶段 2）
-阶段 2：Execution（自主闭环，git worktree 隔离）
-阶段 3：Verification Loop（E2E 验证，失败则根因分析 → 重试或回阶段 1）
-```
+### Claude Code（hook 模式 — 最强）
 
----
+orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
+- **pre_edit**: Phase 1 阻止编辑代码，打印当前步骤
+- **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
-## 阶段 1：Brainstorm
+16 步中 12 步自动推进，4 步需手动：
+  python3 .claude/tools/fastship_orchestrator.py done [--flags]
 
-### 1.1 项目上下文注入（🔴 强制，必须在回复用户之前完成）
+### Codex / 其他 Agent（CLI 模式）
 
-**在说任何话之前**，立即用 Glob + Read 工具读取以下文件。不要跳过，不要先和用户讨论再读，不要用"我来看看代码"代替读架构文档。先读文档，再开口。
+无 hook，agent 手动驱动每一步：
+  1. `python3 .claude/tools/fastship_orchestrator.py next` → 读当前步骤指令
+  2. 执行步骤
+  3. `python3 .claude/tools/fastship_orchestrator.py done [--flags]` → 验证 + 推进
+  4. 重复
 
-```
-必读文件（按顺序，用 Glob 搜索，存在即 Read 全文）：
-├── ARCHITECTURE.md → 模块全貌 + 关键约束（🔴 最重要，有它就不需要大面积读代码）
-│   搜索路径：**/ARCHITECTURE.md
-├── KNOWLEDGE.md → 踩坑记录
-│   搜索路径：**/KNOWLEDGE.md
-├── CLAUDE.md → 项目约定（通常已自动加载，确认即可）
-└── git log --oneline -15 → 最近变更上下文
-```
+全部 16 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
+Validators 自动检测环境：有 hook state 用 hook state，没有则直接扫文件系统。
 
-**为什么必须先读 ARCHITECTURE.md**：它包含模块边界、关键约束、数据流，读完就知道改哪里、不能碰哪里。跳过它直接读代码 = 盲人摸象，浪费时间且容易踩坑。
-
-读完后，识别用户需求可能涉及的模块，重点关注：
-- **关键约束**（架构文档中标注的限制）
-- **废弃/只读模式**（不应修改的代码区域）
-- **最近变更**（避免与近期改动冲突）
-
-### 1.2 与用户讨论
+## 流程概览
 
 ```
-讨论要产出 3 个东西：
-├── 1. AC 清单（验收标准）
-│     每条 AC 必须是可客观验证的（不是"更好"这种主观描述）
-│
-├── 2. E2E 验证方案（🔴 核心 — 怎么证明做对了）
-│     与用户讨论确认验证方式，不预设：
-│     ├── 后端 API → API 调用序列 + DB 状态检查
-│     ├── 前端 UI → Browser E2E / 截图对比
-│     ├── CLI 工具 → 命令行输入输出验证
-│     ├── 库/SDK → 单元测试 + 集成测试
-│     ├── 数据迁移 → SQL 查询验证
-│     ├── 性能 → Benchmark
-│     └── 其他 → 与用户定义
-│
-└── 3. 影响范围评估
-      ├── 涉及哪些模块
-      ├── 是否触碰不应修改的区域
-      └── 回归风险：改动可能影响哪些已有功能
+Phase 1: Brainstorm (8 步)
+  1.0  需求分类         [CC:auto | Codex:done] classify CLI
+  1.1  上下文+recall    [CC:auto | Codex:done] knowledge_recall CLI
+  1.2  并行 Explore     [CC:done  | Codex:done] done --agents N (≥3)
+  1.3  Context Brief    [CC:auto | Codex:done] .fastship-brief.md 验证章节
+  1.3d Bug 诊断         [CC:auto | Codex:done] fix_verified (仅 bugfix)
+  1.4  写计划           [CC:auto | Codex:done] plan 文件 + writing-plans 签名
+  1.5  Grill            [CC:auto | Codex:done] .fastship-grill-result.md 验证
+  1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
+
+Phase 2: Execution (1 步)
+  2.0  执行计划         [CC:done  | Codex:done]
+
+Phase 3: Verification (7 步)
+  3.0  冒烟测试         [CC:done  | Codex:done]
+  3.1  项目测试         [CC:auto | Codex:done] test pass
+  3.2  E2E Runner       [CC:auto | Codex:done] /tmp/e2e_result.json
+  3.3  E2E 报告         [CC:auto | Codex:done] 报告文件 ≥200B
+  3.4  E2E Gate         [CC:auto | Codex:done] e2e_gate
+  3.5  Loop Record      [CC:半auto | Codex:done --outcome pass|fail] fail→手动 --decision
+  3.6  KNOWLEDGE 闭环   [CC:auto | Codex:done] KNOWLEDGE.md
 ```
 
-### 1.3 E2E 验证方案格式
+## 常用命令
 
-根据项目类型选择验证方式。以下是通用模板：
-
-```python
-scenarios = [
-    {
-        "name": "场景名称",
-        "description": "验证什么",
-        "setup": { ... },              # 可选：前置状态/环境准备
-        "steps": [
-            {
-                "action": "描述操作",   # API 调用 / CLI 命令 / UI 操作
-                "input": { ... },
-                "expect": {
-                    "status": "success",
-                    "output_contains": ["..."],
-                    "output_not_contains": ["..."],
-                }
-            },
-            # 后续步骤...
-        ],
-        "teardown": { ... },           # 可选：清理
-        "repeat": 1,                   # LLM 相关场景建议 ≥2 次
-        "pass_criteria": "1/1"
-    }
-]
+```bash
+python3 .claude/tools/fastship_orchestrator.py start "<需求>"  # 启动
+python3 .claude/tools/fastship_orchestrator.py next            # 当前步骤
+python3 .claude/tools/fastship_orchestrator.py done [--flags]  # 完成 + 验证
+python3 .claude/tools/fastship_orchestrator.py status          # 全部状态
+python3 .claude/tools/fastship_orchestrator.py reset           # 重置
 ```
 
-### 1.4 ⏸️ 用户确认
+## 核心红线
 
-输出 AC 清单 + E2E 验证方案 + 影响范围，等待用户明确确认。
-
-**未经用户确认，禁止进入阶段 2。**
-
----
-
-## 阶段 2：Execution
-
-### 2.1 开发环境
-
-根据需求规模选择开发方式（不强制 worktree）：
-
-```
-├── 大特性 / 高风险改动 → 推荐 worktree 隔离（分支命名：fastship/{feature-short-name}）
-├── 中等改动 → 新分支即可
-└── 小改动 / bugfix → 当前分支直接开发也可以
-```
-
-用户可以指定，如果没指定则由你根据影响范围判断。
-
-### 2.2 自主执行
-
-自由决定实现方式：
-- 自己分析代码和数据流
-- 自己拆分子任务
-- 使用 subagent 并行执行
-- 直接写代码
-- 写测试（TDD 或后补都行）
-
-**不规定步骤、不规定角色、不规定文档模板。**
-
-### 2.3 底线 Gate（自动检测）
-
-执行过程中的自动保护（根据项目技术栈自动适配）：
-
-```
-├── 编译检查 — 编辑源文件后自动检查（cargo check / tsc / go vet 等）
-├── 保护标记 — 禁止修改带 REMOVED/bugfix/read-only 注释的代码段
-└── 变更感知 — 编辑核心模块时，查看该文件最近 commit 上下文
-```
-
-### 2.4 🔴 Phase 2 → Phase 3 Gate（Hook 自动强制，无法绕过）
-
-代码改完后，**必须先跑通项目测试和 E2E 才能进入阶段 3**。
-
-这不是靠 LLM 自觉，而是 **hook 自动拦截**：
-
-```
-三层自动 Gate（pre_bash hook 自动触发，exit 1 阻断）：
-
-Gate 1: 想跑 E2E？→ hook 自动检查单测是否通过
-  ├── 单测已通过 → 放行
-  └── 单测未通过 → 🔴 BLOCKED，必须先跑单测
-
-Gate 2: 想跑 E2E Gate？→ hook 自动检查单测 + E2E Runner 是否都完成
-  ├── 都完成 → 放行
-  └── 缺任一项 → 🔴 BLOCKED
-
-Gate 3: 想 merge/push？→ hook 自动检查全部验证完成
-  ├── 全部完成 → 放行
-  └── 缺任一项 → 🔴 BLOCKED
-```
-
-**执行顺序被 hook 强制为**：项目测试 → E2E Runner → E2E Gate → merge/push。
-跳过任何一步，后续步骤会被 hook 自动阻断。不需要手动调用任何 gate 脚本。
-
----
-
-## 阶段 3：Verification Loop
-
-### 3.1 验证执行
-
-```
-Step 1: 项目测试（全量）
-  ├── 通过 → 继续
-  └── 失败 → 修复后重跑（不算 loop 次数）
-
-Step 2: E2E 验证（Runner 采集 → LLM 审查 → 质量报告 → Gate 检查）
-
-  Step 2a: 场景设计（在阶段 1 brainstorm 时完成）
-    ├── 写场景 JSON 到 tests/e2e_scenarios/
-    ├── 🔴 最少 10 轮独立调用（不是 2-3 轮就够）
-    ├── 🔴 必须覆盖不同的输入变体（不能只测一种表述）
-    ├── 🔴 必须包含用户曾经发现的 bug 的复现场景
-    └── 🔴 如涉及 LLM 输出，必须用不同上下文覆盖
-
-  Step 2b: Runner 采集数据
-    ├── 启动被测服务
-    ├── 运行 E2E Runner（编排场景 + 采集响应数据）
-    │   输出结构化 JSON 到 /tmp/e2e_result.json
-    └── 🔴 Runner 只做编排 + 数据采集，不做任何判断
-
-  Step 2c: LLM 审查 + 质量报告（🔴 必须输出）
-    ├── 读取 /tmp/e2e_result.json
-    ├── 逐轮审查：对每个操作，检查输入输出是否符合逻辑
-    ├── 逐条核对阶段 1 定义的 AC
-    └── 输出质量检测报告（格式见 3.1.1）
-
-  Step 2d: E2E Gate（🔴 代码层强制，防止 LLM 偷懒）
-    ├── 验证数据充分性（文件存在、≥10 轮调用、不能太旧）
-    ├── 把原始数据直接展示给用户（用户对照 LLM 报告看是否诚实）
-    └── Gate FAIL → 禁止合入
-
-    🔴 合并前必须跑：
-    python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
-
-Step 3: 回归检查
-  ├── 项目测试已在 Step 1 覆盖
-  └── 如架构文档标注了涉及模块的已知风险 → 额外关注
-```
-
-### 3.1.1 🔴 E2E 质量检测报告
-
-每次 E2E 完成后必须输出。目的：防止 LLM 偷懒。
-
-```markdown
-## E2E 质量检测报告
-
-### 覆盖度
-- 总调用轮数：N
-- 覆盖的场景数：M
-- 覆盖的 AC 条目：列出每条 AC 对应的测试轮次
-
-### 逐轮审查
-
-#### Case: {场景名} — Round X Turn Y
-- **输入**: 原始输入
-- **输出**: 实际输出（🔴 必须完整列出，不能省略）
-- **关键数据**: 列出相关中间状态/pipeline 字段（按场景需要）
-- **判定**: ✅ / ❌
-- **原因**: 具体说明为什么通过或失败。不能只写"一致"——要说清楚哪些内容和哪些数据对应上了
-- **问题定位**:（❌ 时必填）问题在哪个环节
-
-### 总结
-- N 轮中 X 轮 PASS，Y 轮 FAIL
-- 通过率：X/N
-- 🔴 通过率 < 80% 或任意 AC 未覆盖 → 不能合入
-- 发现的问题 + 根因
-- 建议的后续动作
-```
-
-🔴 **报告红线**：
-- 回复原文不能省略或截断
-- 不能只说"看起来没问题"——必须列出具体的对应关系
-- 空回复 = ❌，无条件
-- 每条 AC 必须在报告中标注覆盖状态
-- FAIL 时必须定位到具体环节（不能只说"有问题"）
-- 🔴 通过率不能靠减少测试轮数来提高
-
-### 3.1.2 🔴 E2E Gate（代码层强制，防止 LLM 偷懒）
-
-质量报告由 LLM 输出，但 LLM 可能偷懒。Gate 脚本做两件事：
-1. **验证 E2E 数据充分性**（文件存在、≥10 轮调用、不能太旧）
-2. **把原始数据直接展示给用户**（用户可以对照 LLM 的报告看是否诚实）
-
-```
-🔴 合并前必须跑：
-python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
-
-Gate 输出原始数据（每轮的输入/回复/关键字段），用户对照 LLM 的质量报告判断。
-Gate FAIL → 禁止合入。
-```
-
-### 3.2 结果处理
-
-```
-✅ 全部通过：
-  ├── 更新架构文档（如有，涉及模块的「最近变更」section）
-  ├── 更新知识库文档（如有新的经验教训）
-  ├── 输出改动总结给用户
-  └── 用户手动决定是否合入 main
-
-❌ 失败（第 1 次）：
-  ├── 记录失败详情（哪个 AC 没过、具体错误）
-  └── 自动重试（带失败反馈）
-
-❌ 失败（第 2 次）：
-  ├── 🔴 强制根因分析（不是直接重试）
-  │   ├── 两次失败的共同模式是什么？
-  │   ├── 是代码层面能解决的吗？
-  │   └── 还是 spec/架构层面的问题？
-  ├── 根因 = 代码问题 → 换思路重试（最后 1 次机会）
-  ├── 根因 = spec/架构问题 → 回到阶段 1 与用户讨论
-  └── 根因 = 无法判断 → 停下，输出完整分析给用户
-
-❌ 失败（第 3 次）：
-  └── 停止执行，输出：
-      ├── 3 次失败的详细记录
-      ├── 根因分析
-      ├── 建议（方向调整 / 需要用户决策的问题）
-      └── 代码保留，用户可检查
-```
-
-### 3.3 Loop 流程图
-
-```
-            ┌──────────────┐
-            │ 项目测试     │
-            └──────┬───────┘
-                   │ pass
-            ┌──────▼───────┐
-            │ E2E 验证     │
-            └──────┬───────┘
-                   │
-          ┌────────┴────────┐
-          │                 │
-        pass              fail
-          │                 │
-  ┌───────▼────────┐  ┌────▼─────────────┐
-  │ 更新文档       │  │ 第几次？          │
-  │ 交付用户合入   │  ├── 1 → 自动重试    │
-  └────────────────┘  ├── 2 → 根因分析    │
-                      │   ├─ 代码 → 重试  │
-                      │   ├─ 架构 → 阶段1 │
-                      │   └─ 不确定→停下  │
-                      └── 3 → 停下报告    │
-                      └──────────────────┘
-```
-
----
+- Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）
+- Grill 必须走 grill-me skill（orchestrator 验证 grill 摘要文件 ≥300B + 结构）
+- 执行必须走 executing-plans / subagent-driven-development
+- 主线程禁止亲自 grep/find（改为 1.2 并行 Explore）
+- Phase 1 编辑代码文件 → hook 自动 BLOCK + 打印当前步骤（Claude Code only）
+- E2E 阶段禁止 DB 写入（gate 拦截）
+- Loop 上限 3 次（gate 锁死）
+- KNOWLEDGE.md merge 前必须表态（gate 拦截）
 
 ## 状态行
 
 每次回复末尾包含：
 
 ```
-🚀 /fastship | {需求简述} | 阶段：{1-Brainstorm / 2-Execution / 3-Verification} | Loop: {0/3}
+🚀 /fastship | {需求简述} | Step: {当前步骤 id} | Phase: {1/2/3} | Loop: {0/3}
 ```
-
----
-
-## Red Flags
-
-**禁止：**
-- 未读项目上下文文件就进入 brainstorm
-- 未与用户确认 AC + E2E 方案就进入 execution
-- 🔴 未跑通项目测试就执行 E2E（hook 自动阻断，无法绕过）
-- 🔴 未完成 E2E Runner 就执行 E2E Gate（hook 自动阻断，无法绕过）
-- 在 execution 中修改带保护标记的代码
-- E2E 失败后不做根因分析直接重试第 3 次
-- 自我声称"已验证通过"而不实际执行 E2E
-- 跳过项目测试直接跑 E2E
-- 通过验证后不更新文档
-- 🔴 任何需求都必须经过 E2E 验证，无论是否使用 worktree、无论改动大小
