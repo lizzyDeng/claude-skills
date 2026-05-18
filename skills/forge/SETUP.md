@@ -14,6 +14,7 @@ description: "在当前项目中安装 /forge skill（项目级 harness：roadma
 ```bash
 ls .claude/commands/fastship.md
 ls .claude/hooks/ship_verify_gate.py
+ls .claude/tools/fastship_orchestrator.py
 ```
 
 如果任一文件不存在，告知用户先运行 `/fastship-setup`，然后停止。
@@ -37,7 +38,7 @@ cp /path/to/claude-skills/skills/forge/hooks/forge_gate.py .claude/hooks/
 
 读取当前 `.claude/settings.local.json`，将 forge 的 hook 配置合并进去。
 
-**关键**：不覆盖 fastship 的 hooks，而是在同一个 matcher 的 `hooks` 数组中追加 forge 的 hook entry。forge hooks 应排在 fastship hooks 之前。
+**关键**：不覆盖 fastship orchestrator 的 hooks，而是在同一个 matcher 的 `hooks` 数组中追加 forge 的 hook entry。forge hooks 应排在 orchestrator hooks 之前。fastship hooks 现在指向 `fastship_orchestrator.py`（不再直接指向 `ship_verify_gate.py`）。
 
 参照 `skills/forge/INSTALL.md` 中的完整 JSON 配置。
 
@@ -58,15 +59,24 @@ grep -q ".forge-state.json" .gitignore || echo ".claude/.forge-state.json" >> .g
 ## Step 7: 验证
 
 ```bash
+python3 .claude/hooks/forge_gate.py doctor
 python3 .claude/hooks/forge_gate.py status
 ```
 
-预期输出：`❌ No roadmap found. Run /forge init first.`
+未初始化时预期输出：`❌ No roadmap found. Run /forge init first.`
 
-## Step 8: 输出总结
+## Step 8: 月度审计命令
+
+确认以下命令可运行：
+
+```bash
+python3 .claude/hooks/forge_gate.py audit-month 2026-05
+```
+
+## Step 9: 输出总结
 
 告诉用户：
 
 1. 安装完成，使用 `/forge init` 开始定义项目 roadmap
-2. 完整命令列表：`/forge init` / `add` / `plan` / `dev` / `ship` / `harvest` / `status`
+2. 完整命令列表：`/forge init` / `add` / `plan` / `dev` / `ship` / `harvest` / `status` / `doctor` / `audit-month`
 3. forge 包裹 fastship：进入 feature 开发时会自动调用 fastship 流程
