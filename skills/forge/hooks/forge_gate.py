@@ -24,6 +24,7 @@ Source of truth: {repo_root}/project-roadmap/roadmap.json
 import sys
 import os
 import json
+import re
 import subprocess
 from datetime import datetime, timedelta
 
@@ -58,6 +59,26 @@ def get_git_common_dir(root=None):
         return None
 
 
+def get_git_dir(root=None):
+    """Per-worktree git dir (e.g. .git or .git/worktrees/<name>)."""
+    root = root or get_repo_root()
+    if not root:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        gd = r.stdout.strip()
+        if not gd:
+            return None
+        if not os.path.isabs(gd):
+            gd = os.path.join(root, gd)
+        return os.path.realpath(gd)
+    except Exception:
+        return None
+
+
 def roadmap_dir():
     root = get_repo_root()
     return os.path.join(root, "project-roadmap") if root else None
@@ -78,15 +99,19 @@ def fastship_state_path():
     if not root:
         return None
 
+    gd = get_git_dir(root)
+    current = os.path.join(gd, "fastship", "gate.json") if gd else None
     common = get_git_common_dir(root)
-    current = os.path.join(common, "fastship", "gate.json") if common else None
-    legacy = os.path.join(root, ".claude", ".ship-verify-state.json")
+    shared_legacy = os.path.join(common, "fastship", "gate.json") if common else None
+    old_legacy = os.path.join(root, ".claude", ".ship-verify-state.json")
 
     if current and os.path.exists(current):
         return current
-    if os.path.exists(legacy):
-        return legacy
-    return current or legacy
+    if shared_legacy and os.path.exists(shared_legacy):
+        return shared_legacy
+    if os.path.exists(old_legacy):
+        return old_legacy
+    return current or old_legacy
 
 
 def read_stdin():
@@ -228,6 +253,20 @@ def can_transition(slug, current_status, target_status, repo_root, fastship_stat
 
     if fastship_state is None:
         fastship_state = {}
+
+    # Verify fastship state belongs to this feature
+    fs_feature = fastship_state.get("forge_feature")
+    needs_fs_check = (
+        (current_status == "draft" and target_status == "planned") or
+        (current_status == "in_progress" and target_status == "shipped")
+    )
+    if needs_fs_check:
+        if not fs_feature:
+            return (False, f"Fastship state not bound to any feature. "
+                           f"Run: forge_gate.py activate {slug}")
+        if fs_feature != slug:
+            return (False, f"Fastship state belongs to feature '{fs_feature}', not '{slug}'. "
+                           f"Run: forge_gate.py activate {slug}")
 
     # Gate 2: draft → planned (fastship Phase 1 complete)
     if current_status == "draft" and target_status == "planned":
@@ -507,6 +546,63 @@ def cmd_status():
         print(f"\n  🎯 Active: {active}")
 
 
+def reset_fastship_state_for_feature(slug):
+    """Reset fastship gate state when switching features.
+    Prevents Feature B from inheriting Feature A's plan_ready/test_passed/e2e_executed."""
+    p = fastship_state_path()
+    if not p:
+        return
+    try:
+        if os.path.exists(p):
+            with open(p) as f:
+                st = json.load(f)
+        else:
+            st = {}
+    except Exception:
+        st = {}
+
+    old_feature = st.get("forge_feature")
+    if old_feature == slug:
+        return
+
+    for key in ("plan_ready", "test_passed", "e2e_executed",
+                "knowledge_acknowledged", "plan_bypass",
+                "knowledge_recall_done", "request_classified",
+                "bug_diagnosis_done", "loop_count",
+                "e2e_runs_since_last_record"):
+        if key in st:
+            if isinstance(st[key], bool):
+                st[key] = False
+            elif isinstance(st[key], int):
+                st[key] = 0
+
+    for key in ("plan_file", "plan_ts", "test_ts", "test_tool",
+                "e2e_ts", "knowledge_file", "knowledge_ts",
+                "knowledge_skip_reason", "knowledge_recall_query",
+                "knowledge_recall_count", "knowledge_recall_ts",
+                "request_type", "request_classified_ts",
+                "bug_diagnosis_ts", "bug_diagnosis_reproduce",
+                "bug_diagnosis_root_cause", "last_loop_outcome",
+                "last_loop_reflection"):
+        if key in st:
+            st[key] = None
+
+    if "loop_history" in st:
+        st["loop_history"] = []
+    st["bug_is_bugfix"] = False
+    st["bug_diagnosis_fix_verified"] = False
+    st["forge_feature"] = slug
+
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(st, f, indent=2, ensure_ascii=False)
+
+    if old_feature:
+        print(f"🔄 Fastship state reset: {old_feature} → {slug}")
+    else:
+        print(f"🔄 Fastship state bound to feature: {slug}")
+
+
 def cmd_activate(slug):
     """Set active feature."""
     roadmap = load_roadmap()
@@ -517,6 +613,8 @@ def cmd_activate(slug):
     if not feature:
         print(f"❌ Feature '{slug}' not found in roadmap.")
         sys.exit(1)
+
+    reset_fastship_state_for_feature(slug)
 
     state = derive_state(roadmap, slug)
     save_forge_state(state)
@@ -608,12 +706,24 @@ def cmd_reset():
 # ========== Hook Handlers ==========
 
 def hook_pre_edit():
-    """Protect .forge-state.json from manual tampering."""
+    """Protect .forge-state.json and roadmap.json status from manual tampering."""
     data = read_stdin()
     file_path = data.get("tool_input", {}).get("file_path", "")
     if ".forge-state.json" in file_path:
         print("🚫 Forge Gate: .forge-state.json is managed by forge_gate.py. Do not edit manually.")
         sys.exit(1)
+
+    if file_path.endswith("roadmap.json") and "project-roadmap" in file_path:
+        tool_input = data.get("tool_input", {})
+        old_str = tool_input.get("old_string", "")
+        new_str = tool_input.get("new_string", "")
+        content = tool_input.get("content", "")
+        combined = old_str + new_str + content
+        if re.search(r'"status"\s*:', combined):
+            print("🚫 Forge Gate: roadmap.json の status フィールドを直接編集することはできません。")
+            print("   状態遷移は forge_gate.py transition <slug> <status> を使用してください。")
+            print("   例: python3 forge_gate.py transition my-feature planned")
+            sys.exit(1)
 
 
 def hook_post_edit():

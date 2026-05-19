@@ -5,7 +5,7 @@ State is local runtime data. It should not live in tracked files, and it
 should not disappear when the caller changes directories. The state home is:
 
 1. FASTSHIP_STATE_HOME, when explicitly set.
-2. The current repository's git common dir, when available.
+2. Per-worktree: {git-dir}/fastship (supports parallel agents in worktrees).
 3. The script repository's .claude/state/fastship directory as a fallback.
 """
 
@@ -76,14 +76,25 @@ def git_common_dir() -> Optional[str]:
     return os.path.realpath(common)
 
 
+def git_dir() -> Optional[str]:
+    """Per-worktree git dir (e.g. .git or .git/worktrees/<name>)."""
+    root = repo_root()
+    gd = _run_git(["rev-parse", "--git-dir"], root)
+    if not gd:
+        return None
+    if not os.path.isabs(gd):
+        gd = os.path.join(root, gd)
+    return os.path.realpath(gd)
+
+
 def state_home() -> str:
     explicit = os.environ.get("FASTSHIP_STATE_HOME")
     if explicit:
         return os.path.realpath(explicit)
 
-    common = git_common_dir()
-    if common:
-        return os.path.join(common, "fastship")
+    gd = git_dir()
+    if gd:
+        return os.path.join(gd, "fastship")
 
     return os.path.join(repo_root(), ".claude", "state", "fastship")
 
