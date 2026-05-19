@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 import tempfile
@@ -35,13 +36,17 @@ class TestStateManagement:
         from orchestrator import load_orch_state
         assert load_orch_state(str(tmp_path / "nope.json")) is None
 
-    def test_load_branch_mismatch_returns_none(self, tmp_path, monkeypatch):
+    def test_load_branch_mismatch_keeps_state(self, tmp_path, monkeypatch):
         from orchestrator import save_orch_state, load_orch_state
+        import fastship_state
         f = str(tmp_path / "state.json")
         st = {"requirement": "test", "current_step": "1.0", "branch": "feat/old"}
         save_orch_state(st, f)
-        monkeypatch.setattr("orchestrator._current_branch", lambda: "main")
-        assert load_orch_state(f) is None
+        monkeypatch.setattr("fastship_state.current_branch", lambda: "main")
+        loaded = load_orch_state(f)
+        assert loaded is not None
+        assert loaded["requirement"] == "test"
+        assert fastship_state.branch_mismatch(loaded) is True
 
     def test_load_branch_match_returns_state(self, tmp_path, monkeypatch):
         from orchestrator import save_orch_state, load_orch_state
@@ -52,6 +57,24 @@ class TestStateManagement:
         loaded = load_orch_state(f)
         assert loaded is not None
         assert loaded["requirement"] == "test"
+
+    def test_installed_tool_prefers_script_repo_over_foreign_cwd(self, tmp_path, monkeypatch):
+        import fastship_state
+
+        project = tmp_path / "project"
+        other = tmp_path / "other"
+        tools = project / ".claude" / "tools"
+        tools.mkdir(parents=True)
+        other.mkdir()
+        subprocess.run(["git", "-C", str(project), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(other), "init", "-q"], check=True)
+
+        fake_state = tools / "fastship_state.py"
+        fake_state.write_text("# test path only\n")
+        monkeypatch.setattr(fastship_state, "__file__", str(fake_state))
+        monkeypatch.chdir(other)
+
+        assert fastship_state.repo_root() == str(project.resolve())
 
 
 class TestDelegation:
@@ -440,36 +463,42 @@ class TestHookPreEdit:
         )
         assert result == 1
 
-    def test_phase1_allows_brief_edit(self):
+    def test_phase1_allows_brief_edit(self, tmp_path):
         from orchestrator import hook_pre_edit_logic
+        fake_gate = tmp_path / "gate.py"
+        fake_gate.write_text("import sys; sys.exit(0)")
         orch = {"current_step": "1.3", "phase": 1, "completed_steps": [],
                 "skipped_steps": [], "request_type": "feature", "artifacts": {}}
         result = hook_pre_edit_logic(
             data={"tool_input": {"file_path": ".claude/.fastship-brief.md"}},
             orch_state=orch,
-            gate_path="/nonexistent",
+            gate_path=str(fake_gate),
         )
         assert result == 0
 
-    def test_phase1_allows_plan_edit(self):
+    def test_phase1_allows_plan_edit(self, tmp_path):
         from orchestrator import hook_pre_edit_logic
+        fake_gate = tmp_path / "gate.py"
+        fake_gate.write_text("import sys; sys.exit(0)")
         orch = {"current_step": "1.4", "phase": 1, "completed_steps": [],
                 "skipped_steps": [], "request_type": "feature", "artifacts": {}}
         result = hook_pre_edit_logic(
             data={"tool_input": {"file_path": "docs/superpowers/plans/2026-01-01-x.md"}},
             orch_state=orch,
-            gate_path="/nonexistent",
+            gate_path=str(fake_gate),
         )
         assert result == 0
 
-    def test_phase2_allows_code_edit(self):
+    def test_phase2_allows_code_edit(self, tmp_path):
         from orchestrator import hook_pre_edit_logic
+        fake_gate = tmp_path / "gate.py"
+        fake_gate.write_text("import sys; sys.exit(0)")
         orch = {"current_step": "2.0", "phase": 2, "completed_steps": [],
                 "skipped_steps": [], "request_type": "feature", "artifacts": {}}
         result = hook_pre_edit_logic(
             data={"tool_input": {"file_path": "src/main.py"}},
             orch_state=orch,
-            gate_path="/nonexistent",
+            gate_path=str(fake_gate),
         )
         assert result == 0
 
@@ -642,9 +671,11 @@ class TestIntegrationFullFlow:
         assert st["phase"] == 2
 
         # Phase 2 allows code edits
+        fake_gate = tmp_path / "gate.py"
+        fake_gate.write_text("import sys; sys.exit(0)")
         result = hook_pre_edit_logic(
             data={"tool_input": {"file_path": "src/app.py"}},
-            orch_state=st, gate_path="/nonexistent")
+            orch_state=st, gate_path=str(fake_gate))
         assert result == 0
 
         # 2.0 + 3.0: manual done

@@ -37,7 +37,7 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
                     fix_verified                 — D3 完成，修复假设已验证
                     skip --reason "..."          — 非 Bugfix，跳过诊断 Gate
 
-状态文件: {repo_root}/.claude/.ship-verify-state.json
+状态文件: {git_common_dir}/fastship/gate.json
 
 技术栈自动检测:
   - Rust (Cargo.toml)     → cargo test
@@ -53,25 +53,23 @@ import subprocess
 import re
 from datetime import datetime
 
+SOURCE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+TOOLS_DIR = os.path.join(SOURCE_DIR, "tools")
+for path in (TOOLS_DIR, SOURCE_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+import fastship_state
+
 
 # ---------- 基础工具 ----------
 
 def get_repo_root():
-    try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
+    return fastship_state.repo_root()
 
 
 def get_current_branch():
-    try:
-        r = subprocess.run(["git", "branch", "--show-current"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
+    return fastship_state.current_branch()
 
 
 def is_main_branch(branch):
@@ -80,8 +78,7 @@ def is_main_branch(branch):
 
 
 def state_path():
-    root = get_repo_root()
-    return os.path.join(root, ".claude", ".ship-verify-state.json") if root else None
+    return fastship_state.gate_state_path()
 
 
 LOOP_LIMIT = 3
@@ -129,11 +126,13 @@ def empty_state(branch=None):
 
 
 def load_state():
+    fastship_state.migrate_legacy_state("gate")
     p = state_path()
     if p and os.path.exists(p):
         try:
-            with open(p) as f:
-                return json.load(f)
+            data = fastship_state.load_json(p)
+            if data is not None:
+                return data
         except Exception:
             pass
     return empty_state()
@@ -143,9 +142,7 @@ def save_state(st):
     p = state_path()
     if not p:
         return
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(st, f, indent=2)
+    fastship_state.save_json(p, st)
 
 
 def read_stdin():
@@ -175,10 +172,24 @@ def extract_output(data):
 
 
 def ensure_branch_state(st, branch):
-    """分支变化时自动重置状态"""
-    if st.get("branch") != branch:
-        return empty_state(branch)
+    """Keep state intact across branch changes; callers decide whether to block."""
     return st
+
+
+def branch_mismatch(st, branch=None):
+    return fastship_state.branch_mismatch(st, branch)
+
+
+def print_branch_mismatch(st):
+    print("🔴 Fastship gate paused because the branch changed.")
+    print("\n".join(fastship_state.branch_mismatch_lines(st, "Fastship gate")))
+
+
+def require_branch_match(st, branch=None):
+    if branch_mismatch(st, branch):
+        print_branch_mismatch(st)
+        return False
+    return True
 
 
 # ---------- 技术栈检测 ----------
@@ -359,6 +370,8 @@ def gate_pre_edit():
     if is_code_file(file_path):
         branch = get_current_branch()
         st = ensure_branch_state(load_state(), branch)
+        if not require_branch_match(st, branch):
+            return 1
 
         # 环境变量兜底（便于 CI / 临时绕过）
         if os.environ.get("FASTSHIP_SKIP_PLAN_GATE") == "1":
@@ -397,14 +410,14 @@ def gate_pre_edit():
         if not st.get("request_classified"):
             lines += [
                 "   先分类需求类型（1.0 强制第一步）：",
-                "     python3 .claude/hooks/ship_verify_gate.py classify \\",
+                '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" classify \\',
                 "       --type bugfix|feature|refactor|optimize",
                 "",
             ]
         if not st.get("knowledge_recall_done"):
             lines += [
                 "   先跑 knowledge_recall（1.1 阶段必做，跨 session 学习）：",
-                "     python3 .claude/hooks/ship_verify_gate.py knowledge_recall \\",
+                '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_recall \\',
                 "       --query \"<需求一句话>\"",
                 "",
             ]
@@ -412,13 +425,13 @@ def gate_pre_edit():
             lines += [
                 "   🐛 Bugfix 诊断 Gate 未完成，按顺序执行：",
                 "     D1 复现：跑测试/curl 拿到实际报错，然后：",
-                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis reproduce \\",
+                '       python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis reproduce \\',
                 "         --cmd '<你实际执行的复现命令>'",
                 "     D2 根因：基于 D1 输出追踪到 file:line，然后：",
-                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis root_cause \\",
+                '       python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis root_cause \\',
                 "         --cause '<根因一句话>'",
                 "     D3 验证：最小改动验证修复方向，然后：",
-                "       python3 .claude/hooks/ship_verify_gate.py bug_diagnosis fix_verified",
+                '       python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis fix_verified',
                 "",
             ]
         if not st.get("plan_ready"):
@@ -433,7 +446,7 @@ def gate_pre_edit():
             "   全部就绪后 Gate 自动放行。",
             "",
             "   非 /fastship 流程可临时放行 Plan Gate：",
-            "     python3 .claude/hooks/ship_verify_gate.py plan_bypass",
+            '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" plan_bypass',
         ]
         print("\n".join(lines))
         return 1
@@ -467,6 +480,8 @@ def gate_post_edit():
         print(f"✅ Gate: 检测到 KNOWLEDGE.md 更新，knowledge_acknowledged=true ({file_path})")
 
     if changed:
+        if not require_branch_match(st, branch):
+            return 0
         save_state(st)
     return 0
 
@@ -475,6 +490,8 @@ def gate_plan_bypass():
     """手动放行 Plan Gate（当前分支生效，用于非 fastship 场景）"""
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
     st["plan_bypass"] = True
     save_state(st)
     print(f"⚠️ Gate: 已为当前分支 ({branch}) 放行 Plan Gate")
@@ -552,6 +569,8 @@ def gate_loop_record():
 
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
 
     if not st.get("e2e_executed") or st.get("e2e_runs_since_last_record", 0) < 1:
         print("🔴 当前没有未记录的 E2E 运行可供 loop_record（先跑 E2E Runner）")
@@ -775,6 +794,8 @@ def gate_knowledge_recall():
 
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
     st["knowledge_recall_done"] = True
     st["knowledge_recall_query"] = query.strip()
     st["knowledge_recall_count"] = len(matched)
@@ -805,6 +826,8 @@ def gate_classify():
     req_type = req_type.lower()
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
     now = datetime.now().isoformat()
 
     st["request_classified"] = True
@@ -844,6 +867,8 @@ def gate_bug_diagnosis():
     subcmd = args[0]
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
     now = datetime.now().isoformat()
 
     if subcmd == "mark_bugfix":
@@ -944,7 +969,7 @@ def gate_knowledge_skip():
             break
     if not reason or not reason.strip():
         print("🔴 必须给一个非空 --reason 才能跳过 KNOWLEDGE.md 更新")
-        print("   例：python3 .claude/hooks/ship_verify_gate.py knowledge_skip \\")
+        print('   例：python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip \\')
         print("         --reason '纯文档改动，未触及代码或行为'")
         return 1
     if len(reason.strip()) < 10:
@@ -952,6 +977,8 @@ def gate_knowledge_skip():
         return 1
     branch = get_current_branch()
     st = ensure_branch_state(load_state(), branch)
+    if not require_branch_match(st, branch):
+        return 1
     now = datetime.now().isoformat()
     st["knowledge_acknowledged"] = True
     st["knowledge_skip_reason"] = reason.strip()
@@ -970,6 +997,8 @@ def gate_post_bash():
     output = extract_output(data)
 
     st = ensure_branch_state(load_state(), branch)
+    if branch_mismatch(st, branch):
+        return 0
     now = datetime.now().isoformat()
     changed = False
 
@@ -1030,6 +1059,9 @@ def gate_pre_bash():
     cmd = data.get("tool_input", {}).get("command", "")
 
     st = ensure_branch_state(load_state(), branch)
+    if branch_mismatch(st, branch) and not fastship_state.is_branch_recovery_command(cmd):
+        print_branch_mismatch(st)
+        return 1
 
     # --- Gate 0: E2E 阶段禁止直接 DB 写入 ---
     # 条件：项目测试已通过（说明进入了验证阶段），且检测到 DB 写入命令
@@ -1093,7 +1125,7 @@ def gate_pre_bash():
                 f"🔴 BLOCKED: 上一轮 E2E 未 loop_record，禁止再跑 E2E",
                 "",
                 "   先调用：",
-                "     python3 .claude/hooks/ship_verify_gate.py loop_record \\",
+                '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" loop_record \\',
                 "       --outcome pass | fail [--reflection <path>]",
                 "",
                 "   失败时 reflection 路径推荐：",
@@ -1112,7 +1144,7 @@ def gate_pre_bash():
                 "     - 建议（方向调整 / 需要用户决策的问题）",
                 "",
                 "   如用户决定换方向、回阶段 1，先 reset：",
-                "     python3 .claude/hooks/ship_verify_gate.py reset",
+                '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" reset',
             ]
             print("\n".join(lines))
             return 1
@@ -1141,7 +1173,7 @@ def gate_pre_bash():
             lines.append("   3. KNOWLEDGE.md：")
             lines.append("      - 有新教训 → 编辑 KNOWLEDGE.md（hook 自动检测）")
             lines.append("      - 确实无新教训 → 显式声明跳过：")
-            lines.append("          python3 .claude/hooks/ship_verify_gate.py knowledge_skip \\")
+            lines.append('          python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip \\')
             lines.append("            --reason '<≥10 字的原因，例：纯文档改动，未触及代码或行为>'")
             print("\n".join(lines))
             return 1
@@ -1158,6 +1190,8 @@ def gate_status():
     stacks = detect_stack()
     print(f"Branch:     {branch}")
     print(f"State for:  {st.get('branch', '-')}")
+    if branch_mismatch(st, branch):
+        print("Mismatch:   ⚠️ branch changed; gate mutation is paused until adopt-branch or reset")
     print(f"Stack:      {', '.join(stacks) if stacks else 'unknown'}")
     if st.get("request_classified"):
         print(f"Type:       📋 {st.get('request_type', '-')}  ({st.get('request_classified_ts', '-')})")
@@ -1233,6 +1267,9 @@ def gate_reset():
     branch = get_current_branch()
     st = empty_state(branch)
     save_state(st)
+    legacy = fastship_state.legacy_gate_state_path()
+    if os.path.exists(legacy):
+        os.remove(legacy)
     print(f"✅ Gate: 验证状态已重置 (branch: {branch})")
     return 0
 

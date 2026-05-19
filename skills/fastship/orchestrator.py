@@ -22,37 +22,29 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Callable
 
+import fastship_state
+
 
 # ━━━━━━━━━━━━ State Management ━━━━━━━━━━━━
 
 def _repo_root():
-    try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else os.getcwd()
-    except Exception:
-        return os.getcwd()
+    return fastship_state.repo_root()
 
 
 def orch_state_path():
-    return os.path.join(_repo_root(), ".claude", ".fastship-orchestrator-state.json")
+    return fastship_state.orchestrator_state_path()
 
 
 def hook_state_path():
-    return os.path.join(_repo_root(), ".claude", ".ship-verify-state.json")
+    return fastship_state.gate_state_path()
 
 
 def gate_script_path():
-    return os.path.join(_repo_root(), ".claude", "hooks", "ship_verify_gate.py")
+    return fastship_state.gate_script_path()
 
 
 def _current_branch() -> Optional[str]:
-    try:
-        r = subprocess.run(["git", "branch", "--show-current"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
+    return fastship_state.current_branch()
 
 
 def empty_orchestrator_state(requirement: str) -> dict:
@@ -64,6 +56,7 @@ def empty_orchestrator_state(requirement: str) -> dict:
         "skipped_steps": [],
         "phase": 1,
         "branch": _current_branch(),
+        "repo_root": _repo_root(),
         "brief_path": None,
         "plan_path": None,
         "report_path": None,
@@ -75,38 +68,39 @@ def empty_orchestrator_state(requirement: str) -> dict:
 
 def save_orch_state(st: dict, path: str = None):
     p = path or orch_state_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(st, f, indent=2)
+    fastship_state.save_json(p, st)
+
+
+def save_hook_state(st: dict, path: str = None):
+    p = path or hook_state_path()
+    fastship_state.save_json(p, st)
 
 
 def load_orch_state(path: str = None) -> Optional[dict]:
-    """Load orchestrator state. Returns None if no state or branch mismatch."""
+    """Load orchestrator state. Returns None only if no readable state exists."""
+    if path is None:
+        fastship_state.migrate_legacy_state("orchestrator")
     p = path or orch_state_path()
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p) as f:
-            st = json.load(f)
-    except Exception:
-        return None
-    saved_branch = st.get("branch")
-    if saved_branch is not None:
-        current = _current_branch()
-        if current and current != saved_branch:
-            return None
-    return st
+    return fastship_state.load_json(p)
 
 
 def load_hook_state(path: str = None) -> dict:
+    if path is None:
+        fastship_state.migrate_legacy_state("gate")
     p = path or hook_state_path()
-    if not os.path.exists(p):
-        return {}
-    try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return fastship_state.load_json(p) or {}
+
+
+def _branch_mismatch(st: Optional[dict]) -> bool:
+    return fastship_state.branch_mismatch(st)
+
+
+def _branch_mismatch_text(st: dict) -> str:
+    return "\n".join(fastship_state.branch_mismatch_lines(st))
+
+
+def _is_active(st: Optional[dict]) -> bool:
+    return bool(st and st.get("current_step") not in ("done", "stopped", None))
 
 
 # ━━━━━━━━━━━━ Gate Delegation ━━━━━━━━━━━━
@@ -381,7 +375,7 @@ def validate_knowledge(orch: dict, hook: dict) -> tuple:
 STEPS = [
     Step("1.0", "需求分类", 1, validator=validate_classify,
          instruction="""分析用户需求，执行分类：
-  python3 .claude/hooks/ship_verify_gate.py classify --type <bugfix|feature|refactor|optimize>
+  python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" classify --type <bugfix|feature|refactor|optimize>
 
   bugfix = 报错/数据不对/线上问题    feature = 新功能
   refactor = 重构/规范               optimize = 性能/体验
@@ -392,7 +386,7 @@ STEPS = [
   1. Read ARCHITECTURE.md（Glob **/ARCHITECTURE.md → Read 全文）
   2. 确认 CLAUDE.md 已加载
   3. git log --oneline -15
-  4. python3 .claude/hooks/ship_verify_gate.py knowledge_recall --query "<需求一句话>" --top 5
+  4. python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_recall --query "<需求一句话>" --top 5
 
 把 recall 命中原文保留，后续拷入 Brief。"""),
 
@@ -406,7 +400,7 @@ STEPS = [
 
 🔴 必须同一条消息发出多个 Agent 调用。主线程禁止亲自 grep/find。
 
-完成后: python3 .claude/tools/fastship_orchestrator.py done --agents <N>"""),
+完成后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --agents <N>"""),
 
     Step("1.3", "Context Brief", 1, validator=validate_brief,
          instruction="""聚合 subagent 结果 + recall 命中，用 Write 工具写到 .claude/.fastship-brief.md：
@@ -429,13 +423,13 @@ STEPS = [
          instruction="""Bugfix 诊断三步（缺一不可）：
 
   D1 复现: 实际跑出报错
-    python3 .claude/hooks/ship_verify_gate.py bug_diagnosis reproduce --cmd '<命令>'
+    python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis reproduce --cmd '<命令>'
 
   D2 根因: 基于 D1 追踪到 file:line + 证据链
-    python3 .claude/hooks/ship_verify_gate.py bug_diagnosis root_cause --cause '<根因>'
+    python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis root_cause --cause '<根因>'
 
   D3 验证: 最小改动验证修复方向
-    python3 .claude/hooks/ship_verify_gate.py bug_diagnosis fix_verified
+    python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" bug_diagnosis fix_verified
 
 🔴 禁止"读代码觉得会报错"，必须实际执行。"""),
 
@@ -473,7 +467,7 @@ orchestrator 自动检测文件写入并验证（≥300B + 必须包含 拷问/�
          instruction="""向用户输出 AC + E2E + Plan 摘要，等待明确确认。
 🔴 Phase 1 唯一确认关卡。
 
-用户确认后: python3 .claude/tools/fastship_orchestrator.py done --user-confirmed"""),
+用户确认后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --user-confirmed"""),
 
     Step("2.0", "执行计划", 2, validator=validate_execute,
          instruction="""1. 选择开发方式（worktree / 新分支 / 当前分支）
@@ -482,13 +476,13 @@ orchestrator 自动检测文件写入并验证（≥300B + 必须包含 拷问/�
    无 subagent: Skill(skill="executing-plans")
 🔴 禁止主线程凭直觉写代码。
 
-完成后: python3 .claude/tools/fastship_orchestrator.py done"""),
+完成后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
 
     Step("3.0", "冒烟测试", 3, validator=validate_smoke,
          instruction="""零 setup 冒烟: 启动服务 → API 请求 → 等处理 → SELECT 验证。
 🔴 禁止 DB 写入。失败 → 修，不进 E2E。
 
-完成后: python3 .claude/tools/fastship_orchestrator.py done"""),
+完成后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
 
     Step("3.1", "项目测试", 3, validator=validate_tests,
          instruction="""运行项目全量测试。hook 自动检测通过。
@@ -512,20 +506,20 @@ Gate 展示原始数据给用户对照。FAIL → 禁止合入。orchestrator �
 
     Step("3.5", "Loop Record", 3, validator=validate_loop_record,
          instruction="""记录本轮结果：
-  通过: python3 .claude/hooks/ship_verify_gate.py loop_record --outcome pass
+  通过: python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" loop_record --outcome pass
   失败: 先写 reflection 到 docs/superpowers/plans/<plan>.reflections/loop-N.md
         然后: loop_record --outcome fail --reflection <path>
 
 orchestrator 检测后需手动路由:
-  python3 .claude/tools/fastship_orchestrator.py done --outcome pass
-  python3 .claude/tools/fastship_orchestrator.py done --outcome fail --decision <continue|escalate|stop>
+  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --outcome pass
+  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --outcome fail --decision <continue|escalate|stop>
 
   continue → 回 3.1 重试    escalate → 回 1.0    stop → 停止"""),
 
     Step("3.6", "KNOWLEDGE 闭环", 3, validator=validate_knowledge,
          instruction="""merge 前表态：
   有教训 → 编辑 KNOWLEDGE.md（orchestrator 自动检测）
-  无教训 → python3 .claude/hooks/ship_verify_gate.py knowledge_skip --reason "<≥10字>"
+  无教训 → python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip --reason "<≥10字>"
 """),
 ]
 
@@ -720,6 +714,11 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
             return code
         return 0
 
+    if _is_active(orch_state) and _branch_mismatch(orch_state):
+        print("🔴 BLOCKED: Fastship branch mismatch")
+        print(_branch_mismatch_text(orch_state))
+        return 1
+
     if ".fastship-orchestrator-state.json" in file_path:
         print("🔴 BLOCKED: orchestrator state 由系统管理，禁止手动编辑")
         return 1
@@ -745,6 +744,11 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
             print(stdout, end="")
         return code
 
+    if _is_active(orch_state):
+        print(f"🔴 BLOCKED: Fastship gate script unavailable: {gate_path}")
+        print("   State is active, so edits are blocked instead of silently bypassing gates.")
+        return 1
+
     return 0
 
 
@@ -758,12 +762,23 @@ def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
             return code
         return 0
 
+    if _is_active(orch_state) and _branch_mismatch(orch_state):
+        cmd = data.get("tool_input", {}).get("command", "")
+        if not fastship_state.is_branch_recovery_command(cmd):
+            print("🔴 BLOCKED: Fastship branch mismatch")
+            print(_branch_mismatch_text(orch_state))
+            return 1
+
     if os.path.exists(gate_path):
         code, stdout = delegate_to_gate(gate_path, "pre_bash", data)
         if stdout:
             print(stdout, end="")
         if code != 0:
             return code
+    elif _is_active(orch_state):
+        print(f"🔴 BLOCKED: Fastship gate script unavailable: {gate_path}")
+        print("   State is active, so bash commands are blocked instead of silently bypassing gates.")
+        return 1
 
     return 0
 
@@ -791,7 +806,7 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
                 orch.setdefault("artifacts", {})["loop_outcome"] = "fail"
                 save_orch_state(orch, orch_path)
                 print(f"\n📝 Loop {orch['loop_count']} FAIL 已检测。需要手动指定路由：")
-                print(f"  python3 .claude/tools/fastship_orchestrator.py done \\")
+                print('  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done \\')
                 print(f"    --outcome fail --decision <continue|escalate|stop>")
                 print(f"")
                 print(f"  continue  → 回 3.1 重试 (先写 reflection)")
@@ -941,6 +956,9 @@ def format_status(orch: dict) -> str:
         f"   Phase: {orch.get('phase', '?')} | Step: {orch.get('current_step', '?')} | Loop: {orch.get('loop_count', 0)}/3",
         "",
     ]
+    if _branch_mismatch(orch):
+        lines.extend(fastship_state.branch_mismatch_lines(orch))
+        lines.append("")
     for step in STEPS:
         if step.id in orch.get("completed_steps", []):
             marker = "✅"
@@ -972,7 +990,12 @@ def format_next(orch: dict) -> str:
         return "❓ 未知状态"
 
     phase_names = {1: "Brainstorm", 2: "Execution", 3: "Verification"}
+    prefix = ""
+    if _branch_mismatch(orch):
+        prefix = "\n".join(fastship_state.branch_mismatch_lines(orch)) + "\n\n"
+
     return (
+        prefix +
         f"📋 Step {step.id}: {step.name}  [{phase_names.get(step.phase, '?')}]\n"
         f"{'─' * 50}\n"
         f"{step.instruction}\n"
@@ -987,7 +1010,7 @@ def cmd_start(requirement: str) -> int:
     if existing and existing.get("current_step") not in ("done", "stopped", None):
         print(f"⚠️  已有活跃 session: \"{existing.get('requirement')}\"")
         print(f"   当前: {existing.get('current_step')}")
-        print(f"   重新开始: python3 .claude/tools/fastship_orchestrator.py reset")
+        print('   重新开始: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" reset')
         return 1
     st = empty_orchestrator_state(requirement)
     save_orch_state(st)
@@ -1012,6 +1035,10 @@ def cmd_done(argv: list) -> int:
     st = load_orch_state()
     if not st:
         print("❌ 没有活跃 session。")
+        return 1
+    if _branch_mismatch(st):
+        print("🔴 Fastship flow is paused because the branch changed.")
+        print(_branch_mismatch_text(st))
         return 1
     if st.get("current_step") in ("done", "stopped"):
         print(f"流程已结束 ({st['current_step']})")
@@ -1102,13 +1129,40 @@ def cmd_status() -> int:
 
 
 def cmd_reset() -> int:
-    path = orch_state_path()
-    if os.path.exists(path):
-        os.remove(path)
+    for path in (
+        orch_state_path(),
+        fastship_state.legacy_orchestrator_state_path(),
+    ):
+        if os.path.exists(path):
+            os.remove(path)
     gp = gate_script_path()
     if os.path.exists(gp):
         delegate_to_gate(gp, "reset", {})
     print("✅ Orchestrator + hook state cleared.")
+    return 0
+
+
+def cmd_adopt_branch() -> int:
+    st = load_orch_state()
+    if not st:
+        print("❌ 没有活跃 session。")
+        return 1
+    current = _current_branch()
+    if not current:
+        print("❌ 当前目录无法识别 git branch，不能 adopt。")
+        return 1
+
+    old = st.get("branch")
+    st["branch"] = current
+    st["repo_root"] = _repo_root()
+    save_orch_state(st)
+
+    gate = load_hook_state()
+    if gate:
+        gate["branch"] = current
+        save_hook_state(gate)
+
+    print(f"✅ Fastship session adopted branch: {old or '-'} → {current}")
     return 0
 
 
@@ -1126,6 +1180,7 @@ def main():
         print("  next               当前步骤")
         print("  done [--flags]     完成当前步骤")
         print("  status             全部状态")
+        print("  adopt-branch       将活跃 session 迁移到当前分支")
         print("  reset              重置")
         sys.exit(1)
 
@@ -1138,6 +1193,7 @@ def main():
         "next": cmd_next,
         "status": cmd_status,
         "reset": cmd_reset,
+        "adopt-branch": cmd_adopt_branch,
     }
 
     if cmd == "start":
