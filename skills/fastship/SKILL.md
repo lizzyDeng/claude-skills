@@ -10,7 +10,7 @@ E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifa
 ## 启动
 
 收到需求后立即运行：
-  python3 .claude/tools/fastship_orchestrator.py start "<需求>"
+  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" start "<需求>"
 
 ## 双模工作方式
 
@@ -21,14 +21,14 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
 16 步中 12 步自动推进，4 步需手动：
-  python3 .claude/tools/fastship_orchestrator.py done [--flags]
+  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
 
 无 hook，agent 手动驱动每一步：
-  1. `python3 .claude/tools/fastship_orchestrator.py next` → 读当前步骤指令
+  1. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" next` → 读当前步骤指令
   2. 执行步骤
-  3. `python3 .claude/tools/fastship_orchestrator.py done [--flags]` → 验证 + 推进
+  3. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]` → 验证 + 推进
   4. 重复
 
 全部 16 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
@@ -63,11 +63,13 @@ Phase 3: Verification (7 步)
 ## 常用命令
 
 ```bash
-python3 .claude/tools/fastship_orchestrator.py start "<需求>"  # 启动
-python3 .claude/tools/fastship_orchestrator.py next            # 当前步骤
-python3 .claude/tools/fastship_orchestrator.py done [--flags]  # 完成 + 验证
-python3 .claude/tools/fastship_orchestrator.py status          # 全部状态
-python3 .claude/tools/fastship_orchestrator.py reset           # 重置
+FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
+"$FASTSHIP" start "<需求>"   # 启动
+"$FASTSHIP" next             # 当前步骤
+"$FASTSHIP" done [--flags]   # 完成 + 验证
+"$FASTSHIP" status           # 全部状态
+"$FASTSHIP" adopt-branch     # 将活跃 session 迁移到当前分支
+"$FASTSHIP" reset            # 重置
 ```
 
 ## 核心红线

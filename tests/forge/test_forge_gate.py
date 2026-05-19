@@ -3,6 +3,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import importlib
 import pytest
@@ -53,6 +54,33 @@ class TestRoadmapIO:
             forge_gate.save_roadmap(data)
             result = json.loads((roadmap_dir / "roadmap.json").read_text())
             assert result["project"]["name"] == "test"
+
+
+class TestFastshipStateIO:
+    """Test fastship state discovery used by Forge gates."""
+
+    def test_loads_current_fastship_gate_state_from_git_common_dir(self, tmp_path):
+        subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+        state_dir = tmp_path / ".git" / "fastship"
+        state_dir.mkdir()
+        state = {"plan_ready": True, "test_passed": True}
+        (state_dir / "gate.json").write_text(json.dumps(state))
+
+        with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+            assert forge_gate.fastship_state_path() == str((state_dir / "gate.json").resolve())
+            assert forge_gate.load_fastship_state()["plan_ready"] is True
+
+    def test_loads_legacy_fastship_state_when_current_state_missing(self, tmp_path):
+        subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+        legacy_dir = tmp_path / ".claude"
+        legacy_dir.mkdir()
+        legacy = {"plan_ready": True}
+        legacy_path = legacy_dir / ".ship-verify-state.json"
+        legacy_path.write_text(json.dumps(legacy))
+
+        with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+            assert forge_gate.fastship_state_path() == str(legacy_path)
+            assert forge_gate.load_fastship_state()["plan_ready"] is True
 
 
 class TestFeatureLookup:
