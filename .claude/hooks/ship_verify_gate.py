@@ -118,6 +118,70 @@ def extract_output(data):
     return ""
 
 
+def extract_exit_code(data):
+    """从 hook data 中提取 bash exit code，找不到返回 None"""
+    resp = data.get("tool_response", {})
+    if isinstance(resp, dict):
+        for key in ("exitCode", "exit_code", "returnCode", "return_code"):
+            val = resp.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+    for key in ("exitCode", "exit_code"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+E2E_RESULT_PATH = "/tmp/e2e_result.json"
+
+E2E_FAILURE_PATTERNS = [
+    r'Connection\s+refused',
+    r'ECONNREFUSED',
+    r'ERR_CONNECTION_REFUSED',
+    r'Traceback \(most recent call last\)',
+    r'Error:\s+.*(?:crash|fatal|segfault)',
+    r'(?<![0 ])\bFAILED\b',
+    r'TimeoutError',
+    r'Cannot connect',
+]
+
+
+def e2e_succeeded(data):
+    """判断 E2E 命令是否真正成功"""
+    exit_code = extract_exit_code(data)
+    if exit_code is not None and exit_code != 0:
+        return False, f"exit code={exit_code}"
+
+    if os.path.exists(E2E_RESULT_PATH):
+        try:
+            with open(E2E_RESULT_PATH) as f:
+                result = json.load(f)
+            status = result.get("status", result.get("result", "")).lower()
+            if status in ("pass", "passed", "ok", "success"):
+                return True, "e2e_result.json: pass"
+            if status in ("fail", "failed", "error"):
+                return False, f"e2e_result.json: {status}"
+        except Exception:
+            pass
+
+    if exit_code == 0:
+        return True, "exit code=0"
+
+    output = extract_output(data)
+    for pat in E2E_FAILURE_PATTERNS:
+        if re.search(pat, output, re.IGNORECASE):
+            return False, f"output matched failure pattern: {pat}"
+
+    return True, "no failure signals detected"
+
+
 def ensure_branch_state(st, branch):
     """分支变化时自动重置状态"""
     if st.get("branch") != branch:
@@ -248,12 +312,16 @@ def gate_post_bash():
         else:
             print(f"⚠️ Ship Gate: {stack} test 已执行，但未检测到通过标志")
 
-    # 检测 E2E 验证
+    # 检测 E2E 验证（必须成功才标记）
     if is_e2e_cmd(cmd):
-        st["e2e_executed"] = True
-        st["e2e_ts"] = now
-        changed = True
-        print("✅ Ship Gate: E2E 验证已执行，已记录")
+        ok, reason = e2e_succeeded(data)
+        if ok:
+            st["e2e_executed"] = True
+            st["e2e_ts"] = now
+            changed = True
+            print(f"✅ Ship Gate: E2E 验证通过（{reason}），已记录")
+        else:
+            print(f"⚠️ Ship Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
 
     if changed:
         save_state(st)
