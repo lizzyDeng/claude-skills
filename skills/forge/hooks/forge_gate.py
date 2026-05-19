@@ -39,6 +39,25 @@ def get_repo_root():
         return None
 
 
+def get_git_common_dir(root=None):
+    root = root or get_repo_root()
+    if not root:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        common = r.stdout.strip()
+        if not common:
+            return None
+        if not os.path.isabs(common):
+            common = os.path.join(root, common)
+        return os.path.realpath(common)
+    except Exception:
+        return None
+
+
 def roadmap_dir():
     root = get_repo_root()
     return os.path.join(root, "project-roadmap") if root else None
@@ -56,7 +75,18 @@ def state_path():
 
 def fastship_state_path():
     root = get_repo_root()
-    return os.path.join(root, ".claude", ".ship-verify-state.json") if root else None
+    if not root:
+        return None
+
+    common = get_git_common_dir(root)
+    current = os.path.join(common, "fastship", "gate.json") if common else None
+    legacy = os.path.join(root, ".claude", ".ship-verify-state.json")
+
+    if current and os.path.exists(current):
+        return current
+    if os.path.exists(legacy):
+        return legacy
+    return current or legacy
 
 
 def read_stdin():

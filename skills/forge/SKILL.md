@@ -110,7 +110,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 **流程**：
 
 1. `python3 .claude/hooks/forge_gate.py transition <slug> shipped`
-   - Gate 4 自动检查 `.ship-verify-state.json`
+   - Gate 4 自动检查 fastship gate state（优先读取 `.git/fastship/gate.json`，兼容旧 `.claude/.ship-verify-state.json`）
    - Gate 5 自动从 shipped 转入 measuring
 2. 如果通过 → 输出：
    ```
