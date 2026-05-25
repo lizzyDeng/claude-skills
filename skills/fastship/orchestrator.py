@@ -379,6 +379,12 @@ def validate_e2e_report(orch: dict, hook: dict) -> tuple:
         path = orch.get("report_path")
         if not path or not os.path.exists(path):
             return False, "报告文件不存在"
+        try:
+            rsize = os.path.getsize(path)
+        except OSError:
+            rsize = 0
+        if rsize < 200:
+            return False, f"报告太短 ({rsize}B < 200B)"
         return True, f"report verified (hash match, {turns} turns)"
 
     # Codex fallback: no gate.json — check file size only

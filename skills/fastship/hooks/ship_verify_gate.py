@@ -1148,6 +1148,8 @@ def gate_post_bash():
         if ok:
             st["e2e_executed"] = True
             st["e2e_ts"] = now
+            st["e2e_gate_passed"] = False
+            st["e2e_gate_ts"] = None
             st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
             changed = True
             # Provenance: only hash if the command matches strict runner pattern
@@ -1179,7 +1181,14 @@ def gate_post_bash():
             st["e2e_gate_ts"] = now
             changed = True
             print("✅ Gate: E2E Gate 通过，已记录")
-        elif exit_code is not None:
+        elif exit_code is None:
+            output = extract_output(data)
+            if "GATE PASSED" in output:
+                st["e2e_gate_passed"] = True
+                st["e2e_gate_ts"] = now
+                changed = True
+                print("✅ Gate: E2E Gate 通过（via stdout），已记录")
+        else:
             print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 保持 false")
 
     if changed:
