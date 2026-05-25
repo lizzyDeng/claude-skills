@@ -838,3 +838,37 @@ class TestGateAExtended:
         import ship_verify_gate
         assert ship_verify_gate.is_state_file_write_cmd('cargo test') is False
         assert ship_verify_gate.is_state_file_write_cmd('cat .git/fastship/gate.json') is False
+
+
+class TestStrictRunnerProvenance:
+    """is_strict_e2e_runner must distinguish real runners from fake commands."""
+
+    def test_matches_python_e2e_runner(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('python3 tests/e2e_runner.py -o /tmp/e2e.json') is True
+
+    def test_rejects_echo_e2e(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('echo e2e test passed') is False
+
+    def test_rejects_curl(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('curl http://localhost:3100/api/chat') is False
+
+    def test_matches_playwright(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('playwright test tests/e2e/') is True
+
+    def test_matches_npm_run_e2e(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('npm run test:e2e') is True

@@ -91,6 +91,11 @@ def empty_state(branch=None):
         "test_tool": None,
         "e2e_executed": False,
         "e2e_ts": None,
+        "e2e_result_hash": None,
+        "e2e_result_turns": None,
+        "e2e_runner_cmd": None,
+        "e2e_gate_passed": False,
+        "e2e_gate_ts": None,
         "plan_ready": False,
         "plan_file": None,
         "plan_ts": None,
@@ -339,6 +344,21 @@ def is_e2e_gate_cmd(cmd):
     if not cmd:
         return False
     return bool(re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE))
+
+
+E2E_RUNNER_STRICT_PATTERNS = [
+    r'\bpython3?\s+.*e2e[_-]?runner\b',
+    r'\bplaywright\s+test\b',
+    r'\bcypress\s+run\b',
+    r'\bnpm\s+run\s+.*e2e\b',
+]
+
+
+def is_strict_e2e_runner(cmd):
+    """Strict pattern: only matches actual E2E runner scripts, not arbitrary commands containing 'e2e'."""
+    if not cmd:
+        return False
+    return any(re.search(p, cmd, re.IGNORECASE) for p in E2E_RUNNER_STRICT_PATTERNS)
 
 
 def is_merge_cmd(cmd):
@@ -1130,10 +1150,37 @@ def gate_post_bash():
             st["e2e_ts"] = now
             st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
             changed = True
+            # Provenance: only hash if the command matches strict runner pattern
+            if is_strict_e2e_runner(cmd) and os.path.exists(E2E_RESULT_PATH):
+                try:
+                    import hashlib
+                    with open(E2E_RESULT_PATH, "rb") as f:
+                        st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
+                    with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+                        rdata = json.load(f)
+                    st["e2e_result_turns"] = sum(
+                        len(r.get("turns", []))
+                        for s in rdata.get("scenarios", [])
+                        for r in s.get("rounds", [])
+                    )
+                    st["e2e_runner_cmd"] = cmd[:200]
+                except Exception:
+                    pass
             print(f"✅ Gate: E2E 验证通过（{reason}），loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record")
         else:
             print(f"⚠️ Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
             print("   请排查问题后重跑 E2E")
+
+    # 检测 E2E Gate 脚本执行结果
+    if is_e2e_gate_cmd(cmd):
+        exit_code = extract_exit_code(data)
+        if exit_code == 0:
+            st["e2e_gate_passed"] = True
+            st["e2e_gate_ts"] = now
+            changed = True
+            print("✅ Gate: E2E Gate 通过，已记录")
+        elif exit_code is not None:
+            print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 保持 false")
 
     if changed:
         save_state(st)
@@ -1275,6 +1322,8 @@ def gate_pre_bash():
             blocks.append("项目测试未通过")
         if not st.get("e2e_executed"):
             blocks.append("E2E 验证未执行")
+        if not st.get("e2e_gate_passed"):
+            blocks.append("E2E Gate 未通过（e2e_gate.py 必须 exit 0）")
         if not st.get("knowledge_acknowledged"):
             blocks.append("KNOWLEDGE.md 未更新且未声明跳过")
 
