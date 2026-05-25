@@ -1095,3 +1095,106 @@ class TestLoopRecordHardened:
         orch = {"artifacts": {"loop_outcome": "pass"}}
         ok, _ = validate_loop_record(orch, {})
         assert ok is True
+
+
+class TestFabricationBlocked:
+    """End-to-end test: fabrication paths must be blocked after hardening."""
+
+    def test_fake_e2e_result_blocked(self, tmp_path, monkeypatch):
+        """Claude creates /tmp/e2e_result.json directly → should not pass 3.2."""
+        from orchestrator import validate_e2e_run
+
+        fake_result = tmp_path / "e2e_result.json"
+        fake_result.write_text(json.dumps({
+            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 15}]}]
+        }))
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(fake_result))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": False, "branch": "test"})
+
+        ok, msg = validate_e2e_run({}, {})
+        assert ok is False, f"Fabricated e2e_result.json should be rejected, got: {msg}"
+
+    def test_fake_report_blocked(self, tmp_path, monkeypatch):
+        """Claude writes a >=200B report but gate.json has no hash → should not pass 3.3."""
+        from orchestrator import validate_e2e_report
+
+        report = tmp_path / "e2e-quality-report.md"
+        report.write_text(
+            "## E2E 质量检测报告\n\n"
+            "本 feature 涉及 LLM 意图识别，无法自动化 E2E。\n"
+            "手动验证结果如下：\n"
+            "1. 测试对话场景 A — 通过\n"
+            "2. 测试对话场景 B — 通过\n"
+            "3. 边界测试 — 通过\n\n"
+            "总体通过率: 100%\n"
+        )
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+
+        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
+        assert ok is False, f"Fabricated report should be rejected, got: {msg}"
+
+    def test_self_grading_pass_blocked(self, monkeypatch):
+        """Claude calls done --outcome pass but gate shows tests failed → blocked."""
+        from orchestrator import validate_loop_record
+
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": False, "e2e_executed": True, "e2e_gate_passed": True})
+
+        orch = {"artifacts": {"loop_outcome": "pass"}}
+        ok, msg = validate_loop_record(orch, {})
+        assert ok is False, f"Self-grading should be rejected, got: {msg}"
+
+    def test_hash_tampered_between_steps(self, tmp_path, monkeypatch):
+        """e2e_result.json modified between 3.3 and 3.4 → gate recheck catches it."""
+        import hashlib
+        from orchestrator import validate_e2e_gate
+
+        original = json.dumps({"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]})
+        original_hash = hashlib.sha256(original.encode()).hexdigest()
+
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_text('{"scenarios": [{"rounds": [{"turns": []}]}]}')
+
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": original_hash})
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+
+        ok, msg = validate_e2e_gate({}, {})
+        assert ok is False
+        assert "mismatch" in msg.lower() or "hash" in msg.lower()
+
+    def test_fake_e2e_cmd_no_provenance(self):
+        """A command containing 'e2e' but not a real runner → no hash recorded."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_strict_e2e_runner('echo e2e test passed') is False
+        assert ship_verify_gate.is_strict_e2e_runner('curl http://localhost:3100/api/chat') is False
+        assert ship_verify_gate.is_strict_e2e_runner('python3 tests/e2e_runner.py -o /tmp/e2e.json') is True
+
+    def test_gate_state_file_edit_blocked(self):
+        """Edit/Write to gate.json must be blocked by Gate A."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_fastship_state_file(".git/fastship/gate.json") is True
+
+    def test_gate_state_bash_write_blocked(self):
+        """Bash write to gate.json must be blocked."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+        assert ship_verify_gate.is_state_file_write_cmd(
+            'echo \'{"e2e_executed":true}\' > .git/fastship/gate.json') is True
+
+    def test_e2e_gate_exit_nonzero_blocked(self):
+        """e2e_gate command with exit code 1 must not advance step 3.4."""
+        from orchestrator import detect_completion_post_bash
+        data = {
+            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+            "tool_response": {"exitCode": 1, "stdout": "BLOCKED: not enough turns"},
+        }
+        assert detect_completion_post_bash("3.4", data, {}) is None
