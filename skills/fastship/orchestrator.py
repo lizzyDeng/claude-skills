@@ -287,7 +287,31 @@ def validate_execute(orch: dict, hook: dict) -> tuple:
 
 
 def validate_smoke(orch: dict, hook: dict) -> tuple:
-    return True, "sequencing"
+    root = _repo_root()
+    started_at = orch.get("started_at")
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "diff", "--stat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.stdout.strip():
+            return True, "uncommitted code changes detected"
+        result2 = subprocess.run(
+            ["git", "-C", root, "diff", "--cached", "--stat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result2.stdout.strip():
+            return True, "staged code changes detected"
+        if started_at:
+            result3 = subprocess.run(
+                ["git", "-C", root, "log", f"--since={started_at}", "--oneline"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result3.stdout.strip():
+                return True, "commits since session start detected"
+    except Exception:
+        pass
+    return False, "No code changes detected — 执行阶段未产生代码变更"
 
 
 def validate_tests(orch: dict, hook: dict) -> tuple:
@@ -422,7 +446,22 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
     if outcome not in VALID_OUTCOMES:
         return False, f"无效 outcome: {outcome}。必须是 pass|fail"
     if outcome == "pass":
-        return True, "pass"
+        gate = _read_gate_state_file()
+        if gate:
+            if not gate.get("test_passed"):
+                return False, "outcome=pass 但 gate.json test_passed=false — 测试未通过不能自判 pass"
+            if not gate.get("e2e_executed"):
+                return False, "outcome=pass 但 gate.json e2e_executed=false — E2E 未执行不能自判 pass"
+            if not gate.get("e2e_gate_passed"):
+                return False, "outcome=pass 但 gate.json e2e_gate_passed=false — E2E Gate 未通过不能自判 pass"
+            stored_hash = gate.get("e2e_result_hash")
+            if stored_hash and os.path.exists(E2E_RESULT_PATH):
+                import hashlib
+                with open(E2E_RESULT_PATH, "rb") as f:
+                    actual_hash = hashlib.sha256(f.read()).hexdigest()
+                if actual_hash != stored_hash:
+                    return False, "e2e_result.json hash mismatch — 文件在验证链中被篡改"
+        return True, "pass (gate verified, hash intact)"
     decision = orch.get("artifacts", {}).get("loop_decision")
     if not decision:
         return False, "fail 但未给 decision (done --outcome fail --decision continue|escalate|stop)"

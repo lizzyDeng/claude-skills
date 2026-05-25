@@ -271,8 +271,10 @@ class TestValidatorsPhase3:
         from orchestrator import validate_knowledge
         assert validate_knowledge({}, {"knowledge_acknowledged": True})[0] is True
 
-    def test_loop_pass(self):
+    def test_loop_pass(self, monkeypatch):
         from orchestrator import validate_loop_record
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": True, "e2e_executed": True, "e2e_gate_passed": True})
         orch = {"artifacts": {"loop_outcome": "pass"}}
         assert validate_loop_record(orch, {"loop_count": 1})[0] is True
 
@@ -1057,3 +1059,39 @@ class TestDetectionE2EGateHardened:
             "tool_response": {"stdout": "something else"},
         }
         assert detect_completion_post_bash("3.4", data, {}) is None
+
+
+class TestLoopRecordHardened:
+    """validate_loop_record must cross-check gate.json when outcome=pass."""
+
+    def test_pass_rejected_without_gate_flags(self, monkeypatch):
+        from orchestrator import validate_loop_record
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": False, "e2e_executed": False, "e2e_gate_passed": False})
+        orch = {"artifacts": {"loop_outcome": "pass"}}
+        ok, _ = validate_loop_record(orch, {})
+        assert ok is False
+
+    def test_pass_rejected_without_gate_passed(self, monkeypatch):
+        from orchestrator import validate_loop_record
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": True, "e2e_executed": True, "e2e_gate_passed": False})
+        orch = {"artifacts": {"loop_outcome": "pass"}}
+        ok, msg = validate_loop_record(orch, {})
+        assert ok is False
+        assert "gate_passed" in msg
+
+    def test_pass_accepted_with_all_gate_flags(self, monkeypatch):
+        from orchestrator import validate_loop_record
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": True, "e2e_executed": True, "e2e_gate_passed": True})
+        orch = {"artifacts": {"loop_outcome": "pass"}}
+        ok, _ = validate_loop_record(orch, {})
+        assert ok is True
+
+    def test_pass_accepted_codex_mode(self, monkeypatch):
+        from orchestrator import validate_loop_record
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        orch = {"artifacts": {"loop_outcome": "pass"}}
+        ok, _ = validate_loop_record(orch, {})
+        assert ok is True
