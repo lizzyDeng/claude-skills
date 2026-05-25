@@ -375,7 +375,40 @@ def validate_e2e_report(orch: dict, hook: dict) -> tuple:
 
 
 def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
-    return True, "sequencing"
+    gate = _read_gate_state_file()
+    if not gate:
+        return True, "sequencing (Codex mode — reduced trust)"
+    if not gate.get("e2e_executed"):
+        return False, "e2e_executed not set in gate.json"
+    stored_hash = gate.get("e2e_result_hash")
+    if stored_hash and os.path.exists(E2E_RESULT_PATH):
+        import hashlib
+        with open(E2E_RESULT_PATH, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+        if actual_hash != stored_hash:
+            return False, "e2e_result.json hash mismatch — 文件在 3.3→3.4 间被修改"
+    root = _repo_root()
+    gate_script = None
+    for candidate in ["tests/e2e_gate.py", ".claude/e2e/e2e_gate.py", "e2e/e2e_gate.py"]:
+        path = os.path.join(root, candidate)
+        if os.path.exists(path):
+            gate_script = path
+            break
+    if not gate_script:
+        return False, "e2e_gate.py not found in project"
+    try:
+        result = subprocess.run(
+            [sys.executable, gate_script, "--result", E2E_RESULT_PATH, "--min-turns", "10"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            output_tail = result.stdout[-500:] if result.stdout else ""
+            return False, f"E2E Gate failed (exit {result.returncode}):\n{output_tail}"
+        return True, "E2E Gate passed (subprocess verified, hash intact)"
+    except subprocess.TimeoutExpired:
+        return False, "E2E Gate timed out (30s)"
+    except Exception as e:
+        return False, f"E2E Gate execution error: {e}"
 
 
 VALID_OUTCOMES = {"pass", "fail"}
@@ -612,7 +645,15 @@ def detect_completion_post_bash(current_step: str, data: dict, hook: dict) -> Op
             return "3.2"
 
     if current_step == "3.4" and re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE):
-        return "3.4"
+        exit_code = _extract_exit_code(data)
+        if exit_code == 0:
+            return "3.4"
+        if exit_code is None:
+            output = data.get("tool_response", {})
+            stdout = output.get("stdout", "") if isinstance(output, dict) else ""
+            if "GATE PASSED" in stdout:
+                return "3.4"
+        return None
 
     if current_step == "3.5" and "loop_record" in cmd:
         return "3.5"
@@ -684,6 +725,26 @@ def _is_orchestrator_allowed_file(path: str) -> bool:
     if GRILL_RESULT_FILENAME in p:
         return True
     return False
+
+
+def _extract_exit_code(data: dict) -> Optional[int]:
+    resp = data.get("tool_response", {})
+    if isinstance(resp, dict):
+        for key in ("exitCode", "exit_code", "returnCode", "return_code"):
+            val = resp.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+    for key in ("exitCode", "exit_code"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    return None
 
 
 # ━━━━━━━━━━━━ Advance + Loop Logic ━━━━━━━━━━━━
@@ -854,6 +915,13 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
     if detected:
         if detected == "1.0" and hook.get("request_type"):
             orch["request_type"] = hook["request_type"]
+
+        if detected == "3.4":
+            ok, msg = validate_e2e_gate(orch, hook)
+            if not ok:
+                print(f"⚠️ E2E Gate 命令已检测，但验证未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
 
         if detected == "3.5":
             outcome = hook.get("last_loop_outcome")

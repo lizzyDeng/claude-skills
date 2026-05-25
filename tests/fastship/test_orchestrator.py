@@ -727,9 +727,15 @@ class TestIntegrationFullFlow:
         st = reload()
         assert st["current_step"] == "3.4"
 
-        # 3.4: gate (auto)
+        # 3.4: gate (auto) — needs exit code 0 + validate_e2e_gate pass
+        gate_script = tmp_path / "tests" / "e2e_gate.py"
+        gate_script.parent.mkdir(parents=True, exist_ok=True)
+        gate_script.write_text("import sys; print('GATE PASSED'); sys.exit(0)")
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": e2e_hash})
         hook_post_bash_logic(
-            data={"tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"}},
+            data={"tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+                  "tool_response": {"exitCode": 0, "stdout": "GATE PASSED"}},
             orch_path=orch_file, hook_state=hook)
         st = reload()
         assert st["current_step"] == "3.5"
@@ -982,3 +988,72 @@ class TestE2EReportHardened:
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         ok, _ = validate_e2e_report({"report_path": str(report)}, {})
         assert ok is True
+
+
+class TestE2EGateHardened:
+    """validate_e2e_gate must run gate script as subprocess, not auto-pass."""
+
+    def test_rejects_when_gate_script_missing(self, monkeypatch):
+        from orchestrator import validate_e2e_gate
+        monkeypatch.setattr("orchestrator._repo_root", lambda: "/nonexistent")
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+        ok, _ = validate_e2e_gate({}, {})
+        assert ok is False
+
+    def test_passes_when_gate_exits_zero(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_gate
+        gate_script = tmp_path / "tests" / "e2e_gate.py"
+        gate_script.parent.mkdir(parents=True)
+        gate_script.write_text("import sys; print('GATE PASSED'); sys.exit(0)")
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+        ok, msg = validate_e2e_gate({}, {})
+        assert ok is True
+        assert "passed" in msg.lower()
+
+    def test_rejects_when_gate_exits_nonzero(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_gate
+        gate_script = tmp_path / "tests" / "e2e_gate.py"
+        gate_script.parent.mkdir(parents=True)
+        gate_script.write_text("import sys; print('BLOCKED: not enough turns'); sys.exit(1)")
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+        ok, msg = validate_e2e_gate({}, {})
+        assert ok is False
+
+    def test_codex_fallback_passes(self, monkeypatch):
+        from orchestrator import validate_e2e_gate
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        ok, _ = validate_e2e_gate({}, {})
+        assert ok is True
+
+
+class TestDetectionE2EGateHardened:
+    """detect_completion_post_bash for 3.4 must check exit code."""
+
+    def test_advances_on_exit_zero(self):
+        from orchestrator import detect_completion_post_bash
+        data = {
+            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+            "tool_response": {"exitCode": 0, "stdout": "GATE PASSED"},
+        }
+        assert detect_completion_post_bash("3.4", data, {}) == "3.4"
+
+    def test_blocks_on_exit_nonzero(self):
+        from orchestrator import detect_completion_post_bash
+        data = {
+            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+            "tool_response": {"exitCode": 1, "stdout": "BLOCKED"},
+        }
+        assert detect_completion_post_bash("3.4", data, {}) is None
+
+    def test_blocks_on_unknown_exit_no_gate_passed(self):
+        from orchestrator import detect_completion_post_bash
+        data = {
+            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+            "tool_response": {"stdout": "something else"},
+        }
+        assert detect_completion_post_bash("3.4", data, {}) is None
