@@ -318,8 +318,11 @@ class TestValidatorsCodexFallback:
     def test_e2e_run_fs_fallback(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_run
         result_file = tmp_path / "e2e_result.json"
-        result_file.write_text('{"turns": []}')
+        result_file.write_text(json.dumps({
+            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]
+        }))
         monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         ok, _ = validate_e2e_run({}, {})
         assert ok is True
 
@@ -872,3 +875,45 @@ class TestStrictRunnerProvenance:
         import importlib, ship_verify_gate
         importlib.reload(ship_verify_gate)
         assert ship_verify_gate.is_strict_e2e_runner('npm run test:e2e') is True
+
+
+class TestE2ERunHardened:
+    """validate_e2e_run should only trust gate.json when hooks are active."""
+
+    def test_rejects_file_when_gate_exists(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_run
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_text('{"scenarios": []}')
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": False, "branch": "test"})
+        ok, msg = validate_e2e_run({}, {})
+        assert ok is False
+
+    def test_accepts_gate_executed(self, monkeypatch):
+        from orchestrator import validate_e2e_run
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        ok, _ = validate_e2e_run({}, {})
+        assert ok is True
+
+    def test_codex_fallback_needs_quality(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_run
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_text(json.dumps({
+            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 5}]}]
+        }))
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        ok, msg = validate_e2e_run({}, {})
+        assert ok is False
+        assert "10" in msg
+
+    def test_codex_fallback_passes_with_quality(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_run
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_text(json.dumps({
+            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]
+        }))
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        ok, _ = validate_e2e_run({}, {})
+        assert ok is True

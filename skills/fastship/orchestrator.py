@@ -302,14 +302,28 @@ def validate_tests(orch: dict, hook: dict) -> tuple:
 def validate_e2e_run(orch: dict, hook: dict) -> tuple:
     if hook.get("e2e_executed"):
         return True, "e2e executed"
-    result_path = E2E_RESULT_PATH
-    if os.path.exists(result_path):
-        age = _time.time() - os.path.getmtime(result_path)
-        if age < 3600:
-            return True, f"e2e result found ({int(age)}s ago)"
     gate = _read_gate_state_file()
     if gate.get("e2e_executed"):
         return True, "e2e executed (via state file)"
+    # Codex fallback: only when gate.json is empty/absent (no hooks)
+    if not gate:
+        result_path = E2E_RESULT_PATH
+        if os.path.exists(result_path):
+            age = _time.time() - os.path.getmtime(result_path)
+            if age < 3600:
+                try:
+                    with open(result_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    turns = sum(
+                        len(r.get("turns", []))
+                        for s in data.get("scenarios", [])
+                        for r in s.get("rounds", [])
+                    )
+                    if turns >= 10:
+                        return True, f"e2e result found ({turns} turns, {int(age)}s ago, Codex mode)"
+                    return False, f"e2e_result.json turns 不足 ({turns} < 10)"
+                except Exception as e:
+                    return False, f"e2e_result.json 解析失败: {e}"
     return False, "E2E Runner 未执行"
 
 
