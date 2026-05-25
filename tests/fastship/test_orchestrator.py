@@ -253,16 +253,18 @@ class TestValidatorsPhase3:
         from orchestrator import validate_e2e_run
         assert validate_e2e_run({}, {"e2e_executed": True})[0] is True
 
-    def test_report_pass(self, tmp_path):
+    def test_report_pass_codex_mode(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_report
         f = tmp_path / "report.md"
         f.write_text("## Report\n" + "x " * 150)
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         assert validate_e2e_report({"report_path": str(f)}, {})[0] is True
 
-    def test_report_fail_small(self, tmp_path):
+    def test_report_fail_small_codex_mode(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_report
         f = tmp_path / "report.md"
         f.write_text("short")
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         assert validate_e2e_report({"report_path": str(f)}, {})[0] is False
 
     def test_knowledge_pass(self):
@@ -705,6 +707,16 @@ class TestIntegrationFullFlow:
         assert st["current_step"] == "3.3"
 
         # 3.3: report (auto via post_edit)
+        # Set up e2e_result.json + gate hash so validate_e2e_report passes
+        import hashlib
+        e2e_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
+        e2e_bytes = json.dumps(e2e_data, ensure_ascii=False).encode("utf-8")
+        e2e_file = tmp_path / "e2e_result.json"
+        e2e_file.write_bytes(e2e_bytes)
+        e2e_hash = hashlib.sha256(e2e_bytes).hexdigest()
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(e2e_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": e2e_hash})
         report = tmp_path / "report.md"
         report.write_text("## Report\n" + "x " * 150)
         st["report_path"] = str(report)
@@ -916,4 +928,57 @@ class TestE2ERunHardened:
         monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         ok, _ = validate_e2e_run({}, {})
+        assert ok is True
+
+
+class TestE2EReportHardened:
+    """validate_e2e_report must verify data integrity via gate.json hash."""
+
+    def test_rejects_without_hash(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_report
+        report = tmp_path / "report.md"
+        report.write_text("## Report\n" + "x " * 150)
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
+        assert ok is False
+
+    def test_rejects_hash_mismatch(self, tmp_path, monkeypatch):
+        import hashlib
+        from orchestrator import validate_e2e_report
+        result_file = tmp_path / "e2e_result.json"
+        original = json.dumps({"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]})
+        recorded_hash = hashlib.sha256(original.encode()).hexdigest()
+        result_file.write_text('{"scenarios": [{"rounds": [{"turns": []}]}]}')
+        report = tmp_path / "report.md"
+        report.write_text("## Report\n" + "x " * 150)
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
+        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
+        assert ok is False
+        assert "mismatch" in msg.lower() or "hash" in msg.lower()
+
+    def test_passes_with_valid_hash(self, tmp_path, monkeypatch):
+        import hashlib
+        from orchestrator import validate_e2e_report
+        result_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
+        result_bytes = json.dumps(result_data, ensure_ascii=False).encode("utf-8")
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_bytes(result_bytes)
+        recorded_hash = hashlib.sha256(result_bytes).hexdigest()
+        report = tmp_path / "report.md"
+        report.write_text("## Report\n" + "x " * 150)
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
+        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
+        assert ok is True
+
+    def test_codex_fallback_still_works(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_report
+        report = tmp_path / "report.md"
+        report.write_text("## Report\n" + "x " * 150)
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
         assert ok is True

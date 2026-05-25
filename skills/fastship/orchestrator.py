@@ -328,16 +328,50 @@ def validate_e2e_run(orch: dict, hook: dict) -> tuple:
 
 
 def validate_e2e_report(orch: dict, hook: dict) -> tuple:
-    path = orch.get("report_path")
-    if not path or not os.path.exists(path):
-        return False, "报告文件不存在"
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    if size < 200:
-        return False, f"报告太短 ({size}B < 200B)"
-    return True, f"report: {path}"
+    gate = _read_gate_state_file()
+    stored_hash = gate.get("e2e_result_hash") if gate else None
+
+    if stored_hash:
+        # Hook mode: verify e2e_result.json integrity
+        if not os.path.exists(E2E_RESULT_PATH):
+            return False, f"{E2E_RESULT_PATH} not found"
+        import hashlib
+        with open(E2E_RESULT_PATH, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+        if actual_hash != stored_hash:
+            return False, "e2e_result.json hash mismatch — 文件在 runner 执行后被修改"
+        try:
+            with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            turns = sum(
+                len(r.get("turns", []))
+                for s in data.get("scenarios", [])
+                for r in s.get("rounds", [])
+            )
+            if turns < 10:
+                return False, f"e2e_result.json turns 不足 ({turns} < 10)"
+        except Exception as e:
+            return False, f"e2e_result.json 解析失败: {e}"
+        path = orch.get("report_path")
+        if not path or not os.path.exists(path):
+            return False, "报告文件不存在"
+        return True, f"report verified (hash match, {turns} turns)"
+
+    # Codex fallback: no gate.json — check file size only
+    if not gate:
+        path = orch.get("report_path")
+        if not path or not os.path.exists(path):
+            return False, "报告文件不存在"
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size < 200:
+            return False, f"报告太短 ({size}B < 200B)"
+        return True, f"report: {path} (Codex mode)"
+
+    # gate.json exists but no hash — e2e_runner wasn't run or hash not recorded
+    return False, "gate.json 无 e2e_result_hash — E2E Runner 未正常执行"
 
 
 def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
