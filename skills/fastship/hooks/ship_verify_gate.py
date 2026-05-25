@@ -1188,8 +1188,16 @@ def gate_post_bash():
                 st["e2e_gate_ts"] = now
                 changed = True
                 print("✅ Gate: E2E Gate 通过（via stdout），已记录")
+            else:
+                st["e2e_gate_passed"] = False
+                st["e2e_gate_ts"] = None
+                changed = True
+                print("⚠️ Gate: E2E Gate 结果不明（无 exit code 且无 GATE PASSED），已清除旧状态")
         else:
-            print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 保持 false")
+            st["e2e_gate_passed"] = False
+            st["e2e_gate_ts"] = None
+            changed = True
+            print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 已清除")
 
     if changed:
         save_state(st)

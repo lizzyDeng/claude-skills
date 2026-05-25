@@ -1159,6 +1159,7 @@ def format_status(orch: dict) -> str:
         f"[FASTSHIP_GOAL] step={cs} phase={orch.get('phase', '?')}"
         f" test_passed={str(gate.get('test_passed', False)).lower()}"
         f" e2e_executed={str(gate.get('e2e_executed', False)).lower()}"
+        f" e2e_gate_passed={str(gate.get('e2e_gate_passed', False)).lower()}"
         f" knowledge_acknowledged={str(gate.get('knowledge_acknowledged', False)).lower()}"
         f" loop={orch.get('loop_count', 0)}/3"
     )
@@ -1337,7 +1338,7 @@ def goal_condition(orch: dict) -> str:
     return (
         f"fastship 完成「{req}」的交付 — "
         f"运行 status 命令确认 [FASTSHIP_GOAL] 显示 step=done"
-        f" test_passed=true e2e_executed=true knowledge_acknowledged=true"
+        f" test_passed=true e2e_executed=true e2e_gate_passed=true knowledge_acknowledged=true"
     )
 
 
