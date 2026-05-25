@@ -795,3 +795,46 @@ class TestIntegrationFullFlow:
         }
         _handle_loop_decision(st)
         assert st["current_step"] == "stopped"
+
+
+class TestGateAExtended:
+    """Gate A must protect gate.json and orchestrator.json, not just legacy paths."""
+
+    def test_blocks_edit_gate_json(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_fastship_state_file(".git/fastship/gate.json") is True
+
+    def test_blocks_edit_orchestrator_json(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_fastship_state_file(".git/fastship/orchestrator.json") is True
+
+    def test_allows_non_state_files(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_fastship_state_file("src/main.py") is False
+        assert ship_verify_gate.is_fastship_state_file("gate.json") is False
+
+    def test_blocks_bash_write_to_gate(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_state_file_write_cmd('echo \'{"e2e_executed":true}\' > .git/fastship/gate.json') is True
+        assert ship_verify_gate.is_state_file_write_cmd('python3 -c "..." > .git/fastship/gate.json') is True
+        assert ship_verify_gate.is_state_file_write_cmd('cat /tmp/fake.json > .git/fastship/gate.json') is True
+
+    def test_allows_gate_script_without_redirect(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_state_file_write_cmd('python3 .claude/hooks/ship_verify_gate.py classify --type feature') is False
+
+    def test_blocks_gate_script_with_redirect(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_state_file_write_cmd('python3 .claude/hooks/ship_verify_gate.py status > .git/fastship/gate.json') is True
+
+    def test_allows_normal_bash(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks'))
+        import ship_verify_gate
+        assert ship_verify_gate.is_state_file_write_cmd('cargo test') is False
+        assert ship_verify_gate.is_state_file_write_cmd('cat .git/fastship/gate.json') is False

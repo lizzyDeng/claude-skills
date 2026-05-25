@@ -420,6 +420,45 @@ def is_db_write_cmd(cmd):
     return bool(write_ops)
 
 
+FASTSHIP_STATE_PATTERNS = [
+    "fastship/gate.json",
+    "fastship/orchestrator.json",
+    ".ship-verify-state.json",
+    ".fastship-orchestrator-state.json",
+]
+
+
+def is_fastship_state_file(path):
+    """Check if a path points to any fastship state file (gate or orchestrator)."""
+    p = normalize_path(path)
+    return any(pat in p for pat in FASTSHIP_STATE_PATTERNS)
+
+
+def is_state_file_write_cmd(cmd):
+    """Detect bash commands that write to fastship state files.
+    Allows reads (cat without redirect) and gate script invocations without redirect."""
+    if not cmd:
+        return False
+    # Check for redirect/write patterns targeting state files FIRST
+    # (even gate scripts with redirect are blocked: `gate.py status > gate.json`)
+    for pat in FASTSHIP_STATE_PATTERNS:
+        if pat not in cmd:
+            continue
+        # Redirect to state file = always blocked, no exceptions
+        if re.search(r'>\s*.*' + re.escape(pat), cmd):
+            return True
+    # Gate scripts WITHOUT redirect are allowed (they write via Python open())
+    if "ship_verify_gate.py" in cmd or "fastship_orchestrator.py" in cmd:
+        return False
+    # Other commands writing to state files
+    for pat in FASTSHIP_STATE_PATTERNS:
+        if pat not in cmd:
+            continue
+        if re.search(r'\b(echo|printf|python3?|tee|cp|mv)\b.*' + re.escape(pat), cmd):
+            return True
+    return False
+
+
 # ---------- Gate 动作 ----------
 
 def gate_pre_edit():
@@ -431,8 +470,8 @@ def gate_pre_edit():
     file_path = data.get("tool_input", {}).get("file_path", "")
 
     # --- Gate A: 保护 state file ---
-    if file_path and ".ship-verify-state.json" in file_path:
-        print("🔴 BLOCKED: .ship-verify-state.json 由 hook 自动管理，禁止手动编辑")
+    if file_path and is_fastship_state_file(file_path):
+        print(f"🔴 BLOCKED: fastship state file 由 hook 自动管理，禁止手动编辑 ({file_path})")
         return 1
 
     # --- Gate B: 代码编辑前必须有 plan + 已 knowledge_recall ---
@@ -1135,6 +1174,12 @@ def gate_pre_bash():
     st = ensure_branch_state(load_state(), branch)
     if branch_mismatch(st, branch) and not fastship_state.is_branch_recovery_command(cmd):
         print_branch_mismatch(st)
+        return 1
+
+    # --- Gate -1: 禁止 bash 写入 fastship state files ---
+    if is_state_file_write_cmd(cmd):
+        print("🔴 BLOCKED: fastship state file 由 hook 自动管理，禁止 shell 写入")
+        print(f"   命令: {cmd[:100]}")
         return 1
 
     # --- Gate 0: E2E 阶段禁止直接 DB 写入 ---
