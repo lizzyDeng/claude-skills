@@ -47,17 +47,30 @@ Phase 1: Brainstorm (8 步)
   1.5  Grill            [CC:auto | Codex:done] .fastship-grill-result.md 验证
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
 
-Phase 2: Execution (1 步)
-  2.0  执行计划         [CC:done  | Codex:done]
+Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
+  2.0  执行计划         [/goal 自主驱动]
+  3.0  冒烟测试         [/goal 自主驱动]
+  3.1  项目测试         [/goal + hook auto-detect]
+  3.2  E2E Runner       [/goal + hook auto-detect]
+  3.3  E2E 报告         [/goal + hook auto-detect]
+  3.4  E2E Gate         [/goal + hook auto-detect]
+  3.5  Loop Record      [/goal 自主决策: fail→auto continue, 3次后暂停]
+  3.6  KNOWLEDGE 闭环   [/goal + hook auto-detect]
+```
 
-Phase 3: Verification (7 步)
-  3.0  冒烟测试         [CC:done  | Codex:done]
-  3.1  项目测试         [CC:auto | Codex:done] test pass
-  3.2  E2E Runner       [CC:auto | Codex:done] /tmp/e2e_result.json
-  3.3  E2E 报告         [CC:auto | Codex:done] 报告文件 ≥200B
-  3.4  E2E Gate         [CC:auto | Codex:done] e2e_gate
-  3.5  Loop Record      [CC:半auto | Codex:done --outcome pass|fail] fail→手动 --decision
-  3.6  KNOWLEDGE 闭环   [CC:auto | Codex:done] KNOWLEDGE.md
+## /goal 自主执行（Phase 2+3）
+
+Plan 确认后（步骤 1.6 完成），orchestrator 自动输出 `/goal` 命令。用户执行后：
+
+- Claude 自主驱动 Phase 2（执行）+ Phase 3（验证）全流程
+- Haiku 评估器通过 `[FASTSHIP_GOAL]` 状态行判断是否完成
+- 每步完成后 Claude 运行 `status`，评估器解析 `step=` / `test_passed=` / `e2e_executed=` 等字段
+- Loop Record fail 时 Claude 自主选择 continue（在 3 次上限内），3 次后暂停等用户介入
+- 全部完成（step=done + 三个 gate flag 均为 true）→ /goal 自动结束
+
+生成 /goal 条件（手动场景）：
+```bash
+"$(git rev-parse --show-toplevel)/.claude/tools/fastship" goal
 ```
 
 ## 常用命令
@@ -68,6 +81,7 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 "$FASTSHIP" next             # 当前步骤
 "$FASTSHIP" done [--flags]   # 完成 + 验证
 "$FASTSHIP" status           # 全部状态
+"$FASTSHIP" goal             # 生成 /goal 条件（Phase 2+ 可用）
 "$FASTSHIP" adopt-branch     # 将活跃 session 迁移到当前分支
 "$FASTSHIP" reset            # 重置
 ```
@@ -82,6 +96,7 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 - E2E 阶段禁止 DB 写入（gate 拦截）
 - Loop 上限 3 次（gate 锁死）
 - KNOWLEDGE.md merge 前必须表态（gate 拦截）
+- 禁止自我豁免验证步骤：验证步骤做不了 → 暂停 + 报告阻碍原因，等用户决策。禁止以"无法自动化"、"该 feature 特殊"、"没有 mock endpoint"、"时间紧"为由自行降级、替代或跳过任何步骤。豁免权归用户，不归 Claude。
 
 ## 状态行
 
@@ -90,3 +105,11 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 ```
 🚀 /fastship | {需求简述} | Step: {当前步骤 id} | Phase: {1/2/3} | Loop: {0/3}
 ```
+
+status 命令额外输出机器可读行（供 /goal 评估器解析）：
+
+```
+[FASTSHIP_GOAL] step=3.2 phase=3 test_passed=true e2e_executed=false knowledge_acknowledged=false loop=0/3
+```
+
+🔴 /goal 模式下，每完成关键步骤后务必运行 status 命令，让评估器看到最新进度。
