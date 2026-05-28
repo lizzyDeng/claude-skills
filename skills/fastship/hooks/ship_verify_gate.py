@@ -362,13 +362,16 @@ def is_strict_e2e_runner(cmd):
 
 
 def is_merge_cmd(cmd):
-    """检测合入/切回 main 的命令"""
+    """检测合入/切回 main 的命令 + ref-writing plumbing"""
     if not cmd:
         return False
+    sub = _git_subcommand(cmd)
+    if sub in ("merge", "update-ref"):
+        return True
     pats = [
-        r'\bgit\s+merge\b',
         r'\bgit\s+checkout\s+(main|master)\b',
         r'\bgit\s+switch\s+(main|master)\b',
+        r'\bgit\s+branch\s+-[fF]\b',
     ]
     return any(re.search(p, cmd) for p in pats)
 
@@ -1222,13 +1225,44 @@ def is_push_cmd(cmd):
     return bool(re.search(r'\bgit\s+push\b', cmd))
 
 
+def _git_subcommand(cmd):
+    """Extract the git subcommand, skipping global options like -c, -C, --no-pager."""
+    if not cmd:
+        return ""
+    m = re.search(r'\bgit\b', cmd)
+    if not m:
+        return ""
+    rest = cmd[m.end():].strip()
+    # Skip global options: -c key=val, -C path, --no-pager, --git-dir=x, etc.
+    while rest:
+        if rest.startswith("--no-pager") or rest.startswith("--no-optional-locks"):
+            rest = rest.split(None, 1)[-1] if " " in rest else ""
+        elif re.match(r'-[cC]\s+\S+', rest):
+            rest = re.sub(r'-[cC]\s+\S+\s*', '', rest, count=1).strip()
+        elif re.match(r'--git-dir[=\s]', rest) or re.match(r'--work-tree[=\s]', rest):
+            rest = re.sub(r'--[\w-]+[=\s]\S+\s*', '', rest, count=1).strip()
+        elif rest.startswith("-") and not rest.startswith("--"):
+            rest = rest.split(None, 1)[-1] if " " in rest else ""
+        else:
+            break
+    return rest.split()[0] if rest.split() else ""
+
+
+def is_commit_cmd(cmd):
+    """检测 git commit 命令（含 plumbing ref-write 命令）"""
+    if not cmd:
+        return False
+    sub = _git_subcommand(cmd)
+    return sub in ("commit", "commit-tree", "cherry-pick", "revert", "am")
+
+
 def gate_pre_bash():
     """PreToolUse: Bash — 自动拦截，四层 Gate（所有分支生效）
 
     Gate 0: E2E 阶段 DB 写入 → 禁止（防止 fake 数据构造）
     Gate 1: E2E 命令 → 必须先跑通项目测试（单测）
     Gate 2: E2E Gate 脚本 → 必须项目测试 + E2E Runner 都完成
-    Gate 3: merge/push → 必须项目测试 + E2E 都完成（已有逻辑）
+    Gate 3: commit/merge/push → 必须项目测试 + E2E 都完成
     """
     branch = get_current_branch()
 
@@ -1332,8 +1366,22 @@ def gate_pre_bash():
             print("\n".join(lines))
             return 1
 
-    # --- Gate 3 + 4: merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
-    if is_merge_cmd(cmd) or is_push_cmd(cmd):
+    # --- Gate 3 + 4: commit/merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
+    # Phase 2 WIP commits 放行，其余 commit/merge/push 必须 Phase 3 完成
+    if is_commit_cmd(cmd) or is_merge_cmd(cmd) or is_push_cmd(cmd):
+        if is_commit_cmd(cmd) and not is_merge_cmd(cmd) and not is_push_cmd(cmd):
+            orch_path = fastship_state.orchestrator_state_path()
+            orch = {}
+            try:
+                orch = fastship_state.load_json(orch_path) or {}
+            except Exception:
+                pass
+            step = orch.get("current_step", "")
+            if step.startswith("2."):
+                return 0
+            if not orch or step in ("done", "stopped", "", None):
+                return 0
+
         blocks = []
         if not st.get("test_passed"):
             blocks.append("项目测试未通过")
@@ -1345,14 +1393,14 @@ def gate_pre_bash():
             blocks.append("KNOWLEDGE.md 未更新且未声明跳过")
 
         if blocks:
-            action = "推送" if is_push_cmd(cmd) else "合入"
+            action = "提交" if is_commit_cmd(cmd) else ("推送" if is_push_cmd(cmd) else "合入")
             lines = [
-                f"🔴 BLOCKED: 验证未完成，禁止{action}",
+                f"🔴 BLOCKED: Phase 3 验证未完成，禁止{action}",
             ]
             for b in blocks:
                 lines.append(f"   ❌ {b}")
             lines.append("")
-            lines.append("请先完成验证流程：")
+            lines.append("请先完成 Phase 3 验证流程：")
             lines.append("   1. 项目测试（全量）")
             lines.append("   2. E2E 验证")
             lines.append("   3. KNOWLEDGE.md：")

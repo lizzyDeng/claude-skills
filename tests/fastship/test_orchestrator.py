@@ -10,6 +10,61 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship'))
 
 
+def trust_artifact(orch, step_id, path):
+    from orchestrator import record_step_artifact
+    ok, msg = record_step_artifact(orch, step_id, str(path), source="test")
+    assert ok, msg
+    return orch["artifacts"]["trusted_artifacts"][step_id]["sha256"]
+
+
+def make_trusted_plan(tmp_path, monkeypatch):
+    plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan = plan_dir / "2026-05-18-feat.md"
+    plan.write_text(
+        "# Plan\n"
+        "> **For agentic workers:** REQUIRED\n"
+        "**Goal:** do stuff\n"
+        "**Architecture:** stuff\n"
+        "**Tech Stack:** python\n"
+        "### Task 1\n"
+        "- [ ] **Step 1:** write test\n"
+    )
+    monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+    orch = {"plan_path": str(plan), "artifacts": {}}
+    plan_sha = trust_artifact(orch, "1.4", plan)
+    return orch, plan, plan_sha
+
+
+def codex_review_content(plan_sha256="test-plan-sha", **overrides):
+    gate = {
+        "gate": "PASS",
+        "reviewed_plan_sha256": plan_sha256,
+        "p0_contract_reviewed": True,
+        "ac_e2e_coverage_reviewed": True,
+        "weak_case_reviewed": True,
+        "evidence_plan_reviewed": True,
+        "p0_requirements_missing": [],
+        "uncovered_ac": [],
+        "unmapped_e2e_scenarios": [],
+        "weak_scenarios": [],
+        "non_business_assertions": [],
+        "missing_evidence": [],
+    }
+    gate.update(overrides)
+    text_gate = gate.get("gate", "PASS")
+    return (
+        "## Codex Plan Review\n"
+        "### Findings\n"
+        "- No critical findings\n"
+        "### Contract Gate\n"
+        "```json\n"
+        f"{json.dumps(gate, ensure_ascii=False, indent=2)}\n"
+        "```\n"
+        f"### GATE: {text_gate}\n"
+    )
+
+
 # ━━━━━━━━━━━━ Task 1: Core Infrastructure ━━━━━━━━━━━━
 
 class TestStateManagement:
@@ -124,14 +179,29 @@ class TestValidatorsPhase1:
         from orchestrator import validate_brief
         f = tmp_path / "brief.md"
         f.write_text("## Brief\n### 涉及模块\nx\n### 现有测试\ny\n### 历史变更\nz\n### 历史教训\nw\n" + "p " * 100)
-        assert validate_brief({"brief_path": str(f)}, {})[0] is True
+        orch = {"brief_path": str(f), "artifacts": {}}
+        trust_artifact(orch, "1.3", f)
+        assert validate_brief(orch, {})[0] is True
 
     def test_brief_fail_missing_section(self, tmp_path):
         from orchestrator import validate_brief
         f = tmp_path / "brief.md"
         f.write_text("### 涉及模块\nx\n" + "p " * 100)
-        ok, msg = validate_brief({"brief_path": str(f)}, {})
+        orch = {"brief_path": str(f), "artifacts": {}}
+        trust_artifact(orch, "1.3", f)
+        ok, msg = validate_brief(orch, {})
         assert ok is False
+
+    def test_brief_rejects_tampered_artifact(self, tmp_path):
+        from orchestrator import validate_brief
+        f = tmp_path / "brief.md"
+        f.write_text("## Brief\n### 涉及模块\nx\n### 现有测试\ny\n### 历史变更\nz\n### 历史教训\nw\n" + "p " * 100)
+        orch = {"brief_path": str(f), "artifacts": {}}
+        trust_artifact(orch, "1.3", f)
+        f.write_text("## Brief\n### 涉及模块\nchanged\n")
+        ok, msg = validate_brief(orch, {})
+        assert ok is False
+        assert "mismatch" in msg
 
     def test_brief_fail_no_file(self):
         from orchestrator import validate_brief
@@ -165,7 +235,9 @@ class TestValidatorsPhase1:
             "- [ ] **Step 1:** write test\n"
         )
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        ok, _ = validate_plan({}, {"plan_ready": True, "plan_file": str(plan)})
+        orch = {"plan_path": str(plan), "artifacts": {}}
+        trust_artifact(orch, "1.4", plan)
+        ok, _ = validate_plan(orch, {"plan_ready": True, "plan_file": str(plan)})
         assert ok is True
 
     def test_plan_fail_no_signature(self, tmp_path, monkeypatch):
@@ -175,7 +247,9 @@ class TestValidatorsPhase1:
         plan = plan_dir / "2026-05-18-feat.md"
         plan.write_text("# My hand-written plan\n## Steps\n1. Do stuff\n")
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        ok, msg = validate_plan({}, {"plan_ready": True, "plan_file": str(plan)})
+        orch = {"plan_path": str(plan), "artifacts": {}}
+        trust_artifact(orch, "1.4", plan)
+        ok, msg = validate_plan(orch, {"plan_ready": True, "plan_file": str(plan)})
         assert ok is False
         assert "签名" in msg or "writing-plans" in msg
 
@@ -187,6 +261,7 @@ class TestValidatorsPhase1:
 
     def test_grill_pass(self, tmp_path, monkeypatch):
         from orchestrator import validate_grill
+        orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
         grill = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill.parent.mkdir(parents=True)
         grill.write_text(
@@ -199,8 +274,9 @@ class TestValidatorsPhase1:
             "- 全部 resolved\n"
             + "padding " * 30
         )
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        ok, _ = validate_grill({"artifacts": {}}, {})
+        orch["artifacts"]["grill_result_path"] = str(grill)
+        trust_artifact(orch, "1.5", grill)
+        ok, _ = validate_grill(orch, {})
         assert ok is True
 
     def test_grill_fail_no_file(self, tmp_path, monkeypatch):
@@ -211,23 +287,98 @@ class TestValidatorsPhase1:
 
     def test_grill_fail_missing_section(self, tmp_path, monkeypatch):
         from orchestrator import validate_grill
+        orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
         grill = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill.parent.mkdir(parents=True)
         grill.write_text("## 拷问记录\nstuff\n" + "x " * 200)
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        ok, msg = validate_grill({"artifacts": {}}, {})
+        orch["artifacts"]["grill_result_path"] = str(grill)
+        trust_artifact(orch, "1.5", grill)
+        ok, msg = validate_grill(orch, {})
         assert ok is False
         assert "修订" in msg or "结论" in msg
 
     def test_grill_fail_too_short(self, tmp_path, monkeypatch):
         from orchestrator import validate_grill
+        orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
         grill = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill.parent.mkdir(parents=True)
         grill.write_text("## 拷问\n## 修订\n## 结论\nok")
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        ok, msg = validate_grill({"artifacts": {}}, {})
+        orch["artifacts"]["grill_result_path"] = str(grill)
+        trust_artifact(orch, "1.5", grill)
+        ok, msg = validate_grill(orch, {})
         assert ok is False
         assert "300B" in msg
+
+    def test_codex_review_rejects_filesystem_fallback(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(codex_review_content())
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        ok, msg = validate_codex_review({"artifacts": {}}, {})
+        assert ok is False
+        assert "fallback" in msg
+
+    def test_codex_review_rejects_text_only_pass(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(
+            "## Codex Plan Review\n### Findings\n- none\n### GATE: PASS\n" + "pad " * 30
+        )
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False
+        assert "JSON gate" in msg
+
+    def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(codex_review_content(plan_sha, weak_scenarios=["view-offer only checks button visible"]))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False
+        assert "weak_scenarios" in msg
+
+    def test_codex_review_rejects_unconfirmed_contract_review(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(codex_review_content(plan_sha, p0_contract_reviewed=False))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False
+        assert "p0_contract_reviewed" in msg
+
+    def test_codex_review_rejects_wrong_plan_hash(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(codex_review_content("wrong-plan-hash"))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False
+        assert "plan hash" in msg
+
+    def test_codex_review_passes_with_current_step_artifact(self, tmp_path, monkeypatch):
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(codex_review_content(plan_sha))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, _ = validate_codex_review(orch, {})
+        assert ok is True
 
     def test_confirm_pass(self):
         from orchestrator import validate_user_confirm
@@ -253,12 +404,14 @@ class TestValidatorsPhase3:
         from orchestrator import validate_e2e_run
         assert validate_e2e_run({}, {"e2e_executed": True})[0] is True
 
-    def test_report_pass_codex_mode(self, tmp_path, monkeypatch):
+    def test_report_rejects_codex_mode_without_gate(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_report
         f = tmp_path / "report.md"
         f.write_text("## Report\n" + "x " * 150)
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        assert validate_e2e_report({"report_path": str(f)}, {})[0] is True
+        ok, msg = validate_e2e_report({"report_path": str(f)}, {})
+        assert ok is False
+        assert "fallback" in msg
 
     def test_report_fail_small_codex_mode(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_report
@@ -269,7 +422,8 @@ class TestValidatorsPhase3:
 
     def test_knowledge_pass(self):
         from orchestrator import validate_knowledge
-        assert validate_knowledge({}, {"knowledge_acknowledged": True})[0] is True
+        hook = {"knowledge_acknowledged": True, "knowledge_skip_reason": "no new lessons"}
+        assert validate_knowledge({}, hook)[0] is True
 
     def test_loop_pass(self, monkeypatch):
         from orchestrator import validate_loop_record
@@ -289,8 +443,8 @@ class TestValidatorsPhase3:
         assert validate_loop_record(orch, {})[0] is False
 
 
-class TestValidatorsCodexFallback:
-    def test_plan_fs_fallback(self, tmp_path, monkeypatch):
+class TestValidatorsFallbackDenied:
+    def test_plan_fs_fallback_rejected(self, tmp_path, monkeypatch):
         from orchestrator import validate_plan
         plan_dir = tmp_path / "docs" / "superpowers" / "plans"
         plan_dir.mkdir(parents=True)
@@ -300,8 +454,8 @@ class TestValidatorsCodexFallback:
         )
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
         ok, msg = validate_plan({}, {})
-        assert ok is True
-        assert "feat" in msg
+        assert ok is False
+        assert "fallback" in msg
 
     def test_plan_fs_fallback_no_file(self, tmp_path, monkeypatch):
         from orchestrator import validate_plan
@@ -319,7 +473,7 @@ class TestValidatorsCodexFallback:
         assert ok is True
         assert "feature" in msg
 
-    def test_e2e_run_fs_fallback(self, tmp_path, monkeypatch):
+    def test_e2e_run_fs_fallback_rejected(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_run
         result_file = tmp_path / "e2e_result.json"
         result_file.write_text(json.dumps({
@@ -327,17 +481,20 @@ class TestValidatorsCodexFallback:
         }))
         monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, _ = validate_e2e_run({}, {})
-        assert ok is True
+        ok, msg = validate_e2e_run({}, {})
+        assert ok is False
+        assert "fallback" in msg
 
-    def test_knowledge_fs_fallback(self, tmp_path, monkeypatch):
+    def test_knowledge_fs_fallback_rejected(self, tmp_path, monkeypatch):
         from orchestrator import validate_knowledge
         km = tmp_path / "KNOWLEDGE.md"
         km.write_text("## 2026-05-18 — lesson")
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         orch = {"started_at": "2020-01-01T00:00:00"}
-        ok, _ = validate_knowledge(orch, {})
-        assert ok is True
+        ok, msg = validate_knowledge(orch, {})
+        assert ok is False
+        assert "fallback" in msg
 
     def test_knowledge_fs_fallback_stale(self, tmp_path, monkeypatch):
         from orchestrator import validate_knowledge
@@ -356,7 +513,7 @@ class TestValidatorsCodexFallback:
 class TestSteps:
     def test_step_count(self):
         from orchestrator import STEPS
-        assert len(STEPS) == 16
+        assert len(STEPS) == 17
 
     def test_phase_order(self):
         from orchestrator import STEPS
@@ -377,7 +534,7 @@ class TestSteps:
     def test_required_ids_present(self):
         from orchestrator import STEPS
         ids = {s.id for s in STEPS}
-        for expected in ["1.0", "1.1", "1.2", "1.3", "1.3d", "1.4", "1.5", "1.6",
+        for expected in ["1.0", "1.1", "1.2", "1.3", "1.3d", "1.4", "1.5", "1.5c", "1.6",
                          "2.0", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]:
             assert expected in ids, f"Missing step {expected}"
 
@@ -666,6 +823,16 @@ class TestIntegrationFullFlow:
             data={"tool_input": {"file_path": str(grill_result)}},
             orch_path=orch_file)
         st = reload()
+        assert st["current_step"] == "1.5c"
+
+        # 1.5c: codex review (auto via post_edit when review file written)
+        plan_sha = st["artifacts"]["trusted_artifacts"]["1.4"]["sha256"]
+        codex_review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        codex_review.write_text(codex_review_content(plan_sha))
+        hook_post_edit_logic(
+            data={"tool_input": {"file_path": str(codex_review)}},
+            orch_path=orch_file)
+        st = reload()
         assert st["current_step"] == "1.6"
 
         # 1.6: confirm (manual done)
@@ -720,7 +887,7 @@ class TestIntegrationFullFlow:
         monkeypatch.setattr("orchestrator._read_gate_state_file",
                             lambda: {"e2e_executed": True, "e2e_result_hash": e2e_hash})
         report = tmp_path / "report.md"
-        report.write_text("## Report\n" + "x " * 150)
+        report.write_text(f"## Report\n\ne2e_result_hash: {e2e_hash}\n" + "x " * 150)
         st["report_path"] = str(report)
         save_orch_state(st, orch_file)
         hook_post_edit_logic(
@@ -734,7 +901,12 @@ class TestIntegrationFullFlow:
         gate_script.parent.mkdir(parents=True, exist_ok=True)
         gate_script.write_text("import sys; print('GATE PASSED'); sys.exit(0)")
         monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": e2e_hash})
+                            lambda: {
+                                "test_passed": True,
+                                "e2e_executed": True,
+                                "e2e_result_hash": e2e_hash,
+                                "e2e_gate_passed": True,
+                            })
         hook_post_bash_logic(
             data={"tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
                   "tool_response": {"exitCode": 0, "stdout": "GATE PASSED"}},
@@ -752,6 +924,15 @@ class TestIntegrationFullFlow:
         assert st["current_step"] == "3.6"
 
         # 3.6: knowledge (auto) — write KNOWLEDGE.md in tmp_path so mtime check passes
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {
+                                "test_passed": True,
+                                "e2e_executed": True,
+                                "e2e_result_hash": e2e_hash,
+                                "e2e_gate_passed": True,
+                                "knowledge_acknowledged": True,
+                                "knowledge_file": str(tmp_path / "KNOWLEDGE.md"),
+                            })
         km = tmp_path / "KNOWLEDGE.md"
         km.write_text("## 2026-05-18 — lesson learned")
         hook_post_edit_logic(
@@ -765,7 +946,7 @@ class TestIntegrationFullFlow:
         orch_file = str(tmp_path / "orch.json")
         st = {
             "requirement": "test", "current_step": "3.5", "phase": 3,
-            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6",
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6",
                                 "2.0", "3.0", "3.1", "3.2", "3.3", "3.4"],
             "skipped_steps": ["1.3d"], "request_type": "feature",
             "loop_count": 0, "artifacts": {}, "branch": None,
@@ -787,7 +968,7 @@ class TestIntegrationFullFlow:
         from orchestrator import _handle_loop_decision
         st = {
             "current_step": "3.5", "phase": 3, "loop_count": 1,
-            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6",
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6",
                                 "2.0", "3.0", "3.1", "3.2", "3.3", "3.4"],
             "skipped_steps": ["1.3d"], "request_type": "feature",
             "artifacts": {"loop_outcome": "fail", "loop_decision": "continue"},
@@ -915,7 +1096,7 @@ class TestE2ERunHardened:
         ok, _ = validate_e2e_run({}, {})
         assert ok is True
 
-    def test_codex_fallback_needs_quality(self, tmp_path, monkeypatch):
+    def test_codex_fallback_rejected_even_with_low_quality_file(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_run
         result_file = tmp_path / "e2e_result.json"
         result_file.write_text(json.dumps({
@@ -925,9 +1106,9 @@ class TestE2ERunHardened:
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         ok, msg = validate_e2e_run({}, {})
         assert ok is False
-        assert "10" in msg
+        assert "fallback" in msg
 
-    def test_codex_fallback_passes_with_quality(self, tmp_path, monkeypatch):
+    def test_codex_fallback_rejected_even_with_quality_file(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_run
         result_file = tmp_path / "e2e_result.json"
         result_file.write_text(json.dumps({
@@ -935,8 +1116,9 @@ class TestE2ERunHardened:
         }))
         monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, _ = validate_e2e_run({}, {})
-        assert ok is True
+        ok, msg = validate_e2e_run({}, {})
+        assert ok is False
+        assert "fallback" in msg
 
 
 class TestE2EReportHardened:
@@ -976,20 +1158,42 @@ class TestE2EReportHardened:
         result_file.write_bytes(result_bytes)
         recorded_hash = hashlib.sha256(result_bytes).hexdigest()
         report = tmp_path / "report.md"
-        report.write_text("## Report\n" + "x " * 150)
+        report.write_text(f"## Report\n\ne2e_result_hash: {recorded_hash}\n" + "x " * 150)
+        orch = {"report_path": str(report), "artifacts": {}}
+        trust_artifact(orch, "3.3", report)
         monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
         monkeypatch.setattr("orchestrator._read_gate_state_file",
                             lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
-        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
+        ok, _ = validate_e2e_report(orch, {})
         assert ok is True
 
-    def test_codex_fallback_still_works(self, tmp_path, monkeypatch):
+    def test_rejects_report_missing_result_hash_reference(self, tmp_path, monkeypatch):
+        import hashlib
+        from orchestrator import validate_e2e_report
+        result_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
+        result_bytes = json.dumps(result_data, ensure_ascii=False).encode("utf-8")
+        result_file = tmp_path / "e2e_result.json"
+        result_file.write_bytes(result_bytes)
+        recorded_hash = hashlib.sha256(result_bytes).hexdigest()
+        report = tmp_path / "report.md"
+        report.write_text("## Report\n\nAll good, but no raw result hash.\n" + "x " * 150)
+        orch = {"report_path": str(report), "artifacts": {}}
+        trust_artifact(orch, "3.3", report)
+        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
+        ok, msg = validate_e2e_report(orch, {})
+        assert ok is False
+        assert "e2e_result_hash" in msg
+
+    def test_codex_fallback_is_rejected(self, tmp_path, monkeypatch):
         from orchestrator import validate_e2e_report
         report = tmp_path / "report.md"
         report.write_text("## Report\n" + "x " * 150)
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
-        assert ok is True
+        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
+        assert ok is False
+        assert "fallback" in msg
 
 
 class TestE2EGateHardened:
@@ -1026,11 +1230,12 @@ class TestE2EGateHardened:
         ok, msg = validate_e2e_gate({}, {})
         assert ok is False
 
-    def test_codex_fallback_passes(self, monkeypatch):
+    def test_codex_fallback_is_rejected(self, monkeypatch):
         from orchestrator import validate_e2e_gate
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, _ = validate_e2e_gate({}, {})
-        assert ok is True
+        ok, msg = validate_e2e_gate({}, {})
+        assert ok is False
+        assert "fallback" in msg
 
 
 class TestDetectionE2EGateHardened:
@@ -1089,12 +1294,13 @@ class TestLoopRecordHardened:
         ok, _ = validate_loop_record(orch, {})
         assert ok is True
 
-    def test_pass_accepted_codex_mode(self, monkeypatch):
+    def test_pass_rejected_codex_mode_without_gate(self, monkeypatch):
         from orchestrator import validate_loop_record
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
         orch = {"artifacts": {"loop_outcome": "pass"}}
-        ok, _ = validate_loop_record(orch, {})
-        assert ok is True
+        ok, msg = validate_loop_record(orch, {})
+        assert ok is False
+        assert "fallback" in msg
 
 
 class TestFabricationBlocked:
@@ -1198,3 +1404,71 @@ class TestFabricationBlocked:
             "tool_response": {"exitCode": 1, "stdout": "BLOCKED: not enough turns"},
         }
         assert detect_completion_post_bash("3.4", data, {}) is None
+
+
+class TestStepArtifactGuard:
+    """Prevent out-of-order step artifact writes."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_branch(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_current_branch", lambda: "test")
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+
+    @pytest.fixture
+    def noop_gate(self, tmp_path):
+        """Gate script that always returns 0."""
+        gate = tmp_path / "gate.py"
+        gate.write_text("import sys, json; json.load(sys.stdin); print(''); sys.exit(0)")
+        return str(gate)
+
+    def test_grill_blocked_when_at_plan_step(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic, GRILL_RESULT_FILENAME
+        orch = {"current_step": "1.4", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": f"/repo/.claude/{GRILL_RESULT_FILENAME}"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code == 1, "Should block grill write when at plan step"
+
+    def test_plan_allowed_when_at_plan_step(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic
+        orch = {"current_step": "1.4", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": "/repo/docs/superpowers/plans/2026-01-01-test.md"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code != 1, "Should allow plan write when at plan step"
+
+    def test_brief_blocked_when_at_grill_step(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic, BRIEF_FILENAME
+        orch = {"current_step": "1.5", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": f"/repo/.claude/{BRIEF_FILENAME}"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code == 1, "Should block brief write when at grill step"
+
+    def test_codex_review_blocked_when_at_grill_step(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic, CODEX_REVIEW_FILENAME
+        orch = {"current_step": "1.5", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": f"/repo/.claude/{CODEX_REVIEW_FILENAME}"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code == 1, "Should block codex review write when at grill step"
+
+    def test_grill_allowed_when_at_grill_step(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic, GRILL_RESULT_FILENAME
+        orch = {"current_step": "1.5", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": f"/repo/.claude/{GRILL_RESULT_FILENAME}"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code != 1, "Should allow grill write when at grill step"
+
+    def test_non_artifact_file_not_blocked(self, noop_gate):
+        from orchestrator import hook_pre_edit_logic
+        orch = {"current_step": "1.4", "phase": 1, "branch": "test"}
+        data = {"tool_input": {"file_path": "/repo/.claude/some-random-note.md"}}
+        code = hook_pre_edit_logic(data, orch, noop_gate)
+        assert code != 1, "Non-artifact files should not be blocked"
+
+    def test_artifact_owner_mapping(self):
+        from orchestrator import _artifact_owner_step, BRIEF_FILENAME, GRILL_RESULT_FILENAME, CODEX_REVIEW_FILENAME
+        assert _artifact_owner_step(f"/repo/.claude/{BRIEF_FILENAME}") == "1.3"
+        assert _artifact_owner_step(f"/repo/.claude/{GRILL_RESULT_FILENAME}") == "1.5"
+        assert _artifact_owner_step(f"/repo/.claude/{CODEX_REVIEW_FILENAME}") == "1.5c"
+        assert _artifact_owner_step("/repo/docs/superpowers/plans/2026-test.md") == "1.4"
+        assert _artifact_owner_step("/repo/docs/KNOWLEDGE.MD") == "3.6"
+        assert _artifact_owner_step("/repo/src/main.rs") is None

@@ -185,9 +185,9 @@ python3 .claude/hooks/forge_gate.py audit-month 2026-05 --strict
 | Gate | 转换 | 检查内容 |
 |------|------|---------|
 | G1 | → draft | metric.json 存在且合法 |
-| G2 | draft → planned | fastship Phase 1 完成 (plan_ready) 或存在匹配的 plan artifact |
+| G2 | draft → planned | 当前 worktree fastship Phase 1 完成：plan/grill/codex trusted artifact + user sign-off，禁止 filesystem/legacy fallback |
 | G3 | planned → in_progress | 自动（/forge dev 触发） |
-| G4 | in_progress → shipped | fastship Phase 3 完成 (test + e2e + knowledge) |
+| G4 | in_progress → shipped | fastship Phase 3 完成：test + e2e + e2e_gate + e2e_result_hash + loop pass + knowledge + orchestrator step=done |
 | G5 | shipped → measuring | 自动（/forge ship 内部） |
-| G6 | measuring → concluded | harvest.json 存在且合法 |
+| G6 | measuring → concluded | harvest.json 合法且绑定 evidence raw_path/raw_sha256，hash mismatch 即失败 |
 | Audit | 月度审计 | plan / metric / roadmap 三方一致性 |

@@ -6,5 +6,11 @@
   "verdict": "",
   "notes": "",
   "next_action": "",
-  "next_feature": null
+  "next_feature": null,
+  "evidence": {
+    "source": "",
+    "collected_at": "",
+    "raw_path": "",
+    "raw_sha256": ""
+  }
 }

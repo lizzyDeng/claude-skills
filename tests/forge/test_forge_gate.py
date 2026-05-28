@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import importlib
+import hashlib
 import pytest
 from unittest.mock import patch
 from datetime import datetime
@@ -25,6 +26,125 @@ def reload_module():
 # reference), NOT `from forge_gate import X`. The top-level import + autouse reload
 # fixture ensures consistent behavior. When implementing, replace any remaining
 # `from forge_gate import X` with `forge_gate.X` throughout ALL test classes.
+
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def trusted_artifact(step_id, path):
+    data = path.read_bytes()
+    return {
+        "step_id": step_id,
+        "path": str(path),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "source": "test",
+    }
+
+
+def codex_review_content(plan_sha):
+    gate = {
+        "gate": "PASS",
+        "reviewed_plan_sha256": plan_sha,
+        "p0_contract_reviewed": True,
+        "ac_e2e_coverage_reviewed": True,
+        "weak_case_reviewed": True,
+        "evidence_plan_reviewed": True,
+        "p0_requirements_missing": [],
+        "uncovered_ac": [],
+        "unmapped_e2e_scenarios": [],
+        "weak_scenarios": [],
+        "non_business_assertions": [],
+        "missing_evidence": [],
+    }
+    return (
+        "## Codex Plan Review\n"
+        "### Contract Gate\n"
+        "```json\n"
+        f"{json.dumps(gate, indent=2)}\n"
+        "```\n"
+        "### GATE: PASS\n"
+    )
+
+
+def make_fastship_phase1_state(tmp_path, slug="f1"):
+    plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n")
+    grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+    grill.parent.mkdir(parents=True, exist_ok=True)
+    grill.write_text("## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- pass\n" + "x " * 150)
+    plan_rec = trusted_artifact("1.4", plan)
+    codex = tmp_path / ".claude" / ".fastship-codex-review.md"
+    codex.write_text(codex_review_content(plan_rec["sha256"]))
+    orch = {
+        "current_step": "2.0",
+        "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6"],
+        "plan_path": str(plan),
+        "artifacts": {
+            "user_confirmed": True,
+            "grill_result_path": str(grill),
+            "codex_review_path": str(codex),
+            "trusted_artifacts": {
+                "1.4": plan_rec,
+                "1.5": trusted_artifact("1.5", grill),
+                "1.5c": trusted_artifact("1.5c", codex),
+            },
+        },
+    }
+    gate = {"forge_feature": slug, "plan_ready": True}
+    return gate, orch
+
+
+def make_fastship_done_state(tmp_path, slug="f1"):
+    gate, orch = make_fastship_phase1_state(tmp_path, slug)
+    result_hash = "a" * 64
+    report = tmp_path / "report.md"
+    report.write_text(f"## E2E Report\n\ne2e_result_hash: {result_hash}\n" + "x " * 150)
+    knowledge = tmp_path / "KNOWLEDGE.md"
+    knowledge.write_text("## lesson\nvalidated")
+    orch["current_step"] = "done"
+    orch["completed_steps"].extend(["2.0", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"])
+    orch["report_path"] = str(report)
+    orch["artifacts"]["knowledge_path"] = str(knowledge)
+    orch["artifacts"]["trusted_artifacts"]["3.3"] = trusted_artifact("3.3", report)
+    orch["artifacts"]["trusted_artifacts"]["3.6"] = trusted_artifact("3.6", knowledge)
+    gate.update({
+        "test_passed": True,
+        "e2e_executed": True,
+        "e2e_gate_passed": True,
+        "knowledge_acknowledged": True,
+        "e2e_result_hash": result_hash,
+        "last_loop_outcome": "pass",
+        "loop_count": 1,
+        "e2e_runs_since_last_record": 0,
+    })
+    return gate, orch
+
+
+def make_harvest(tmp_path, slug="f1", **overrides):
+    feature_dir = tmp_path / "project-roadmap" / "features" / slug
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    evidence = feature_dir / "evidence.json"
+    evidence.write_text(json.dumps({"actual": 0.41, "source": "warehouse query"}))
+    harvest = {
+        "harvested_at": "2026-05-13",
+        "actual": 0.41,
+        "baseline": 0.32,
+        "target": 0.45,
+        "verdict": "partial",
+        "notes": "Some notes",
+        "next_action": "iterate",
+        "evidence": {
+            "source": "warehouse query",
+            "collected_at": "2026-05-13T00:00:00",
+            "raw_path": "evidence.json",
+            "raw_sha256": sha256_file(evidence),
+        },
+    }
+    harvest.update(overrides)
+    return harvest
 
 
 class TestRoadmapIO:
@@ -70,7 +190,7 @@ class TestFastshipStateIO:
             assert forge_gate.fastship_state_path() == str((state_dir / "gate.json").resolve())
             assert forge_gate.load_fastship_state()["plan_ready"] is True
 
-    def test_loads_legacy_fastship_state_when_current_state_missing(self, tmp_path):
+    def test_ignores_legacy_fastship_state_when_current_state_missing(self, tmp_path):
         subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
         legacy_dir = tmp_path / ".claude"
         legacy_dir.mkdir()
@@ -79,8 +199,19 @@ class TestFastshipStateIO:
         legacy_path.write_text(json.dumps(legacy))
 
         with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
-            assert forge_gate.fastship_state_path() == str(legacy_path)
-            assert forge_gate.load_fastship_state()["plan_ready"] is True
+            assert forge_gate.fastship_state_path() == str((tmp_path / ".git" / "fastship" / "gate.json").resolve())
+            assert forge_gate.load_fastship_state() == {}
+
+    def test_loads_current_fastship_orchestrator_state(self, tmp_path):
+        subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+        state_dir = tmp_path / ".git" / "fastship"
+        state_dir.mkdir()
+        state = {"current_step": "done"}
+        (state_dir / "orchestrator.json").write_text(json.dumps(state))
+
+        with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+            assert forge_gate.fastship_orchestrator_state_path() == str((state_dir / "orchestrator.json").resolve())
+            assert forge_gate.load_fastship_orchestrator_state()["current_step"] == "done"
 
 
 class TestFeatureLookup:
@@ -148,6 +279,12 @@ class TestValidateHarvest:
             "verdict": "partial",
             "notes": "Some notes",
             "next_action": "iterate",
+            "evidence": {
+                "source": "warehouse query",
+                "collected_at": "2026-05-13T00:00:00",
+                "raw_path": "evidence.json",
+                "raw_sha256": "a" * 64,
+            },
         }
         ok, errors = forge_gate.validate_harvest(harvest)
         assert ok is True
@@ -161,19 +298,44 @@ class TestValidateHarvest:
             "verdict": "invalid_value",
             "notes": "Notes",
             "next_action": "done",
+            "evidence": {
+                "source": "warehouse query",
+                "collected_at": "2026-05-13T00:00:00",
+                "raw_path": "evidence.json",
+                "raw_sha256": "a" * 64,
+            },
         }
         ok, errors = forge_gate.validate_harvest(harvest)
         assert ok is False
+
+    def test_missing_evidence_fails(self):
+        harvest = {
+            "harvested_at": "2026-05-13",
+            "actual": 0.41,
+            "baseline": 0.32,
+            "target": 0.45,
+            "verdict": "partial",
+            "notes": "Notes",
+            "next_action": "done",
+        }
+        ok, errors = forge_gate.validate_harvest(harvest)
+        assert ok is False
+        assert any("evidence" in e for e in errors)
 
 
 class TestStateTransition:
     """Test state machine transitions with gate checks."""
 
     def test_valid_transition_draft_to_planned(self, tmp_path):
-        # G2 requires plan_ready from fastship state
-        fastship_state = {"plan_ready": True}
-        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state)
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is True
+
+    def test_draft_to_planned_rejects_plan_ready_without_artifacts(self, tmp_path):
+        fastship_state = {"forge_feature": "f1", "plan_ready": True}
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, {})
+        assert ok is False
+        assert "orchestrator" in reason or "trusted" in reason
 
     def test_invalid_transition_skipping_states(self):
         ok, reason = forge_gate.can_transition("f1", "draft", "shipped", None, {})
@@ -213,11 +375,30 @@ class TestGate6Harvest:
     def test_g6_passes_with_valid_harvest(self, tmp_path):
         features_dir = tmp_path / "project-roadmap" / "features" / "f1"
         features_dir.mkdir(parents=True)
+        harvest = make_harvest(tmp_path, "f1")
+        (features_dir / "harvest.json").write_text(json.dumps(harvest))
+        ok, reason = forge_gate.check_g6_harvest("f1", str(tmp_path))
+        assert ok is True
+
+    def test_g6_rejects_harvest_without_evidence_hash(self, tmp_path):
+        features_dir = tmp_path / "project-roadmap" / "features" / "f1"
+        features_dir.mkdir(parents=True)
         harvest = {"harvested_at": "2026-05-13", "actual": 0.41, "baseline": 0.32,
                    "target": 0.45, "verdict": "partial", "notes": "N", "next_action": "iterate"}
         (features_dir / "harvest.json").write_text(json.dumps(harvest))
         ok, reason = forge_gate.check_g6_harvest("f1", str(tmp_path))
-        assert ok is True
+        assert ok is False
+        assert "evidence" in reason
+
+    def test_g6_rejects_evidence_hash_mismatch(self, tmp_path):
+        features_dir = tmp_path / "project-roadmap" / "features" / "f1"
+        features_dir.mkdir(parents=True)
+        harvest = make_harvest(tmp_path, "f1")
+        harvest["evidence"]["raw_sha256"] = "b" * 64
+        (features_dir / "harvest.json").write_text(json.dumps(harvest))
+        ok, reason = forge_gate.check_g6_harvest("f1", str(tmp_path))
+        assert ok is False
+        assert "mismatch" in reason
 
     def test_g6_fails_without_harvest_file(self, tmp_path):
         ok, reason = forge_gate.check_g6_harvest("f1", str(tmp_path))
@@ -307,18 +488,22 @@ class TestFullLifecycle:
             }
             forge_gate.save_roadmap(roadmap)
 
-            # 2. draft → planned (G2: fastship plan_ready=true)
-            fs_state = {"plan_ready": True}
-            ok, reason = forge_gate.can_transition("test-feature", "draft", "planned", str(tmp_path), fs_state)
+            # 2. draft → planned (G2: trusted fastship Phase 1)
+            fs_state, orch_state = make_fastship_phase1_state(tmp_path, "test-feature")
+            ok, reason = forge_gate.can_transition(
+                "test-feature", "draft", "planned", str(tmp_path), fs_state, orch_state
+            )
             assert ok, reason
 
             # 3. planned → in_progress (G3: automatic)
             ok, reason = forge_gate.can_transition("test-feature", "planned", "in_progress", str(tmp_path), {})
             assert ok, reason
 
-            # 4. in_progress → shipped (G4: fastship complete)
-            fs_state_complete = {"test_passed": True, "e2e_executed": True, "knowledge_acknowledged": True}
-            ok, reason = forge_gate.can_transition("test-feature", "in_progress", "shipped", str(tmp_path), fs_state_complete)
+            # 4. in_progress → shipped (G4: trusted fastship Phase 3)
+            fs_state_complete, orch_done = make_fastship_done_state(tmp_path, "test-feature")
+            ok, reason = forge_gate.can_transition(
+                "test-feature", "in_progress", "shipped", str(tmp_path), fs_state_complete, orch_done
+            )
             assert ok, reason
 
             # 5. shipped → measuring (G5: automatic, done within cmd_transition)
@@ -326,15 +511,7 @@ class TestFullLifecycle:
             assert ok, reason
 
             # 6. measuring → concluded (G6: harvest.json must exist on disk)
-            harvest = {
-                "harvested_at": "2026-05-13",
-                "actual": 0.52,
-                "baseline": 0.30,
-                "target": 0.50,
-                "verdict": "achieved",
-                "notes": "Exceeded target",
-                "next_action": "done",
-            }
+            harvest = make_harvest(tmp_path, "test-feature", actual=0.52, verdict="achieved", next_action="done")
             (features_dir / "harvest.json").write_text(json.dumps(harvest))
             ok_h, _ = forge_gate.validate_harvest(harvest)
             assert ok_h
@@ -344,10 +521,27 @@ class TestFullLifecycle:
     def test_gate4_blocks_without_fastship_complete(self, tmp_path):
         """G4 should block if fastship hasn't completed."""
         with patch.object(forge_gate, 'get_repo_root', return_value=str(tmp_path)):
-            fs_state = {"test_passed": True, "e2e_executed": False, "knowledge_acknowledged": True}
-            ok, reason = forge_gate.can_transition("f1", "in_progress", "shipped", str(tmp_path), fs_state)
+            fs_state, orch_state = make_fastship_done_state(tmp_path, "f1")
+            fs_state["e2e_executed"] = False
+            ok, reason = forge_gate.can_transition("f1", "in_progress", "shipped", str(tmp_path), fs_state, orch_state)
             assert not ok
             assert "e2e_executed" in reason
+
+    def test_gate4_blocks_without_e2e_gate_passed(self, tmp_path):
+        with patch.object(forge_gate, 'get_repo_root', return_value=str(tmp_path)):
+            fs_state, orch_state = make_fastship_done_state(tmp_path, "f1")
+            fs_state["e2e_gate_passed"] = False
+            ok, reason = forge_gate.can_transition("f1", "in_progress", "shipped", str(tmp_path), fs_state, orch_state)
+            assert not ok
+            assert "e2e_gate_passed" in reason
+
+    def test_gate4_blocks_without_trusted_report(self, tmp_path):
+        with patch.object(forge_gate, 'get_repo_root', return_value=str(tmp_path)):
+            fs_state, orch_state = make_fastship_done_state(tmp_path, "f1")
+            orch_state["artifacts"]["trusted_artifacts"].pop("3.3")
+            ok, reason = forge_gate.can_transition("f1", "in_progress", "shipped", str(tmp_path), fs_state, orch_state)
+            assert not ok
+            assert "3.3" in reason
 
 
 class TestRoadmapMdGeneration:
