@@ -91,6 +91,27 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 "$FASTSHIP" reset            # 重置
 ```
 
+## 项目级 E2E 配置
+
+项目如需固定本地启动方式、端口、scenario 或 runner 参数，必须写入 `.claude/fastship.project.json`。fastship 的 `next` 指令、hook hash 记录、E2E 报告校验和 Gate 子进程都会读取同一份配置；禁止只把启动命令写在 CLAUDE.md/README 里。
+
+示例：
+
+```json
+{
+  "e2e": {
+    "setup_commands": ["./dev_local.sh"],
+    "runner_command": "python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health --scenario tests/e2e_scenarios/core.json -o /tmp/e2e_result.json",
+    "gate_command": "python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10",
+    "result_path": "/tmp/e2e_result.json",
+    "min_turns": 10,
+    "notes": ["Use the project local dev script so E2E runs against the same services as development."]
+  }
+}
+```
+
+`runner_command`/`gate_command` 是给 agent 执行的标准指令；`result_path`/`min_turns` 是 validator 的硬输入。两边必须一致，否则 Step 3.3/3.4 会因为 hash、turns 或 Gate 参数不一致而失败。
+
 ## 核心红线
 
 - Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）

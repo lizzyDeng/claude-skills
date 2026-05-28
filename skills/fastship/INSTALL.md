@@ -74,6 +74,22 @@ cp /path/to/claude-skills/skills/fastship/fastship .claude/tools/fastship
 chmod +x .claude/tools/fastship
 ```
 
+## 2.6 配置项目 E2E 合同（可选但推荐）
+
+如果项目的 E2E 需要固定启动脚本、端口、scenario 或 runner 参数，写入 `.claude/fastship.project.json`。不要只写在 README/CLAUDE.md，否则 agent 在 Step 3.2 只会看到默认 runner。
+
+```json
+{
+  "e2e": {
+    "setup_commands": ["./dev_local.sh"],
+    "runner_command": "python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health --scenario tests/e2e_scenarios/core.json -o /tmp/e2e_result.json",
+    "gate_command": "python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10",
+    "result_path": "/tmp/e2e_result.json",
+    "min_turns": 10
+  }
+}
+```
+
 ## 3. 配置 hooks
 
 hooks 指向 orchestrator（orchestrator 内部 subprocess 调用 ship_verify_gate）。

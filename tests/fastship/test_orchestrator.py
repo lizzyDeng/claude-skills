@@ -17,6 +17,13 @@ def trust_artifact(orch, step_id, path):
     return orch["artifacts"]["trusted_artifacts"][step_id]["sha256"]
 
 
+def write_project_config(root, e2e):
+    config_path = root / ".claude" / "fastship.project.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"e2e": e2e}, ensure_ascii=False, indent=2))
+    return config_path
+
+
 def make_trusted_plan(tmp_path, monkeypatch):
     plan_dir = tmp_path / "docs" / "superpowers" / "plans"
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -529,7 +536,8 @@ class TestSteps:
     def test_all_have_instructions(self):
         from orchestrator import STEPS
         for s in STEPS:
-            assert len(s.instruction) > 30, f"{s.id} instruction too short"
+            instruction = s.instruction({}) if callable(s.instruction) else s.instruction
+            assert len(instruction) > 30, f"{s.id} instruction too short"
 
     def test_required_ids_present(self):
         from orchestrator import STEPS
@@ -1236,6 +1244,100 @@ class TestE2EGateHardened:
         ok, msg = validate_e2e_gate({}, {})
         assert ok is False
         assert "fallback" in msg
+
+
+class TestProjectE2EConfig:
+    """Project config is the single source for local E2E setup and gate args."""
+
+    def test_missing_project_config_returns_empty(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+        assert fastship_state.load_project_config() == {}
+
+    def test_format_next_e2e_runner_uses_project_config(self, tmp_path, monkeypatch):
+        from orchestrator import format_next
+
+        result_path = tmp_path / "e2e_result.json"
+        write_project_config(tmp_path, {
+            "setup_commands": ["./dev_local.sh"],
+            "runner_command": f"python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health -o {result_path}",
+            "gate_command": f"python3 tests/e2e_gate.py --result {result_path} --min-turns 12",
+            "result_path": str(result_path),
+            "min_turns": 12,
+            "notes": ["Use dev_local.sh for local services."],
+        })
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+
+        output = format_next({"current_step": "3.2", "phase": 3})
+
+        assert "./dev_local.sh" in output
+        assert "--base-url http://localhost:3100" in output
+        assert f"原始结果必须写入 {result_path}" in output
+        assert "最少 12 轮" in output
+        assert "Use dev_local.sh" in output
+
+    def test_format_next_e2e_gate_uses_project_config(self, tmp_path, monkeypatch):
+        from orchestrator import format_next
+
+        result_path = tmp_path / "custom-result.json"
+        write_project_config(tmp_path, {
+            "gate_command": f"python3 tests/e2e_gate.py --result {result_path} --min-turns 17",
+            "result_path": str(result_path),
+            "min_turns": 17,
+        })
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+
+        output = format_next({"current_step": "3.4", "phase": 3})
+
+        assert f"--result {result_path}" in output
+        assert "--min-turns 17" in output
+
+    def test_validate_e2e_gate_passes_configured_result_and_min_turns(self, tmp_path, monkeypatch):
+        from orchestrator import validate_e2e_gate
+
+        result_path = tmp_path / "custom-result.json"
+        argv_path = tmp_path / "argv.json"
+        write_project_config(tmp_path, {
+            "result_path": str(result_path),
+            "min_turns": 17,
+        })
+        gate_script = tmp_path / "tests" / "e2e_gate.py"
+        gate_script.parent.mkdir(parents=True)
+        gate_script.write_text(
+            "import json, sys\n"
+            f"open({str(argv_path)!r}, 'w').write(json.dumps(sys.argv))\n"
+            "sys.exit(0)\n"
+        )
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True})
+
+        ok, msg = validate_e2e_gate({}, {})
+
+        assert ok is True, msg
+        argv = json.loads(argv_path.read_text())
+        assert argv[argv.index("--result") + 1] == str(result_path)
+        assert argv[argv.index("--min-turns") + 1] == "17"
+
+    def test_hook_gate_matches_configured_runner_and_result_path(self, tmp_path, monkeypatch):
+        hooks_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks')
+        sys.path.insert(0, hooks_dir)
+        import importlib, ship_verify_gate
+        importlib.reload(ship_verify_gate)
+
+        result_path = tmp_path / "custom-result.json"
+        result_path.write_text(json.dumps({"status": "pass", "scenarios": []}))
+        write_project_config(tmp_path, {
+            "runner_command": "./scripts/run-local-e2e",
+            "result_path": str(result_path),
+        })
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+
+        assert ship_verify_gate.is_e2e_cmd("./scripts/run-local-e2e") is True
+        assert ship_verify_gate.is_strict_e2e_runner("./scripts/run-local-e2e") is True
+        ok, reason = ship_verify_gate.e2e_succeeded({"tool_response": {"stdout": ""}})
+        assert ok is True, reason
 
 
 class TestDetectionE2EGateHardened:

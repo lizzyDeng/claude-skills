@@ -129,6 +129,18 @@ def fastship_cli_path() -> str:
     return os.path.join(script_repo_root(), ".claude", "tools", "fastship")
 
 
+PROJECT_CONFIG_REL_PATH = os.path.join(".claude", "fastship.project.json")
+
+
+def project_config_path() -> str:
+    return os.path.join(repo_root(), PROJECT_CONFIG_REL_PATH)
+
+
+def load_project_config() -> dict:
+    data = load_json(project_config_path())
+    return data if isinstance(data, dict) else {}
+
+
 def current_branch() -> Optional[str]:
     return _run_git(["branch", "--show-current"], repo_root())
 

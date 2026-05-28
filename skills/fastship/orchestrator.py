@@ -20,7 +20,7 @@ import hashlib
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, Any, Union
 
 import fastship_state
 
@@ -163,7 +163,7 @@ class Step:
     id: str
     name: str
     phase: int
-    instruction: str
+    instruction: Union[str, Callable[[dict], str]]
     validator: Callable[[dict, dict], tuple]
     done_flags: list = field(default_factory=list)
     conditional: Optional[str] = None
@@ -174,6 +174,7 @@ class Step:
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
 E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
 
@@ -230,6 +231,110 @@ def _absolute_path(path: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(_repo_root(), path)
     return os.path.realpath(path)
+
+
+def _project_e2e_config() -> dict:
+    cfg = fastship_state.load_project_config()
+    e2e = cfg.get("e2e") if isinstance(cfg, dict) else None
+    return e2e if isinstance(e2e, dict) else {}
+
+
+def _config_str(value: Any, default: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _config_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _config_list(value: Any) -> list:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = [value]
+    else:
+        return []
+    cleaned = []
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _e2e_result_path() -> str:
+    path = _config_str(_project_e2e_config().get("result_path"), E2E_RESULT_PATH)
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    return os.path.abspath(path)
+
+
+def _e2e_min_turns() -> int:
+    return _config_int(_project_e2e_config().get("min_turns"), E2E_MIN_TURNS)
+
+
+def _e2e_setup_commands() -> list:
+    return _config_list(_project_e2e_config().get("setup_commands"))
+
+
+def _e2e_notes() -> list:
+    return _config_list(_project_e2e_config().get("notes"))
+
+
+def _e2e_runner_command() -> str:
+    default = f"python3 tests/e2e_runner.py -o {_e2e_result_path()}"
+    return _config_str(_project_e2e_config().get("runner_command"), default)
+
+
+def _e2e_gate_command() -> str:
+    default = f"python3 tests/e2e_gate.py --result {_e2e_result_path()} --min-turns {_e2e_min_turns()}"
+    return _config_str(_project_e2e_config().get("gate_command"), default)
+
+
+def _command_block(commands: list) -> str:
+    return "\n".join(f"  {cmd}" for cmd in commands)
+
+
+def _e2e_runner_instruction(_orch: dict = None) -> str:
+    lines = ["运行项目 E2E Runner 采集数据："]
+    setup = _e2e_setup_commands()
+    if setup:
+        lines.extend(["", "准备服务（按顺序执行，保持服务可用）：", _command_block(setup)])
+    lines.extend(["", "采集数据：", f"  {_e2e_runner_command()}"])
+    notes = _e2e_notes()
+    if notes:
+        lines.extend(["", "项目说明："])
+        lines.extend(f"- {note}" for note in notes)
+    lines.append(f"🔴 最少 {_e2e_min_turns()} 轮。Runner 只采集不判断。orchestrator 自动检测。")
+    lines.append(f"🔴 原始结果必须写入 {_e2e_result_path()}，hook/gate 会记录 hash。")
+    return "\n".join(lines)
+
+
+def _e2e_report_instruction(_orch: dict = None) -> str:
+    result_path = _e2e_result_path()
+    return f"""读 {result_path}，写 E2E 质量检测报告到文件。
+报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
+🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
+🔴 Validator 自动验证 {result_path} 完整性（hash 比对 gate.json 记录）。
+🔴 禁止手动创建或修改 {result_path}。
+用 Write 工具保存报告。orchestrator 自动检测文件写入。"""
+
+
+def _e2e_gate_instruction(_orch: dict = None) -> str:
+    return f"""运行 Gate 脚本：
+  {_e2e_gate_command()}
+Gate 展示原始数据给用户对照。FAIL → 禁止合入。
+🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
+🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
+🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""
 
 
 def _file_fingerprint(path: str) -> tuple[str, int]:
@@ -548,25 +653,27 @@ def validate_e2e_run(orch: dict, hook: dict) -> tuple:
 def validate_e2e_report(orch: dict, hook: dict) -> tuple:
     gate = _read_gate_state_file()
     stored_hash = gate.get("e2e_result_hash") if gate else None
+    result_path = _e2e_result_path()
+    min_turns = _e2e_min_turns()
 
     if stored_hash:
         # Hook mode: verify e2e_result.json integrity
-        if not os.path.exists(E2E_RESULT_PATH):
-            return False, f"{E2E_RESULT_PATH} not found"
-        with open(E2E_RESULT_PATH, "rb") as f:
+        if not os.path.exists(result_path):
+            return False, f"{result_path} not found"
+        with open(result_path, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash != stored_hash:
             return False, "e2e_result.json hash mismatch — 文件在 runner 执行后被修改"
         try:
-            with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+            with open(result_path, encoding="utf-8") as f:
                 data = json.load(f)
             turns = sum(
                 len(r.get("turns", []))
                 for s in data.get("scenarios", [])
                 for r in s.get("rounds", [])
             )
-            if turns < 10:
-                return False, f"e2e_result.json turns 不足 ({turns} < 10)"
+            if turns < min_turns:
+                return False, f"e2e_result.json turns 不足 ({turns} < {min_turns})"
         except Exception as e:
             return False, f"e2e_result.json 解析失败: {e}"
         path = orch.get("report_path")
@@ -600,14 +707,15 @@ def validate_e2e_report(orch: dict, hook: dict) -> tuple:
 
 def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
     gate = _read_gate_state_file()
+    result_path = _e2e_result_path()
     if not gate:
         return False, "gate.json 不存在，禁止 Codex fallback 通过 E2E Gate"
     if not gate.get("e2e_executed"):
         return False, "e2e_executed not set in gate.json"
     stored_hash = gate.get("e2e_result_hash")
-    if stored_hash and os.path.exists(E2E_RESULT_PATH):
+    if stored_hash and os.path.exists(result_path):
         import hashlib
-        with open(E2E_RESULT_PATH, "rb") as f:
+        with open(result_path, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash != stored_hash:
             return False, "e2e_result.json hash mismatch — 文件在 3.3→3.4 间被修改"
@@ -622,7 +730,7 @@ def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
         return False, "e2e_gate.py not found in project"
     try:
         result = subprocess.run(
-            [sys.executable, gate_script, "--result", E2E_RESULT_PATH, "--min-turns", "10"],
+            [sys.executable, gate_script, "--result", result_path, "--min-turns", str(_e2e_min_turns())],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -657,9 +765,10 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
             if not gate.get("e2e_gate_passed"):
                 return False, "outcome=pass 但 gate.json e2e_gate_passed=false — E2E Gate 未通过不能自判 pass"
             stored_hash = gate.get("e2e_result_hash")
-            if stored_hash and os.path.exists(E2E_RESULT_PATH):
+            result_path = _e2e_result_path()
+            if stored_hash and os.path.exists(result_path):
                 import hashlib
-                with open(E2E_RESULT_PATH, "rb") as f:
+                with open(result_path, "rb") as f:
                     actual_hash = hashlib.sha256(f.read()).hexdigest()
                 if actual_hash != stored_hash:
                     return False, "e2e_result.json hash mismatch — 文件在验证链中被篡改"
@@ -861,25 +970,13 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
 失败 → 修复后重跑。orchestrator 自动检测 test pass。"""),
 
     Step("3.2", "E2E Runner", 3, validator=validate_e2e_run,
-         instruction="""运行 E2E Runner 采集数据：
-  python3 tests/e2e_runner.py -o /tmp/e2e_result.json
-🔴 最少 10 轮。Runner 只采集不判断。orchestrator 自动检测。"""),
+         instruction=_e2e_runner_instruction),
 
-	    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
-	         instruction="""读 /tmp/e2e_result.json，写 E2E 质量检测报告到文件。
-	报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
-🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
-🔴 Validator 自动验证 e2e_result.json 完整性（hash 比对 gate.json 记录）。
-🔴 禁止手动创建或修改 /tmp/e2e_result.json。
-用 Write 工具保存报告。orchestrator 自动检测文件写入。"""),
+    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
+         instruction=_e2e_report_instruction),
 
     Step("3.4", "E2E Gate", 3, validator=validate_e2e_gate,
-         instruction="""运行 Gate 脚本：
-  python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
-Gate 展示原始数据给用户对照。FAIL → 禁止合入。
-🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
-🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
-🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""),
+         instruction=_e2e_gate_instruction),
 
     Step("3.5", "Loop Record", 3, validator=validate_loop_record,
          instruction="""记录本轮结果：
@@ -1524,11 +1621,13 @@ def format_next(orch: dict) -> str:
     if _branch_mismatch(orch):
         prefix = "\n".join(fastship_state.branch_mismatch_lines(orch)) + "\n\n"
 
+    instruction = step.instruction(orch) if callable(step.instruction) else step.instruction
+
     return (
         prefix +
         f"📋 Step {step.id}: {step.name}  [{phase_names.get(step.phase, '?')}]\n"
         f"{'─' * 50}\n"
-        f"{step.instruction}\n"
+        f"{instruction}\n"
         f"{'─' * 50}"
     )
 
