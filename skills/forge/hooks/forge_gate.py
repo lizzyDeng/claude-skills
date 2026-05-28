@@ -19,6 +19,8 @@ Hook handlers (called by Claude Code hooks):
 
 State file: {repo_root}/.claude/.forge-state.json (derived cache)
 Source of truth: {repo_root}/project-roadmap/roadmap.json
+Fastship trust inputs: current worktree {git-dir}/fastship/gate.json + orchestrator.json.
+Legacy fastship state fallback is intentionally disabled.
 """
 
 import sys
@@ -26,7 +28,35 @@ import os
 import json
 import re
 import subprocess
+import hashlib
 from datetime import datetime, timedelta
+import time as _time
+
+
+# ========== Context Compact Gate ==========
+
+COMPACT_RECENCY_SECS = int(os.environ.get("FORGE_COMPACT_RECENCY", "120"))
+
+
+def _last_compaction_epoch() -> float:
+    root = get_repo_root() or "."
+    log = os.path.join(root, ".claude", "checkpoints", "compaction.log")
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 256))
+            last_line = f.read().decode().strip().rsplit("\n", 1)[-1]
+            ts = last_line.split(" ", 1)[0]
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _compact_is_recent() -> bool:
+    age = _time.time() - _last_compaction_epoch()
+    return 0 <= age < COMPACT_RECENCY_SECS
 
 
 # ========== Helpers ==========
@@ -100,18 +130,15 @@ def fastship_state_path():
         return None
 
     gd = get_git_dir(root)
-    current = os.path.join(gd, "fastship", "gate.json") if gd else None
-    common = get_git_common_dir(root)
-    shared_legacy = os.path.join(common, "fastship", "gate.json") if common else None
-    old_legacy = os.path.join(root, ".claude", ".ship-verify-state.json")
+    return os.path.join(gd, "fastship", "gate.json") if gd else None
 
-    if current and os.path.exists(current):
-        return current
-    if shared_legacy and os.path.exists(shared_legacy):
-        return shared_legacy
-    if os.path.exists(old_legacy):
-        return old_legacy
-    return current or old_legacy
+
+def fastship_orchestrator_state_path():
+    root = get_repo_root()
+    if not root:
+        return None
+    gd = get_git_dir(root)
+    return os.path.join(gd, "fastship", "orchestrator.json") if gd else None
 
 
 def read_stdin():
@@ -153,12 +180,66 @@ def find_feature(roadmap, slug):
     return None
 
 
+def _load_json(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            size += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _resolve_feature_path(repo_root, slug, path):
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return os.path.realpath(path)
+    return os.path.realpath(os.path.join(repo_root, "project-roadmap", "features", slug, path))
+
+
 # ========== Validation (Gates) ==========
 
 METRIC_REQUIRED_FIELDS = ["metric_name", "event_name", "baseline", "target", "harvest_days", "data_source"]
-HARVEST_REQUIRED_FIELDS = ["harvested_at", "actual", "baseline", "target", "verdict", "notes", "next_action"]
+HARVEST_REQUIRED_FIELDS = [
+    "harvested_at",
+    "actual",
+    "baseline",
+    "target",
+    "verdict",
+    "notes",
+    "next_action",
+    "evidence",
+]
+HARVEST_EVIDENCE_REQUIRED_FIELDS = ["source", "collected_at", "raw_path", "raw_sha256"]
 VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
+CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
+    "p0_contract_reviewed",
+    "ac_e2e_coverage_reviewed",
+    "weak_case_reviewed",
+    "evidence_plan_reviewed",
+)
+CODEX_REVIEW_REQUIRED_EMPTY_FIELDS = (
+    "p0_requirements_missing",
+    "uncovered_ac",
+    "unmapped_e2e_scenarios",
+    "weak_scenarios",
+    "non_business_assertions",
+    "missing_evidence",
+)
 
 
 def validate_metric(metric):
@@ -192,7 +273,139 @@ def validate_harvest(harvest):
     if "actual" in harvest and harvest["actual"] is not None:
         if not isinstance(harvest["actual"], (int, float)):
             errors.append("actual must be numeric")
+    evidence = harvest.get("evidence")
+    if not isinstance(evidence, dict):
+        errors.append("evidence must be an object")
+    else:
+        for field in HARVEST_EVIDENCE_REQUIRED_FIELDS:
+            if field not in evidence or evidence[field] in (None, ""):
+                errors.append(f"Missing required evidence field: {field}")
+        raw_sha = evidence.get("raw_sha256")
+        if raw_sha and not re.fullmatch(r"[a-fA-F0-9]{64}", str(raw_sha)):
+            errors.append("evidence.raw_sha256 must be a SHA-256 hex digest")
     return (len(errors) == 0, errors)
+
+
+def _trusted_artifact(orch_state, step_id):
+    return (
+        orch_state.get("artifacts", {})
+        .get("trusted_artifacts", {})
+        .get(step_id)
+    )
+
+
+def verify_trusted_artifact(orch_state, step_id):
+    rec = _trusted_artifact(orch_state, step_id)
+    if not rec:
+        return (False, f"missing trusted artifact for step {step_id}", None)
+    path = rec.get("path")
+    if not path or not os.path.exists(path):
+        return (False, f"trusted artifact path missing for step {step_id}", rec)
+    if rec.get("step_id") != step_id:
+        return (False, f"trusted artifact step mismatch for {step_id}", rec)
+    try:
+        digest, size = _sha256_file(path)
+    except OSError as e:
+        return (False, f"cannot hash trusted artifact for step {step_id}: {e}", rec)
+    if digest != rec.get("sha256") or size != rec.get("size"):
+        return (False, f"trusted artifact hash/size mismatch for step {step_id}", rec)
+    return (True, "", rec)
+
+
+def verify_codex_review_artifact(orch_state):
+    ok, reason, codex_rec = verify_trusted_artifact(orch_state, "1.5c")
+    if not ok:
+        return (False, reason)
+    ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
+    if not ok:
+        return (False, reason)
+    try:
+        with open(codex_rec["path"], encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return (False, f"cannot read codex review artifact: {e}")
+    matches = CODEX_GATE_JSON_RE.findall(content)
+    if not matches:
+        return (False, "Codex review missing structured JSON gate")
+    try:
+        gate = json.loads(matches[-1])
+    except json.JSONDecodeError as e:
+        return (False, f"Codex review JSON gate invalid: {e}")
+    if str(gate.get("gate", "")).upper() != "PASS":
+        return (False, "Codex review JSON gate is not PASS")
+    if gate.get("reviewed_plan_sha256") != plan_rec.get("sha256"):
+        return (False, "Codex review not bound to current plan hash")
+    missing_true = [field for field in CODEX_REVIEW_REQUIRED_TRUE_FIELDS if gate.get(field) is not True]
+    if missing_true:
+        return (False, "Codex review missing hard review fields: " + ", ".join(missing_true))
+    missing_lists = [
+        field for field in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS
+        if field not in gate or not isinstance(gate.get(field), list)
+    ]
+    if missing_lists:
+        return (False, "Codex review missing issue arrays: " + ", ".join(missing_lists))
+    unresolved = [field for field in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS if gate.get(field)]
+    if unresolved:
+        return (False, "Codex review has unresolved issues: " + ", ".join(unresolved))
+    return (True, "")
+
+
+def fastship_phase1_complete(slug, fastship_state, orch_state):
+    if not fastship_state.get("plan_ready"):
+        return (False, "Gate 2: fastship plan not yet ready (plan_ready=false)")
+    if not orch_state:
+        return (False, "Gate 2: fastship orchestrator state missing")
+    completed = set(orch_state.get("completed_steps", []))
+    required = {"1.4", "1.5", "1.5c", "1.6"}
+    missing = sorted(required - completed)
+    if missing:
+        return (False, "Gate 2: fastship Phase 1 incomplete. Missing: " + ", ".join(missing))
+    if not orch_state.get("artifacts", {}).get("user_confirmed"):
+        return (False, "Gate 2: user confirmation missing")
+    for step_id in ("1.4", "1.5"):
+        ok, reason, _ = verify_trusted_artifact(orch_state, step_id)
+        if not ok:
+            return (False, "Gate 2: " + reason)
+    ok, reason = verify_codex_review_artifact(orch_state)
+    if not ok:
+        return (False, "Gate 2: " + reason)
+    return (True, "")
+
+
+def fastship_phase3_complete(slug, fastship_state, orch_state):
+    missing = []
+    for field in ("test_passed", "e2e_executed", "e2e_gate_passed", "knowledge_acknowledged"):
+        if not fastship_state.get(field):
+            missing.append(field)
+    if not fastship_state.get("e2e_result_hash"):
+        missing.append("e2e_result_hash")
+    if fastship_state.get("last_loop_outcome") != "pass":
+        missing.append("last_loop_outcome=pass")
+    if not isinstance(fastship_state.get("loop_count"), int) or fastship_state.get("loop_count", 0) < 1:
+        missing.append("loop_count>=1")
+    if fastship_state.get("e2e_runs_since_last_record", 0) != 0:
+        missing.append("loop_record_after_latest_e2e")
+    if missing:
+        return (False, "Gate 4: fastship not complete. Missing: " + ", ".join(missing))
+    if not orch_state:
+        return (False, "Gate 4: fastship orchestrator state missing")
+    if orch_state.get("current_step") != "done":
+        return (False, f"Gate 4: fastship orchestrator not done (step={orch_state.get('current_step')})")
+    ok, reason, report_rec = verify_trusted_artifact(orch_state, "3.3")
+    if not ok:
+        return (False, "Gate 4: " + reason)
+    try:
+        with open(report_rec["path"], encoding="utf-8") as f:
+            report_content = f.read()
+    except Exception as e:
+        return (False, f"Gate 4: cannot read E2E report: {e}")
+    if fastship_state["e2e_result_hash"] not in report_content:
+        return (False, "Gate 4: E2E report is not bound to e2e_result_hash")
+    if not fastship_state.get("knowledge_skip_reason"):
+        ok, reason, _ = verify_trusted_artifact(orch_state, "3.6")
+        if not ok:
+            return (False, "Gate 4: " + reason)
+    return (True, "")
 
 
 # ========== State Machine ==========
@@ -227,10 +440,11 @@ def check_g1_metric(slug, repo_root):
 
 
 def check_g6_harvest(slug, repo_root):
-    """Gate 6: harvest.json must exist and be valid before concluding."""
+    """Gate 6: harvest.json must exist, be valid, and bind to raw evidence."""
     if not repo_root:
         return (False, "Gate 6: cannot determine repo root")
-    harvest_path = os.path.join(repo_root, "project-roadmap", "features", slug, "harvest.json")
+    feature_dir = os.path.join(repo_root, "project-roadmap", "features", slug)
+    harvest_path = os.path.join(feature_dir, "harvest.json")
     if not os.path.exists(harvest_path):
         return (False, f"Gate 6: harvest.json not found at {harvest_path}")
     try:
@@ -239,12 +453,24 @@ def check_g6_harvest(slug, repo_root):
         ok, errors = validate_harvest(harvest)
         if not ok:
             return (False, f"Gate 6: harvest.json invalid — {'; '.join(errors)}")
+        evidence = harvest["evidence"]
+        raw_path = _resolve_feature_path(repo_root, slug, evidence.get("raw_path"))
+        if not raw_path or not os.path.exists(raw_path):
+            return (False, f"Gate 6: evidence raw_path not found — {evidence.get('raw_path')}")
+        feature_root = os.path.realpath(feature_dir)
+        if not raw_path.startswith(feature_root + os.sep):
+            return (False, "Gate 6: evidence raw_path must live under this feature directory")
+        digest, size = _sha256_file(raw_path)
+        if size <= 0:
+            return (False, "Gate 6: evidence raw_path is empty")
+        if digest != evidence.get("raw_sha256"):
+            return (False, "Gate 6: evidence raw_sha256 mismatch")
     except Exception as e:
         return (False, f"Gate 6: cannot read harvest.json — {e}")
     return (True, "")
 
 
-def can_transition(slug, current_status, target_status, repo_root, fastship_state=None):
+def can_transition(slug, current_status, target_status, repo_root, fastship_state=None, fastship_orch_state=None):
     """Check if a state transition is allowed. Returns (ok, reason)."""
     if (current_status, target_status) not in TRANSITIONS:
         return (False, f"Not allowed: {current_status} → {target_status}. "
@@ -252,7 +478,9 @@ def can_transition(slug, current_status, target_status, repo_root, fastship_stat
                        f"{[t for (s, t) in TRANSITIONS if s == current_status]}")
 
     if fastship_state is None:
-        fastship_state = {}
+        fastship_state = load_fastship_state()
+    if fastship_orch_state is None:
+        fastship_orch_state = load_fastship_orchestrator_state()
 
     # Verify fastship state belongs to this feature
     fs_feature = fastship_state.get("forge_feature")
@@ -270,20 +498,15 @@ def can_transition(slug, current_status, target_status, repo_root, fastship_stat
 
     # Gate 2: draft → planned (fastship Phase 1 complete)
     if current_status == "draft" and target_status == "planned":
-        if not fastship_state.get("plan_ready"):
-            return (False, "Gate 2: fastship plan not yet ready (plan_ready=false)")
+        ok, reason = fastship_phase1_complete(slug, fastship_state, fastship_orch_state)
+        if not ok:
+            return (False, reason)
 
     # Gate 4: in_progress → shipped (fastship Phase 3 complete)
     if current_status == "in_progress" and target_status == "shipped":
-        missing = []
-        if not fastship_state.get("test_passed"):
-            missing.append("test_passed")
-        if not fastship_state.get("e2e_executed"):
-            missing.append("e2e_executed")
-        if not fastship_state.get("knowledge_acknowledged"):
-            missing.append("knowledge_acknowledged")
-        if missing:
-            return (False, f"Gate 4: fastship not complete. Missing: {', '.join(missing)}")
+        ok, reason = fastship_phase3_complete(slug, fastship_state, fastship_orch_state)
+        if not ok:
+            return (False, reason)
 
     # Gate 6: measuring → concluded (harvest.json must exist and be valid)
     if current_status == "measuring" and target_status == "concluded":
@@ -317,13 +540,12 @@ def get_overdue_harvests(features, today_str=None):
 
 def load_fastship_state():
     p = fastship_state_path()
-    if not p or not os.path.exists(p):
-        return {}
-    try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return _load_json(p)
+
+
+def load_fastship_orchestrator_state():
+    p = fastship_orchestrator_state_path()
+    return _load_json(p)
 
 
 def derive_state(roadmap, active_feature=None):
@@ -371,9 +593,10 @@ def derive_state(roadmap, active_feature=None):
             except Exception:
                 pass
 
-    # Check G2: fastship plan_ready
+    # Check G2: trusted fastship Phase 1 completion
     fs_state = load_fastship_state()
-    state["g2_plan_ready"] = bool(fs_state.get("plan_ready"))
+    orch_state = load_fastship_orchestrator_state()
+    state["g2_plan_ready"] = fastship_phase1_complete(active_feature, fs_state, orch_state)[0]
 
     # Check G3-G6 from roadmap status
     state["g3_dev_started"] = status in ("in_progress", "shipped", "measuring", "concluded")
@@ -387,7 +610,7 @@ def derive_state(roadmap, active_feature=None):
             try:
                 with open(harvest_path) as f:
                     harvest = json.load(f)
-                ok, _ = validate_harvest(harvest)
+                ok, _ = check_g6_harvest(active_feature, root)
                 state["g6_harvested"] = ok
             except Exception:
                 pass
@@ -566,7 +789,7 @@ def reset_fastship_state_for_feature(slug):
         return
 
     for key in ("plan_ready", "test_passed", "e2e_executed",
-                "knowledge_acknowledged", "plan_bypass",
+                "e2e_gate_passed", "knowledge_acknowledged", "plan_bypass",
                 "knowledge_recall_done", "request_classified",
                 "bug_diagnosis_done", "loop_count",
                 "e2e_runs_since_last_record"):
@@ -577,7 +800,9 @@ def reset_fastship_state_for_feature(slug):
                 st[key] = 0
 
     for key in ("plan_file", "plan_ts", "test_ts", "test_tool",
-                "e2e_ts", "knowledge_file", "knowledge_ts",
+                "e2e_ts", "e2e_result_hash", "e2e_result_turns",
+                "e2e_runner_cmd", "e2e_gate_ts",
+                "knowledge_file", "knowledge_ts",
                 "knowledge_skip_reason", "knowledge_recall_query",
                 "knowledge_recall_count", "knowledge_recall_ts",
                 "request_type", "request_classified_ts",
@@ -605,6 +830,10 @@ def reset_fastship_state_for_feature(slug):
 
 def cmd_activate(slug):
     """Set active feature."""
+    if not _compact_is_recent():
+        print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
+        print("   运行 /compact 后重试。")
+        sys.exit(1)
     roadmap = load_roadmap()
     if not roadmap:
         print("❌ No roadmap found.")
@@ -640,8 +869,9 @@ def cmd_transition(slug, target_status):
 
     root = get_repo_root()
     fs_state = load_fastship_state()
+    orch_state = load_fastship_orchestrator_state()
 
-    ok, reason = can_transition(slug, current, target_status, root, fs_state)
+    ok, reason = can_transition(slug, current, target_status, root, fs_state, orch_state)
     if not ok:
         print(f"🚫 Transition blocked: {reason}")
         sys.exit(1)
@@ -665,7 +895,7 @@ def cmd_transition(slug, target_status):
         due = (datetime.now() + timedelta(days=harvest_days)).strftime("%Y-%m-%d")
         feature["harvest_due"] = due
         # Auto-transition to measuring (G5) — validate through can_transition
-        ok_g5, reason_g5 = can_transition(slug, "shipped", "measuring", root, fs_state)
+        ok_g5, reason_g5 = can_transition(slug, "shipped", "measuring", root, fs_state, orch_state)
         if not ok_g5:
             print(f"🚫 G5 auto-transition blocked: {reason_g5}")
             sys.exit(1)

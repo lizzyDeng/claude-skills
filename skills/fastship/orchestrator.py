@@ -16,13 +16,38 @@ import os
 import json
 import re
 import subprocess
-import glob as _glob
+import hashlib
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Callable
 
 import fastship_state
+
+
+# ━━━━━━━━━━━━ Context Compact Gate ━━━━━━━━━━━━
+
+COMPACT_RECENCY_SECS = int(os.environ.get("FASTSHIP_COMPACT_RECENCY", "120"))
+
+
+def _last_compaction_epoch() -> float:
+    log = os.path.join(_repo_root(), ".claude", "checkpoints", "compaction.log")
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 256))
+            last_line = f.read().decode().strip().rsplit("\n", 1)[-1]
+            ts = last_line.split(" ", 1)[0]
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _compact_is_recent() -> bool:
+    age = _time.time() - _last_compaction_epoch()
+    return 0 <= age < COMPACT_RECENCY_SECS
 
 
 # ━━━━━━━━━━━━ State Management ━━━━━━━━━━━━
@@ -144,12 +169,33 @@ class Step:
     conditional: Optional[str] = None
 
 
-# ━━━━━━━━━━━━ Validators (dual-path: hook state → fs fallback) ━━━━━━━━━━━━
+# ━━━━━━━━━━━━ Validators (state-bound; no filesystem fallback) ━━━━━━━━━━━━
 
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
 E2E_RESULT_PATH = "/tmp/e2e_result.json"
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
+CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
+
+STEP_ARTIFACT_OWNERS = {
+    BRIEF_FILENAME: "1.3",
+    GRILL_RESULT_FILENAME: "1.5",
+    CODEX_REVIEW_FILENAME: "1.5c",
+}
+
+
+def _artifact_owner_step(file_path: str) -> Optional[str]:
+    """Return the step ID that owns this artifact, or None if not a step artifact."""
+    p = _normalize(file_path)
+    for marker, step_id in STEP_ARTIFACT_OWNERS.items():
+        if marker in p:
+            return step_id
+    if PLAN_DIR_MARKER in p and p.endswith(".md"):
+        return "1.4"
+    if p.endswith("/knowledge.md") or os.path.basename(p).upper() == "KNOWLEDGE.MD":
+        return "3.6"
+    return None
+
 
 PLAN_SIGNATURE_MARKERS = [
     "For agentic workers",
@@ -158,6 +204,94 @@ PLAN_SIGNATURE_MARKERS = [
 ]
 
 GRILL_REQUIRED_SECTIONS = ["拷问", "修订", "结论"]
+CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
+CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
+CODEX_REVIEW_PLAN_HASH_FIELD = "reviewed_plan_sha256"
+CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
+    "p0_contract_reviewed",
+    "ac_e2e_coverage_reviewed",
+    "weak_case_reviewed",
+    "evidence_plan_reviewed",
+)
+CODEX_REVIEW_REQUIRED_EMPTY_FIELDS = (
+    "p0_requirements_missing",
+    "uncovered_ac",
+    "unmapped_e2e_scenarios",
+    "weak_scenarios",
+    "non_business_assertions",
+    "missing_evidence",
+)
+
+
+def _absolute_path(path: str) -> str:
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    return os.path.realpath(path)
+
+
+def _file_fingerprint(path: str) -> tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            size += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _trusted_artifacts(orch: dict) -> dict:
+    return orch.setdefault("artifacts", {}).setdefault(TRUSTED_ARTIFACTS_KEY, {})
+
+
+def record_step_artifact(orch: dict, step_id: str, path: str, source: str = "hook") -> tuple[bool, str]:
+    """Record current-step artifact provenance in orchestrator state."""
+    abs_path = _absolute_path(path)
+    if not abs_path or not os.path.exists(abs_path):
+        return False, f"artifact 不存在: {path}"
+    try:
+        digest, size = _file_fingerprint(abs_path)
+    except OSError as e:
+        return False, f"artifact fingerprint 失败: {e}"
+    _trusted_artifacts(orch)[step_id] = {
+        "step_id": step_id,
+        "path": abs_path,
+        "sha256": digest,
+        "size": size,
+        "source": source,
+        "recorded_at": datetime.now().isoformat(),
+    }
+    return True, digest
+
+
+def _clear_trusted_artifacts(orch: dict, step_ids: tuple[str, ...]):
+    trusted = orch.setdefault("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {})
+    for step_id in step_ids:
+        trusted.pop(step_id, None)
+
+
+def _verify_step_artifact(orch: dict, step_id: str, path: str) -> tuple[bool, str, dict]:
+    trusted = orch.get("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {})
+    rec = trusted.get(step_id)
+    if not rec:
+        return False, f"Step {step_id} artifact 缺少可信 provenance/hash 记录", {}
+    abs_path = _absolute_path(path)
+    rec_path = _absolute_path(rec.get("path", ""))
+    if not abs_path or abs_path != rec_path:
+        return False, f"Step {step_id} artifact 路径与 provenance 不一致", rec
+    if rec.get("step_id") != step_id:
+        return False, f"Step {step_id} artifact provenance step 不一致", rec
+    if not os.path.exists(abs_path):
+        return False, f"Step {step_id} artifact 文件不存在: {path}", rec
+    try:
+        digest, size = _file_fingerprint(abs_path)
+    except OSError as e:
+        return False, f"Step {step_id} artifact fingerprint 失败: {e}", rec
+    if digest != rec.get("sha256") or size != rec.get("size"):
+        return False, f"Step {step_id} artifact hash/size mismatch — 文件记录后被修改", rec
+    return True, "trusted artifact verified", rec
 
 
 def _read_gate_state_file() -> dict:
@@ -198,12 +332,11 @@ def validate_explore(orch: dict, hook: dict) -> tuple:
 
 def validate_brief(orch: dict, hook: dict) -> tuple:
     path = orch.get("brief_path")
-    if not path or not os.path.exists(path):
-        default = os.path.join(_repo_root(), ".claude", BRIEF_FILENAME)
-        if os.path.exists(default):
-            path = default
-    if not path or not os.path.exists(path):
-        return False, "Brief 文件不存在"
+    if not path:
+        return False, "brief_path 未由当前 step 写入记录，禁止 filesystem fallback"
+    ok, msg, _rec = _verify_step_artifact(orch, "1.3", path)
+    if not ok:
+        return False, msg
     try:
         content = open(path, encoding="utf-8").read()
     except Exception:
@@ -229,19 +362,19 @@ def validate_diagnosis(orch: dict, hook: dict) -> tuple:
 
 
 def validate_plan(orch: dict, hook: dict) -> tuple:
-    plan_path = None
-    if hook.get("plan_ready") and hook.get("plan_file"):
-        candidate = hook["plan_file"]
-        if not os.path.isabs(candidate):
-            candidate = os.path.join(_repo_root(), candidate)
-        if os.path.exists(candidate):
-            plan_path = candidate
+    plan_path = orch.get("plan_path")
     if not plan_path:
-        plans = _glob.glob(os.path.join(_repo_root(), "docs", "superpowers", "plans", "*.md"))
-        if plans:
-            plan_path = max(plans, key=os.path.getmtime)
-    if not plan_path:
-        return False, "plan 文件未检测到 (docs/superpowers/plans/*.md)"
+        return False, "plan_path 未由当前 step 写入记录，禁止 filesystem fallback"
+    if not os.path.isabs(plan_path):
+        plan_path = os.path.join(_repo_root(), plan_path)
+    normalized = _normalize(plan_path)
+    if PLAN_DIR_MARKER not in normalized or not normalized.endswith(".md"):
+        return False, f"plan_path 非合法 plan 产物: {plan_path}"
+    if not os.path.exists(plan_path):
+        return False, f"plan 文件不存在: {plan_path}"
+    ok, msg, _rec = _verify_step_artifact(orch, "1.4", plan_path)
+    if not ok:
+        return False, msg
     try:
         content = open(plan_path, encoding="utf-8").read()
     except Exception:
@@ -258,7 +391,13 @@ def validate_plan(orch: dict, hook: dict) -> tuple:
 def validate_grill(orch: dict, hook: dict) -> tuple:
     path = orch.get("artifacts", {}).get("grill_result_path")
     if not path:
-        path = os.path.join(_repo_root(), ".claude", GRILL_RESULT_FILENAME)
+        return False, "grill_result_path 未由当前 step 写入记录，禁止 filesystem fallback"
+    ok, msg, _plan_rec = _verify_step_artifact(orch, "1.4", orch.get("plan_path"))
+    if not ok:
+        return False, "Grill 无可信 plan 输入: " + msg
+    ok, msg, _rec = _verify_step_artifact(orch, "1.5", path)
+    if not ok:
+        return False, msg
     if not os.path.exists(path):
         return False, (
             f"Grill 结果文件不存在: {GRILL_RESULT_FILENAME}。"
@@ -276,6 +415,78 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
     return True, "grill validated"
 
 
+def validate_codex_review(orch: dict, hook: dict) -> tuple:
+    path = orch.get("artifacts", {}).get("codex_review_path")
+    if not path:
+        return False, "codex_review_path 未由当前 step 写入记录，禁止 filesystem fallback"
+    plan_ok, plan_msg, plan_rec = _verify_step_artifact(orch, "1.4", orch.get("plan_path"))
+    if not plan_ok:
+        return False, "Codex review 无可信 plan 输入: " + plan_msg
+    ok, msg, _rec = _verify_step_artifact(orch, "1.5c", path)
+    if not ok:
+        return False, msg
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    if CODEX_REVIEW_FILENAME not in _normalize(path):
+        return False, f"Codex review 路径非法: {path}"
+    if not os.path.exists(path):
+        return False, (
+            f"Codex review 结果不存在: {CODEX_REVIEW_FILENAME}。"
+            f"调用 Skill(skill='codex') review plan，完成后写结果到 .claude/{CODEX_REVIEW_FILENAME}"
+        )
+    try:
+        content = open(path, encoding="utf-8").read()
+    except Exception:
+        return False, f"无法读取: {path}"
+    if len(content) < 100:
+        return False, f"Codex review 太短 ({len(content)}B < 100B)"
+    m = CODEX_GATE_RE.search(content)
+    if not m:
+        return False, "Codex review 缺少显式 GATE 判定行（格式: ### GATE: PASS 或 ### GATE: FAIL）"
+    verdict = m.group(1).upper()
+    if verdict == "FAIL":
+        return False, "codex review FAIL — 需更新 plan 后重新 review（orchestrator 自动回退到 1.4）"
+
+    matches = CODEX_GATE_JSON_RE.findall(content)
+    if not matches:
+        return False, "Codex review 缺少机器可验证 JSON gate，禁止纯文本 PASS"
+    try:
+        gate = json.loads(matches[-1])
+    except json.JSONDecodeError as e:
+        return False, f"Codex review JSON gate 解析失败: {e}"
+    if not isinstance(gate, dict):
+        return False, "Codex review JSON gate 必须是 object"
+
+    json_verdict = str(gate.get("gate", "")).upper()
+    if json_verdict not in {"PASS", "FAIL"}:
+        return False, "Codex review JSON gate 缺少 gate=PASS/FAIL"
+    if json_verdict != verdict:
+        return False, f"Codex review 文本 GATE={verdict} 与 JSON gate={json_verdict} 不一致"
+    if json_verdict == "FAIL":
+        return False, "codex review JSON gate FAIL — 需更新 plan 后重新 review"
+
+    reviewed_hash = gate.get(CODEX_REVIEW_PLAN_HASH_FIELD)
+    if reviewed_hash != plan_rec.get("sha256"):
+        return False, "Codex review 未绑定当前 plan hash，禁止复用/伪造旧 review"
+
+    missing_true = [field for field in CODEX_REVIEW_REQUIRED_TRUE_FIELDS if gate.get(field) is not True]
+    if missing_true:
+        return False, "Codex review 未确认硬审查项: " + ", ".join(missing_true)
+
+    missing_lists = [
+        field for field in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS
+        if field not in gate or not isinstance(gate.get(field), list)
+    ]
+    if missing_lists:
+        return False, "Codex review JSON gate 缺少数组字段: " + ", ".join(missing_lists)
+
+    unresolved = [field for field in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS if gate.get(field)]
+    if unresolved:
+        return False, "Codex review 存在未解决覆盖/证据问题: " + ", ".join(unresolved)
+
+    return True, "codex review PASS (structured gate verified)"
+
+
 def validate_user_confirm(orch: dict, hook: dict) -> tuple:
     if orch.get("artifacts", {}).get("user_confirmed"):
         return True, "confirmed"
@@ -287,7 +498,31 @@ def validate_execute(orch: dict, hook: dict) -> tuple:
 
 
 def validate_smoke(orch: dict, hook: dict) -> tuple:
-    return True, "sequencing"
+    root = _repo_root()
+    started_at = orch.get("started_at")
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "diff", "--stat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.stdout.strip():
+            return True, "uncommitted code changes detected"
+        result2 = subprocess.run(
+            ["git", "-C", root, "diff", "--cached", "--stat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result2.stdout.strip():
+            return True, "staged code changes detected"
+        if started_at:
+            result3 = subprocess.run(
+                ["git", "-C", root, "log", f"--since={started_at}", "--oneline"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result3.stdout.strip():
+                return True, "commits since session start detected"
+    except Exception:
+        pass
+    return False, "No code changes detected — 执行阶段未产生代码变更"
 
 
 def validate_tests(orch: dict, hook: dict) -> tuple:
@@ -302,32 +537,102 @@ def validate_tests(orch: dict, hook: dict) -> tuple:
 def validate_e2e_run(orch: dict, hook: dict) -> tuple:
     if hook.get("e2e_executed"):
         return True, "e2e executed"
-    result_path = E2E_RESULT_PATH
-    if os.path.exists(result_path):
-        age = _time.time() - os.path.getmtime(result_path)
-        if age < 3600:
-            return True, f"e2e result found ({int(age)}s ago)"
     gate = _read_gate_state_file()
     if gate.get("e2e_executed"):
         return True, "e2e executed (via state file)"
+    if not gate:
+        return False, "gate.json 不存在，禁止 Codex/filesystem fallback 通过 E2E Runner"
     return False, "E2E Runner 未执行"
 
 
 def validate_e2e_report(orch: dict, hook: dict) -> tuple:
-    path = orch.get("report_path")
-    if not path or not os.path.exists(path):
-        return False, "报告文件不存在"
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    if size < 200:
-        return False, f"报告太短 ({size}B < 200B)"
-    return True, f"report: {path}"
+    gate = _read_gate_state_file()
+    stored_hash = gate.get("e2e_result_hash") if gate else None
+
+    if stored_hash:
+        # Hook mode: verify e2e_result.json integrity
+        if not os.path.exists(E2E_RESULT_PATH):
+            return False, f"{E2E_RESULT_PATH} not found"
+        with open(E2E_RESULT_PATH, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+        if actual_hash != stored_hash:
+            return False, "e2e_result.json hash mismatch — 文件在 runner 执行后被修改"
+        try:
+            with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            turns = sum(
+                len(r.get("turns", []))
+                for s in data.get("scenarios", [])
+                for r in s.get("rounds", [])
+            )
+            if turns < 10:
+                return False, f"e2e_result.json turns 不足 ({turns} < 10)"
+        except Exception as e:
+            return False, f"e2e_result.json 解析失败: {e}"
+        path = orch.get("report_path")
+        if not path:
+            return False, "report_path 未由当前 step 写入记录，禁止 filesystem fallback"
+        ok, msg, _rec = _verify_step_artifact(orch, "3.3", path)
+        if not ok:
+            return False, msg
+        if not os.path.exists(path):
+            return False, "报告文件不存在"
+        try:
+            rsize = os.path.getsize(path)
+        except OSError:
+            rsize = 0
+        if rsize < 200:
+            return False, f"报告太短 ({rsize}B < 200B)"
+        try:
+            report_content = open(path, encoding="utf-8").read()
+        except Exception:
+            return False, f"无法读取报告: {path}"
+        if stored_hash not in report_content:
+            return False, "E2E 报告未引用 gate.json 中的 e2e_result_hash，禁止报告自证"
+        return True, f"report verified (artifact + result hash match, {turns} turns)"
+
+    if not gate:
+        return False, "gate.json 不存在，禁止 Codex/filesystem fallback 通过 E2E 报告"
+
+    # gate.json exists but no hash — e2e_runner wasn't run or hash not recorded
+    return False, "gate.json 无 e2e_result_hash — E2E Runner 未正常执行"
 
 
 def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
-    return True, "sequencing"
+    gate = _read_gate_state_file()
+    if not gate:
+        return False, "gate.json 不存在，禁止 Codex fallback 通过 E2E Gate"
+    if not gate.get("e2e_executed"):
+        return False, "e2e_executed not set in gate.json"
+    stored_hash = gate.get("e2e_result_hash")
+    if stored_hash and os.path.exists(E2E_RESULT_PATH):
+        import hashlib
+        with open(E2E_RESULT_PATH, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+        if actual_hash != stored_hash:
+            return False, "e2e_result.json hash mismatch — 文件在 3.3→3.4 间被修改"
+    root = _repo_root()
+    gate_script = None
+    for candidate in ["tests/e2e_gate.py", ".claude/e2e/e2e_gate.py", "e2e/e2e_gate.py"]:
+        path = os.path.join(root, candidate)
+        if os.path.exists(path):
+            gate_script = path
+            break
+    if not gate_script:
+        return False, "e2e_gate.py not found in project"
+    try:
+        result = subprocess.run(
+            [sys.executable, gate_script, "--result", E2E_RESULT_PATH, "--min-turns", "10"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            output_tail = result.stdout[-500:] if result.stdout else ""
+            return False, f"E2E Gate failed (exit {result.returncode}):\n{output_tail}"
+        return True, "E2E Gate passed (subprocess verified, hash intact)"
+    except subprocess.TimeoutExpired:
+        return False, "E2E Gate timed out (30s)"
+    except Exception as e:
+        return False, f"E2E Gate execution error: {e}"
 
 
 VALID_OUTCOMES = {"pass", "fail"}
@@ -341,7 +646,24 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
     if outcome not in VALID_OUTCOMES:
         return False, f"无效 outcome: {outcome}。必须是 pass|fail"
     if outcome == "pass":
-        return True, "pass"
+        gate = _read_gate_state_file()
+        if not gate:
+            return False, "gate.json 不存在，禁止 Codex fallback 自判 pass"
+        if gate:
+            if not gate.get("test_passed"):
+                return False, "outcome=pass 但 gate.json test_passed=false — 测试未通过不能自判 pass"
+            if not gate.get("e2e_executed"):
+                return False, "outcome=pass 但 gate.json e2e_executed=false — E2E 未执行不能自判 pass"
+            if not gate.get("e2e_gate_passed"):
+                return False, "outcome=pass 但 gate.json e2e_gate_passed=false — E2E Gate 未通过不能自判 pass"
+            stored_hash = gate.get("e2e_result_hash")
+            if stored_hash and os.path.exists(E2E_RESULT_PATH):
+                import hashlib
+                with open(E2E_RESULT_PATH, "rb") as f:
+                    actual_hash = hashlib.sha256(f.read()).hexdigest()
+                if actual_hash != stored_hash:
+                    return False, "e2e_result.json hash mismatch — 文件在验证链中被篡改"
+        return True, "pass (gate verified, hash intact)"
     decision = orch.get("artifacts", {}).get("loop_decision")
     if not decision:
         return False, "fail 但未给 decision (done --outcome fail --decision continue|escalate|stop)"
@@ -351,22 +673,24 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
 
 
 def validate_knowledge(orch: dict, hook: dict) -> tuple:
-    if hook.get("knowledge_acknowledged"):
-        return True, "done"
-    root = _repo_root()
-    km = os.path.join(root, "KNOWLEDGE.md")
-    started_at = orch.get("started_at")
-    if started_at and os.path.exists(km):
-        try:
-            km_mtime = os.path.getmtime(km)
-            session_start = datetime.fromisoformat(started_at).timestamp()
-            if km_mtime > session_start:
-                return True, "KNOWLEDGE.md modified after session start"
-        except (ValueError, OSError):
-            pass
     gate = _read_gate_state_file()
-    if gate.get("knowledge_acknowledged"):
-        return True, "done (via state file)"
+    acknowledged = hook.get("knowledge_acknowledged") or gate.get("knowledge_acknowledged")
+    if acknowledged:
+        if hook.get("knowledge_skip_reason") or gate.get("knowledge_skip_reason"):
+            return True, "done (explicit skip via gate state)"
+        path = (
+            hook.get("knowledge_file")
+            or gate.get("knowledge_file")
+            or orch.get("artifacts", {}).get("knowledge_path")
+        )
+        if not path:
+            return False, "knowledge_acknowledged 但缺少 knowledge_file provenance"
+        ok, msg, _rec = _verify_step_artifact(orch, "3.6", path)
+        if not ok:
+            return False, msg
+        return True, "done (trusted KNOWLEDGE artifact)"
+    if not gate:
+        return False, "gate.json 不存在，禁止 filesystem fallback 通过 KNOWLEDGE 闭环"
     return False, "KNOWLEDGE.md 未表态"
 
 
@@ -463,6 +787,46 @@ orchestrator 自动检测 plan 文件写入 + 验证 writing-plans 签名。""")
 
 orchestrator 自动检测文件写入并验证（≥300B + 必须包含 拷问/修订/结论 章节）。"""),
 
+    Step("1.5c", "Codex Review", 1, validator=validate_codex_review,
+         instruction=f"""调用 codex 对 plan 进行独立 review：
+  Skill(skill="codex")
+  → 选 review 模式，review 当前 plan 文件
+
+Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
+
+  ## Codex Plan Review
+  ### Findings
+  - [P1/P2] {{finding}}
+  ### Contract Gate
+	  ```json
+	  {{
+	    "gate": "PASS",
+	    "reviewed_plan_sha256": "<当前 1.4 plan artifact sha256>",
+	    "p0_contract_reviewed": true,
+    "ac_e2e_coverage_reviewed": true,
+    "weak_case_reviewed": true,
+    "evidence_plan_reviewed": true,
+    "p0_requirements_missing": [],
+    "uncovered_ac": [],
+    "unmapped_e2e_scenarios": [],
+    "weak_scenarios": [],
+    "non_business_assertions": [],
+    "missing_evidence": []
+  }}
+  ```
+  ### GATE: PASS / FAIL
+
+	Codex 必须按同一套 P0 contract / AC / E2E 证据规则审查：
+	  - reviewed_plan_sha256 必须等于当前 1.4 plan artifact hash，禁止复用旧 review
+	  - P0/P1 需求不能靠 agent 自己降级，缺 source/覆盖即 FAIL
+  - 每个 P0/P1 AC 必须映射到 E2E scenario，未覆盖即 FAIL
+  - 只测 button visible/page loads/status 200/no console error/text contains 的弱 case 必须列入 weak_scenarios 并 FAIL
+  - 主断言必须验证业务结果或可观察证据，缺 screenshot/network/url/API/DB evidence 计划即 FAIL
+🔴 纯文本 PASS 无效，JSON gate 任何问题数组非空或审查布尔项非 true 都不推进。
+🔴 GATE: FAIL → 先更新 plan 修复 findings，再重新调 codex review。
+   orchestrator 检测到 FAIL 自动回退到 1.4（写计划），更新后重走 1.5 → 1.5c。
+🔴 GATE: PASS → 自动推进到用户确认。"""),
+
     Step("1.6", "用户确认", 1, validator=validate_user_confirm, done_flags=["--user-confirmed"],
          instruction="""向用户输出 AC + E2E + Plan 摘要，等待明确确认。
 🔴 Phase 1 唯一确认关卡。
@@ -470,17 +834,25 @@ orchestrator 自动检测文件写入并验证（≥300B + 必须包含 拷问/�
 用户确认后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --user-confirmed"""),
 
     Step("2.0", "执行计划", 2, validator=validate_execute,
-         instruction="""1. 选择开发方式（worktree / 新分支 / 当前分支）
-2. 通过 Skill 工具执行：
-   有 subagent: Skill(skill="subagent-driven-development")
-   无 subagent: Skill(skill="executing-plans")
-🔴 禁止主线程凭直觉写代码。
+         instruction="""🎯 向用户展示 /goal 命令，进入自主执行模式（Phase 2+3 一气呵成）：
+  运行: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" goal
+  将输出的 /goal 命令呈现给用户，请用户执行。
 
-完成后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
+/goal 模式下 Claude 自主驱动：
+  1. 选择开发方式（worktree / 新分支 / 当前分支）
+  2. 通过 Skill 执行 plan（subagent-driven-development 或 executing-plans）
+  3. 冒烟测试 → 项目测试 → E2E → 报告 → Gate → Loop Record → Knowledge 闭环
+  4. 每步完成后运行 status 命令，让 /goal 评估器看到 [FASTSHIP_GOAL] 进度
+
+🔴 禁止主线程凭直觉写代码。
+🔴 每完成一个关键步骤后运行 status，确保 /goal 评估器能跟踪进度。
+
+手动模式（不用 /goal）: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
 
     Step("3.0", "冒烟测试", 3, validator=validate_smoke,
          instruction="""零 setup 冒烟: 启动服务 → API 请求 → 等处理 → SELECT 验证。
 🔴 禁止 DB 写入。失败 → 修，不进 E2E。
+🔴 Validator 自动检测 git diff 中是否有代码变更。无变更 = 执行阶段未产出。
 
 完成后: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
 
@@ -493,16 +865,21 @@ orchestrator 自动检测文件写入并验证（≥300B + 必须包含 拷问/�
   python3 tests/e2e_runner.py -o /tmp/e2e_result.json
 🔴 最少 10 轮。Runner 只采集不判断。orchestrator 自动检测。"""),
 
-    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
-         instruction="""读 /tmp/e2e_result.json，写 E2E 质量检测报告到文件。
-报告含: 覆盖度 / 逐轮审查(完整输出) / 总结。
+	    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
+	         instruction="""读 /tmp/e2e_result.json，写 E2E 质量检测报告到文件。
+	报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
 🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
+🔴 Validator 自动验证 e2e_result.json 完整性（hash 比对 gate.json 记录）。
+🔴 禁止手动创建或修改 /tmp/e2e_result.json。
 用 Write 工具保存报告。orchestrator 自动检测文件写入。"""),
 
     Step("3.4", "E2E Gate", 3, validator=validate_e2e_gate,
          instruction="""运行 Gate 脚本：
   python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
-Gate 展示原始数据给用户对照。FAIL → 禁止合入。orchestrator 自动检测。"""),
+Gate 展示原始数据给用户对照。FAIL → 禁止合入。
+🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
+🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
+🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""),
 
     Step("3.5", "Loop Record", 3, validator=validate_loop_record,
          instruction="""记录本轮结果：
@@ -557,7 +934,15 @@ def detect_completion_post_bash(current_step: str, data: dict, hook: dict) -> Op
             return "3.2"
 
     if current_step == "3.4" and re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE):
-        return "3.4"
+        exit_code = _extract_exit_code(data)
+        if exit_code == 0:
+            return "3.4"
+        if exit_code is None:
+            output = data.get("tool_response", {})
+            stdout = output.get("stdout", "") if isinstance(output, dict) else ""
+            if "GATE PASSED" in stdout:
+                return "3.4"
+        return None
 
     if current_step == "3.5" and "loop_record" in cmd:
         return "3.5"
@@ -582,6 +967,9 @@ def detect_completion_post_edit(current_step: str, data: dict) -> Optional[str]:
 
     if current_step == "1.5" and GRILL_RESULT_FILENAME in file_path:
         return "1.5"
+
+    if current_step == "1.5c" and CODEX_REVIEW_FILENAME in file_path:
+        return "1.5c"
 
     if current_step == "3.3" and file_path.endswith(".md"):
         if "e2e" in file_path.lower() or "report" in file_path.lower() or "质量" in file_path:
@@ -628,7 +1016,29 @@ def _is_orchestrator_allowed_file(path: str) -> bool:
         return True
     if GRILL_RESULT_FILENAME in p:
         return True
+    if CODEX_REVIEW_FILENAME in p:
+        return True
     return False
+
+
+def _extract_exit_code(data: dict) -> Optional[int]:
+    resp = data.get("tool_response", {})
+    if isinstance(resp, dict):
+        for key in ("exitCode", "exit_code", "returnCode", "return_code"):
+            val = resp.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+    for key in ("exitCode", "exit_code"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    return None
 
 
 # ━━━━━━━━━━━━ Advance + Loop Logic ━━━━━━━━━━━━
@@ -719,9 +1129,31 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
         print(_branch_mismatch_text(orch_state))
         return 1
 
-    if ".fastship-orchestrator-state.json" in file_path:
-        print("🔴 BLOCKED: orchestrator state 由系统管理，禁止手动编辑")
+    # Block edits to any fastship state file
+    normalized = _normalize(file_path)
+    if any(pat in normalized for pat in ("fastship/gate.json", "fastship/orchestrator.json",
+                                          ".fastship-orchestrator-state.json", ".ship-verify-state.json")):
+        print("🔴 BLOCKED: fastship state 由系统管理，禁止手动编辑")
         return 1
+
+    # Block out-of-order step artifact writes
+    if _is_active(orch_state):
+        artifact_step = _artifact_owner_step(file_path)
+        current = orch_state.get("current_step", "")
+        if artifact_step and artifact_step != current:
+            step_map = _get_step_map()
+            owner = step_map.get(artifact_step)
+            cur = step_map.get(current)
+            print(f"🔴 BLOCKED: 当前在 step {current}"
+                  f"{(' (' + cur.name + ')') if cur else ''}，"
+                  f"不能写 step {artifact_step}"
+                  f"{(' (' + owner.name + ')') if owner else ''} 的产物。")
+            print(f"   必须按顺序完成当前步骤后才能产出下一步的文件。")
+            if cur:
+                print(f"\n📋 当前步骤指令:")
+                print(f"{'─' * 50}")
+                print(cur.instruction)
+            return 1
 
     if orch_state.get("phase", 1) == 1 and _is_code_file(file_path) and not _is_orchestrator_allowed_file(file_path):
         step_map = _get_step_map()
@@ -797,11 +1229,23 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
         if detected == "1.0" and hook.get("request_type"):
             orch["request_type"] = hook["request_type"]
 
+        if detected == "3.4":
+            ok, msg = validate_e2e_gate(orch, hook)
+            if not ok:
+                print(f"⚠️ E2E Gate 命令已检测，但验证未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+
         if detected == "3.5":
             outcome = hook.get("last_loop_outcome")
             orch["loop_count"] = hook.get("loop_count", 0)
             if outcome == "pass":
-                pass  # fall through to normal advance
+                orch.setdefault("artifacts", {})["loop_outcome"] = "pass"
+                ok, msg = validate_loop_record(orch, hook)
+                if not ok:
+                    print(f"⚠️ Loop Record pass 已检测，但验证未通过: {msg}")
+                    save_orch_state(orch, orch_path)
+                    return 0
             else:
                 orch.setdefault("artifacts", {})["loop_outcome"] = "fail"
                 save_orch_state(orch, orch_path)
@@ -839,6 +1283,11 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
     if detected:
         if detected == "1.3":
             orch["brief_path"] = file_path
+            ok, msg = record_step_artifact(orch, "1.3", file_path)
+            if not ok:
+                print(f"⚠️ Brief artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
             hook = load_hook_state()
             ok, msg = validate_brief(orch, hook)
             if not ok:
@@ -847,14 +1296,31 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 return 0
 
         if detected == "1.4":
+            orch["plan_path"] = file_path
+            ok, msg = record_step_artifact(orch, "1.4", file_path)
+            if not ok:
+                print(f"⚠️ Plan artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
             hook = load_hook_state()
             ok, msg = validate_plan(orch, hook)
             if not ok:
                 print(f"⚠️ Plan 写入已检测，但验证未通过: {msg}")
                 save_orch_state(orch, orch_path)
                 return 0
+            for stale in (GRILL_RESULT_FILENAME, CODEX_REVIEW_FILENAME):
+                p = os.path.join(_repo_root(), ".claude", stale)
+                if os.path.exists(p):
+                    os.remove(p)
+            _clear_trusted_artifacts(orch, ("1.5", "1.5c"))
 
         if detected == "1.5":
+            orch.setdefault("artifacts", {})["grill_result_path"] = file_path
+            ok, msg = record_step_artifact(orch, "1.5", file_path)
+            if not ok:
+                print(f"⚠️ Grill artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
             hook = load_hook_state()
             ok, msg = validate_grill(orch, hook)
             if not ok:
@@ -862,8 +1328,45 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 save_orch_state(orch, orch_path)
                 return 0
 
+        if detected == "1.5c":
+            orch.setdefault("artifacts", {})["codex_review_path"] = file_path
+            ok, msg = record_step_artifact(orch, "1.5c", file_path)
+            if not ok:
+                print(f"⚠️ Codex review artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+            hook = load_hook_state()
+            ok, msg = validate_codex_review(orch, hook)
+            if not ok and "FAIL" in msg:
+                review_path = os.path.join(_repo_root(), ".claude", CODEX_REVIEW_FILENAME)
+                if os.path.exists(review_path):
+                    os.remove(review_path)
+                orch["current_step"] = "1.4"
+                orch["phase"] = 1
+                orch["plan_path"] = None
+                orch.setdefault("artifacts", {}).pop("grill_result_path", None)
+                orch.setdefault("artifacts", {}).pop("codex_review_path", None)
+                _clear_trusted_artifacts(orch, ("1.4", "1.5", "1.5c"))
+                for sid in ("1.4", "1.5", "1.5c"):
+                    if sid in orch.get("completed_steps", []):
+                        orch["completed_steps"].remove(sid)
+                save_orch_state(orch, orch_path)
+                print(f"\n🔄 Codex review FAIL — 回退到 1.4 更新 plan。")
+                print(f"   {msg}")
+                print(f"\n{format_next(orch)}")
+                return 0
+            if not ok:
+                print(f"⚠️ Codex review 写入已检测，但验证未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+
         if detected == "3.3":
             orch["report_path"] = file_path
+            ok, msg = record_step_artifact(orch, "3.3", file_path)
+            if not ok:
+                print(f"⚠️ 报告 artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
             hook = load_hook_state()
             ok, msg = validate_e2e_report(orch, hook)
             if not ok:
@@ -872,6 +1375,12 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 return 0
 
         if detected == "3.6":
+            orch.setdefault("artifacts", {})["knowledge_path"] = file_path
+            ok, msg = record_step_artifact(orch, "3.6", file_path)
+            if not ok:
+                print(f"⚠️ KNOWLEDGE artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
             hook = load_hook_state()
             ok, msg = validate_knowledge(orch, hook)
             if not ok:
@@ -928,7 +1437,17 @@ def hook_post_edit():
 
 # ━━━━━━━━━━━━ CLI Arg Parsing ━━━━━━━━━━━━
 
-VALUED_FLAGS = {"--agents", "--brief", "--report", "--outcome", "--decision"}
+VALUED_FLAGS = {
+    "--agents",
+    "--brief",
+    "--plan",
+    "--grill",
+    "--codex-review",
+    "--report",
+    "--knowledge",
+    "--outcome",
+    "--decision",
+}
 BOOLEAN_FLAGS = {"--grill-complete", "--user-confirmed"}
 
 
@@ -975,6 +1494,17 @@ def format_status(orch: dict) -> str:
         lines.append("\n✅ 全部完成")
     elif cs == "stopped":
         lines.append("\n🛑 已停止")
+
+    gate = _read_gate_state_file()
+    lines.append("")
+    lines.append(
+        f"[FASTSHIP_GOAL] step={cs} phase={orch.get('phase', '?')}"
+        f" test_passed={str(gate.get('test_passed', False)).lower()}"
+        f" e2e_executed={str(gate.get('e2e_executed', False)).lower()}"
+        f" e2e_gate_passed={str(gate.get('e2e_gate_passed', False)).lower()}"
+        f" knowledge_acknowledged={str(gate.get('knowledge_acknowledged', False)).lower()}"
+        f" loop={orch.get('loop_count', 0)}/3"
+    )
     return "\n".join(lines)
 
 
@@ -1011,6 +1541,10 @@ def cmd_start(requirement: str) -> int:
         print(f"⚠️  已有活跃 session: \"{existing.get('requirement')}\"")
         print(f"   当前: {existing.get('current_step')}")
         print('   重新开始: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" reset')
+        return 1
+    if not _compact_is_recent():
+        print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
+        print("   运行 /compact 后重试 start。")
         return 1
     st = empty_orchestrator_state(requirement)
     save_orch_state(st)
@@ -1070,8 +1604,40 @@ def cmd_done(argv: list) -> int:
         artifacts["user_confirmed"] = True
     if "--brief" in args:
         st["brief_path"] = args["--brief"]
+        ok, msg = record_step_artifact(st, "1.3", args["--brief"], source="cli_done")
+        if not ok:
+            print(f"❌ Brief artifact 记录失败: {msg}")
+            return 1
+    if "--plan" in args:
+        st["plan_path"] = args["--plan"]
+        ok, msg = record_step_artifact(st, "1.4", args["--plan"], source="cli_done")
+        if not ok:
+            print(f"❌ Plan artifact 记录失败: {msg}")
+            return 1
+    if "--grill" in args:
+        artifacts["grill_result_path"] = args["--grill"]
+        ok, msg = record_step_artifact(st, "1.5", args["--grill"], source="cli_done")
+        if not ok:
+            print(f"❌ Grill artifact 记录失败: {msg}")
+            return 1
+    if "--codex-review" in args:
+        artifacts["codex_review_path"] = args["--codex-review"]
+        ok, msg = record_step_artifact(st, "1.5c", args["--codex-review"], source="cli_done")
+        if not ok:
+            print(f"❌ Codex review artifact 记录失败: {msg}")
+            return 1
     if "--report" in args:
         st["report_path"] = args["--report"]
+        ok, msg = record_step_artifact(st, "3.3", args["--report"], source="cli_done")
+        if not ok:
+            print(f"❌ 报告 artifact 记录失败: {msg}")
+            return 1
+    if "--knowledge" in args:
+        artifacts["knowledge_path"] = args["--knowledge"]
+        ok, msg = record_step_artifact(st, "3.6", args["--knowledge"], source="cli_done")
+        if not ok:
+            print(f"❌ KNOWLEDGE artifact 记录失败: {msg}")
+            return 1
     if "--outcome" in args:
         artifacts["loop_outcome"] = args["--outcome"]
     if "--decision" in args:
@@ -1114,6 +1680,8 @@ def cmd_done(argv: list) -> int:
     if next_step:
         print()
         print(format_next(st))
+        if step.id == "1.6" and st.get("current_step") == "2.0":
+            _print_goal_hint(st)
     elif st.get("current_step") == "done":
         print("\n🎉 全部完成！")
     return 0
@@ -1139,6 +1707,39 @@ def cmd_reset() -> int:
     if os.path.exists(gp):
         delegate_to_gate(gp, "reset", {})
     print("✅ Orchestrator + hook state cleared.")
+    return 0
+
+
+def goal_condition(orch: dict) -> str:
+    """Generate a /goal condition string based on current orchestrator state."""
+    req = orch.get("requirement", "?")
+    return (
+        f"fastship 完成「{req}」的交付 — "
+        f"运行 status 命令确认 [FASTSHIP_GOAL] 显示 step=done"
+        f" test_passed=true e2e_executed=true e2e_gate_passed=true knowledge_acknowledged=true"
+    )
+
+
+def _print_goal_hint(orch: dict):
+    """Print /goal suggestion when entering Phase 2."""
+    condition = goal_condition(orch)
+    print()
+    print("🎯 Plan 已确认，推荐使用 /goal 自主执行 Phase 2+3：")
+    print(f"   /goal {condition}")
+    print()
+
+
+def cmd_goal() -> int:
+    st = load_orch_state()
+    if not st:
+        print("❌ 没有活跃 session。")
+        return 1
+    phase = st.get("phase", 1)
+    if phase < 2 and st.get("current_step") != "2.0":
+        print("⚠️ 还在 Phase 1，完成 plan 确认后再用 /goal。")
+        return 1
+    condition = goal_condition(st)
+    print(f"/goal {condition}")
     return 0
 
 
@@ -1180,6 +1781,7 @@ def main():
         print("  next               当前步骤")
         print("  done [--flags]     完成当前步骤")
         print("  status             全部状态")
+        print("  goal               生成 /goal 条件（Phase 2+ 可用）")
         print("  adopt-branch       将活跃 session 迁移到当前分支")
         print("  reset              重置")
         sys.exit(1)
@@ -1192,6 +1794,7 @@ def main():
         "post_bash": hook_post_bash,
         "next": cmd_next,
         "status": cmd_status,
+        "goal": cmd_goal,
         "reset": cmd_reset,
         "adopt-branch": cmd_adopt_branch,
     }

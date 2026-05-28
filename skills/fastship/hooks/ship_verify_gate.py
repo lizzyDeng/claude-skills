@@ -91,6 +91,11 @@ def empty_state(branch=None):
         "test_tool": None,
         "e2e_executed": False,
         "e2e_ts": None,
+        "e2e_result_hash": None,
+        "e2e_result_turns": None,
+        "e2e_runner_cmd": None,
+        "e2e_gate_passed": False,
+        "e2e_gate_ts": None,
         "plan_ready": False,
         "plan_file": None,
         "plan_ts": None,
@@ -341,14 +346,32 @@ def is_e2e_gate_cmd(cmd):
     return bool(re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE))
 
 
-def is_merge_cmd(cmd):
-    """检测合入/切回 main 的命令"""
+E2E_RUNNER_STRICT_PATTERNS = [
+    r'\bpython3?\s+.*e2e[_-]?runner\b',
+    r'\bplaywright\s+test\b',
+    r'\bcypress\s+run\b',
+    r'\bnpm\s+run\s+.*e2e\b',
+]
+
+
+def is_strict_e2e_runner(cmd):
+    """Strict pattern: only matches actual E2E runner scripts, not arbitrary commands containing 'e2e'."""
     if not cmd:
         return False
+    return any(re.search(p, cmd, re.IGNORECASE) for p in E2E_RUNNER_STRICT_PATTERNS)
+
+
+def is_merge_cmd(cmd):
+    """检测合入/切回 main 的命令 + ref-writing plumbing"""
+    if not cmd:
+        return False
+    sub = _git_subcommand(cmd)
+    if sub in ("merge", "update-ref"):
+        return True
     pats = [
-        r'\bgit\s+merge\b',
         r'\bgit\s+checkout\s+(main|master)\b',
         r'\bgit\s+switch\s+(main|master)\b',
+        r'\bgit\s+branch\s+-[fF]\b',
     ]
     return any(re.search(p, cmd) for p in pats)
 
@@ -420,6 +443,45 @@ def is_db_write_cmd(cmd):
     return bool(write_ops)
 
 
+FASTSHIP_STATE_PATTERNS = [
+    "fastship/gate.json",
+    "fastship/orchestrator.json",
+    ".ship-verify-state.json",
+    ".fastship-orchestrator-state.json",
+]
+
+
+def is_fastship_state_file(path):
+    """Check if a path points to any fastship state file (gate or orchestrator)."""
+    p = normalize_path(path)
+    return any(pat in p for pat in FASTSHIP_STATE_PATTERNS)
+
+
+def is_state_file_write_cmd(cmd):
+    """Detect bash commands that write to fastship state files.
+    Allows reads (cat without redirect) and gate script invocations without redirect."""
+    if not cmd:
+        return False
+    # Check for redirect/write patterns targeting state files FIRST
+    # (even gate scripts with redirect are blocked: `gate.py status > gate.json`)
+    for pat in FASTSHIP_STATE_PATTERNS:
+        if pat not in cmd:
+            continue
+        # Redirect to state file = always blocked, no exceptions
+        if re.search(r'>\s*.*' + re.escape(pat), cmd):
+            return True
+    # Gate scripts WITHOUT redirect are allowed (they write via Python open())
+    if "ship_verify_gate.py" in cmd or "fastship_orchestrator.py" in cmd:
+        return False
+    # Other commands writing to state files
+    for pat in FASTSHIP_STATE_PATTERNS:
+        if pat not in cmd:
+            continue
+        if re.search(r'\b(echo|printf|python3?|tee|cp|mv)\b.*' + re.escape(pat), cmd):
+            return True
+    return False
+
+
 # ---------- Gate 动作 ----------
 
 def gate_pre_edit():
@@ -431,8 +493,8 @@ def gate_pre_edit():
     file_path = data.get("tool_input", {}).get("file_path", "")
 
     # --- Gate A: 保护 state file ---
-    if file_path and ".ship-verify-state.json" in file_path:
-        print("🔴 BLOCKED: .ship-verify-state.json 由 hook 自动管理，禁止手动编辑")
+    if file_path and is_fastship_state_file(file_path):
+        print(f"🔴 BLOCKED: fastship state file 由 hook 自动管理，禁止手动编辑 ({file_path})")
         return 1
 
     # --- Gate B: 代码编辑前必须有 plan + 已 knowledge_recall ---
@@ -1089,12 +1151,56 @@ def gate_post_bash():
         if ok:
             st["e2e_executed"] = True
             st["e2e_ts"] = now
+            st["e2e_gate_passed"] = False
+            st["e2e_gate_ts"] = None
             st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
             changed = True
+            # Provenance: only hash if the command matches strict runner pattern
+            if is_strict_e2e_runner(cmd) and os.path.exists(E2E_RESULT_PATH):
+                try:
+                    import hashlib
+                    with open(E2E_RESULT_PATH, "rb") as f:
+                        st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
+                    with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+                        rdata = json.load(f)
+                    st["e2e_result_turns"] = sum(
+                        len(r.get("turns", []))
+                        for s in rdata.get("scenarios", [])
+                        for r in s.get("rounds", [])
+                    )
+                    st["e2e_runner_cmd"] = cmd[:200]
+                except Exception:
+                    pass
             print(f"✅ Gate: E2E 验证通过（{reason}），loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record")
         else:
             print(f"⚠️ Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
             print("   请排查问题后重跑 E2E")
+
+    # 检测 E2E Gate 脚本执行结果
+    if is_e2e_gate_cmd(cmd):
+        exit_code = extract_exit_code(data)
+        if exit_code == 0:
+            st["e2e_gate_passed"] = True
+            st["e2e_gate_ts"] = now
+            changed = True
+            print("✅ Gate: E2E Gate 通过，已记录")
+        elif exit_code is None:
+            output = extract_output(data)
+            if "GATE PASSED" in output:
+                st["e2e_gate_passed"] = True
+                st["e2e_gate_ts"] = now
+                changed = True
+                print("✅ Gate: E2E Gate 通过（via stdout），已记录")
+            else:
+                st["e2e_gate_passed"] = False
+                st["e2e_gate_ts"] = None
+                changed = True
+                print("⚠️ Gate: E2E Gate 结果不明（无 exit code 且无 GATE PASSED），已清除旧状态")
+        else:
+            st["e2e_gate_passed"] = False
+            st["e2e_gate_ts"] = None
+            changed = True
+            print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 已清除")
 
     if changed:
         save_state(st)
@@ -1119,13 +1225,44 @@ def is_push_cmd(cmd):
     return bool(re.search(r'\bgit\s+push\b', cmd))
 
 
+def _git_subcommand(cmd):
+    """Extract the git subcommand, skipping global options like -c, -C, --no-pager."""
+    if not cmd:
+        return ""
+    m = re.search(r'\bgit\b', cmd)
+    if not m:
+        return ""
+    rest = cmd[m.end():].strip()
+    # Skip global options: -c key=val, -C path, --no-pager, --git-dir=x, etc.
+    while rest:
+        if rest.startswith("--no-pager") or rest.startswith("--no-optional-locks"):
+            rest = rest.split(None, 1)[-1] if " " in rest else ""
+        elif re.match(r'-[cC]\s+\S+', rest):
+            rest = re.sub(r'-[cC]\s+\S+\s*', '', rest, count=1).strip()
+        elif re.match(r'--git-dir[=\s]', rest) or re.match(r'--work-tree[=\s]', rest):
+            rest = re.sub(r'--[\w-]+[=\s]\S+\s*', '', rest, count=1).strip()
+        elif rest.startswith("-") and not rest.startswith("--"):
+            rest = rest.split(None, 1)[-1] if " " in rest else ""
+        else:
+            break
+    return rest.split()[0] if rest.split() else ""
+
+
+def is_commit_cmd(cmd):
+    """检测 git commit 命令（含 plumbing ref-write 命令）"""
+    if not cmd:
+        return False
+    sub = _git_subcommand(cmd)
+    return sub in ("commit", "commit-tree", "cherry-pick", "revert", "am")
+
+
 def gate_pre_bash():
     """PreToolUse: Bash — 自动拦截，四层 Gate（所有分支生效）
 
     Gate 0: E2E 阶段 DB 写入 → 禁止（防止 fake 数据构造）
     Gate 1: E2E 命令 → 必须先跑通项目测试（单测）
     Gate 2: E2E Gate 脚本 → 必须项目测试 + E2E Runner 都完成
-    Gate 3: merge/push → 必须项目测试 + E2E 都完成（已有逻辑）
+    Gate 3: commit/merge/push → 必须项目测试 + E2E 都完成
     """
     branch = get_current_branch()
 
@@ -1135,6 +1272,12 @@ def gate_pre_bash():
     st = ensure_branch_state(load_state(), branch)
     if branch_mismatch(st, branch) and not fastship_state.is_branch_recovery_command(cmd):
         print_branch_mismatch(st)
+        return 1
+
+    # --- Gate -1: 禁止 bash 写入 fastship state files ---
+    if is_state_file_write_cmd(cmd):
+        print("🔴 BLOCKED: fastship state file 由 hook 自动管理，禁止 shell 写入")
+        print(f"   命令: {cmd[:100]}")
         return 1
 
     # --- Gate 0: E2E 阶段禁止直接 DB 写入 ---
@@ -1223,25 +1366,41 @@ def gate_pre_bash():
             print("\n".join(lines))
             return 1
 
-    # --- Gate 3 + 4: merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
-    if is_merge_cmd(cmd) or is_push_cmd(cmd):
+    # --- Gate 3 + 4: commit/merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
+    # Phase 2 WIP commits 放行，其余 commit/merge/push 必须 Phase 3 完成
+    if is_commit_cmd(cmd) or is_merge_cmd(cmd) or is_push_cmd(cmd):
+        if is_commit_cmd(cmd) and not is_merge_cmd(cmd) and not is_push_cmd(cmd):
+            orch_path = fastship_state.orchestrator_state_path()
+            orch = {}
+            try:
+                orch = fastship_state.load_json(orch_path) or {}
+            except Exception:
+                pass
+            step = orch.get("current_step", "")
+            if step.startswith("2."):
+                return 0
+            if not orch or step in ("done", "stopped", "", None):
+                return 0
+
         blocks = []
         if not st.get("test_passed"):
             blocks.append("项目测试未通过")
         if not st.get("e2e_executed"):
             blocks.append("E2E 验证未执行")
+        if not st.get("e2e_gate_passed"):
+            blocks.append("E2E Gate 未通过（e2e_gate.py 必须 exit 0）")
         if not st.get("knowledge_acknowledged"):
             blocks.append("KNOWLEDGE.md 未更新且未声明跳过")
 
         if blocks:
-            action = "推送" if is_push_cmd(cmd) else "合入"
+            action = "提交" if is_commit_cmd(cmd) else ("推送" if is_push_cmd(cmd) else "合入")
             lines = [
-                f"🔴 BLOCKED: 验证未完成，禁止{action}",
+                f"🔴 BLOCKED: Phase 3 验证未完成，禁止{action}",
             ]
             for b in blocks:
                 lines.append(f"   ❌ {b}")
             lines.append("")
-            lines.append("请先完成验证流程：")
+            lines.append("请先完成 Phase 3 验证流程：")
             lines.append("   1. 项目测试（全量）")
             lines.append("   2. E2E 验证")
             lines.append("   3. KNOWLEDGE.md：")
