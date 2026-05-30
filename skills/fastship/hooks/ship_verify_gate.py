@@ -86,6 +86,7 @@ LOOP_LIMIT = 3
 
 def empty_state(branch=None):
     return {
+        "session_id": fastship_state.resolve_session_id(),
         "test_passed": False,
         "test_ts": None,
         "test_tool": None,
@@ -147,6 +148,11 @@ def save_state(st):
     p = state_path()
     if not p:
         return
+    if isinstance(st, dict):
+        sid = fastship_state.resolve_session_id()
+        if sid:
+            st["session_id"] = sid
+            fastship_state.set_current_session_id(sid, state=st)
     fastship_state.save_json(p, st)
 
 
@@ -198,6 +204,59 @@ def extract_exit_code(data):
 
 
 E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_MIN_TURNS = 10
+
+
+def _project_e2e_config():
+    cfg = fastship_state.load_project_config()
+    e2e = cfg.get("e2e") if isinstance(cfg, dict) else None
+    return e2e if isinstance(e2e, dict) else {}
+
+
+def _config_str(value, default):
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _config_int(value, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _absolute_project_path(path):
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        path = os.path.join(get_repo_root(), path)
+    return os.path.abspath(path)
+
+
+def e2e_result_path():
+    path = _config_str(_project_e2e_config().get("result_path"), E2E_RESULT_PATH)
+    return _absolute_project_path(path)
+
+
+def configured_e2e_runner_command():
+    default = f"python3 tests/e2e_runner.py -o {e2e_result_path()}"
+    return _config_str(_project_e2e_config().get("runner_command"), default)
+
+
+def configured_e2e_gate_command():
+    min_turns = _config_int(_project_e2e_config().get("min_turns"), E2E_MIN_TURNS)
+    default = f"python3 tests/e2e_gate.py --result {e2e_result_path()} --min-turns {min_turns}"
+    return _config_str(_project_e2e_config().get("gate_command"), default)
+
+
+def _command_matches_configured(cmd, configured):
+    if not cmd or not configured:
+        return False
+    normalized_cmd = " ".join(str(cmd).split())
+    normalized_configured = " ".join(str(configured).split())
+    return normalized_configured in normalized_cmd or normalized_cmd in normalized_configured
 
 E2E_FAILURE_PATTERNS = [
     r'Connection\s+refused',
@@ -214,7 +273,7 @@ E2E_FAILURE_PATTERNS = [
 def e2e_succeeded(data):
     """判断 E2E 命令是否真正成功。三层检查：
     1. exit code 非 0 → 失败；exit code == 0 → 信任，跳过模式匹配
-    2. /tmp/e2e_result.json 有 pass/fail → 以此为准
+    2. configured e2e_result.json 有 pass/fail → 以此为准
     3. 输出包含明显失败模式 → 失败（仅当 exit code 未知时）
     exit code 未知 + 无 result file + 无失败模式 → 保守认为成功（向后兼容）
     """
@@ -222,9 +281,10 @@ def e2e_succeeded(data):
     if exit_code is not None and exit_code != 0:
         return False, f"exit code={exit_code}"
 
-    if os.path.exists(E2E_RESULT_PATH):
+    result_path = e2e_result_path()
+    if os.path.exists(result_path):
         try:
-            with open(E2E_RESULT_PATH) as f:
+            with open(result_path) as f:
                 result = json.load(f)
             status = result.get("status", result.get("result", "")).lower()
             if status in ("pass", "passed", "ok", "success"):
@@ -324,6 +384,8 @@ def is_e2e_cmd(cmd):
     """检测 E2E 验证命令"""
     if not cmd:
         return False
+    if _command_matches_configured(cmd, configured_e2e_runner_command()):
+        return True
     pats = [
         r'\bagent-browser\b',
         r'\bcurl\s.*localhost',
@@ -343,6 +405,8 @@ def is_e2e_gate_cmd(cmd):
     """检测 E2E Gate 脚本命令"""
     if not cmd:
         return False
+    if _command_matches_configured(cmd, configured_e2e_gate_command()):
+        return True
     return bool(re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE))
 
 
@@ -358,6 +422,8 @@ def is_strict_e2e_runner(cmd):
     """Strict pattern: only matches actual E2E runner scripts, not arbitrary commands containing 'e2e'."""
     if not cmd:
         return False
+    if _command_matches_configured(cmd, configured_e2e_runner_command()):
+        return True
     return any(re.search(p, cmd, re.IGNORECASE) for p in E2E_RUNNER_STRICT_PATTERNS)
 
 
@@ -444,6 +510,8 @@ def is_db_write_cmd(cmd):
 
 
 FASTSHIP_STATE_PATTERNS = [
+    "fastship/registry.json",
+    "fastship/sessions/",
     "fastship/gate.json",
     "fastship/orchestrator.json",
     ".ship-verify-state.json",
@@ -1156,12 +1224,13 @@ def gate_post_bash():
             st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
             changed = True
             # Provenance: only hash if the command matches strict runner pattern
-            if is_strict_e2e_runner(cmd) and os.path.exists(E2E_RESULT_PATH):
+            result_path = e2e_result_path()
+            if is_strict_e2e_runner(cmd) and os.path.exists(result_path):
                 try:
                     import hashlib
-                    with open(E2E_RESULT_PATH, "rb") as f:
+                    with open(result_path, "rb") as f:
                         st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
-                    with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+                    with open(result_path, encoding="utf-8") as f:
                         rdata = json.load(f)
                     st["e2e_result_turns"] = sum(
                         len(r.get("turns", []))
@@ -1421,6 +1490,7 @@ def gate_status():
     branch = get_current_branch()
     st = load_state()
     stacks = detect_stack()
+    print(f"Session:    {st.get('session_id') or fastship_state.current_session_id() or '-'}")
     print(f"Branch:     {branch}")
     print(f"State for:  {st.get('branch', '-')}")
     if branch_mismatch(st, branch):
@@ -1498,21 +1568,48 @@ def gate_status():
 def gate_reset():
     """手动重置验证状态（新需求开始时调用）"""
     branch = get_current_branch()
+    previous = load_state()
+    forge_feature = previous.get("forge_feature") if isinstance(previous, dict) else None
     st = empty_state(branch)
+    if forge_feature:
+        st["forge_feature"] = forge_feature
     save_state(st)
     legacy = fastship_state.legacy_gate_state_path()
     if os.path.exists(legacy):
         os.remove(legacy)
-    print(f"✅ Gate: 验证状态已重置 (branch: {branch})")
+    print(f"✅ Gate: 验证状态已重置 (session: {st.get('session_id') or '-'}, branch: {branch})")
     return 0
 
 
 # ---------- 入口 ----------
 
+def strip_global_session_arg(argv):
+    session_id = None
+    stripped = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--session", "-s") and i + 1 < len(argv):
+            session_id = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--session="):
+            session_id = arg.split("=", 1)[1]
+            i += 1
+            continue
+        stripped.append(arg)
+        i += 1
+    return session_id, stripped
+
+
 def main():
-    if len(sys.argv) < 2:
+    session_arg, argv = strip_global_session_arg(sys.argv[1:])
+    if session_arg:
+        os.environ[fastship_state.SESSION_ENV] = fastship_state.normalize_session_id(session_arg) or session_arg
+    if len(argv) < 1:
         print("Usage: ship_verify_gate.py <post_bash|post_edit|pre_bash|pre_edit|status|reset|plan_bypass|knowledge_skip|knowledge_recall|loop_record>")
         sys.exit(1)
+    sys.argv = [sys.argv[0], *argv]
 
     handlers = {
         "post_bash": gate_post_bash,

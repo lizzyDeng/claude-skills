@@ -87,6 +87,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    📡 Event: <event_name>
    ```
 4. **注入 fastship**：调用 `/fastship`，在 Phase 1 上下文中追加：
+   - 使用 feature slug 作为 fastship session：`fastship start --session <slug> "<需求>"`
    - "本 feature 的交付 AC 必须包含：埋点事件 `<event_name>` 的实现"
    - "本 feature 服务于子目标：<objective_name> — <objective_description>"
 5. fastship Phase 1 完成后（plan 落库 + grill 通过 + Codex Review structured gate + 用户 sign-off + trusted artifact hash）：
@@ -112,7 +113,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 **流程**：
 
 1. `python3 .claude/hooks/forge_gate.py transition <slug> shipped`
-   - Gate 4 自动检查当前 worktree 的 fastship gate state + orchestrator state
+   - Gate 4 自动检查当前 worktree 中该 feature slug 对应的 fastship session state + orchestrator state
    - 不读取旧 `.claude/.ship-verify-state.json`，禁止 legacy fallback
    - 必须验证 E2E 报告 trusted artifact，并确认报告引用 `e2e_result_hash`
    - Gate 5 自动从 shipped 转入 measuring
@@ -193,4 +194,5 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 4. 跳过 `/forge ship` 直接标记 concluded — Gate 4/5/6 联合拦截
 5. 不做 harvest 就开始下一个 feature — measuring 状态的 feature 会在每次调用时提醒
 6. 修改 fastship 的 ship_verify_gate.py 来适配 forge — forge 单向依赖 fastship，不改 fastship
-7. 依赖旧 fastship state 或单个布尔字段推进 forge 状态 — G2/G4 必须读当前 worktree 的 gate.json + orchestrator.json，并校验 trusted artifact hash
+7. 依赖旧 fastship state 或单个布尔字段推进 forge 状态 — G2/G4 必须读当前 worktree 的 `fastship/sessions/<slug>/gate.json` + `orchestrator.json`，并校验 trusted artifact hash
+8. 用 Forge 激活 feature 时清空其他 feature 的 fastship state — 切换只允许更新当前 session 指针，不能 reset 另一个需求的状态

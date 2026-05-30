@@ -50,10 +50,10 @@ mkdir -p project-roadmap/features
 
 ## Step 6: 更新 .gitignore
 
-检查 `.gitignore` 是否已包含 `.claude/.forge-state.json`，如果没有则追加：
+检查 `.gitignore` 是否已包含 `.claude/forge-state/`，如果没有则追加：
 
 ```bash
-grep -q ".forge-state.json" .gitignore || echo ".claude/.forge-state.json" >> .gitignore
+grep -q ".claude/forge-state/" .gitignore || echo ".claude/forge-state/" >> .gitignore
 ```
 
 ## Step 7: 验证

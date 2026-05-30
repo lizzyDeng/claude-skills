@@ -17,10 +17,11 @@ import json
 import re
 import subprocess
 import hashlib
+import shutil
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, Any, Union
 
 import fastship_state
 
@@ -93,6 +94,8 @@ def empty_orchestrator_state(requirement: str) -> dict:
 
 def save_orch_state(st: dict, path: str = None):
     p = path or orch_state_path()
+    if path is None:
+        fastship_state.update_session_from_state(st)
     fastship_state.save_json(p, st)
 
 
@@ -163,7 +166,7 @@ class Step:
     id: str
     name: str
     phase: int
-    instruction: str
+    instruction: Union[str, Callable[[dict], str]]
     validator: Callable[[dict, dict], tuple]
     done_flags: list = field(default_factory=list)
     conditional: Optional[str] = None
@@ -174,6 +177,7 @@ class Step:
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
 E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
 
@@ -230,6 +234,110 @@ def _absolute_path(path: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(_repo_root(), path)
     return os.path.realpath(path)
+
+
+def _project_e2e_config() -> dict:
+    cfg = fastship_state.load_project_config()
+    e2e = cfg.get("e2e") if isinstance(cfg, dict) else None
+    return e2e if isinstance(e2e, dict) else {}
+
+
+def _config_str(value: Any, default: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _config_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _config_list(value: Any) -> list:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = [value]
+    else:
+        return []
+    cleaned = []
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _e2e_result_path() -> str:
+    path = _config_str(_project_e2e_config().get("result_path"), E2E_RESULT_PATH)
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    return os.path.abspath(path)
+
+
+def _e2e_min_turns() -> int:
+    return _config_int(_project_e2e_config().get("min_turns"), E2E_MIN_TURNS)
+
+
+def _e2e_setup_commands() -> list:
+    return _config_list(_project_e2e_config().get("setup_commands"))
+
+
+def _e2e_notes() -> list:
+    return _config_list(_project_e2e_config().get("notes"))
+
+
+def _e2e_runner_command() -> str:
+    default = f"python3 tests/e2e_runner.py -o {_e2e_result_path()}"
+    return _config_str(_project_e2e_config().get("runner_command"), default)
+
+
+def _e2e_gate_command() -> str:
+    default = f"python3 tests/e2e_gate.py --result {_e2e_result_path()} --min-turns {_e2e_min_turns()}"
+    return _config_str(_project_e2e_config().get("gate_command"), default)
+
+
+def _command_block(commands: list) -> str:
+    return "\n".join(f"  {cmd}" for cmd in commands)
+
+
+def _e2e_runner_instruction(_orch: dict = None) -> str:
+    lines = ["运行项目 E2E Runner 采集数据："]
+    setup = _e2e_setup_commands()
+    if setup:
+        lines.extend(["", "准备服务（按顺序执行，保持服务可用）：", _command_block(setup)])
+    lines.extend(["", "采集数据：", f"  {_e2e_runner_command()}"])
+    notes = _e2e_notes()
+    if notes:
+        lines.extend(["", "项目说明："])
+        lines.extend(f"- {note}" for note in notes)
+    lines.append(f"🔴 最少 {_e2e_min_turns()} 轮。Runner 只采集不判断。orchestrator 自动检测。")
+    lines.append(f"🔴 原始结果必须写入 {_e2e_result_path()}，hook/gate 会记录 hash。")
+    return "\n".join(lines)
+
+
+def _e2e_report_instruction(_orch: dict = None) -> str:
+    result_path = _e2e_result_path()
+    return f"""读 {result_path}，写 E2E 质量检测报告到文件。
+报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
+🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
+🔴 Validator 自动验证 {result_path} 完整性（hash 比对 gate.json 记录）。
+🔴 禁止手动创建或修改 {result_path}。
+用 Write 工具保存报告。orchestrator 自动检测文件写入。"""
+
+
+def _e2e_gate_instruction(_orch: dict = None) -> str:
+    return f"""运行 Gate 脚本：
+  {_e2e_gate_command()}
+Gate 展示原始数据给用户对照。FAIL → 禁止合入。
+🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
+🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
+🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""
 
 
 def _file_fingerprint(path: str) -> tuple[str, int]:
@@ -548,25 +656,27 @@ def validate_e2e_run(orch: dict, hook: dict) -> tuple:
 def validate_e2e_report(orch: dict, hook: dict) -> tuple:
     gate = _read_gate_state_file()
     stored_hash = gate.get("e2e_result_hash") if gate else None
+    result_path = _e2e_result_path()
+    min_turns = _e2e_min_turns()
 
     if stored_hash:
         # Hook mode: verify e2e_result.json integrity
-        if not os.path.exists(E2E_RESULT_PATH):
-            return False, f"{E2E_RESULT_PATH} not found"
-        with open(E2E_RESULT_PATH, "rb") as f:
+        if not os.path.exists(result_path):
+            return False, f"{result_path} not found"
+        with open(result_path, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash != stored_hash:
             return False, "e2e_result.json hash mismatch — 文件在 runner 执行后被修改"
         try:
-            with open(E2E_RESULT_PATH, encoding="utf-8") as f:
+            with open(result_path, encoding="utf-8") as f:
                 data = json.load(f)
             turns = sum(
                 len(r.get("turns", []))
                 for s in data.get("scenarios", [])
                 for r in s.get("rounds", [])
             )
-            if turns < 10:
-                return False, f"e2e_result.json turns 不足 ({turns} < 10)"
+            if turns < min_turns:
+                return False, f"e2e_result.json turns 不足 ({turns} < {min_turns})"
         except Exception as e:
             return False, f"e2e_result.json 解析失败: {e}"
         path = orch.get("report_path")
@@ -600,14 +710,15 @@ def validate_e2e_report(orch: dict, hook: dict) -> tuple:
 
 def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
     gate = _read_gate_state_file()
+    result_path = _e2e_result_path()
     if not gate:
         return False, "gate.json 不存在，禁止 Codex fallback 通过 E2E Gate"
     if not gate.get("e2e_executed"):
         return False, "e2e_executed not set in gate.json"
     stored_hash = gate.get("e2e_result_hash")
-    if stored_hash and os.path.exists(E2E_RESULT_PATH):
+    if stored_hash and os.path.exists(result_path):
         import hashlib
-        with open(E2E_RESULT_PATH, "rb") as f:
+        with open(result_path, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash != stored_hash:
             return False, "e2e_result.json hash mismatch — 文件在 3.3→3.4 间被修改"
@@ -622,7 +733,7 @@ def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
         return False, "e2e_gate.py not found in project"
     try:
         result = subprocess.run(
-            [sys.executable, gate_script, "--result", E2E_RESULT_PATH, "--min-turns", "10"],
+            [sys.executable, gate_script, "--result", result_path, "--min-turns", str(_e2e_min_turns())],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -657,9 +768,10 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
             if not gate.get("e2e_gate_passed"):
                 return False, "outcome=pass 但 gate.json e2e_gate_passed=false — E2E Gate 未通过不能自判 pass"
             stored_hash = gate.get("e2e_result_hash")
-            if stored_hash and os.path.exists(E2E_RESULT_PATH):
+            result_path = _e2e_result_path()
+            if stored_hash and os.path.exists(result_path):
                 import hashlib
-                with open(E2E_RESULT_PATH, "rb") as f:
+                with open(result_path, "rb") as f:
                     actual_hash = hashlib.sha256(f.read()).hexdigest()
                 if actual_hash != stored_hash:
                     return False, "e2e_result.json hash mismatch — 文件在验证链中被篡改"
@@ -861,25 +973,13 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
 失败 → 修复后重跑。orchestrator 自动检测 test pass。"""),
 
     Step("3.2", "E2E Runner", 3, validator=validate_e2e_run,
-         instruction="""运行 E2E Runner 采集数据：
-  python3 tests/e2e_runner.py -o /tmp/e2e_result.json
-🔴 最少 10 轮。Runner 只采集不判断。orchestrator 自动检测。"""),
+         instruction=_e2e_runner_instruction),
 
-	    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
-	         instruction="""读 /tmp/e2e_result.json，写 E2E 质量检测报告到文件。
-	报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
-🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
-🔴 Validator 自动验证 e2e_result.json 完整性（hash 比对 gate.json 记录）。
-🔴 禁止手动创建或修改 /tmp/e2e_result.json。
-用 Write 工具保存报告。orchestrator 自动检测文件写入。"""),
+    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
+         instruction=_e2e_report_instruction),
 
     Step("3.4", "E2E Gate", 3, validator=validate_e2e_gate,
-         instruction="""运行 Gate 脚本：
-  python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10
-Gate 展示原始数据给用户对照。FAIL → 禁止合入。
-🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
-🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
-🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""),
+         instruction=_e2e_gate_instruction),
 
     Step("3.5", "Loop Record", 3, validator=validate_loop_record,
          instruction="""记录本轮结果：
@@ -1131,8 +1231,16 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
 
     # Block edits to any fastship state file
     normalized = _normalize(file_path)
-    if any(pat in normalized for pat in ("fastship/gate.json", "fastship/orchestrator.json",
-                                          ".fastship-orchestrator-state.json", ".ship-verify-state.json")):
+    if (
+        any(pat in normalized for pat in (
+            "fastship/gate.json",
+            "fastship/orchestrator.json",
+            "fastship/registry.json",
+            ".fastship-orchestrator-state.json",
+            ".ship-verify-state.json",
+        ))
+        or ("fastship/sessions/" in normalized and normalized.endswith(("/gate.json", "/orchestrator.json")))
+    ):
         print("🔴 BLOCKED: fastship state 由系统管理，禁止手动编辑")
         return 1
 
@@ -1472,6 +1580,7 @@ def parse_done_args(argv: list) -> dict:
 def format_status(orch: dict) -> str:
     lines = [
         f"🚀 Fastship: {orch.get('requirement', '?')}",
+        f"   Session: {orch.get('session_id', fastship_state.current_session_id() or '-')}",
         f"   Phase: {orch.get('phase', '?')} | Step: {orch.get('current_step', '?')} | Loop: {orch.get('loop_count', 0)}/3",
         "",
     ]
@@ -1524,34 +1633,61 @@ def format_next(orch: dict) -> str:
     if _branch_mismatch(orch):
         prefix = "\n".join(fastship_state.branch_mismatch_lines(orch)) + "\n\n"
 
+    instruction = step.instruction(orch) if callable(step.instruction) else step.instruction
+
     return (
         prefix +
         f"📋 Step {step.id}: {step.name}  [{phase_names.get(step.phase, '?')}]\n"
         f"{'─' * 50}\n"
-        f"{step.instruction}\n"
+        f"{instruction}\n"
         f"{'─' * 50}"
     )
 
 
 # ━━━━━━━━━━━━ CLI Commands ━━━━━━━━━━━━
 
+def _session_id_for_start(requirement: str) -> str:
+    explicit = fastship_state.normalize_session_id(os.environ.get(fastship_state.SESSION_ENV))
+    if explicit:
+        return explicit
+
+    current = fastship_state.current_session_id()
+    if current:
+        current_orch = fastship_state.load_json(fastship_state.orchestrator_state_path(current)) or {}
+        current_gate = fastship_state.load_json(fastship_state.gate_state_path(current)) or {}
+        # Forge activates a feature by selecting its session before fastship starts.
+        # Reuse that feature-scoped session instead of deriving a second id from
+        # the natural-language requirement.
+        if not _is_active(current_orch) and current_gate.get("forge_feature") == current:
+            return current
+
+    return fastship_state.session_id_from_requirement(requirement)
+
+
 def cmd_start(requirement: str) -> int:
-    existing = load_orch_state()
+    session_id = _session_id_for_start(requirement)
+    os.environ[fastship_state.SESSION_ENV] = session_id
+    existing = load_orch_state(fastship_state.orchestrator_state_path(session_id))
     if existing and existing.get("current_step") not in ("done", "stopped", None):
-        print(f"⚠️  已有活跃 session: \"{existing.get('requirement')}\"")
+        print(f"⚠️  session 已活跃: {session_id}")
+        print(f"   需求: \"{existing.get('requirement')}\"")
         print(f"   当前: {existing.get('current_step')}")
-        print('   重新开始: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" reset')
+        print(f'   查看: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} status')
+        print(f'   重来: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} reset')
         return 1
     if not _compact_is_recent():
         print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
         print("   运行 /compact 后重试 start。")
         return 1
     st = empty_orchestrator_state(requirement)
+    st["session_id"] = session_id
+    fastship_state.set_current_session_id(session_id, requirement, st)
     save_orch_state(st)
     gp = gate_script_path()
     if os.path.exists(gp):
         delegate_to_gate(gp, "reset", {})
-    print(f"🚀 Fastship started: \"{requirement}\"\n")
+    print(f"🚀 Fastship started: \"{requirement}\"")
+    print(f"   Session: {session_id}\n")
     print(format_next(st))
     return 0
 
@@ -1690,23 +1826,90 @@ def cmd_done(argv: list) -> int:
 def cmd_status() -> int:
     st = load_orch_state()
     if not st:
-        print("❌ 没有活跃 session。")
+        sessions = fastship_state.list_sessions()
+        if sessions:
+            print("❌ 当前没有选中的 session。可用 session:")
+            print(format_session_list())
+        else:
+            print("❌ 没有活跃 session。")
         return 1
     print(format_status(st))
     return 0
 
 
-def cmd_reset() -> int:
+def format_session_list() -> str:
+    registry = fastship_state.load_registry()
+    current = registry.get("current_session")
+    sessions = registry.get("sessions", {})
+    if not sessions:
+        return "（无 fastship sessions）"
+    lines = []
+    for sid, rec in sorted(sessions.items()):
+        marker = "*" if sid == current else " "
+        req = rec.get("requirement", "-")
+        step = rec.get("current_step", "-")
+        status = rec.get("status", "-")
+        branch = rec.get("branch", "-")
+        lines.append(f"{marker} {sid}  step={step} status={status} branch={branch}  {req}")
+    return "\n".join(lines)
+
+
+def cmd_list() -> int:
+    print(format_session_list())
+    return 0
+
+
+def cmd_use(session_id: str) -> int:
+    sid = fastship_state.normalize_session_id(session_id)
+    if not sid:
+        print("Usage: use <session>")
+        return 1
+    registry = fastship_state.load_registry()
+    if sid not in registry.get("sessions", {}):
+        print(f"❌ Unknown fastship session: {sid}")
+        print(format_session_list())
+        return 1
+    st = fastship_state.load_json(fastship_state.orchestrator_state_path(sid)) or {}
+    fastship_state.set_current_session_id(sid, st.get("requirement"), st)
+    print(f"✅ Current fastship session: {sid}")
+    return 0
+
+
+def cmd_reset(argv: list = None) -> int:
+    argv = argv or []
+    reset_all = "--all" in argv
+
+    if reset_all:
+        if os.path.exists(fastship_state.sessions_dir()):
+            shutil.rmtree(fastship_state.sessions_dir())
+        for path in (
+            fastship_state.registry_path(),
+            fastship_state.legacy_single_orchestrator_state_path(),
+            fastship_state.legacy_single_gate_state_path(),
+            fastship_state.legacy_orchestrator_state_path(),
+            fastship_state.legacy_gate_state_path(),
+        ):
+            if os.path.exists(path):
+                os.remove(path)
+        print("✅ All Fastship sessions cleared.")
+        return 0
+
+    session_id = fastship_state.resolve_session_id(default=False)
+    if not session_id:
+        print("❌ 没有选中的 session。使用 list 查看，或 reset --all。")
+        return 1
+
     for path in (
-        orch_state_path(),
-        fastship_state.legacy_orchestrator_state_path(),
+        fastship_state.orchestrator_state_path(session_id),
+        fastship_state.gate_state_path(session_id),
     ):
         if os.path.exists(path):
             os.remove(path)
-    gp = gate_script_path()
-    if os.path.exists(gp):
-        delegate_to_gate(gp, "reset", {})
-    print("✅ Orchestrator + hook state cleared.")
+    session_dir = fastship_state.session_state_dir(session_id)
+    if os.path.isdir(session_dir) and not os.listdir(session_dir):
+        os.rmdir(session_dir)
+    fastship_state.unregister_session(session_id)
+    print(f"✅ Fastship session cleared: {session_id}")
     return 0
 
 
@@ -1769,24 +1972,49 @@ def cmd_adopt_branch() -> int:
 
 # ━━━━━━━━━━━━ Main ━━━━━━━━━━━━
 
+def strip_global_session_arg(argv: list[str]) -> tuple[Optional[str], list[str]]:
+    session_id = None
+    stripped = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--session", "-s") and i + 1 < len(argv):
+            session_id = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--session="):
+            session_id = arg.split("=", 1)[1]
+            i += 1
+            continue
+        stripped.append(arg)
+        i += 1
+    return session_id, stripped
+
+
 def main():
-    if len(sys.argv) < 2:
+    session_arg, argv = strip_global_session_arg(sys.argv[1:])
+    if session_arg:
+        os.environ[fastship_state.SESSION_ENV] = fastship_state.normalize_session_id(session_arg) or session_arg
+
+    if len(argv) < 1:
         print("Usage: fastship_orchestrator.py <command>")
         print()
         print("Hook mode (called by settings.local.json):")
         print("  pre_edit / pre_bash / post_edit / post_bash")
         print()
         print("CLI mode (called by Claude/Codex):")
-        print("  start \"<需求>\"     开始 session")
+        print("  start [--session ID] \"<需求>\"     开始/恢复需求 session")
         print("  next               当前步骤")
         print("  done [--flags]     完成当前步骤")
         print("  status             全部状态")
+        print("  list               列出全部需求 sessions")
+        print("  use <session>      切换 hook/CLI 默认 session")
         print("  goal               生成 /goal 条件（Phase 2+ 可用）")
         print("  adopt-branch       将活跃 session 迁移到当前分支")
-        print("  reset              重置")
+        print("  reset [--all]      重置当前 session 或全部 sessions")
         sys.exit(1)
 
-    cmd = sys.argv[1]
+    cmd = argv[0]
     handlers = {
         "pre_edit": hook_pre_edit,
         "pre_bash": hook_pre_bash,
@@ -1794,18 +2022,25 @@ def main():
         "post_bash": hook_post_bash,
         "next": cmd_next,
         "status": cmd_status,
+        "list": cmd_list,
         "goal": cmd_goal,
-        "reset": cmd_reset,
         "adopt-branch": cmd_adopt_branch,
     }
 
     if cmd == "start":
-        if len(sys.argv) < 3:
-            print("Usage: start \"<需求>\"")
+        if len(argv) < 2:
+            print("Usage: start [--session ID] \"<需求>\"")
             sys.exit(1)
-        sys.exit(cmd_start(sys.argv[2]))
+        sys.exit(cmd_start(argv[1]))
     elif cmd == "done":
-        sys.exit(cmd_done(sys.argv[2:]))
+        sys.exit(cmd_done(argv[1:]))
+    elif cmd == "use":
+        if len(argv) < 2:
+            print("Usage: use <session>")
+            sys.exit(1)
+        sys.exit(cmd_use(argv[1]))
+    elif cmd == "reset":
+        sys.exit(cmd_reset(argv[1:]))
     elif cmd in handlers:
         sys.exit(handlers[cmd]())
     else:

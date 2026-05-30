@@ -7,12 +7,24 @@ should not disappear when the caller changes directories. The state home is:
 1. FASTSHIP_STATE_HOME, when explicitly set.
 2. Per-worktree: {git-dir}/fastship (supports parallel agents in worktrees).
 3. The script repository's .claude/state/fastship directory as a fallback.
+
+Within that home, runtime state is scoped by requirement/session:
+
+  registry.json
+  sessions/<session-id>/orchestrator.json
+  sessions/<session-id>/gate.json
+
+The registry only stores pointers and metadata. The actual flow state for one
+requirement never shares a JSON document with another requirement.
 """
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+from datetime import datetime
 from typing import Optional
 
 
@@ -105,11 +117,184 @@ def ensure_state_home() -> str:
     return home
 
 
-def orchestrator_state_path() -> str:
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _status_from_state(state: dict) -> str:
+    step = state.get("current_step")
+    if step in ("done", "stopped"):
+        return step
+    if step:
+        return "active"
+    return "unknown"
+
+
+REGISTRY_FILENAME = "registry.json"
+SESSIONS_DIRNAME = "sessions"
+DEFAULT_SESSION_ID = "default"
+SESSION_ENV = "FASTSHIP_SESSION"
+
+
+def normalize_session_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(os.sep, "-")
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip(".-_").lower()
+    text = re.sub(r"-{2,}", "-", text)
+    return (text or DEFAULT_SESSION_ID)[:96]
+
+
+def session_id_from_requirement(requirement: str) -> str:
+    base = normalize_session_id(requirement) or "req"
+    digest = hashlib.sha1((requirement or "").encode("utf-8")).hexdigest()[:10]
+    if base == DEFAULT_SESSION_ID:
+        base = "req"
+    max_base = 64 - len(digest) - 1
+    return f"{base[:max_base].rstrip('-')}-{digest}"
+
+
+def registry_path() -> str:
+    return os.path.join(ensure_state_home(), REGISTRY_FILENAME)
+
+
+def sessions_dir() -> str:
+    return os.path.join(ensure_state_home(), SESSIONS_DIRNAME)
+
+
+def load_registry() -> dict:
+    data = load_json(registry_path())
+    if not isinstance(data, dict):
+        data = {}
+    sessions = data.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+    return {
+        "version": int(data.get("version", 1) or 1),
+        "current_session": normalize_session_id(data.get("current_session")),
+        "sessions": sessions,
+    }
+
+
+def save_registry(registry: dict) -> None:
+    registry = dict(registry or {})
+    registry["version"] = int(registry.get("version", 1) or 1)
+    sessions = registry.get("sessions")
+    registry["sessions"] = sessions if isinstance(sessions, dict) else {}
+    registry["current_session"] = normalize_session_id(registry.get("current_session"))
+    save_json(registry_path(), registry)
+
+
+def current_session_id() -> Optional[str]:
+    env_session = normalize_session_id(os.environ.get(SESSION_ENV))
+    if env_session:
+        return env_session
+    current = load_registry().get("current_session")
+    return normalize_session_id(current)
+
+
+def list_sessions() -> dict:
+    return load_registry().get("sessions", {})
+
+
+def set_current_session_id(session_id: str, requirement: str = None, state: dict = None) -> str:
+    sid = normalize_session_id(session_id) or DEFAULT_SESSION_ID
+    registry = load_registry()
+    sessions = registry.setdefault("sessions", {})
+    rec = dict(sessions.get(sid) or {})
+    rec.update({
+        "id": sid,
+        "updated_at": _now_iso(),
+        "repo_root": repo_root(),
+    })
+    if requirement:
+        rec["requirement"] = requirement
+    if state:
+        rec["current_step"] = state.get("current_step")
+        rec["phase"] = state.get("phase")
+        rec["branch"] = state.get("branch")
+        rec["status"] = _status_from_state(state)
+        if state.get("requirement"):
+            rec["requirement"] = state.get("requirement")
+    rec.setdefault("created_at", rec["updated_at"])
+    sessions[sid] = rec
+    registry["current_session"] = sid
+    save_registry(registry)
+    return sid
+
+
+def unregister_session(session_id: str) -> None:
+    sid = normalize_session_id(session_id)
+    if not sid:
+        return
+    registry = load_registry()
+    registry.get("sessions", {}).pop(sid, None)
+    if registry.get("current_session") == sid:
+        remaining = sorted(registry.get("sessions", {}).keys())
+        registry["current_session"] = remaining[0] if len(remaining) == 1 else None
+    save_registry(registry)
+
+
+def update_session_from_state(state: dict, session_id: str = None) -> None:
+    if not isinstance(state, dict):
+        return
+    sid = normalize_session_id(session_id or state.get("session_id") or current_session_id())
+    if not sid:
+        return
+    state["session_id"] = sid
+    set_current_session_id(sid, state.get("requirement"), state)
+
+
+def resolve_session_id(
+    explicit: str = None,
+    requirement: str = None,
+    create: bool = False,
+    default: bool = True,
+) -> Optional[str]:
+    sid = normalize_session_id(explicit)
+    if sid:
+        return sid
+
+    env_session = normalize_session_id(os.environ.get(SESSION_ENV))
+    if env_session:
+        return env_session
+
+    if create and requirement:
+        return session_id_from_requirement(requirement)
+
+    registry = load_registry()
+    current = normalize_session_id(registry.get("current_session"))
+    if current:
+        return current
+
+    sessions = registry.get("sessions", {})
+    if isinstance(sessions, dict) and len(sessions) == 1:
+        return normalize_session_id(next(iter(sessions.keys())))
+
+    return DEFAULT_SESSION_ID if default else None
+
+
+def session_state_dir(session_id: str = None) -> str:
+    sid = resolve_session_id(explicit=session_id)
+    return os.path.join(sessions_dir(), sid)
+
+
+def orchestrator_state_path(session_id: str = None) -> str:
+    return os.path.join(session_state_dir(session_id), "orchestrator.json")
+
+
+def gate_state_path(session_id: str = None) -> str:
+    return os.path.join(session_state_dir(session_id), "gate.json")
+
+
+def legacy_single_orchestrator_state_path() -> str:
     return os.path.join(ensure_state_home(), "orchestrator.json")
 
 
-def gate_state_path() -> str:
+def legacy_single_gate_state_path() -> str:
     return os.path.join(ensure_state_home(), "gate.json")
 
 
@@ -127,6 +312,18 @@ def gate_script_path() -> str:
 
 def fastship_cli_path() -> str:
     return os.path.join(script_repo_root(), ".claude", "tools", "fastship")
+
+
+PROJECT_CONFIG_REL_PATH = os.path.join(".claude", "fastship.project.json")
+
+
+def project_config_path() -> str:
+    return os.path.join(repo_root(), PROJECT_CONFIG_REL_PATH)
+
+
+def load_project_config() -> dict:
+    data = load_json(project_config_path())
+    return data if isinstance(data, dict) else {}
 
 
 def current_branch() -> Optional[str]:
@@ -150,20 +347,35 @@ def save_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def migrate_legacy_state(kind: str) -> bool:
+def migrate_legacy_state(kind: str, session_id: str = None) -> bool:
     if kind == "orchestrator":
-        src = legacy_orchestrator_state_path()
-        dst = orchestrator_state_path()
+        sources = (legacy_single_orchestrator_state_path(), legacy_orchestrator_state_path())
+        default_src = next((p for p in sources if os.path.exists(p)), None)
+        default_data = load_json(default_src) if default_src else {}
+        sid = (
+            normalize_session_id(session_id)
+            or normalize_session_id((default_data or {}).get("session_id"))
+            or (session_id_from_requirement(default_data.get("requirement")) if default_data and default_data.get("requirement") else None)
+            or resolve_session_id(default=False)
+            or DEFAULT_SESSION_ID
+        )
+        dst = orchestrator_state_path(sid)
     elif kind == "gate":
-        src = legacy_gate_state_path()
-        dst = gate_state_path()
+        sources = (legacy_single_gate_state_path(), legacy_gate_state_path())
+        sid = normalize_session_id(session_id) or resolve_session_id(default=False) or DEFAULT_SESSION_ID
+        dst = gate_state_path(sid)
     else:
         raise ValueError(f"unknown state kind: {kind}")
 
-    if os.path.exists(dst) or not os.path.exists(src):
+    src = next((p for p in sources if os.path.exists(p)), None)
+    if os.path.exists(dst) or not src:
         return False
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy2(src, dst)
+    data = load_json(dst) or {}
+    data["session_id"] = sid
+    save_json(dst, data)
+    set_current_session_id(sid, data.get("requirement"), data)
     return True
 
 
