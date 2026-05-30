@@ -138,6 +138,33 @@ class TestStateManagement:
 
         assert fastship_state.repo_root() == str(project.resolve())
 
+    def test_state_paths_are_session_scoped(self, tmp_path, monkeypatch):
+        import fastship_state
+
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "Feature A")
+
+        assert fastship_state.orchestrator_state_path().endswith(
+            "sessions/feature-a/orchestrator.json"
+        )
+        assert fastship_state.gate_state_path().endswith(
+            "sessions/feature-a/gate.json"
+        )
+
+    def test_registry_tracks_multiple_requirement_sessions(self, tmp_path, monkeypatch):
+        import fastship_state
+
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        a = fastship_state.session_id_from_requirement("fix chat latency")
+        b = fastship_state.session_id_from_requirement("fix canvas position")
+
+        fastship_state.set_current_session_id(a, "fix chat latency", {"current_step": "1.2"})
+        fastship_state.set_current_session_id(b, "fix canvas position", {"current_step": "2.0"})
+
+        sessions = fastship_state.list_sessions()
+        assert set(sessions) == {a, b}
+        assert fastship_state.current_session_id() == b
+
 
 class TestDelegation:
     def test_delegate_to_gate_returns_exit_code(self, tmp_path):

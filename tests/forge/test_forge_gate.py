@@ -179,18 +179,18 @@ class TestRoadmapIO:
 class TestFastshipStateIO:
     """Test fastship state discovery used by Forge gates."""
 
-    def test_loads_current_fastship_gate_state_from_git_common_dir(self, tmp_path):
+    def test_loads_feature_scoped_fastship_gate_state(self, tmp_path):
         subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
-        state_dir = tmp_path / ".git" / "fastship"
-        state_dir.mkdir()
+        state_dir = tmp_path / ".git" / "fastship" / "sessions" / "f1"
+        state_dir.mkdir(parents=True)
         state = {"plan_ready": True, "test_passed": True}
         (state_dir / "gate.json").write_text(json.dumps(state))
 
         with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
-            assert forge_gate.fastship_state_path() == str((state_dir / "gate.json").resolve())
-            assert forge_gate.load_fastship_state()["plan_ready"] is True
+            assert forge_gate.fastship_state_path("f1") == str((state_dir / "gate.json").resolve())
+            assert forge_gate.load_fastship_state("f1")["plan_ready"] is True
 
-    def test_ignores_legacy_fastship_state_when_current_state_missing(self, tmp_path):
+    def test_requires_feature_session_when_current_state_missing(self, tmp_path):
         subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
         legacy_dir = tmp_path / ".claude"
         legacy_dir.mkdir()
@@ -199,19 +199,34 @@ class TestFastshipStateIO:
         legacy_path.write_text(json.dumps(legacy))
 
         with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
-            assert forge_gate.fastship_state_path() == str((tmp_path / ".git" / "fastship" / "gate.json").resolve())
+            assert forge_gate.fastship_state_path() is None
             assert forge_gate.load_fastship_state() == {}
 
-    def test_loads_current_fastship_orchestrator_state(self, tmp_path):
+    def test_loads_feature_scoped_fastship_orchestrator_state(self, tmp_path):
         subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
-        state_dir = tmp_path / ".git" / "fastship"
-        state_dir.mkdir()
+        state_dir = tmp_path / ".git" / "fastship" / "sessions" / "f1"
+        state_dir.mkdir(parents=True)
         state = {"current_step": "done"}
         (state_dir / "orchestrator.json").write_text(json.dumps(state))
 
         with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
-            assert forge_gate.fastship_orchestrator_state_path() == str((state_dir / "orchestrator.json").resolve())
-            assert forge_gate.load_fastship_orchestrator_state()["current_step"] == "done"
+            assert forge_gate.fastship_orchestrator_state_path("f1") == str((state_dir / "orchestrator.json").resolve())
+            assert forge_gate.load_fastship_orchestrator_state("f1")["current_step"] == "done"
+
+    def test_binding_feature_does_not_reset_other_fastship_session(self, tmp_path):
+        subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+        f1_dir = tmp_path / ".git" / "fastship" / "sessions" / "f1"
+        f1_dir.mkdir(parents=True)
+        (f1_dir / "gate.json").write_text(json.dumps({"forge_feature": "f1", "plan_ready": True}))
+
+        with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+            forge_gate.bind_fastship_state_for_feature("f2")
+
+        assert json.loads((f1_dir / "gate.json").read_text())["plan_ready"] is True
+        f2_gate = tmp_path / ".git" / "fastship" / "sessions" / "f2" / "gate.json"
+        assert json.loads(f2_gate.read_text())["forge_feature"] == "f2"
+        registry = json.loads((tmp_path / ".git" / "fastship" / "registry.json").read_text())
+        assert registry["current_session"] == "f2"
 
 
 class TestFeatureLookup:

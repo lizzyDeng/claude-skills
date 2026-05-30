@@ -13,14 +13,14 @@ Internal CLI (called by /forge skill, not by users directly):
   reset                  — Clear active feature state
 
 Hook handlers (called by Claude Code hooks):
-  pre_edit               — Protect .forge-state.json from tampering
+  pre_edit               — Protect derived forge state from tampering
   post_edit              — Detect metric.json/harvest.json/roadmap.json writes
   post_bash              — Check overdue harvests, print reminder
 
-State file: {repo_root}/.claude/.forge-state.json (derived cache)
+State files: {repo_root}/.claude/forge-state/features/<slug>/state.json (derived cache)
 Source of truth: {repo_root}/project-roadmap/roadmap.json
-Fastship trust inputs: current worktree {git-dir}/fastship/gate.json + orchestrator.json.
-Legacy fastship state fallback is intentionally disabled.
+Fastship trust inputs: current worktree {git-dir}/fastship/sessions/<slug>/gate.json + orchestrator.json.
+Legacy single-file fastship state fallback is intentionally disabled.
 """
 
 import sys
@@ -109,6 +109,18 @@ def get_git_dir(root=None):
         return None
 
 
+def get_current_branch(root=None):
+    root = root or get_repo_root()
+    if not root:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", root, "branch", "--show-current"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def roadmap_dir():
     root = get_repo_root()
     return os.path.join(root, "project-roadmap") if root else None
@@ -119,26 +131,125 @@ def roadmap_path():
     return os.path.join(d, "roadmap.json") if d else None
 
 
-def state_path():
+def _slug_id(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(os.sep, "-")
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip(".-_").lower()
+    text = re.sub(r"-{2,}", "-", text)
+    return text or None
+
+
+def forge_state_home():
+    root = get_repo_root()
+    return os.path.join(root, ".claude", "forge-state") if root else None
+
+
+def forge_registry_path():
+    home = forge_state_home()
+    return os.path.join(home, "registry.json") if home else None
+
+
+def legacy_forge_state_path():
     root = get_repo_root()
     return os.path.join(root, ".claude", ".forge-state.json") if root else None
 
 
-def fastship_state_path():
-    root = get_repo_root()
+def _load_forge_registry():
+    p = forge_registry_path()
+    data = _load_json(p)
+    features = data.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    return {
+        "version": int(data.get("version", 1) or 1),
+        "active_feature": _slug_id(data.get("active_feature")),
+        "features": features,
+    }
+
+
+def _save_forge_registry(registry):
+    p = forge_registry_path()
+    if not p:
+        return
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    registry = dict(registry or {})
+    registry["version"] = int(registry.get("version", 1) or 1)
+    registry["active_feature"] = _slug_id(registry.get("active_feature"))
+    if not isinstance(registry.get("features"), dict):
+        registry["features"] = {}
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
+
+
+def current_feature_id():
+    env_feature = _slug_id(os.environ.get("FORGE_FEATURE"))
+    if env_feature:
+        return env_feature
+    current = _load_forge_registry().get("active_feature")
+    if current:
+        return current
+    legacy = _load_json(legacy_forge_state_path())
+    return _slug_id(legacy.get("active_feature")) if legacy else None
+
+
+def state_path(slug=None):
+    home = forge_state_home()
+    feature = _slug_id(slug) or current_feature_id()
+    if not home or not feature:
+        return None
+    return os.path.join(home, "features", feature, "state.json")
+
+
+def fastship_state_home(root=None):
+    root = root or get_repo_root()
     if not root:
         return None
-
+    explicit = os.environ.get("FASTSHIP_STATE_HOME")
+    if explicit:
+        return os.path.realpath(explicit)
     gd = get_git_dir(root)
-    return os.path.join(gd, "fastship", "gate.json") if gd else None
+    return os.path.join(gd, "fastship") if gd else None
 
 
-def fastship_orchestrator_state_path():
-    root = get_repo_root()
-    if not root:
+def _load_fastship_registry():
+    home = fastship_state_home()
+    return _load_json(os.path.join(home, "registry.json")) if home else {}
+
+
+def current_fastship_session_id():
+    env_session = _slug_id(os.environ.get("FASTSHIP_SESSION"))
+    if env_session:
+        return env_session
+    registry = _load_fastship_registry()
+    current = _slug_id(registry.get("current_session"))
+    if current:
+        return current
+    sessions = registry.get("sessions")
+    if isinstance(sessions, dict) and len(sessions) == 1:
+        return _slug_id(next(iter(sessions.keys())))
+    return None
+
+
+def fastship_session_dir(session_id=None):
+    home = fastship_state_home()
+    sid = _slug_id(session_id) or current_fastship_session_id()
+    if not home or not sid:
         return None
-    gd = get_git_dir(root)
-    return os.path.join(gd, "fastship", "orchestrator.json") if gd else None
+    return os.path.join(home, "sessions", sid)
+
+
+def fastship_state_path(session_id=None):
+    d = fastship_session_dir(session_id)
+    return os.path.join(d, "gate.json") if d else None
+
+
+def fastship_orchestrator_state_path(session_id=None):
+    d = fastship_session_dir(session_id)
+    return os.path.join(d, "orchestrator.json") if d else None
 
 
 def read_stdin():
@@ -478,9 +589,9 @@ def can_transition(slug, current_status, target_status, repo_root, fastship_stat
                        f"{[t for (s, t) in TRANSITIONS if s == current_status]}")
 
     if fastship_state is None:
-        fastship_state = load_fastship_state()
+        fastship_state = load_fastship_state(slug)
     if fastship_orch_state is None:
-        fastship_orch_state = load_fastship_orchestrator_state()
+        fastship_orch_state = load_fastship_orchestrator_state(slug)
 
     # Verify fastship state belongs to this feature
     fs_feature = fastship_state.get("forge_feature")
@@ -538,13 +649,13 @@ def get_overdue_harvests(features, today_str=None):
 
 # ========== State Derivation ==========
 
-def load_fastship_state():
-    p = fastship_state_path()
+def load_fastship_state(session_id=None):
+    p = fastship_state_path(session_id)
     return _load_json(p)
 
 
-def load_fastship_orchestrator_state():
-    p = fastship_orchestrator_state_path()
+def load_fastship_orchestrator_state(session_id=None):
+    p = fastship_orchestrator_state_path(session_id)
     return _load_json(p)
 
 
@@ -594,8 +705,8 @@ def derive_state(roadmap, active_feature=None):
                 pass
 
     # Check G2: trusted fastship Phase 1 completion
-    fs_state = load_fastship_state()
-    orch_state = load_fastship_orchestrator_state()
+    fs_state = load_fastship_state(active_feature)
+    orch_state = load_fastship_orchestrator_state(active_feature)
     state["g2_plan_ready"] = fastship_phase1_complete(active_feature, fs_state, orch_state)[0]
 
     # Check G3-G6 from roadmap status
@@ -618,24 +729,55 @@ def derive_state(roadmap, active_feature=None):
     return state
 
 
-def load_forge_state():
-    p = state_path()
+def load_forge_state(slug=None):
+    feature = _slug_id(slug) or current_feature_id()
+    p = state_path(feature)
     if p and os.path.exists(p):
         try:
-            with open(p) as f:
-                return json.load(f)
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("active_feature", feature)
+                return data
         except Exception:
             pass
-    return {"active_feature": None}
+
+    legacy = _load_json(legacy_forge_state_path())
+    legacy_feature = _slug_id(legacy.get("active_feature")) if legacy else None
+    if legacy and (not feature or legacy_feature == feature):
+        feature = legacy_feature
+        if feature:
+            save_forge_state(legacy, feature)
+        return legacy
+
+    return {"active_feature": feature}
 
 
-def save_forge_state(state):
-    p = state_path()
+def save_forge_state(state, slug=None):
+    feature = _slug_id(slug) or _slug_id((state or {}).get("active_feature")) or current_feature_id()
+    if not feature:
+        return
+    state = dict(state or {})
+    state["active_feature"] = feature
+    p = state_path(feature)
     if not p:
         return
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(state, f, indent=2)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+    registry = _load_forge_registry()
+    features = registry.setdefault("features", {})
+    rec = dict(features.get(feature) or {})
+    rec.update({
+        "slug": feature,
+        "phase": state.get("phase"),
+        "updated_at": datetime.now().isoformat(),
+    })
+    rec.setdefault("created_at", rec["updated_at"])
+    features[feature] = rec
+    registry["active_feature"] = feature
+    _save_forge_registry(registry)
 
 
 # ========== Roadmap.md Generation ==========
@@ -769,63 +911,56 @@ def cmd_status():
         print(f"\n  🎯 Active: {active}")
 
 
-def reset_fastship_state_for_feature(slug):
-    """Reset fastship gate state when switching features.
-    Prevents Feature B from inheriting Feature A's plan_ready/test_passed/e2e_executed."""
-    p = fastship_state_path()
-    if not p:
+def bind_fastship_state_for_feature(slug):
+    """Select the feature-scoped fastship session without mutating other sessions."""
+    session_id = _slug_id(slug)
+    home = fastship_state_home()
+    if not home or not session_id:
         return
-    try:
-        if os.path.exists(p):
-            with open(p) as f:
-                st = json.load(f)
-        else:
-            st = {}
-    except Exception:
-        st = {}
 
+    session_dir = fastship_session_dir(session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    p = fastship_state_path(session_id)
+    st = _load_json(p)
     old_feature = st.get("forge_feature")
-    if old_feature == slug:
-        return
-
-    for key in ("plan_ready", "test_passed", "e2e_executed",
-                "e2e_gate_passed", "knowledge_acknowledged", "plan_bypass",
-                "knowledge_recall_done", "request_classified",
-                "bug_diagnosis_done", "loop_count",
-                "e2e_runs_since_last_record"):
-        if key in st:
-            if isinstance(st[key], bool):
-                st[key] = False
-            elif isinstance(st[key], int):
-                st[key] = 0
-
-    for key in ("plan_file", "plan_ts", "test_ts", "test_tool",
-                "e2e_ts", "e2e_result_hash", "e2e_result_turns",
-                "e2e_runner_cmd", "e2e_gate_ts",
-                "knowledge_file", "knowledge_ts",
-                "knowledge_skip_reason", "knowledge_recall_query",
-                "knowledge_recall_count", "knowledge_recall_ts",
-                "request_type", "request_classified_ts",
-                "bug_diagnosis_ts", "bug_diagnosis_reproduce",
-                "bug_diagnosis_root_cause", "last_loop_outcome",
-                "last_loop_reflection"):
-        if key in st:
-            st[key] = None
-
-    if "loop_history" in st:
-        st["loop_history"] = []
-    st["bug_is_bugfix"] = False
-    st["bug_diagnosis_fix_verified"] = False
-    st["forge_feature"] = slug
-
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
+    st["forge_feature"] = session_id
+    st.setdefault("session_id", session_id)
+    st.setdefault("branch", get_current_branch())
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(st, f, indent=2, ensure_ascii=False)
 
-    if old_feature:
-        print(f"🔄 Fastship state reset: {old_feature} → {slug}")
+    registry_path = os.path.join(home, "registry.json")
+    registry = _load_json(registry_path)
+    sessions = registry.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+    rec = dict(sessions.get(session_id) or {})
+    rec.update({
+        "id": session_id,
+        "repo_root": get_repo_root(),
+        "branch": get_current_branch(),
+        "forge_feature": session_id,
+        "updated_at": datetime.now().isoformat(),
+    })
+    rec.setdefault("requirement", session_id)
+    rec.setdefault("created_at", rec["updated_at"])
+    sessions[session_id] = rec
+    registry["version"] = int(registry.get("version", 1) or 1)
+    registry["current_session"] = session_id
+    registry["sessions"] = sessions
+    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+    with open(registry_path, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
+
+    if old_feature and old_feature != session_id:
+        print(f"🔄 Fastship session rebound: {old_feature} → {session_id}")
     else:
-        print(f"🔄 Fastship state bound to feature: {slug}")
+        print(f"🔄 Fastship session selected: {session_id}")
+
+
+def reset_fastship_state_for_feature(slug):
+    """Backward-compatible name; now binds instead of resetting shared state."""
+    bind_fastship_state_for_feature(slug)
 
 
 def cmd_activate(slug):
@@ -868,8 +1003,8 @@ def cmd_transition(slug, target_status):
         sys.exit(0)
 
     root = get_repo_root()
-    fs_state = load_fastship_state()
-    orch_state = load_fastship_orchestrator_state()
+    fs_state = load_fastship_state(slug)
+    orch_state = load_fastship_orchestrator_state(slug)
 
     ok, reason = can_transition(slug, current, target_status, root, fs_state, orch_state)
     if not ok:
@@ -928,19 +1063,21 @@ def cmd_generate_view():
 
 def cmd_reset():
     """Clear active feature state."""
-    state = {"active_feature": None}
-    save_forge_state(state)
+    registry = _load_forge_registry()
+    registry["active_feature"] = None
+    _save_forge_registry(registry)
     print("✅ Active feature cleared.")
 
 
 # ========== Hook Handlers ==========
 
 def hook_pre_edit():
-    """Protect .forge-state.json and roadmap.json status from manual tampering."""
+    """Protect derived forge state and roadmap.json status from manual tampering."""
     data = read_stdin()
     file_path = data.get("tool_input", {}).get("file_path", "")
-    if ".forge-state.json" in file_path:
-        print("🚫 Forge Gate: .forge-state.json is managed by forge_gate.py. Do not edit manually.")
+    normalized = file_path.replace("\\", "/")
+    if ".forge-state.json" in normalized or "/.claude/forge-state/" in normalized or normalized.startswith(".claude/forge-state/"):
+        print("🚫 Forge Gate: derived forge state is managed by forge_gate.py. Do not edit manually.")
         sys.exit(1)
 
     if file_path.endswith("roadmap.json") and "project-roadmap" in file_path:

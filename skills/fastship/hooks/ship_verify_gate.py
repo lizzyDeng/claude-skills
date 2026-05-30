@@ -86,6 +86,7 @@ LOOP_LIMIT = 3
 
 def empty_state(branch=None):
     return {
+        "session_id": fastship_state.resolve_session_id(),
         "test_passed": False,
         "test_ts": None,
         "test_tool": None,
@@ -147,6 +148,11 @@ def save_state(st):
     p = state_path()
     if not p:
         return
+    if isinstance(st, dict):
+        sid = fastship_state.resolve_session_id()
+        if sid:
+            st["session_id"] = sid
+            fastship_state.set_current_session_id(sid, state=st)
     fastship_state.save_json(p, st)
 
 
@@ -504,6 +510,8 @@ def is_db_write_cmd(cmd):
 
 
 FASTSHIP_STATE_PATTERNS = [
+    "fastship/registry.json",
+    "fastship/sessions/",
     "fastship/gate.json",
     "fastship/orchestrator.json",
     ".ship-verify-state.json",
@@ -1482,6 +1490,7 @@ def gate_status():
     branch = get_current_branch()
     st = load_state()
     stacks = detect_stack()
+    print(f"Session:    {st.get('session_id') or fastship_state.current_session_id() or '-'}")
     print(f"Branch:     {branch}")
     print(f"State for:  {st.get('branch', '-')}")
     if branch_mismatch(st, branch):
@@ -1559,21 +1568,48 @@ def gate_status():
 def gate_reset():
     """手动重置验证状态（新需求开始时调用）"""
     branch = get_current_branch()
+    previous = load_state()
+    forge_feature = previous.get("forge_feature") if isinstance(previous, dict) else None
     st = empty_state(branch)
+    if forge_feature:
+        st["forge_feature"] = forge_feature
     save_state(st)
     legacy = fastship_state.legacy_gate_state_path()
     if os.path.exists(legacy):
         os.remove(legacy)
-    print(f"✅ Gate: 验证状态已重置 (branch: {branch})")
+    print(f"✅ Gate: 验证状态已重置 (session: {st.get('session_id') or '-'}, branch: {branch})")
     return 0
 
 
 # ---------- 入口 ----------
 
+def strip_global_session_arg(argv):
+    session_id = None
+    stripped = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--session", "-s") and i + 1 < len(argv):
+            session_id = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--session="):
+            session_id = arg.split("=", 1)[1]
+            i += 1
+            continue
+        stripped.append(arg)
+        i += 1
+    return session_id, stripped
+
+
 def main():
-    if len(sys.argv) < 2:
+    session_arg, argv = strip_global_session_arg(sys.argv[1:])
+    if session_arg:
+        os.environ[fastship_state.SESSION_ENV] = fastship_state.normalize_session_id(session_arg) or session_arg
+    if len(argv) < 1:
         print("Usage: ship_verify_gate.py <post_bash|post_edit|pre_bash|pre_edit|status|reset|plan_bypass|knowledge_skip|knowledge_recall|loop_record>")
         sys.exit(1)
+    sys.argv = [sys.argv[0], *argv]
 
     handlers = {
         "post_bash": gate_post_bash,

@@ -14,6 +14,10 @@ E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifa
 收到需求后立即运行：
   "$(git rev-parse --show-toplevel)/.claude/tools/fastship" start "<需求>"
 
+fastship 支持并行多个活跃需求。每个需求有独立 session/state：
+`{git-dir}/fastship/sessions/<session-id>/orchestrator.json` + `gate.json`。
+默认 session 由需求文本生成；需要和 Forge feature 对齐时使用 `--session <feature-slug>`。
+
 ## 双模工作方式
 
 ### Claude Code（hook 模式 — 最强）
@@ -83,12 +87,16 @@ Plan 确认后（步骤 1.6 完成），orchestrator 自动输出 `/goal` 命令
 ```bash
 FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 "$FASTSHIP" start "<需求>"   # 启动
+"$FASTSHIP" start --session <id> "<需求>"  # 指定需求/feature 维度
 "$FASTSHIP" next             # 当前步骤
 "$FASTSHIP" done [--flags]   # 完成 + 验证
 "$FASTSHIP" status           # 全部状态
+"$FASTSHIP" list             # 列出全部需求 sessions
+"$FASTSHIP" use <id>         # 切换 hook/CLI 默认 session
 "$FASTSHIP" goal             # 生成 /goal 条件（Phase 2+ 可用）
 "$FASTSHIP" adopt-branch     # 将活跃 session 迁移到当前分支
-"$FASTSHIP" reset            # 重置
+"$FASTSHIP" reset            # 重置当前 session
+"$FASTSHIP" reset --all      # 清空全部 sessions
 ```
 
 ## 项目级 E2E 配置
