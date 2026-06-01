@@ -180,11 +180,13 @@ E2E_RESULT_PATH = "/tmp/e2e_result.json"
 E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
+CODE_REVIEW_FILENAME = ".fastship-code-review.md"
 
 STEP_ARTIFACT_OWNERS = {
     BRIEF_FILENAME: "1.3",
     GRILL_RESULT_FILENAME: "1.5",
     CODEX_REVIEW_FILENAME: "1.5c",
+    CODE_REVIEW_FILENAME: "2.5",
 }
 
 
@@ -225,6 +227,22 @@ CODEX_REVIEW_REQUIRED_EMPTY_FIELDS = (
     "weak_scenarios",
     "non_business_assertions",
     "missing_evidence",
+)
+
+# ── Code Review (Step 2.5) gate contract — reviews the IMPLEMENTATION, not the plan ──
+# Binding is to the design source (reviewed_against) + changed files, NOT a plan hash:
+# a code review checks the implementation against the design, so plan-hash binding
+# (as 1.5c uses) would be meaningless here.
+CODE_REVIEW_REQUIRED_TRUE_FIELDS = (
+    "design_fidelity_reviewed",
+    "spec_compliance_reviewed",
+    "quality_reviewed",
+)
+CODE_REVIEW_REQUIRED_EMPTY_FIELDS = (
+    "design_deviations",
+    "spec_gaps",
+    "quality_issues",
+    "unverified_claims",
 )
 
 
@@ -413,6 +431,47 @@ def _read_gate_state_file() -> dict:
         return {}
 
 
+def _git_head_sha() -> Optional[str]:
+    """Best-effort HEAD sha recorded at session start as the code-review diff base."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", _repo_root(), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        sha = r.stdout.strip()
+        return sha or None
+    except Exception:
+        return None
+
+
+def _changed_files(base_sha: Optional[str] = None) -> set:
+    """Best-effort set of repo-relative paths changed in this feature.
+
+    Union of uncommitted (working tree + staged) and, when a base sha was
+    recorded at session start, everything committed since the base. Returns an
+    empty set when git is unavailable (e.g. tests) so callers can skip the
+    diff-intersection check rather than fail spuriously.
+    """
+    root = _repo_root()
+    files: set = set()
+    cmds = [
+        ["git", "-C", root, "diff", "--name-only", "HEAD"],
+        ["git", "-C", root, "diff", "--name-only", "--cached"],
+    ]
+    if base_sha:
+        cmds.append(["git", "-C", root, "diff", "--name-only", f"{base_sha}...HEAD"])
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    files.add(_normalize(line))
+        except Exception:
+            pass
+    return files
+
+
 def validate_classify(orch: dict, hook: dict) -> tuple:
     if hook.get("request_classified"):
         return True, f"classified: {hook.get('request_type')}"
@@ -593,6 +652,104 @@ def validate_codex_review(orch: dict, hook: dict) -> tuple:
         return False, "Codex review 存在未解决覆盖/证据问题: " + ", ".join(unresolved)
 
     return True, "codex review PASS (structured gate verified)"
+
+
+def validate_code_review(orch: dict, hook: dict) -> tuple:
+    """Step 2.5 gate — adversarial review of the IMPLEMENTATION (not the plan).
+
+    Mirrors the 1.5c structured-gate contract but binds the review to the design/
+    spec artifact it compared against (reviewed_against) and to the files it
+    actually inspected (reviewed_files ∩ git diff). This is the defense that
+    catches "tests pass but it doesn't match the design" failures: empty
+    design_deviations is required, and the review must name a real design source.
+    """
+    path = orch.get("artifacts", {}).get("code_review_path")
+    if not path:
+        return False, "code_review_path 未由当前 step 写入记录，禁止 filesystem fallback"
+    ok, msg, _rec = _verify_step_artifact(orch, "2.5", path)
+    if not ok:
+        return False, msg
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    if CODE_REVIEW_FILENAME not in _normalize(path):
+        return False, f"Code review 路径非法: {path}"
+    if not os.path.exists(path):
+        return False, (
+            f"Code review 结果不存在: {CODE_REVIEW_FILENAME}。"
+            f"对实现做对抗性 review（设计稿保真度 + spec 合同 + 质量），写结果到 .claude/{CODE_REVIEW_FILENAME}"
+        )
+    try:
+        content = open(path, encoding="utf-8").read()
+    except Exception:
+        return False, f"无法读取: {path}"
+    if len(content) < 200:
+        return False, f"Code review 太短 ({len(content)}B < 200B)，需逐 task review + 设计稿保真度比对"
+
+    m = CODEX_GATE_RE.search(content)
+    if not m:
+        return False, "Code review 缺少显式 GATE 判定行（格式: ### GATE: PASS 或 ### GATE: FAIL）"
+    verdict = m.group(1).upper()
+    if verdict == "FAIL":
+        return False, "code review FAIL — 修复实现后重新 review（留在 2.5，不回退 plan）"
+
+    matches = CODEX_GATE_JSON_RE.findall(content)
+    if not matches:
+        return False, "Code review 缺少机器可验证 JSON gate，禁止纯文本 PASS"
+    try:
+        gate = json.loads(matches[-1])
+    except json.JSONDecodeError as e:
+        return False, f"Code review JSON gate 解析失败: {e}"
+    if not isinstance(gate, dict):
+        return False, "Code review JSON gate 必须是 object"
+
+    json_verdict = str(gate.get("gate", "")).upper()
+    if json_verdict not in {"PASS", "FAIL"}:
+        return False, "Code review JSON gate 缺少 gate=PASS/FAIL"
+    if json_verdict != verdict:
+        return False, f"Code review 文本 GATE={verdict} 与 JSON gate={json_verdict} 不一致"
+    if json_verdict == "FAIL":
+        return False, "code review JSON gate FAIL — 修复实现后重新 review"
+
+    missing_true = [f for f in CODE_REVIEW_REQUIRED_TRUE_FIELDS if gate.get(f) is not True]
+    if missing_true:
+        return False, "Code review 未确认硬审查项: " + ", ".join(missing_true)
+
+    missing_lists = [
+        f for f in CODE_REVIEW_REQUIRED_EMPTY_FIELDS
+        if f not in gate or not isinstance(gate.get(f), list)
+    ]
+    if missing_lists:
+        return False, "Code review JSON gate 缺少数组字段: " + ", ".join(missing_lists)
+    unresolved = [f for f in CODE_REVIEW_REQUIRED_EMPTY_FIELDS if gate.get(f)]
+    if unresolved:
+        return False, "Code review 存在未解决问题: " + ", ".join(unresolved)
+
+    # Design-fidelity anchor: the review must compare against a real design/spec source.
+    reviewed_against = gate.get("reviewed_against")
+    if not reviewed_against or not isinstance(reviewed_against, str):
+        return False, "Code review 缺少 reviewed_against（设计稿/spec 路径，禁止对着空气 review）"
+    ra_abs = reviewed_against if os.path.isabs(reviewed_against) else os.path.join(_repo_root(), reviewed_against)
+    if not os.path.exists(ra_abs):
+        return False, f"Code review reviewed_against 指向的设计依据不存在: {reviewed_against}"
+
+    # Anti-rubber-stamp: reviewed_files must be real and intersect the actual diff.
+    reviewed_files = gate.get("reviewed_files")
+    if not isinstance(reviewed_files, list) or not reviewed_files:
+        return False, "Code review 缺少 reviewed_files（实际审查的文件列表）"
+    for rf in reviewed_files:
+        if not isinstance(rf, str):
+            return False, "Code review reviewed_files 含非字符串项"
+        rf_abs = rf if os.path.isabs(rf) else os.path.join(_repo_root(), rf)
+        if not os.path.exists(rf_abs):
+            return False, f"Code review reviewed_files 含不存在的文件: {rf}"
+    changed = _changed_files(orch.get("base_sha"))
+    if changed:
+        changed_base = {os.path.basename(c) for c in changed}
+        reviewed_base = {os.path.basename(_normalize(rf)) for rf in reviewed_files}
+        if not (changed_base & reviewed_base):
+            return False, "Code review 未覆盖任何实际改动文件（reviewed_files 与 git diff 不相交）"
+
+    return True, "code review PASS (structured gate verified)"
 
 
 def validate_user_confirm(orch: dict, hook: dict) -> tuple:
@@ -950,16 +1107,50 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
   运行: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" goal
   将输出的 /goal 命令呈现给用户，请用户执行。
 
-/goal 模式下 Claude 自主驱动：
+/goal 模式下 Claude 自主驱动 —— execute 与 code review 同时跑（ultracode）：
   1. 选择开发方式（worktree / 新分支 / 当前分支）
-  2. 通过 Skill 执行 plan（subagent-driven-development 或 executing-plans）
-  3. 冒烟测试 → 项目测试 → E2E → 报告 → Gate → Loop Record → Knowledge 闭环
-  4. 每步完成后运行 status 命令，让 /goal 评估器看到 [FASTSHIP_GOAL] 进度
+  2. 用 Workflow（ultracode）跑 implement→review pipeline 执行 plan：
+       pipeline(tasks, implement, review)
+     每个 plan task 实现完，立刻被对抗性 review（设计稿保真度 / spec 合同 / 质量三视角），
+     review 不过当场打回重做 —— 不要全做完才 review。
+     （单线程场景退化为 subagent-driven-development 的逐 task 两段 review。）
+  3. 逐 task review 的 verdict 累积下来，留给 Step 2.5 合并成 code-review 产物。
+  4. 每步完成后运行 status 命令，让 /goal 评估器看到 [FASTSHIP_GOAL] 进度。
 
-🔴 禁止主线程凭直觉写代码。
+🔴 禁止主线程凭直觉写代码。execute 必须带并发 review，不是先写完再说。
 🔴 每完成一个关键步骤后运行 status，确保 /goal 评估器能跟踪进度。
 
+执行完成 → done 进入 2.5 Code Review 合并 gate。
 手动模式（不用 /goal）: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
+
+    Step("2.5", "Code Review", 2, validator=validate_code_review,
+         instruction="""🔴 Phase 2 硬 gate：对写出的代码做对抗性 code review（execute 阶段已逐 task review，这里合并成可审查产物 + 卡门）。
+
+用 ultracode Workflow 跑多视角 review，对照三条 lens：
+  1. 设计稿/spec 保真度 —— 逐屏/逐组件拿实现对着 plan 引用的设计依据（设计稿 HTML / spec / 截图）比对，
+     列出所有偏差。tests 绿 ≠ 长得像设计稿。
+  2. spec 合同 —— P0/P1 需求是否真的实现，有无被悄悄降级 / 漏做。
+  3. 代码质量 —— 正确性、边界、与既有模式一致性。
+
+把结果写到 .claude/.fastship-code-review.md，必须含：
+  - 逐 task / 逐 lens 的 verdict
+  - 一行 "### GATE: PASS" 或 "### GATE: FAIL"
+  - 机器可验证 JSON gate（最后一个 json 代码块）字段：
+      gate                    "PASS" | "FAIL"
+      reviewed_against        plan 引用的设计稿/spec 路径（必须真实存在）
+      reviewed_files          实际改动且审查过的文件列表（须与 git diff 相交）
+      design_fidelity_reviewed  true
+      spec_compliance_reviewed  true
+      quality_reviewed          true
+      design_deviations         []   ← 任一非空即 FAIL
+      spec_gaps                 []
+      quality_issues            []
+      unverified_claims         []
+
+🔴 任一 deviations/gaps/issues 数组非空 → GATE: FAIL → 修复实现后重新 review（留在 2.5，不回退 plan）。
+🔴 reviewed_against 必须指向真实存在的设计依据；reviewed_files 必须与实际 git diff 相交（防橡皮图章）。
+
+提交: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --code-review .claude/.fastship-code-review.md"""),
 
     Step("3.0", "冒烟测试", 3, validator=validate_smoke,
          instruction="""零 setup 冒烟: 启动服务 → API 请求 → 等处理 → SELECT 验证。
@@ -1071,6 +1262,9 @@ def detect_completion_post_edit(current_step: str, data: dict) -> Optional[str]:
     if current_step == "1.5c" and CODEX_REVIEW_FILENAME in file_path:
         return "1.5c"
 
+    if current_step == "2.5" and CODE_REVIEW_FILENAME in file_path:
+        return "2.5"
+
     if current_step == "3.3" and file_path.endswith(".md"):
         if "e2e" in file_path.lower() or "report" in file_path.lower() or "质量" in file_path:
             return "3.3"
@@ -1117,6 +1311,8 @@ def _is_orchestrator_allowed_file(path: str) -> bool:
     if GRILL_RESULT_FILENAME in p:
         return True
     if CODEX_REVIEW_FILENAME in p:
+        return True
+    if CODE_REVIEW_FILENAME in p:
         return True
     return False
 
@@ -1190,12 +1386,20 @@ def _handle_loop_decision(orch: dict):
         return
 
     if decision == "continue":
-        orch["completed_steps"] = [s for s in orch.get("completed_steps", []) if s not in REWINDABLE_STEPS]
-        orch["current_step"] = "3.1"
-        orch["phase"] = 3
+        # A loop fix MODIFIES the implementation, so the code-review gate (2.5) MUST
+        # re-fire on the fixed code — otherwise design drift introduced while fixing a
+        # verification failure ships unreviewed, which is the exact failure 2.5 exists
+        # to prevent. Re-enter at 2.5 (not 3.1), clear it from completed_steps, and drop
+        # its prior artifact so a fresh review of the now-current code is forced.
+        cleared = REWINDABLE_STEPS | {"2.5"}
+        orch["completed_steps"] = [s for s in orch.get("completed_steps", []) if s not in cleared]
+        orch.setdefault("artifacts", {}).pop("code_review_path", None)
+        _clear_trusted_artifacts(orch, ("2.5",))
+        orch["current_step"] = "2.5"
+        orch["phase"] = 2
         for k in ("loop_outcome", "loop_decision"):
             orch.get("artifacts", {}).pop(k, None)
-        print(f"\n📝 Loop {loop_count} FAIL → continue → 回到 3.1 重试")
+        print(f"\n📝 Loop {loop_count} FAIL → continue → 回到 2.5 重新 code review + 重试验证")
     elif decision == "escalate":
         orch["current_step"] = "1.0"
         orch["phase"] = 1
@@ -1468,6 +1672,20 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 save_orch_state(orch, orch_path)
                 return 0
 
+        if detected == "2.5":
+            orch.setdefault("artifacts", {})["code_review_path"] = file_path
+            ok, msg = record_step_artifact(orch, "2.5", file_path)
+            if not ok:
+                print(f"⚠️ Code review artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+            hook = load_hook_state()
+            ok, msg = validate_code_review(orch, hook)
+            if not ok:
+                print(f"⚠️ Code review 写入已检测，但验证未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+
         if detected == "3.3":
             orch["report_path"] = file_path
             ok, msg = record_step_artifact(orch, "3.3", file_path)
@@ -1551,6 +1769,7 @@ VALUED_FLAGS = {
     "--plan",
     "--grill",
     "--codex-review",
+    "--code-review",
     "--report",
     "--knowledge",
     "--outcome",
@@ -1611,6 +1830,7 @@ def format_status(orch: dict) -> str:
         f" test_passed={str(gate.get('test_passed', False)).lower()}"
         f" e2e_executed={str(gate.get('e2e_executed', False)).lower()}"
         f" e2e_gate_passed={str(gate.get('e2e_gate_passed', False)).lower()}"
+        f" code_reviewed={str('2.5' in orch.get('completed_steps', [])).lower()}"
         f" knowledge_acknowledged={str(gate.get('knowledge_acknowledged', False)).lower()}"
         f" loop={orch.get('loop_count', 0)}/3"
     )
@@ -1681,6 +1901,7 @@ def cmd_start(requirement: str) -> int:
         return 1
     st = empty_orchestrator_state(requirement)
     st["session_id"] = session_id
+    st["base_sha"] = _git_head_sha()
     fastship_state.set_current_session_id(session_id, requirement, st)
     save_orch_state(st)
     gp = gate_script_path()
@@ -1761,6 +1982,12 @@ def cmd_done(argv: list) -> int:
         ok, msg = record_step_artifact(st, "1.5c", args["--codex-review"], source="cli_done")
         if not ok:
             print(f"❌ Codex review artifact 记录失败: {msg}")
+            return 1
+    if "--code-review" in args:
+        artifacts["code_review_path"] = args["--code-review"]
+        ok, msg = record_step_artifact(st, "2.5", args["--code-review"], source="cli_done")
+        if not ok:
+            print(f"❌ Code review artifact 记录失败: {msg}")
             return 1
     if "--report" in args:
         st["report_path"] = args["--report"]
@@ -1919,7 +2146,7 @@ def goal_condition(orch: dict) -> str:
     return (
         f"fastship 完成「{req}」的交付 — "
         f"运行 status 命令确认 [FASTSHIP_GOAL] 显示 step=done"
-        f" test_passed=true e2e_executed=true e2e_gate_passed=true knowledge_acknowledged=true"
+        f" test_passed=true e2e_executed=true e2e_gate_passed=true code_reviewed=true knowledge_acknowledged=true"
     )
 
 

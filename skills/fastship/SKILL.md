@@ -26,7 +26,7 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **pre_edit**: Phase 1 阻止编辑代码，打印当前步骤
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
-17 步中多数步骤由 hook 自动推进，少数确认/决策步骤需手动：
+18 步中多数步骤由 hook 自动推进，少数确认/决策步骤需手动：
   "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
@@ -37,9 +37,9 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
   3. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]` → 验证 + 推进
   4. 重复
 
-全部 17 步需手动 done，但 protected validators 不允许 filesystem fallback。
+全部 18 步需手动 done，但 protected validators 不允许 filesystem fallback。
 无 hook/gate state 的关键步骤（plan provenance、Codex review、E2E、report、gate、loop pass、knowledge）必须失败，不能靠文件存在自动通过。
-Codex/CLI 模式下，文件产物步骤必须显式绑定 artifact：`done --brief <path>`、`done --plan <path>`、`done --grill <path>`、`done --codex-review <path>`、`done --report <path>`、`done --knowledge <path>`。没有绑定就不能通过。
+Codex/CLI 模式下，文件产物步骤必须显式绑定 artifact：`done --brief <path>`、`done --plan <path>`、`done --grill <path>`、`done --codex-review <path>`、`done --code-review <path>`、`done --report <path>`、`done --knowledge <path>`。没有绑定就不能通过。
 
 ## 流程概览
 
@@ -57,7 +57,9 @@ Phase 1: Brainstorm (8 步)
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
 
 Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
-  2.0  执行计划         [/goal 自主驱动]
+  2.0  执行计划         [/goal 自主驱动] ultracode implement→review pipeline（执行+并发对抗 review）
+  2.5  Code Review      [硬 gate] .fastship-code-review.md PASS/FAIL
+                        FAIL → 修复实现后重新 review（留在 2.5，不回退 plan）
   3.0  冒烟测试         [/goal 自主驱动]
   3.1  项目测试         [/goal + hook auto-detect]
   3.2  E2E Runner       [/goal + hook auto-detect]
@@ -72,6 +74,7 @@ Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
 Plan 确认后（步骤 1.6 完成），orchestrator 自动输出 `/goal` 命令。用户执行后：
 
 - Claude 自主驱动 Phase 2（执行）+ Phase 3（验证）全流程
+- Phase 2 执行走 ultracode Workflow implement→review pipeline：每个 plan task 实现完立即对抗性 review（设计稿保真度 / spec 合同 / 质量三视角），并在 2.5 合并成 code-review 硬 gate。tests 绿 ≠ 长得像设计稿
 - Haiku 评估器通过 `[FASTSHIP_GOAL]` 状态行判断是否完成
 - 每步完成后 Claude 运行 `status`，评估器解析 `step=` / `test_passed=` / `e2e_executed=` 等字段
 - Loop Record fail 时 Claude 自主选择 continue（在 3 次上限内），3 次后暂停等用户介入
@@ -125,6 +128,7 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 - Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）
 - Grill 必须走 grill-me skill（orchestrator 验证 grill 摘要文件 ≥300B + 结构）
 - Codex Review 必须执行同一套 P0 contract / AC / E2E 证据审查，且输出机器可验证 JSON gate；纯文本 `GATE: PASS` 无效
+- Code Review (2.5) 硬 gate — 对实现做对抗性 review，产出 `.claude/.fastship-code-review.md` 结构化 JSON gate；design_deviations/spec_gaps/quality_issues 任一非空即 FAIL；reviewed_against 须指向真实设计稿/spec，reviewed_files 须与 git diff 相交（防橡皮图章）
 - 每个 step 产出的报告/artifact 必须写入 trusted artifact ledger（path + sha256 + size + step_id）；validator 必须重算 hash，记录后被改即 FAIL
 - 执行必须走 executing-plans / subagent-driven-development
 - 关键步骤禁止 fallback：没有当前 step artifact 记录或 gate state → validator 必须返回 false
@@ -167,6 +171,25 @@ Codex Review 必须同步遵循上述规则。`.claude/.fastship-codex-review.md
 
 `reviewed_plan_sha256` 必须等于当前 1.4 plan artifact hash。任一审查布尔项不是 `true`，或任一问题数组非空，Codex Review 必须 `FAIL`，orchestrator 不得推进到用户确认。
 
+Code Review (Step 2.5) 复用同一结构化 gate 合同，但审查对象是**实现代码**而非 plan。`.claude/.fastship-code-review.md` 必须包含结构化 JSON gate：
+
+```json
+{
+  "gate": "PASS",
+  "reviewed_against": "<真实设计稿/spec 文件路径，须存在>",
+  "reviewed_files": ["<本次实现改动的真实文件，须存在>"],
+  "design_fidelity_reviewed": true,
+  "spec_compliance_reviewed": true,
+  "quality_reviewed": true,
+  "design_deviations": [],
+  "spec_gaps": [],
+  "quality_issues": [],
+  "unverified_claims": []
+}
+```
+
+`reviewed_against` 须指向真实存在的设计稿/spec 源文件；`reviewed_files` 须为真实存在文件列表，且当 git diff 可观察时其 basename 必须与改动文件相交（防橡皮图章）。任一审查布尔项不是 `true`，或任一问题数组（design_deviations/spec_gaps/quality_issues/unverified_claims）非空，Code Review 必须 `FAIL` → 留在 2.5 修复实现后重 review（不回退 plan）。
+
 E2E 报告必须引用 gate state 中的 `e2e_result_hash`。报告没有绑定 runner 原始结果 hash，或报告文件在记录后被修改，Step 3.3 必须 `FAIL`。
 
 ## 状态行
@@ -180,7 +203,7 @@ E2E 报告必须引用 gate state 中的 `e2e_result_hash`。报告没有绑定 
 status 命令额外输出机器可读行（供 /goal 评估器解析）：
 
 ```
-[FASTSHIP_GOAL] step=3.2 phase=3 test_passed=true e2e_executed=false knowledge_acknowledged=false loop=0/3
+[FASTSHIP_GOAL] step=3.2 phase=3 test_passed=true e2e_executed=false e2e_gate_passed=false code_reviewed=false knowledge_acknowledged=false loop=0/3
 ```
 
 🔴 /goal 模式下，每完成关键步骤后务必运行 status 命令，让评估器看到最新进度。

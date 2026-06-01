@@ -72,6 +72,52 @@ def codex_review_content(plan_sha256="test-plan-sha", **overrides):
     )
 
 
+def code_review_content(**overrides):
+    gate = {
+        "gate": "PASS",
+        "reviewed_against": "design.html",
+        "reviewed_files": ["src.py"],
+        "design_fidelity_reviewed": True,
+        "spec_compliance_reviewed": True,
+        "quality_reviewed": True,
+        "design_deviations": [],
+        "spec_gaps": [],
+        "quality_issues": [],
+        "unverified_claims": [],
+    }
+    gate.update(overrides)
+    text_gate = gate.get("gate", "PASS")
+    return (
+        "## Code Review\n"
+        "### Per-task verdicts\n"
+        "- Task 1: design fidelity OK, spec OK, quality OK\n"
+        "### Design Fidelity\n"
+        "- Implementation matches the design source pixel treatment\n"
+        "### Contract Gate\n"
+        "```json\n"
+        f"{json.dumps(gate, ensure_ascii=False, indent=2)}\n"
+        "```\n"
+        f"### GATE: {text_gate}\n"
+    )
+
+
+def make_trusted_code_review(tmp_path, monkeypatch, **overrides):
+    monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+    claude = tmp_path / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    design = tmp_path / "design.html"
+    design.write_text("<html>design board</html>")
+    src = tmp_path / "src.py"
+    src.write_text("print('x')")
+    fields = {"reviewed_against": str(design), "reviewed_files": [str(src)]}
+    fields.update(overrides)
+    review = claude / ".fastship-code-review.md"
+    review.write_text(code_review_content(**fields))
+    orch = {"artifacts": {"code_review_path": str(review)}}
+    trust_artifact(orch, "2.5", review)
+    return orch, review
+
+
 # ━━━━━━━━━━━━ Task 1: Core Infrastructure ━━━━━━━━━━━━
 
 class TestStateManagement:
@@ -425,6 +471,103 @@ class TestValidatorsPhase2:
         assert validate_execute({}, {})[0] is True
 
 
+class TestCodeReviewGate:
+    def test_rejects_filesystem_fallback(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        review = tmp_path / ".claude" / ".fastship-code-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(code_review_content())
+        # path not recorded by current step → must refuse filesystem fallback
+        ok, msg = validate_code_review({"artifacts": {}}, {})
+        assert ok is False
+        assert "fallback" in msg
+
+    def test_rejects_text_only_pass(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review, CODE_REVIEW_FILENAME
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True)
+        review = claude / CODE_REVIEW_FILENAME
+        review.write_text("## Code Review\n### GATE: PASS\n" + "x " * 120)  # no JSON gate
+        orch = {"artifacts": {"code_review_path": str(review)}}
+        trust_artifact(orch, "2.5", review)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "JSON gate" in msg
+
+    def test_rejects_nonempty_design_deviations(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(
+            tmp_path, monkeypatch, design_deviations=["头像不是径向渐变，背景缺页面径向渐变"])
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "未解决问题" in msg
+
+    def test_rejects_unconfirmed_fidelity(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, design_fidelity_reviewed=False)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "硬审查项" in msg
+
+    def test_rejects_empty_reviewed_against(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_against="")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "reviewed_against" in msg
+
+    def test_rejects_nonexistent_reviewed_against(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_against="/nope/missing-board.html")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "不存在" in msg
+
+    def test_rejects_nonexistent_reviewed_files(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_files=["/nope/missing.py"])
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "reviewed_files" in msg
+
+    def test_rejects_fail_verdict(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, gate="FAIL")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "FAIL" in msg
+
+    def test_rejects_tamper_after_record(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, review = make_trusted_code_review(tmp_path, monkeypatch)
+        review.write_text(review.read_text() + "\n<!-- tampered after record -->\n")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert ("修改" in msg) or ("mismatch" in msg)
+
+    def test_passes_with_current_step_artifact(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is True
+
+    def test_detect_code_review_post_edit(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/.fastship-code-review.md"}}
+        assert detect_completion_post_edit("2.5", data) == "2.5"
+
+    def test_no_detect_code_review_wrong_step(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/.fastship-code-review.md"}}
+        assert detect_completion_post_edit("1.5c", data) is None
+
+    def test_code_review_flag_registered(self):
+        from orchestrator import VALUED_FLAGS
+        assert "--code-review" in VALUED_FLAGS
+
+
 class TestValidatorsPhase3:
     def test_tests_pass(self):
         from orchestrator import validate_tests
@@ -547,7 +690,7 @@ class TestValidatorsFallbackDenied:
 class TestSteps:
     def test_step_count(self):
         from orchestrator import STEPS
-        assert len(STEPS) == 17
+        assert len(STEPS) == 18
 
     def test_phase_order(self):
         from orchestrator import STEPS
@@ -570,7 +713,7 @@ class TestSteps:
         from orchestrator import STEPS
         ids = {s.id for s in STEPS}
         for expected in ["1.0", "1.1", "1.2", "1.3", "1.3d", "1.4", "1.5", "1.5c", "1.6",
-                         "2.0", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]:
+                         "2.0", "2.5", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]:
             assert expected in ids, f"Missing step {expected}"
 
 
@@ -887,7 +1030,8 @@ class TestIntegrationFullFlow:
             orch_state=st, gate_path=str(fake_gate))
         assert result == 0
 
-        # 2.0 + 3.0: manual done
+        # 2.0 → 2.5 → 3.0 → 3.1: manual done (validators bypassed via _advance_state)
+        st = _advance_state(st)  # → 2.5
         st = _advance_state(st)  # → 3.0
         st = _advance_state(st)  # → 3.1
         save_orch_state(st, orch_file)
@@ -1004,14 +1148,24 @@ class TestIntegrationFullFlow:
         st = {
             "current_step": "3.5", "phase": 3, "loop_count": 1,
             "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6",
-                                "2.0", "3.0", "3.1", "3.2", "3.3", "3.4"],
+                                "2.0", "2.5", "3.0", "3.1", "3.2", "3.3", "3.4"],
             "skipped_steps": ["1.3d"], "request_type": "feature",
-            "artifacts": {"loop_outcome": "fail", "loop_decision": "continue"},
+            "artifacts": {
+                "loop_outcome": "fail", "loop_decision": "continue",
+                "code_review_path": "/proj/.claude/.fastship-code-review.md",
+                "trusted_artifacts": {"2.5": {"step_id": "2.5", "sha256": "x"}},
+            },
         }
         _handle_loop_decision(st)
-        assert st["current_step"] == "3.1"
+        # Loop continue must re-review: re-enter at 2.5 (phase 2), clearing 2.5 + 3.x
+        # and dropping the stale code-review artifact so a fresh review is forced.
+        assert st["current_step"] == "2.5"
+        assert st["phase"] == 2
+        assert "2.5" not in st["completed_steps"]
         assert "3.1" not in st["completed_steps"]
         assert "1.0" in st["completed_steps"]
+        assert "code_review_path" not in st["artifacts"]
+        assert "2.5" not in st["artifacts"].get("trusted_artifacts", {})
 
     def test_loop_fail_escalate_via_done(self):
         from orchestrator import _handle_loop_decision
