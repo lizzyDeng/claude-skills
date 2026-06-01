@@ -26,7 +26,7 @@ from typing import Optional, Callable, Any, Union
 import fastship_state
 
 
-# ━━━━━━━━━━━━ Context Compact Gate ━━━━━━━━━━━━
+# ━━━━━━━━━━━━ Context Compact Advisory ━━━━━━━━━━━━
 
 COMPACT_RECENCY_SECS = int(os.environ.get("FASTSHIP_COMPACT_RECENCY", "120"))
 
@@ -1896,9 +1896,11 @@ def cmd_start(requirement: str) -> int:
         print(f'   重来: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} reset')
         return 1
     if not _compact_is_recent():
-        print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
-        print("   运行 /compact 后重试 start。")
-        return 1
+        # Advisory, not a hard gate: a stale context is a quality risk, not a
+        # correctness one — blocking start on it cost more than it saved. Warn and
+        # proceed; the user decides whether to /compact first.
+        print("🧠 SUGGESTION: 建议新 feature 前先 /compact，确保 context 干净。")
+        print("   未检测到最近 2 分钟内 /compact；继续 start（不阻断）。")
     st = empty_orchestrator_state(requirement)
     st["session_id"] = session_id
     st["base_sha"] = _git_head_sha()

@@ -905,6 +905,22 @@ class TestCLI:
         assert "1.0" in output
         assert "classify" in output
 
+    def test_start_proceeds_without_recent_compact(self, tmp_path, monkeypatch, capsys):
+        # Compact is a SOFT advisory, not a hard gate: a stale context must warn but
+        # NOT block start (rc != 1). Regression guard for the gate→advisory change.
+        from orchestrator import cmd_start
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "soft compact test")
+        monkeypatch.setattr("orchestrator._compact_is_recent", lambda: False)
+        monkeypatch.setattr("orchestrator.load_orch_state", lambda *a, **k: None)
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator.gate_script_path", lambda: str(tmp_path / "absent_gate.py"))
+        rc = cmd_start("soft compact test")
+        out = capsys.readouterr().out
+        assert rc == 0           # not blocked
+        assert "SUGGESTION" in out
+        assert "Fastship started" in out
+
 
 # ━━━━━━━━━━━━ Task 6: Integration ━━━━━━━━━━━━
 

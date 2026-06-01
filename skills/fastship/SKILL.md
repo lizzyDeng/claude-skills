@@ -9,7 +9,7 @@ E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifa
 
 ## 启动
 
-🧠 **Context 预检**（机械强制）：`start` 命令会检查最近 2 分钟内是否执行过 `/compact`。未 compact → BLOCK。先 `/compact` 再 start。
+🧠 **Context 预检**（软建议）：`start` 命令会检查最近 2 分钟内是否执行过 `/compact`。未 compact → 打印建议但**继续启动**（不阻断）；大需求前建议主动 `/compact` 保持 context 干净，是否执行由用户决定。
 
 收到需求后立即运行：
   "$(git rev-parse --show-toplevel)/.claude/tools/fastship" start "<需求>"
