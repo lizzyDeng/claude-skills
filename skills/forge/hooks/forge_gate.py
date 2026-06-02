@@ -124,12 +124,13 @@ def get_current_branch(root=None):
 # ========== Worktree Cleanup (reaper) ==========
 
 def _git_out(args, cwd=None):
-    """Run git; return (returncode, stdout-stripped-trailing). Never raises."""
+    """Run git; return (returncode, stdout, stderr) as strings. Never raises.
+    stderr is returned so callers can surface real git failure messages."""
     try:
         r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-        return r.returncode, r.stdout
-    except Exception:
-        return 1, ""
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
 
 
 def list_worktrees(root=None):
@@ -138,7 +139,7 @@ def list_worktrees(root=None):
     root = root or get_repo_root()
     if not root:
         return []
-    rc, out = _git_out(["-C", root, "worktree", "list", "--porcelain"], cwd=root)
+    rc, out, _ = _git_out(["-C", root, "worktree", "list", "--porcelain"], cwd=root)
     if rc != 0:
         return []
     worktrees, cur = [], None
@@ -171,7 +172,7 @@ def detect_trunk(root=None):
     if not root:
         return None
     for ref in ("origin/main", "main", "origin/master", "master"):
-        rc, _ = _git_out(["-C", root, "rev-parse", "--verify", "--quiet", ref], cwd=root)
+        rc, _, _ = _git_out(["-C", root, "rev-parse", "--verify", "--quiet", ref], cwd=root)
         if rc == 0:
             return ref
     return None
@@ -179,7 +180,7 @@ def detect_trunk(root=None):
 
 def worktree_is_clean(path):
     """True iff no uncommitted or untracked changes in the worktree."""
-    rc, out = _git_out(["-C", path, "status", "--porcelain"], cwd=path)
+    rc, out, _ = _git_out(["-C", path, "status", "--porcelain"], cwd=path)
     return rc == 0 and out.strip() == ""
 
 
@@ -188,7 +189,7 @@ def branch_merged(root, head_sha, trunk):
     Squash-merges are intentionally NOT detected → returns False (kept safe)."""
     if not head_sha or not trunk:
         return False
-    rc, _ = _git_out(["-C", root, "merge-base", "--is-ancestor", head_sha, trunk], cwd=root)
+    rc, _, _ = _git_out(["-C", root, "merge-base", "--is-ancestor", head_sha, trunk], cwd=root)
     return rc == 0
 
 
@@ -234,13 +235,20 @@ def remove_worktree(root, wt, delete_branch=True):
     PRECONDITION: callers MUST run classify_worktree() first — this function does
     NOT re-validate merged/clean/managed/current status. The only safety it adds on
     its own is git's refusal to remove a dirty worktree (no --force) or delete an
-    unmerged branch (-d). All exposed paths (sweep_worktrees) classify before calling."""
-    rc, out = _git_out(["-C", root, "worktree", "remove", wt["path"]], cwd=root)
+    unmerged branch (-d). All exposed paths (sweep_worktrees) classify before calling.
+    Returns (ok, note): note carries a branch-not-deleted warning when applicable."""
+    rc, _, err = _git_out(["-C", root, "worktree", "remove", wt["path"]], cwd=root)
     if rc != 0:
-        return (False, f"git worktree remove 拒绝：{out.strip()[:120]}")
+        return (False, f"git worktree remove 拒绝：{(err or '').strip()[:160]}")
+    note = ""
     if delete_branch and wt.get("branch"):
-        _git_out(["-C", root, "branch", "-d", wt["branch"]], cwd=root)
-    return (True, "")
+        # -d is safe: git refuses to delete a not-fully-merged branch. If it
+        # refuses (e.g. merged into trunk but not local HEAD), the worktree is
+        # still gone; surface that the branch was kept instead of silently lying.
+        brc, _, berr = _git_out(["-C", root, "branch", "-d", wt["branch"]], cwd=root)
+        if brc != 0:
+            note = f"（分支 {wt['branch']} 未删，已保留：{(berr or '').strip()[:80]}）"
+    return (True, note)
 
 
 def sweep_worktrees(root=None, dry_run=False, prune=False):
@@ -280,11 +288,31 @@ def sweep_worktrees(root=None, dry_run=False, prune=False):
         if dry_run:
             res["removed"].append((wt["path"], wt.get("branch"), "DRY-RUN: 干净且已合并"))
             continue
-        ok, err = remove_worktree(main_root, wt)
+        # Revalidate immediately before removal to close the classify→remove window
+        # (defends against a concurrent commit / ref change between the two). git's
+        # own guards (remove without --force, branch -d) already prevent data loss;
+        # this makes the "never removes unmerged/dirty" invariant strict, not racy.
+        rpath = os.path.realpath(wt["path"])
+        # Re-read the worktree's CURRENT HEAD (not the stale one from list_worktrees):
+        # a concurrent commit could leave the tree clean again while moving HEAD off
+        # the merged SHA. Test merge against the fresh HEAD.
+        #
+        # An irreducible sub-ms window remains between this recheck and the remove
+        # below (no cross-process lock exists for `git worktree remove`). It cannot
+        # cause CODE LOSS: `git worktree remove` (no --force) refuses a dirty tree,
+        # and `git branch -d` refuses an unmerged branch — so a raced commit keeps
+        # its branch+commits even if the worktree directory (a recoverable checkout)
+        # is removed. The contract is "never lose committed work", and that holds.
+        rc_h, head_now, _ = _git_out(["-C", rpath, "rev-parse", "HEAD"], cwd=rpath)
+        head_now = head_now.strip() if rc_h == 0 else wt.get("head")
+        if not (worktree_is_clean(rpath) and branch_merged(main_root, head_now, trunk)):
+            res["kept"].append((wt["path"], wt.get("branch"), "kept-raced", "判定后状态改变，保守保留"))
+            continue
+        ok, note = remove_worktree(main_root, wt)
         if ok:
-            res["removed"].append((wt["path"], wt.get("branch"), reason))
+            res["removed"].append((wt["path"], wt.get("branch"), reason + ((" " + note) if note else "")))
         else:
-            res["kept"].append((wt["path"], wt.get("branch"), "kept-remove-failed", err))
+            res["kept"].append((wt["path"], wt.get("branch"), "kept-remove-failed", note))
     if prune and not dry_run:
         _git_out(["-C", main_root, "worktree", "prune"], cwd=main_root)
     return res
