@@ -32,6 +32,10 @@ def main():
                        help="最少调用轮数")
     parser.add_argument("--max-age-minutes", type=int, default=30,
                        help="结果文件最大年龄（分钟）")
+    parser.add_argument("--max-empty-ratio", type=float, default=0.5,
+                       help="空回复占比上限，超过即判退化 FAIL（0~1）")
+    parser.add_argument("--max-error-ratio", type=float, default=0.5,
+                       help="出错轮占比上限，超过即判退化 FAIL（0~1）")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -89,11 +93,29 @@ def main():
         print("  → 增加场景或 repeat 数")
         sys.exit(1)
 
-    if total_empty > 0:
-        print(f"\n⚠️ 警告: 有 {total_empty} 轮空回复")
+    # Check 4b: 退化检测（smell test）。
+    # 旧版本对空回复/出错只打 warning 仍 PASS —— 这就是「reward=0.0 → 耸耸肩」。
+    # 这里把已经算好的占比变成硬 FAIL：极端退化时先怀疑 setup/测量，不要直接
+    # 归因于被测对象。只用空回复率/错误率（领域无关、且健康跑必为 0），
+    # 不用延迟/全同回复等会误伤合法 runner 的信号。
+    empty_ratio = total_empty / total_turns if total_turns else 0.0
+    error_ratio = total_errors / total_turns if total_turns else 0.0
+    smell_reasons = []
+    if empty_ratio >= args.max_empty_ratio:
+        smell_reasons.append(
+            f"空回复率 {empty_ratio:.0%} ≥ 上限 {args.max_empty_ratio:.0%} "
+            f"（{total_empty}/{total_turns} 轮空回复）"
+        )
+    elif total_empty > 0:
+        print(f"\n⚠️ 警告: 有 {total_empty} 轮空回复（占比 {empty_ratio:.0%}）")
 
-    if total_errors > 0:
-        print(f"\n⚠️ 警告: 有 {total_errors} 轮出错")
+    if error_ratio >= args.max_error_ratio:
+        smell_reasons.append(
+            f"出错率 {error_ratio:.0%} ≥ 上限 {args.max_error_ratio:.0%} "
+            f"（{total_errors}/{total_turns} 轮出错）"
+        )
+    elif total_errors > 0:
+        print(f"\n⚠️ 警告: 有 {total_errors} 轮出错（占比 {error_ratio:.0%}）")
 
     # Check 5: 输出原始数据给用户审查
     print("\n" + "=" * 60)
@@ -142,6 +164,13 @@ def main():
                         print(f"      {k}: {v_str}")
 
     print("\n" + "=" * 60)
+    if smell_reasons:
+        print("❌ BLOCKED (SMELL TEST): 结果疑似退化，先怀疑 setup/测量，别急着归因于被测对象")
+        for reason in smell_reasons:
+            print(f"   - {reason}")
+        print("   → 这种结果像「reward=0.0」：多半是服务没起来 / 路由配错 / mock 没接上 / 鉴权失败，")
+        print("     而不是被测对象本身就这么烂。修好测量链路后重跑，确属真实再用 --max-*-ratio 放宽。")
+        sys.exit(1)
     print("✅ GATE PASSED — 数据充分，请用户审查上述原始数据")
     print("   LLM 的质量报告是否诚实？对照上面的原始数据判断")
     print("=" * 60)
