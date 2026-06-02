@@ -166,7 +166,21 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 **流程**：
 
 1. `python3 .claude/hooks/forge_gate.py status`
-2. 输出全局 roadmap 状态 + 到期提醒
+2. 输出全局 roadmap 状态 + 到期提醒 + 可清理的孤儿 worktree 计数（如有 → 提示 `/forge sweep-worktrees`）
+
+### `/forge sweep-worktrees [--dry-run]`
+
+**前置**：无
+
+清理所有交付完成的孤儿 worktree，杜绝它们占用磁盘/内存。
+
+**流程**：
+
+1. `python3 .claude/hooks/forge_gate.py sweep-worktrees [--dry-run]`
+2. 扫描 `<main-worktree>/.claude/worktrees/` 下所有 worktree，逐个判定并输出 removed/kept 摘要
+3. 额外跑 `git worktree prune` 清理「工作目录已被手动删除」的失联 admin 记录（绝不丢提交）
+
+**安全契约（绝不丢失代码）**：只删除「工作区干净 + 分支已真合并进 trunk（origin/main…，`git merge-base --is-ancestor`）」的 worktree。脏的 / 未合并的 / 当前所在的 / 主工作区 / 不在 `.claude/worktrees/` 下的一律保留。squash-merge 检测不到，保守保留。删 worktree 不带 `--force`、删分支用 `git branch -d` —— 三层独立兜底。`/forge ship` 成功后也会自动跑一次。
 
 ---
 

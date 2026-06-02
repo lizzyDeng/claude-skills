@@ -121,6 +121,218 @@ def get_current_branch(root=None):
         return None
 
 
+# ========== Worktree Cleanup (reaper) ==========
+
+def _git_out(args, cwd=None):
+    """Run git; return (returncode, stdout-stripped-trailing). Never raises."""
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        return r.returncode, r.stdout
+    except Exception:
+        return 1, ""
+
+
+def list_worktrees(root=None):
+    """Parse `git worktree list --porcelain` into dicts:
+    {path, head, branch, detached, is_main}. First entry is the main worktree."""
+    root = root or get_repo_root()
+    if not root:
+        return []
+    rc, out = _git_out(["-C", root, "worktree", "list", "--porcelain"], cwd=root)
+    if rc != 0:
+        return []
+    worktrees, cur = [], None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                worktrees.append(cur)
+            cur = {"path": line[len("worktree "):], "head": None,
+                   "branch": None, "detached": False, "is_main": False}
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif line.strip() == "detached":
+            cur["detached"] = True
+    if cur:
+        worktrees.append(cur)
+    if worktrees:
+        worktrees[0]["is_main"] = True
+    return worktrees
+
+
+def detect_trunk(root=None):
+    """Trunk ref to test merges against: origin/main, main, origin/master,
+    master — first that resolves. None if none exist."""
+    root = root or get_repo_root()
+    if not root:
+        return None
+    for ref in ("origin/main", "main", "origin/master", "master"):
+        rc, _ = _git_out(["-C", root, "rev-parse", "--verify", "--quiet", ref], cwd=root)
+        if rc == 0:
+            return ref
+    return None
+
+
+def worktree_is_clean(path):
+    """True iff no uncommitted or untracked changes in the worktree."""
+    rc, out = _git_out(["-C", path, "status", "--porcelain"], cwd=path)
+    return rc == 0 and out.strip() == ""
+
+
+def branch_merged(root, head_sha, trunk):
+    """Conservative: True iff head_sha is an ancestor of trunk (a real merge).
+    Squash-merges are intentionally NOT detected → returns False (kept safe)."""
+    if not head_sha or not trunk:
+        return False
+    rc, _ = _git_out(["-C", root, "merge-base", "--is-ancestor", head_sha, trunk], cwd=root)
+    return rc == 0
+
+
+def managed_worktrees_root(root=None):
+    root = root or get_repo_root()
+    return os.path.realpath(os.path.join(root, ".claude", "worktrees")) if root else ""
+
+
+def is_managed_worktree(wt_path, main_root=None):
+    """True iff the worktree lives under <main_root>/.claude/worktrees/.
+    `main_root` MUST be the MAIN worktree path (see classify_worktree)."""
+    base = managed_worktrees_root(main_root)
+    return bool(base) and os.path.realpath(wt_path).startswith(base + os.sep)
+
+
+def classify_worktree(wt, main_root, trunk, current_path):
+    """Decide whether one worktree may be reaped.
+    `main_root` MUST be the MAIN worktree path (anchors the managed-scope check),
+    NOT the current worktree — otherwise running from inside a linked worktree
+    mis-derives the managed base and skips every sibling.
+    Returns (removable: bool, status: str, reason: str)."""
+    rpath = os.path.realpath(wt["path"])
+    if rpath == os.path.realpath(current_path):
+        return (False, "kept-current", "当前工作区，不能删除自身")
+    if wt.get("is_main"):
+        return (False, "kept-main", "主工作区")
+    if not is_managed_worktree(rpath, main_root):
+        return (False, "kept-unmanaged", "不在 .claude/worktrees/ 下，跳过")
+    if not os.path.isdir(rpath):
+        return (False, "kept-missing", "worktree 路径不存在")
+    if wt.get("detached") or not wt.get("branch"):
+        return (False, "kept-detached", "detached HEAD，无法判定合并")
+    if not worktree_is_clean(rpath):
+        return (False, "kept-dirty", "有未提交/未跟踪改动")
+    if not branch_merged(main_root, wt.get("head"), trunk):
+        return (False, "kept-unmerged", f"分支未并入 {trunk}（squash-merge 保守保留）")
+    return (True, "removable", f"干净且已并入 {trunk}")
+
+
+def remove_worktree(root, wt, delete_branch=True):
+    """Remove a worktree WITHOUT --force (git refuses if dirty). Optionally
+    delete its branch with -d (git refuses if not fully merged).
+    PRECONDITION: callers MUST run classify_worktree() first — this function does
+    NOT re-validate merged/clean/managed/current status. The only safety it adds on
+    its own is git's refusal to remove a dirty worktree (no --force) or delete an
+    unmerged branch (-d). All exposed paths (sweep_worktrees) classify before calling."""
+    rc, out = _git_out(["-C", root, "worktree", "remove", wt["path"]], cwd=root)
+    if rc != 0:
+        return (False, f"git worktree remove 拒绝：{out.strip()[:120]}")
+    if delete_branch and wt.get("branch"):
+        _git_out(["-C", root, "branch", "-d", wt["branch"]], cwd=root)
+    return (True, "")
+
+
+def sweep_worktrees(root=None, dry_run=False, prune=False):
+    """Reap ALL managed orphan worktrees (clean + truly merged into trunk).
+    - prune=True: also run `git worktree prune` (clears admin entries whose working dir
+      was manually deleted — safe, only acts on missing dirs, never loses committed work).
+    Returns {removed:[(path,branch,reason)], kept:[(path,branch,status,reason)], trunk, error?}.
+
+    Note: there is intentionally no per-feature targeting. git forbids removing the
+    worktree you are standing in, so a per-feature reap run from inside `/forge ship`
+    would always no-op; a full sweep instead reaps every other delivered feature's
+    orphan and converges to zero across deliveries."""
+    root = root or get_repo_root()           # current worktree (for never-remove-self)
+    res = {"removed": [], "kept": [], "trunk": None}
+    if not root:
+        res["error"] = "不在 git 仓库中"
+        return res
+    wts = list_worktrees(root)
+    if not wts:
+        res["error"] = "无 worktree 列表"
+        return res
+    # Anchor the managed-scope check and all git ops on the MAIN worktree (always
+    # the first `git worktree list` entry), NOT the current worktree — so a sweep
+    # run from inside a linked feature worktree still sees siblings under
+    # <main>/.claude/worktrees/ and reaps them.
+    main_root = os.path.realpath(wts[0]["path"])
+    trunk = detect_trunk(main_root)
+    res["trunk"] = trunk
+    if not trunk:
+        res["error"] = "未找到 trunk (origin/main|main|origin/master|master)，跳过清理"
+        return res
+    for wt in wts:
+        removable, status, reason = classify_worktree(wt, main_root, trunk, root)
+        if not removable:
+            res["kept"].append((wt["path"], wt.get("branch"), status, reason))
+            continue
+        if dry_run:
+            res["removed"].append((wt["path"], wt.get("branch"), "DRY-RUN: 干净且已合并"))
+            continue
+        ok, err = remove_worktree(main_root, wt)
+        if ok:
+            res["removed"].append((wt["path"], wt.get("branch"), reason))
+        else:
+            res["kept"].append((wt["path"], wt.get("branch"), "kept-remove-failed", err))
+    if prune and not dry_run:
+        _git_out(["-C", main_root, "worktree", "prune"], cwd=main_root)
+    return res
+
+
+def removable_orphan_count(root=None):
+    """Count managed worktrees that are clean + merged (safe to remove)."""
+    root = root or get_repo_root()
+    if not root:
+        return 0
+    wts = list_worktrees(root)
+    if not wts:
+        return 0
+    main_root = os.path.realpath(wts[0]["path"])
+    trunk = detect_trunk(main_root)
+    if not trunk:
+        return 0
+    n = 0
+    for wt in wts:
+        removable, _, _ = classify_worktree(wt, main_root, trunk, root)
+        if removable:
+            n += 1
+    return n
+
+
+def _print_sweep(res):
+    if res.get("error"):
+        print(f"🧹 worktree 清理跳过：{res['error']}")
+        return
+    trunk = res.get("trunk")
+    for path, branch, reason in res["removed"]:
+        print(f"🧹 已清理 worktree: {path} [{branch}] — {reason}")
+    for item in res["kept"]:
+        path, branch, status = item[0], item[1], item[2]
+        why = item[3] if len(item) > 3 else ""
+        print(f"   保留 {path} [{branch}] — {status}{(': ' + why) if why else ''}")
+    print(f"🧹 worktree sweep: 清理 {len(res['removed'])} 个，保留 {len(res['kept'])} 个 (trunk={trunk})")
+
+
+def cmd_sweep_worktrees(dry_run=False):
+    root = get_repo_root()
+    if not root:
+        print("❌ 不在 git 仓库中。")
+        sys.exit(1)
+    # Manual sweep targets all managed worktrees and also prunes orphan admin dirs.
+    _print_sweep(sweep_worktrees(root, dry_run=dry_run, prune=True))
+
+
 def roadmap_dir():
     root = get_repo_root()
     return os.path.join(root, "project-roadmap") if root else None
@@ -910,6 +1122,10 @@ def cmd_status():
     if active:
         print(f"\n  🎯 Active: {active}")
 
+    n_orphans = removable_orphan_count()
+    if n_orphans:
+        print(f"\n🧹 {n_orphans} 个可清理的孤儿 worktree（干净+已合并）→ run /forge sweep-worktrees")
+
 
 def bind_fastship_state_for_feature(slug):
     """Select the feature-scoped fastship session without mutating other sessions."""
@@ -1047,6 +1263,20 @@ def cmd_transition(slug, target_status):
     state = derive_state(roadmap, active)
     save_forge_state(state)
 
+    # On delivery transitions, sweep ALL managed orphan worktrees (clean + truly
+    # merged). Best-effort — wrapped so a cleanup error never blocks the transition.
+    # Full sweep (not per-feature) because git forbids removing the worktree you're
+    # standing in: reaping every *other* delivered feature's orphan here converges
+    # to zero across deliveries. The just-shipped feature's own worktree (if you're
+    # inside it) is caught later by `/forge status` + manual `/forge sweep-worktrees`.
+    if target_status in ("shipped", "measuring", "concluded"):
+        try:
+            res = sweep_worktrees(root)
+            if res.get("removed"):
+                _print_sweep(res)
+        except Exception as e:
+            print(f"⚠️  worktree 自动清理跳过（非致命）：{e}")
+
     print(f"✅ {slug}: {current} → {target_status}")
 
 
@@ -1176,6 +1406,8 @@ def main():
         cmd_transition(sys.argv[2], sys.argv[3])
     elif action == "generate-view":
         cmd_generate_view()
+    elif action == "sweep-worktrees":
+        cmd_sweep_worktrees(dry_run="--dry-run" in sys.argv)
     elif action == "reset":
         cmd_reset()
     elif action == "pre_edit":

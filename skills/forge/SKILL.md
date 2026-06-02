@@ -117,6 +117,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    - 不读取旧 `.claude/.ship-verify-state.json`，禁止 legacy fallback
    - 必须验证 E2E 报告 trusted artifact，并确认报告引用 `e2e_result_hash`
    - Gate 5 自动从 shipped 转入 measuring
+   - **自动 worktree 清理**：transition 成功后跑一次全量 managed-orphan sweep（仅清理「干净 + 已真合并进 trunk」的 worktree）。你正在 ship 的那个 worktree 因 git 限制无法自删（保留为 `kept-current`），会在下次交付或 `/forge sweep-worktrees` 时回收。清理失败绝不阻断 transition。
 2. 如果通过 → 输出：
    ```
    ✅ <feature_name> 已上线！
@@ -182,7 +183,23 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 **流程**：
 
 1. `python3 .claude/hooks/forge_gate.py status`
-2. 输出全局 roadmap 状态 + 到期提醒
+2. 输出全局 roadmap 状态 + 到期提醒 + 可清理的孤儿 worktree 计数（如有 → 提示 `/forge sweep-worktrees`）
+
+### `/forge sweep-worktrees [--dry-run]`
+
+**前置**：无
+
+清理所有交付完成的孤儿 worktree，杜绝它们占用磁盘/内存。
+
+**流程**：
+
+1. `python3 .claude/hooks/forge_gate.py sweep-worktrees [--dry-run]`
+2. 扫描 `<main-worktree>/.claude/worktrees/` 下的所有 worktree，逐个判定并输出 removed/kept 摘要
+3. 额外跑 `git worktree prune` 清理「工作目录已被手动删除」的失联 admin 记录（绝不丢提交）
+
+**安全契约（绝不丢失代码）**：只删除「工作区干净（`git status` 为空）+ 分支已真合并进 trunk（origin/main…，用 `git merge-base --is-ancestor` 判定）」的 worktree。脏的 / 未合并的 / 当前所在的 / 主工作区 / 不在 `.claude/worktrees/` 下的一律保留。squash-merge 用 ancestor 判定检测不到，保守保留，请手动处理。删除 worktree 不带 `--force`（git 拒删脏工作区）；删分支用 `git branch -d`（git 拒删未合并分支）—— 三层独立兜底。
+
+> 从主工作区运行最彻底：git 不允许删除你当前所在的 worktree。
 
 ---
 
