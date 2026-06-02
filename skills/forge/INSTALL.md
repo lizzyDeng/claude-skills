@@ -32,6 +32,18 @@ cp /path/to/claude-skills/skills/forge/SKILL.md .claude/commands/forge.md
 cp /path/to/claude-skills/skills/forge/hooks/forge_gate.py .claude/hooks/
 ```
 
+## 2.5 复制可视化 dashboard（/forge dashboard）
+
+零依赖 stdlib Web UI，看 forge 目标 + 每个 feature 的 fastship 执行进度。
+
+```bash
+cp /path/to/claude-skills/skills/forge/forge_dashboard.py .claude/tools/
+cp /path/to/claude-skills/skills/forge/forge-dashboard .claude/tools/
+chmod +x .claude/tools/forge-dashboard
+```
+
+启动：`.claude/tools/forge-dashboard`（端口 7575，自动刷新）。无 hook 配置，纯只读，可随时跑。
+
 ## 3. 配置 hooks
 
 在 `.claude/settings.local.json` 中**合并**以下配置（与 fastship orchestrator hooks 共存）：

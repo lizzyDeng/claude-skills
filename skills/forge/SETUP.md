@@ -34,6 +34,16 @@ cp /path/to/claude-skills/skills/forge/SKILL.md .claude/commands/forge.md
 cp /path/to/claude-skills/skills/forge/hooks/forge_gate.py .claude/hooks/
 ```
 
+## Step 3.5: 复制可视化 dashboard
+
+```bash
+cp /path/to/claude-skills/skills/forge/forge_dashboard.py .claude/tools/
+cp /path/to/claude-skills/skills/forge/forge-dashboard .claude/tools/
+chmod +x .claude/tools/forge-dashboard
+```
+
+`/forge dashboard` 用：零依赖 stdlib Web UI（端口 7575），看目标 + 每个 feature 的 fastship 执行进度。纯只读，无 hook。
+
 ## Step 4: 配置 hooks
 
 读取当前 `.claude/settings.local.json`，将 forge 的 hook 配置合并进去。
