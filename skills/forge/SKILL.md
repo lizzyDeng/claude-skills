@@ -186,6 +186,28 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 ---
 
+### `/forge dashboard`
+
+可视化进度页面（只读 Web UI），看 forge 目标 + 每个 feature 的 fastship 执行进度。
+
+**前置**：无
+
+**流程**：
+
+1. 启动本地 dashboard（零依赖 stdlib，端口 7575，每 5s 自动刷新）：
+
+   ```bash
+   .claude/tools/forge-dashboard            # serve on http://127.0.0.1:7575
+   .claude/tools/forge-dashboard --port N   # 自定义端口
+   .claude/tools/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
+   ```
+
+2. 页面层级：**North Star → objective 卡片**（总体进度条 + status chips + **剩余 TODO 列表**）**→ feature 行**（status 徽章 + 进度条 + fastship 18 步执行条 + 指标 baseline→target→actual）。
+
+**它读什么**（全只读）：`project-roadmap/roadmap.json` + 每个 feature 的 `metric.json`/`harvest.json` + `.claude/forge-state/` gate 缓存；并扫描当前 repo 全部 worktree 的 fastship session（`<git-common-dir>/fastship` + `worktrees/*/fastship`），按 slug 把 session 关联到 feature。一个大目标拆成多个 feature（如 obj-4 的 F1-F7）时，objective 卡片给出**总体进展 + TODO**。
+
+---
+
 ## 🚫 Red Flags（禁止行为）
 
 1. 跳过 `/forge add` 直接进入 `/forge plan` — metric 未定义就开发 = 无法回收

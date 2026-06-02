@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Forge + Fastship progress dashboard launcher.
+# Usage: .claude/tools/forge-dashboard            # serve on :7575, auto-refresh
+#        .claude/tools/forge-dashboard --port N   # custom port
+#        .claude/tools/forge-dashboard --once     # print snapshot JSON and exit
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+exec python3 "$ROOT/.claude/tools/forge_dashboard.py" --repo-root "$ROOT" "$@"
