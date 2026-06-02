@@ -97,7 +97,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **前置**：feature 状态为 `planned`（G2 已通过）
 
-🧠 **Context 预检**（机械强制）：`activate` 命令会检查最近 2 分钟内是否执行过 `/compact`。未 compact → BLOCK。先 `/compact` 再 activate。
+🧠 **Context 预检**（软建议）：`activate` 命令会检查最近 2 分钟内是否执行过 `/compact`。未 compact → 打印建议但继续激活；建议在大需求前主动 `/compact` 保持 context 干净。
 
 **流程**：
 

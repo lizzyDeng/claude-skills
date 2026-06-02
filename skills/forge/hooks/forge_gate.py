@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 import time as _time
 
 
-# ========== Context Compact Gate ==========
+# ========== Context Compact Advisory ==========
 
 COMPACT_RECENCY_SECS = int(os.environ.get("FORGE_COMPACT_RECENCY", "120"))
 
@@ -966,9 +966,8 @@ def reset_fastship_state_for_feature(slug):
 def cmd_activate(slug):
     """Set active feature."""
     if not _compact_is_recent():
-        print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
-        print("   运行 /compact 后重试。")
-        sys.exit(1)
+        print("🧠 SUGGESTION: 建议新 feature 前先 /compact，确保 context 干净。")
+        print("   未检测到最近 2 分钟内 /compact；继续 activate。")
     roadmap = load_roadmap()
     if not roadmap:
         print("❌ No roadmap found.")
