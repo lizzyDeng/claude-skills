@@ -335,6 +335,8 @@ class OtherRenderTest(unittest.TestCase):
         self.assertIn("otherCard", h)
         self.assertIn("wtLine", h)
         self.assertIn('o.branch||"—"', h)   # unknown -> visible em dash, not blank
+        self.assertIn("staleHint", h)       # active sessions started long ago flagged stale
+        self.assertIn("started_at", h)
 
 
 if __name__ == "__main__":

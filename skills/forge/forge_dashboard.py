@@ -390,6 +390,7 @@ HTML = r"""<!DOCTYPE html>
   .wt{font-size:12px;color:var(--mut);margin-top:2px}
   .b-active{background:#0d2c4d;color:var(--run)}.b-done{background:#1a3a24;color:var(--ok)}
   .b-stopped,.b-unknown{background:#262b31;color:var(--draft)}
+  .stale{color:var(--todo);font-size:11px;margin-left:4px}
 </style></head>
 <body>
 <header><h1>Forge / Fastship</h1><span class="ns" id="ns"></span>
@@ -402,9 +403,13 @@ function bar(p){return `<div class="bar"><i style="width:${Math.max(0,Math.min(1
 function steps(fs){if(!fs)return "";const done=new Set(fs.completed_steps||[]);const skip=new Set(fs.skipped_steps||[]);
   return '<div class="steps">'+ALL.map(s=>{let c="step";if(skip.has(s))c+=" skip";else if(s===fs.current_step)c+=" cur";else if(done.has(s))c+=" done";
   return `<span class="${c}" title="${s}"></span>`;}).join("")+'</div>';}
+function ageDays(iso){if(!iso)return null;const t=Date.parse(iso);return isNaN(t)?null:(Date.now()-t)/864e5;}
+function staleHint(s){const a=ageDays(s.started_at);
+  return (s.status==='active'&&a!=null&&a>14)
+    ?`<span class="stale" title="started ${esc((s.started_at||'').slice(0,10))}, still at ${esc(s.current_step)}">⚠ stale? ${Math.round(a)}d no progress</span>`:'';}
 function fsCell(fs){if(!fs)return '<span class="mut">--</span>';
   return `<div class="sess">step ${esc(fs.current_step)} / P${esc(fs.phase)} / ${fs.completed_count}/${fs.applicable_steps} / loop ${fs.loop_count}/3`
-    +(fs.test_passed?' / OK test':'')+(fs.e2e_gate_passed?' / OK e2e':'')+`</div>`+steps(fs);}
+    +(fs.started_at?` / ${esc(fs.started_at.slice(0,10))}`:'')+(fs.test_passed?' / OK test':'')+(fs.e2e_gate_passed?' / OK e2e':'')+staleHint(fs)+`</div>`+steps(fs);}
 function metricCell(f){if(!f.metric)return '<span class="mut">--</span>';
   const m=f.metric,h=f.harvest;let s=`${esc(m.baseline)} -> ${esc(m.target)}`;
   if(h&&h.actual!=null)s+=` / actual ${esc(h.actual)} (${esc(h.verdict)})`;return `<span class="mut">${s}</span>`;}
