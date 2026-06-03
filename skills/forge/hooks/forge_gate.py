@@ -1411,6 +1411,84 @@ def cmd_doctor():
     print(f"✅ Forge doctor passed ({len(features)} roadmap feature(s) checked)")
 
 
+def cmd_audit_month(month, strict=False):
+    """Audit monthly plan files against Forge metric artifacts."""
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        print("Usage: forge_gate.py audit-month YYYY-MM [--strict]")
+        sys.exit(1)
+
+    root = get_repo_root()
+    if not root:
+        print("🚫 Forge audit: cannot determine repo root")
+        sys.exit(1)
+
+    roadmap = load_roadmap()
+    if not roadmap:
+        print("🚫 Forge audit: project-roadmap/roadmap.json not found")
+        sys.exit(1)
+
+    plans = month_plan_slugs(root, month)
+    metrics = metric_slugs(root)
+    roadmap_slugs = sorted(f.get("slug") for f in roadmap.get("features", []) if f.get("slug"))
+
+    missing_metric_for_plan = [slug for slug in plans if slug not in metrics]
+    metric_not_in_roadmap = [slug for slug in metrics if slug not in roadmap_slugs]
+    roadmap_without_metric = [slug for slug in roadmap_slugs if slug not in metrics]
+
+    print(f"📊 Forge audit {month}")
+    print(f"  plans:   {len(plans)}")
+    print(f"  metrics: {len(metrics)}")
+    print(f"  roadmap: {len(roadmap_slugs)}")
+
+    if missing_metric_for_plan:
+        label = "🚫 Missing metric.json for plan" if strict else "⚠️  Plans without metric.json"
+        print(f"\n{label}:")
+        for slug in missing_metric_for_plan:
+            print(f"  - {slug}")
+
+    if metric_not_in_roadmap:
+        print("\n⚠️  metric.json exists but feature is not listed in roadmap.json:")
+        for slug in metric_not_in_roadmap:
+            print(f"  - {slug}")
+
+    if roadmap_without_metric:
+        print("\n🚫 roadmap feature missing metric.json:")
+        for slug in roadmap_without_metric:
+            print(f"  - {slug}")
+
+    if roadmap_without_metric or (strict and missing_metric_for_plan):
+        print("\n🚫 Forge audit failed")
+        sys.exit(1)
+
+    print("\n✅ Forge audit completed")
+
+
+def month_plan_slugs(root, month):
+    """Return slugs from docs/superpowers/plans/YYYY-MM-DD-*.md."""
+    plans_dir = os.path.join(root, "docs", "superpowers", "plans")
+    if not os.path.isdir(plans_dir):
+        return []
+    pattern = re.compile(rf"^{re.escape(month)}-\d{{2}}-(.+)\.md$")
+    slugs = []
+    for name in sorted(os.listdir(plans_dir)):
+        match = pattern.match(name)
+        if match:
+            slugs.append(match.group(1))
+    return slugs
+
+
+def metric_slugs(root):
+    features_dir = os.path.join(root, "project-roadmap", "features")
+    if not os.path.isdir(features_dir):
+        return []
+    slugs = []
+    for entry in sorted(os.listdir(features_dir)):
+        metric_path = os.path.join(features_dir, entry, "metric.json")
+        if os.path.isdir(os.path.join(features_dir, entry)) and os.path.exists(metric_path):
+            slugs.append(entry)
+    return slugs
+
+
 # ========== Hook Handlers ==========
 
 def hook_pre_edit():
@@ -1509,6 +1587,11 @@ def main():
         cmd_status()
     elif action == "doctor":
         cmd_doctor()
+    elif action == "audit-month":
+        if len(sys.argv) < 3:
+            print("Usage: forge_gate.py audit-month YYYY-MM [--strict]")
+            sys.exit(1)
+        cmd_audit_month(sys.argv[2], strict="--strict" in sys.argv[3:])
     elif action == "activate":
         if len(sys.argv) < 3:
             print("Usage: forge_gate.py activate <slug>")
