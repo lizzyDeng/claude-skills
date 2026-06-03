@@ -7,10 +7,12 @@ description: "Result-driven development skill. Python orchestrator drives every 
 
 E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifact 硬验证，不能跳步。
 
+> 引擎路径用 `${CLAUDE_PLUGIN_ROOT}`（插件安装后由 Claude Code 注入）。源/dev 调试（非插件模式）时直接运行源树 `skills/fastship/fastship` 或 `skills/fastship/orchestrator.py`。
+
 ## 启动
 
 收到需求后立即运行：
-  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" start "<需求>"
+  "${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" start "<需求>"
 
 ## 双模工作方式
 
@@ -21,14 +23,14 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
 18 步中多数自动推进，关键关卡需手动：
-  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]
+  "${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
 
 无 hook，agent 手动驱动每一步：
-  1. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" next` → 读当前步骤指令
+  1. `"${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" next` → 读当前步骤指令
   2. 执行步骤
-  3. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]` → 验证 + 推进
+  3. `"${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" done [--flags]` → 验证 + 推进
   4. 重复
 
 全部 18 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
@@ -65,7 +67,7 @@ Phase 3: Verification (7 步)
 ## 常用命令
 
 ```bash
-FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
+FASTSHIP="${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship"
 "$FASTSHIP" start "<需求>"   # 启动
 "$FASTSHIP" next             # 当前步骤
 "$FASTSHIP" done [--flags]   # 完成 + 验证

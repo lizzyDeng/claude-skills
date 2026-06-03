@@ -1,0 +1,11 @@
+{
+  "name": "claude-skills",
+  "owner": { "name": "lizzyDeng" },
+  "plugins": [
+    {
+      "name": "forge",
+      "source": "./",
+      "description": "forge + fastship engine plugin"
+    }
+  ]
+}
