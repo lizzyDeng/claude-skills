@@ -1552,6 +1552,27 @@ _AMBIGUOUS_HINT = (
 )
 
 
+def _other_active_sessions(current_sid: str) -> list:
+    cur = fastship_state.normalize_session_id(current_sid)
+    return [s for s in fastship_state.active_session_ids() if s != cur]
+
+
+def _blocking_active_session_msg(current_sid: str):
+    """Return a refusal message if another active session shares this
+    state-home, else None."""
+    others = _other_active_sessions(current_sid)
+    if not others:
+        return None
+    return (
+        f"🔴 本 worktree 已有活跃 session: {', '.join(others)}\n"
+        f"   一 session 一 worktree 是默认隔离方式。请二选一：\n"
+        f"     • 在新的 git worktree 里 start（推荐，隔离最干净）\n"
+        f"     • 确需同 worktree 内并行：加 --shared 或 --session <id> 重新 start\n"
+        f"   （同 worktree 多 session 时 hook 会停止自动推进以防串台，"
+        f"且 .claude/.fastship-*.md 评审产物会共享。）"
+    )
+
+
 def hook_post_bash_logic(data: dict, orch_path: str = None,
                          hook_state: dict = None) -> int:
     if orch_path is None and _hook_session_ambiguous():
@@ -1808,7 +1829,7 @@ VALUED_FLAGS = {
     "--outcome",
     "--decision",
 }
-BOOLEAN_FLAGS = {"--grill-complete", "--user-confirmed"}
+BOOLEAN_FLAGS = {"--grill-complete", "--user-confirmed", "--shared"}
 
 
 def parse_done_args(argv: list) -> dict:
@@ -1917,7 +1938,12 @@ def _session_id_for_start(requirement: str) -> str:
     return fastship_state.session_id_from_requirement(requirement)
 
 
-def cmd_start(requirement: str) -> int:
+def cmd_start(requirement: str, argv: list = None) -> int:
+    if argv is None:
+        argv = []
+    # Capture SESSION_ENV before we overwrite it below, to detect an explicit
+    # --session <id> opt-in that was set by the global arg-stripping in main().
+    explicit_session_before_start = os.environ.get(fastship_state.SESSION_ENV)
     session_id = _session_id_for_start(requirement)
     os.environ[fastship_state.SESSION_ENV] = session_id
     existing = load_orch_state(fastship_state.orchestrator_state_path(session_id))
@@ -1928,6 +1954,15 @@ def cmd_start(requirement: str) -> int:
         print(f'   查看: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} status')
         print(f'   重来: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} reset')
         return 1
+    # Allow a second session only when the user explicitly opts in via --shared or
+    # --session <id> (the latter is detected by SESSION_ENV being set before this
+    # function ran, i.e. main() stripped and applied it).
+    shared = "--shared" in argv or bool(explicit_session_before_start)
+    if not shared:
+        msg = _blocking_active_session_msg(session_id)
+        if msg:
+            print(msg)
+            return 1
     if not _compact_is_recent():
         # Advisory, not a hard gate: a stale context is a quality risk, not a
         # correctness one — blocking start on it cost more than it saved. Warn and
@@ -2293,7 +2328,7 @@ def main():
         if len(argv) < 2:
             print("Usage: start [--session ID] \"<需求>\"")
             sys.exit(1)
-        sys.exit(cmd_start(argv[1]))
+        sys.exit(cmd_start(argv[1], argv[2:]))
     elif cmd == "done":
         sys.exit(cmd_done(argv[1:]))
     elif cmd == "use":

@@ -1995,3 +1995,29 @@ class TestAmbiguousSessionGuard:
         rc = orchestrator.hook_pre_edit_logic(
             {"tool_input": {"file_path": "src/app.rs"}}, orch_state, "/nonexistent-gate.py")
         assert rc == 1
+
+
+class TestStartSecondSessionRefusal:
+    def test_other_active_sessions_excludes_self_and_done(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("self", "mine", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("other", "theirs", {"current_step": "1.4"})
+        fastship_state.set_current_session_id("old", "done", {"current_step": "done"})
+        assert orchestrator._other_active_sessions("self") == ["other"]
+
+    def test_blocking_message_lists_other_and_mentions_shared(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("other", "theirs", {"current_step": "1.4"})
+        msg = orchestrator._blocking_active_session_msg("newcomer")
+        assert msg is not None
+        assert "other" in msg
+        assert "--shared" in msg
+        assert "worktree" in msg.lower()
+
+    def test_no_block_when_no_other_active(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("solo", "only", {"current_step": "1.0"})
+        assert orchestrator._blocking_active_session_msg("solo") is None
