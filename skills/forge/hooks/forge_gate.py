@@ -38,11 +38,9 @@ import time as _time
 COMPACT_RECENCY_SECS = int(os.environ.get("FORGE_COMPACT_RECENCY", "120"))
 
 
-def _last_compaction_epoch() -> float:
-    root = get_repo_root() or "."
-    log = os.path.join(root, ".claude", "checkpoints", "compaction.log")
+def _read_compaction_log_epoch(log_path: str) -> float:
     try:
-        with open(log, "rb") as f:
+        with open(log_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 256))
@@ -52,6 +50,42 @@ def _last_compaction_epoch() -> float:
             return dt.timestamp()
     except Exception:
         return 0.0
+
+
+def _compaction_log_paths() -> list:
+    """Candidate compaction.log locations, most-authoritative first.
+
+    /compact's post-compact hook writes to the MAIN worktree's
+    .claude/checkpoints/compaction.log (the parent of git-common-dir). Inside a
+    linked worktree, get_repo_root() points at the worktree whose own log is
+    stale, so the per-worktree path alone never sees the compact. Consult the
+    shared (main-worktree) log as well and take the most recent across both —
+    main-repo behaviour is unchanged since the two paths coincide there.
+    Mirrors the fastship fix for the same worktree gate bug.
+    """
+    paths = []
+    seen = set()
+
+    def _add(p):
+        if p and p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    common = get_git_common_dir()
+    if common:
+        main_root = os.path.dirname(common)
+        _add(os.path.join(main_root, ".claude", "checkpoints", "compaction.log"))
+
+    root = get_repo_root() or "."
+    _add(os.path.join(root, ".claude", "checkpoints", "compaction.log"))
+    return paths
+
+
+def _last_compaction_epoch() -> float:
+    return max(
+        (_read_compaction_log_epoch(p) for p in _compaction_log_paths()),
+        default=0.0,
+    )
 
 
 def _compact_is_recent() -> bool:
