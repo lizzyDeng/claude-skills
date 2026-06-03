@@ -404,9 +404,12 @@ function steps(fs){if(!fs)return "";const done=new Set(fs.completed_steps||[]);c
   return '<div class="steps">'+ALL.map(s=>{let c="step";if(skip.has(s))c+=" skip";else if(s===fs.current_step)c+=" cur";else if(done.has(s))c+=" done";
   return `<span class="${c}" title="${s}"></span>`;}).join("")+'</div>';}
 function ageDays(iso){if(!iso)return null;const t=Date.parse(iso);return isNaN(t)?null:(Date.now()-t)/864e5;}
-function staleHint(s){const a=ageDays(s.started_at);
-  return (s.status==='active'&&a!=null&&a>14)
-    ?`<span class="stale" title="started ${esc((s.started_at||'').slice(0,10))}, still at ${esc(s.current_step)}">⚠ stale? ${Math.round(a)}d no progress</span>`:'';}
+function staleHint(s){const a=ageDays(s.started_at);if(a==null||s.status!=='active')return '';
+  const t=`started ${esc((s.started_at||'').slice(0,10))}, still at ${esc(s.current_step)}`;
+  // stuck in Phase-1 (brainstorm/plan) for days = typical abandonment (work shipped outside fastship)
+  if((''+s.current_step).charAt(0)==='1'&&a>2) return `<span class="stale" title="${t}">⚠ stuck in planning ${Math.round(a)}d</span>`;
+  if(a>14) return `<span class="stale" title="${t}">⚠ stale? ${Math.round(a)}d no progress</span>`;
+  return '';}
 function fsCell(fs){if(!fs)return '<span class="mut">--</span>';
   return `<div class="sess">step ${esc(fs.current_step)} / P${esc(fs.phase)} / ${fs.completed_count}/${fs.applicable_steps} / loop ${fs.loop_count}/3`
     +(fs.started_at?` / ${esc(fs.started_at.slice(0,10))}`:'')+(fs.test_passed?' / OK test':'')+(fs.e2e_gate_passed?' / OK e2e':'')+staleHint(fs)+`</div>`+steps(fs);}
