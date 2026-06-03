@@ -125,30 +125,51 @@ def _assistant_summary(content):
 
 
 def extract_activity(objs):
-    """Walk the transcript tail: latest assistant action + latest cwd/branch.
+    """Walk the transcript tail to derive what the session is actually DOING.
 
-    Returns (activity, cwd, branch, errored). An error tail yields a '⚠ …'
-    activity and errored=True so liveness can mark it errored, not 'working'.
+    "NOW" should be a real ACTION, not chatter. So:
+      - latest assistant turn has a tool_use  -> show that tool action (in flight)
+      - latest assistant turn is an error text -> '⚠ …' + errored=True
+      - latest assistant turn is plain prose   -> the session replied / went idle;
+        show its most recent real tool action instead (what it last DID). Only when
+        the session has used no tool at all do we fall back to the reply text,
+        prefixed '💬' to mark it as a reply rather than an action.
+    Also returns the latest cwd/branch from the tail.
     """
     cwd = branch = None
-    activity = None
+    latest_kind = None          # 'tools' | 'error' | 'text'
+    latest_tools = latest_reply = None
+    prior_tool = None           # most recent tool action at/behind the tail
     errored = False
+    scanned = 0
     for o in reversed(objs):
         if cwd is None and o.get("cwd"):
             cwd, branch = o.get("cwd"), o.get("gitBranch")
-        if activity is None and o.get("type") == "assistant":
+        if o.get("type") == "assistant":
             text, tools = _assistant_summary((o.get("message") or {}).get("content"))
-            if tools:
-                activity = " · ".join(tools[:3])
-            elif text:
-                if is_error_text(text):
-                    errored = True
-                    activity = "⚠ " + _ws(text)[:80]
-                else:
-                    activity = _ws(text)[:90]
-        if activity is not None and cwd is not None:
+            if latest_kind is None:
+                if tools:
+                    latest_kind, latest_tools = "tools", " · ".join(tools[:3])
+                elif text and is_error_text(text):
+                    latest_kind, errored = "error", True
+                    latest_reply = "⚠ " + _ws(text)[:80]
+                elif text:
+                    latest_kind = "text"
+                    latest_reply = "💬 " + _ws(text)[:80]
+            if prior_tool is None and tools:
+                prior_tool = " · ".join(tools[:3])
+            scanned += 1
+            if scanned >= 60:
+                break
+        if cwd is not None and prior_tool is not None and latest_kind is not None:
             break
-    return (activity or ""), cwd, branch, errored
+    if latest_kind == "tools":
+        activity = latest_tools
+    elif latest_kind == "error":
+        activity = latest_reply
+    else:  # plain-text reply, or no assistant turn at all
+        activity = prior_tool or latest_reply or ""
+    return activity, cwd, branch, errored
 
 
 LIVENESS_LABELS = {
@@ -285,26 +306,30 @@ _WTCD_RE = re.compile(r"(?:\bWT=|\bcd\s+)(/(?:Users|home)/[^\s;&|'\"]+)")
 
 
 def _now_other_repo(objs, project):
-    """If the MOST RECENT assistant tool action explicitly switches to another
-    repo (a `WT=<abs>` or `cd <abs>` in a Bash command), return that repo's name
-    when it differs from `project`. This is concrete evidence taken from the
-    command text — not a guess. Surfaces the 'sits in repo A, operating on repo
-    B' case (e.g. a claude-skills task launched inside an aifriends worktree)."""
+    """If the action NOW shows (the most recent tool_use) explicitly targets a
+    different repo via `WT=<abs>` or `cd <abs>` in its command, return that repo's
+    name. Concrete evidence taken from the command text — not a guess. Surfaces
+    the 'sits in repo A, operating on repo B' case (e.g. a claude-skills task run
+    from an aifriends worktree, or a session that cd'd into another checkout)."""
     if not project:
         return None
     for o in reversed(objs):
         if o.get("type") != "assistant":
             continue
         content = (o.get("message") or {}).get("content")
-        if isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    cmd = str((b.get("input") or {}).get("command", ""))
-                    for p in _WTCD_RE.findall(cmd):
-                        other = project_of(p.rstrip("/"))
-                        if other and other != project and other != "(no cwd)":
-                            return other
-        return None  # only inspect the single latest assistant turn
+        if not isinstance(content, list):
+            continue
+        cmds = [str((b.get("input") or {}).get("command", ""))
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not cmds:
+            continue  # text-only turn — keep looking for the most recent ACTION
+        for cmd in cmds:
+            for p in _WTCD_RE.findall(cmd):
+                other = project_of(p.rstrip("/"))
+                if other and other != project and other != "(no cwd)":
+                    return other
+        return None  # this is the latest tool action; it had no cross-repo cd
     return None
 
 

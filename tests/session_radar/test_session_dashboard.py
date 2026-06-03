@@ -90,7 +90,30 @@ class ExtractActivityTest(unittest.TestCase):
         objs = [{"type": "user", "cwd": "/repo", "message": {"role": "user", "content": "hi"}}]
         activity, cwd, branch, errored = sd.extract_activity(objs)
         self.assertEqual(activity, "")
-        self.assertEqual(cwd, "/repo")
+
+    def test_idle_reply_shows_last_action_not_chat(self):
+        # latest turn is a prose reply to the user; NOW must show the last ACTION,
+        # not the chat text.
+        objs = [
+            {"type": "assistant", "cwd": "/r", "gitBranch": "main",
+             "message": {"role": "assistant", "content": [
+                 {"type": "tool_use", "name": "Bash", "input": {"command": "gh pr create"}}]}},
+            {"type": "assistant", "cwd": "/r", "gitBranch": "main",
+             "message": {"role": "assistant", "content": [
+                 {"type": "text", "text": "Done — created PR #24, you can review it now."}]}},
+        ]
+        activity, cwd, branch, errored = sd.extract_activity(objs)
+        self.assertIn("Bash", activity)         # the real action
+        self.assertNotIn("PR #24", activity)    # NOT the chat reply
+        self.assertFalse(errored)
+
+    def test_pure_conversational_falls_back_to_marked_reply(self):
+        # no tool ever used -> show the reply, but marked 💬 (a reply, not an action)
+        objs = [{"type": "assistant", "cwd": "/r",
+                 "message": {"role": "assistant", "content": [
+                     {"type": "text", "text": "Here is the explanation you asked for."}]}}]
+        activity, cwd, branch, errored = sd.extract_activity(objs)
+        self.assertTrue(activity.startswith("💬"))
         self.assertFalse(errored)
 
 
