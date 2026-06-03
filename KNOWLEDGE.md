@@ -12,3 +12,9 @@
 - **安装/复制脚本会覆盖本地修复**：如果只修项目本地 `.claude/hooks/ship_verify_gate.py`，后续按 INSTALL 或 settings 重新从 `claude-skills` 复制 hook 时可能丢失补丁。维护 hook 行为时要明确改的是源头、项目副本，还是两者都需要。
 - **Forge 依赖 fastship state 字段兼容性**：Forge Gate 4 接受 `test_passed` 或 `cargo_test_passed`，但必须有 `e2e_executed` 和 `knowledge_acknowledged` / `knowledge_skipped` / `knowledge_done` 之一。改 fastship state schema 时要同步验证 Forge gate。
 - **文档存在不等于项目安装生效**：`fastship/SKILL.md` 和 `INSTALL.md` 可以描述完整流程，但项目本地 hook 仍可能是旧代码。遇到 gate blocker 时要同时检查文档、源 hook、项目 hook、`.ship-verify-state.json` 四处。
+
+## 自定义 fastship E2E runner 的两处 schema/信号坑（forge dashboard 增强时踩到）
+
+- **E2E 报告 Step 3.3 数 turns 用嵌套 schema**：orchestrator `validate_e2e_report` 统计 `scenarios[].rounds[].turns`，**不是**顶层 flat `turns`。自定义 runner 若只产出 flat `{turns, passed}`（给项目自带 gate 用），3.3 会报 `e2e_result.json turns 不足 (0 < N)`。解法：runner 同时产出嵌套镜像 `"scenarios":[{"rounds":[{"turns": turns}]}]`，flat 键保留给项目 gate，两个消费方都满足。
+- **e2e_gate_passed 只认 exit code**：ship_verify_gate `gate_post_bash` 对 e2e-gate 命令调 `extract_exit_code(tool_response.exitCode/exit_code/...)`，==0 才置 `e2e_gate_passed=true`；只输出文本 "GATE PASS" 不够（它找的是 exit code，文本里找 "GATE PASSED"）。CLI 模式手动喂 post_bash 时 `tool_response` 必须带 `exitCode:0`。
+- **zsh 不对未加引号的 `$CMD` 做分词**：`CMD="python3 x.py -o out"; $CMD >log` 在 zsh 里会把整串当一个命令名（"no such file or directory"），导致 e2e "跑了" 实则用了上一轮 stale 结果文件、hash 不变而不自知。直接写出命令或用 `${=CMD}`/`eval`。
