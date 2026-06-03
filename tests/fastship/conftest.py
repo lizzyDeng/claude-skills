@@ -25,3 +25,8 @@ def isolate_fastship_state_home(tmp_path_factory, monkeypatch):
     home = tmp_path_factory.mktemp("fastship_state_home")
     monkeypatch.setenv("FASTSHIP_STATE_HOME", str(home))
     monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+    # Strip ambient harness env so project-root resolution tests aren't polluted:
+    # a CLAUDE_PROJECT_DIR / FASTSHIP_REPO_ROOT inherited from the running session
+    # would otherwise make repo_root() resolve there instead of the test fixture.
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)

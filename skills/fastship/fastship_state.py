@@ -69,6 +69,14 @@ def repo_root() -> str:
     if explicit:
         return os.path.realpath(explicit)
 
+    # Plugin-mode signal: when the engine runs as an installed Claude Code plugin,
+    # CLAUDE_PROJECT_DIR points at the user's project root (the engine lives under
+    # ~/.claude/plugins/cache/...). It wins over the installed-tool / cwd fallbacks
+    # but stays below the explicit FASTSHIP_REPO_ROOT override above.
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project_dir and os.path.isdir(project_dir):
+        return os.path.realpath(project_dir)
+
     script_root = script_repo_root()
     script_git_root = _run_git(["rev-parse", "--show-toplevel"], script_root)
 
