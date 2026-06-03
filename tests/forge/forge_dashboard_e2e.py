@@ -24,7 +24,10 @@ def _build_fixture():
     'big feature split into many roadmaps' case); a concluded feature with
     metric+harvest; and one in_progress feature linked to a fastship session."""
     tmp = tempfile.mkdtemp(prefix="forge_e2e_")
-    subprocess.run(["git", "init", "-q", tmp], check=True)
+    _genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", "-b", "main", tmp], check=True)
+    subprocess.run(["git", "-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=_genv)
     features = [
         {"slug": "telegram-binding", "name": "Telegram bind", "objective_id": "obj-1", "status": "in_progress"},
         {"slug": "admin-stats", "name": "Admin Stats", "objective_id": "obj-1", "status": "concluded"},
@@ -48,13 +51,41 @@ def _build_fixture():
     sess = os.path.join(tmp, ".git", "fastship", "sessions", "telegram-binding")
     _write(os.path.join(sess, "orchestrator.json"), {
         "session_id": "telegram-binding", "requirement": "Telegram bind",
-        "current_step": "2.0", "phase": 2,
+        "current_step": "2.0", "phase": 2, "branch": "feat/telegram-binding",
         "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6"],
         "skipped_steps": ["1.3d"], "started_at": "2026-05-29T19:24:31",
     })
     _write(os.path.join(sess, "gate.json"),
            {"forge_feature": "telegram-binding", "test_passed": True,
             "e2e_executed": False, "e2e_gate_passed": False, "request_type": "feature"})
+    # stale DUPLICATE of linked telegram-binding (older) -> must NOT leak into Other
+    dup = os.path.join(tmp, ".git", "fastship", "sessions", "telegram-binding-old")
+    _write(os.path.join(dup, "orchestrator.json"),
+           {"session_id": "telegram-binding-old", "current_step": "1.4", "completed_steps": [], "skipped_steps": []})
+    _write(os.path.join(dup, "gate.json"), {})
+    for _fn in ("orchestrator.json", "gate.json"):
+        os.utime(os.path.join(dup, _fn), (1_000_000, 1_000_000))
+    # REAL worktree whose basename == an obj-4 slug, NO session (exercises porcelain fallback)
+    subprocess.run(["git", "-C", tmp, "worktree", "add", "-q", "-b", "feat/img-gen",
+                    os.path.join(tmp, "wt", "persona-image-generator")], check=True)
+    # REAL worktree "wt-bf" on LIVE branch feat/bf-live; its session records a STALE branch
+    subprocess.run(["git", "-C", tmp, "worktree", "add", "-q", "-b", "feat/bf-live",
+                    os.path.join(tmp, "wt", "wt-bf")], check=True)
+    common = os.path.join(tmp, ".git")
+    bf = os.path.join(common, "worktrees", "wt-bf", "fastship", "sessions", "boyfriend-chat-route")
+    _write(os.path.join(bf, "orchestrator.json"),
+           {"session_id": "boyfriend-chat-route", "requirement": "bf chat", "current_step": "2.0",
+            "branch": "feat/bf-STALE", "completed_steps": ["1.0", "1.1"], "skipped_steps": []})
+    _write(os.path.join(bf, "gate.json"), {"forge_feature": "boyfriend-chat-route"})
+    # unlinked orphan -> Other
+    lab = os.path.join(common, "fastship", "sessions", "lab-experiment")
+    _write(os.path.join(lab, "orchestrator.json"),
+           {"session_id": "lab-experiment", "requirement": "lab", "current_step": "1.4",
+            "branch": "feat/lab", "completed_steps": [], "skipped_steps": []})
+    _write(os.path.join(lab, "gate.json"), {})
+    # 'default' placeholder -> excluded from Other
+    _write(os.path.join(common, "fastship", "sessions", "default", "orchestrator.json"),
+           {"session_id": "default", "current_step": None, "completed_steps": [], "skipped_steps": []})
     return tmp
 
 
@@ -154,8 +185,33 @@ def main():
             return True, f"{len(linked)} link(s) justified+coherent"
         turn("every feature<->session link justified by slug rule AND step-coherent", _links_coherent)
 
+        # ---- R1: per-feature branch/worktree (real worktree fallback + live-over-stale) ----
+        allfeats = [f for o in objs for f in o["features"]]
+        turn("every feature exposes branch+worktree keys (— when unknown)",
+             lambda: (all("branch" in f and "worktree" in f for f in allfeats), f"n={len(allfeats)}"))
+        img = next((f for f in allfeats if f["slug"] == "persona-image-generator"), None)
+        turn("no-session feature resolves branch via REAL git worktree fallback",
+             lambda: (bool(img and img.get("worktree") == "persona-image-generator" and img.get("branch") == "feat/img-gen"),
+                      f"wt={img and img.get('worktree')} br={img and img.get('branch')}"))
+        bf = next((f for f in allfeats if f["slug"] == "boyfriend-chat-route"), None)
+        turn("worktree-session feature prefers LIVE porcelain branch over stale recorded branch",
+             lambda: (bool(bf and bf.get("worktree") == "wt-bf" and bf.get("branch") == "feat/bf-live"),
+                      f"wt={bf and bf.get('worktree')} br={bf and bf.get('branch')}"))
+        # ---- R2: Other = unlinked-only (excludes linked + stale dup + default) ----
+        oth = snap.get("other_sessions", [])
+        oids = {s["session_id"] for s in oth}
+        turn("other_sessions = unlinked only (lab-experiment in; linked+default+dup out)",
+             lambda: ("lab-experiment" in oids and "telegram-binding" not in oids
+                      and "boyfriend-chat-route" not in oids and "default" not in oids
+                      and "telegram-binding-old" not in oids, f"other={sorted(oids)}"))
+        lab = next((s for s in oth if s["session_id"] == "lab-experiment"), None)
+        turn("Other session carries fastship progress + branch (no metric)",
+             lambda: (bool(lab and lab.get("branch") == "feat/lab" and "step_progress" in lab), f"lab={lab and lab.get('branch')}"))
+
         sh, html = _get(base + "/")
         turn("GET / serves dashboard HTML that fetches /api/state", lambda: (sh == 200 and "/api/state" in html and "<!DOCTYPE html>" in html, "html ok"))
+        turn("HTML wires otherCard + wtLine with em-dash fallback",
+             lambda: (all(k in html for k in ("other_sessions", "otherCard", "wtLine")) and 'o.branch||"—"' in html, "html wired"))
     finally:
         proc.terminate()
         try:

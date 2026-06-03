@@ -16,6 +16,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,6 +61,42 @@ def _mtime(path):
         return os.path.getmtime(path)
     except Exception:
         return 0.0
+
+
+def _worktree_from_path(path):
+    """Extract the linked-worktree name from a fastship state-home path, else None."""
+    m = re.search(r"/worktrees/([^/]+)/fastship/", (path or "") + "/")
+    return m.group(1) if m else None
+
+
+def _parse_worktree_list(output):
+    """Parse `git worktree list --porcelain` -> [{path, head, branch, is_bare}].
+    Tolerant: detached -> branch None; bare -> is_bare True; missing fields ignored."""
+    out, cur = [], None
+    for line in (output or "").splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                out.append(cur)
+            cur = {"path": line[9:].strip(), "head": None, "branch": None, "is_bare": False}
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[5:].strip()
+        elif line.startswith("branch "):
+            b = line[7:].strip()
+            cur["branch"] = b[11:] if b.startswith("refs/heads/") else b
+        elif line.strip() == "bare":
+            cur["is_bare"] = True
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _worktrees(repo_root):
+    """basename(worktree path) -> {path, branch} from `git worktree list --porcelain`."""
+    rows = _parse_worktree_list(_git(["worktree", "list", "--porcelain"], repo_root))
+    return {os.path.basename(r["path"].rstrip("/")): {"path": r["path"], "branch": r["branch"]}
+            for r in rows if r.get("path")}
 
 
 # ---------------------------------------------------------------------------
@@ -141,16 +178,24 @@ def _session_summary(sid, sdir, orch, gate, mtime):
         "e2e_executed": bool(gate.get("e2e_executed")),
         "e2e_gate_passed": bool(gate.get("e2e_gate_passed")),
         "knowledge_acknowledged": bool(gate.get("knowledge_acknowledged")),
+        "branch": orch.get("branch") or gate.get("branch"),
+        "base_sha": orch.get("base_sha"),
+        "worktree": _worktree_from_path(sdir),
     }
+
+
+def _session_matches_slug(s, slug):
+    """A session is LINKED to a feature if its forge_feature, exact id, or id-prefix matches."""
+    return bool(slug) and (s.get("forge_feature") == slug
+                           or s.get("session_id") == slug
+                           or str(s.get("session_id", "")).startswith(slug + "-"))
 
 
 def _link_session(slug, sessions):
     """Find the best fastship session for a feature slug, freshest first."""
     if not slug:
         return None
-    cands = [s for s in sessions.values()
-             if s.get("forge_feature") == slug or s["session_id"] == slug
-             or s["session_id"].startswith(slug + "-")]
+    cands = [s for s in sessions.values() if _session_matches_slug(s, slug)]
     if not cands:
         return None
     # mtime (filesystem truth) primary; updated_at only as deterministic tiebreak
@@ -162,20 +207,35 @@ def _link_session(slug, sessions):
 # Forge roadmap aggregation
 # ---------------------------------------------------------------------------
 
-def _feature_record(repo_root, feat, sessions):
+def _feature_branch_worktree(slug, fs, worktrees):
+    # worktree-session: prefer LIVE porcelain branch (recorded branch may be stale)
+    if fs and fs.get("worktree"):
+        wt = worktrees.get(fs["worktree"])
+        return ((wt["branch"] if wt and wt.get("branch") else fs.get("branch")), fs["worktree"])
+    # main-checkout session
+    if fs and fs.get("branch"):
+        return fs.get("branch"), None
+    # fallback: a worktree whose basename == feature slug
+    if slug and slug in worktrees:
+        return worktrees[slug]["branch"], slug
+    return None, None
+
+
+def _feature_record(repo_root, feat, sessions, worktrees):
     slug = feat.get("slug")
     fdir = os.path.join(repo_root, "project-roadmap", "features", slug or "")
     metric = _read_json(os.path.join(fdir, "metric.json")) or None
     harvest = _read_json(os.path.join(fdir, "harvest.json")) or None
     gates = _read_json(os.path.join(repo_root, ".claude", "forge-state", "features", slug or "", "state.json")) or None
     fs = _link_session(slug, sessions)
+    branch, worktree = _feature_branch_worktree(slug, fs, worktrees)
     return {
         "slug": slug, "name": feat.get("name"), "objective_id": feat.get("objective_id"),
         "status": feat.get("status"), "created_at": feat.get("created_at"),
         "shipped_at": feat.get("shipped_at"), "concluded_at": feat.get("concluded_at"),
         "harvest_due": feat.get("harvest_due"),
         "metric": metric, "harvest": harvest, "forge_gates": gates,
-        "fastship": fs,
+        "fastship": fs, "branch": branch, "worktree": worktree,
         "feature_progress": _feature_progress(feat.get("status"), fs),
     }
 
@@ -233,18 +293,29 @@ def build_snapshot(repo_root):
         objectives.append(rec)
         by_obj[obj.get("id")] = rec
 
+    worktrees = _worktrees(repo_root)
+    linked_ids = set()
     orphans = []
     total_features = 0
     for feat in features_raw:
         if not isinstance(feat, dict):
             continue
         total_features += 1
-        rec = _feature_record(repo_root, feat, sessions)
+        rec = _feature_record(repo_root, feat, sessions, worktrees)
+        # EVERY session matching this slug is linked (not just the freshest _link_session pick)
+        for s in sessions.values():
+            if _session_matches_slug(s, feat.get("slug")):
+                linked_ids.add(s["session_id"])
         target = by_obj.get(feat.get("objective_id"))
         (target["features"] if target else orphans).append(rec)
 
     for rec in objectives:
         rec["rollup"] = _rollup(rec["features"])
+
+    other_sessions = sorted(
+        [s for s in sessions.values()
+         if s["session_id"] not in linked_ids and s["session_id"] != "default"],
+        key=lambda s: (s.get("mtime", 0.0), s["session_id"]), reverse=True)
 
     return {
         "generated_at": _now_iso(),
@@ -252,6 +323,7 @@ def build_snapshot(repo_root):
         "north_star": roadmap.get("north_star"),
         "objectives": objectives,
         "orphan_features": orphans,
+        "other_sessions": other_sessions,
         "sessions": sorted(sessions.values(), key=lambda s: (s.get("started_at") or "", s["session_id"]), reverse=True),
         "counts": {"objectives": len(objectives), "features": total_features, "sessions": len(sessions)},
     }
@@ -292,6 +364,9 @@ HTML = r"""<!DOCTYPE html>
   .step.done{background:var(--ok)}.step.cur{background:var(--run)}.step.skip{background:#30240d}
   .todo{margin-top:12px;font-size:12px;color:var(--todo)}.todo b{color:var(--fg)}
   .mut{color:var(--mut)}.sess{font-size:12px;color:var(--mut)}
+  .wt{font-size:12px;color:var(--mut);margin-top:2px}
+  .b-active{background:#0d2c4d;color:var(--run)}.b-done{background:#1a3a24;color:var(--ok)}
+  .b-stopped,.b-unknown{background:#262b31;color:var(--draft)}
 </style></head>
 <body>
 <header><h1>Forge / Fastship</h1><span class="ns" id="ns"></span>
@@ -310,8 +385,19 @@ function fsCell(fs){if(!fs)return '<span class="mut">--</span>';
 function metricCell(f){if(!f.metric)return '<span class="mut">--</span>';
   const m=f.metric,h=f.harvest;let s=`${esc(m.baseline)} -> ${esc(m.target)}`;
   if(h&&h.actual!=null)s+=` / actual ${esc(h.actual)} (${esc(h.verdict)})`;return `<span class="mut">${s}</span>`;}
+function wtLine(o){return `<div class="wt">⎇ ${esc(o.branch||"—")} · 🗂 ${esc(o.worktree||"—")}</div>`;}
+function otherCard(list){if(!list||!list.length)return "";
+  const rows=list.map(s=>`<tr>
+    <td><b>${esc(s.requirement||s.session_id)}</b><div class="mut">${esc(s.session_id)}</div>${wtLine(s)}</td>
+    <td><span class="badge b-${esc(s.status)}">${esc(s.status)}</span></td>
+    <td style="min-width:120px">${bar(s.step_progress)}<span class="mut">${s.step_progress}%</span></td>
+    <td>${fsCell(s)}</td><td><span class="mut">--</span></td></tr>`).join("");
+  return `<section class="obj"><h2>Other <span class="mut">未归入 forge</span></h2>
+    <div class="tm">fastship session 未关联任何 forge feature（无 metric）</div>
+    <table><thead><tr><th>Session</th><th>status</th><th>progress</th><th>fastship</th><th>metric</th></tr></thead>
+    <tbody>${rows}</tbody></table></section>`;}
 function featRow(f){return `<tr>
-  <td><b>${esc(f.name)}</b><div class="mut">${esc(f.slug)}</div></td>
+  <td><b>${esc(f.name)}</b><div class="mut">${esc(f.slug)}</div>${wtLine(f)}</td>
   <td><span class="badge b-${esc(f.status)}">${esc(f.status)}</span></td>
   <td style="min-width:120px">${bar(f.feature_progress)}<span class="mut">${f.feature_progress}%</span></td>
   <td>${fsCell(f.fastship)}</td>
@@ -330,7 +416,8 @@ async function load(){try{const s=await (await fetch("/api/state")).json();
   document.getElementById("ns").textContent=(s.north_star||"");
   document.getElementById("counts").textContent=`${s.counts.objectives} objectives / ${s.counts.features} features / ${s.counts.sessions} sessions / ${esc(s.generated_at)}`;
   document.getElementById("root").innerHTML=(s.objectives||[]).map(objCard).join("")
-    +((s.orphan_features||[]).length?`<section class="obj"><h2>Unassigned Features</h2><table><tbody>${s.orphan_features.map(featRow).join("")}</tbody></table></section>`:"");
+    +((s.orphan_features||[]).length?`<section class="obj"><h2>Unassigned Features</h2><table><tbody>${s.orphan_features.map(featRow).join("")}</tbody></table></section>`:"")
+    +otherCard(s.other_sessions);
 }catch(e){document.getElementById("root").textContent="load failed: "+e;}}
 load();setInterval(load,5000);
 </script></body></html>"""

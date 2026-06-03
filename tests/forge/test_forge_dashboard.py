@@ -1,4 +1,4 @@
-import json, os, subprocess, tempfile, unittest, importlib.util
+import json, os, shutil, subprocess, tempfile, unittest, importlib.util
 
 FORGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "skills", "forge")
 spec = importlib.util.spec_from_file_location("forge_dashboard", os.path.join(FORGE_DIR, "forge_dashboard.py"))
@@ -162,6 +162,138 @@ class RenderAndCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         parsed = json.loads(buf.getvalue())
         self.assertEqual(parsed["north_star"], "NS")
+
+
+class WorktreeParseTest(unittest.TestCase):
+    def test_parse_tolerates_branch_detached_bare_and_empty(self):
+        out = ("worktree /a\nHEAD abc\nbranch refs/heads/feat/x\n\n"
+               "worktree /b\nHEAD def\ndetached\n\n"
+               "worktree /c\nbare\n")
+        rows = fd._parse_worktree_list(out)
+        self.assertEqual(rows[0]["path"], "/a")
+        self.assertEqual(rows[0]["branch"], "feat/x")
+        self.assertIsNone(rows[1]["branch"])         # detached -> None
+        self.assertTrue(rows[2]["is_bare"])
+        self.assertEqual(fd._parse_worktree_list(""), [])
+        self.assertEqual(fd._parse_worktree_list(None), [])
+
+
+class SessionBranchTest(unittest.TestCase):
+    def _s(self, sdir, orch, gate):
+        return fd._session_summary("sid", sdir, orch, gate, 1.0)
+
+    def test_branch_from_orch_and_worktree_from_path(self):
+        s = self._s("/r/.git/worktrees/wt-foo/fastship/sessions/sid",
+                    {"branch": "feat/a", "base_sha": "deadbeef"}, {})
+        self.assertEqual(s["branch"], "feat/a")
+        self.assertEqual(s["base_sha"], "deadbeef")
+        self.assertEqual(s["worktree"], "wt-foo")
+
+    def test_branch_falls_back_to_gate_main_has_no_worktree(self):
+        s = self._s("/r/.git/fastship/sessions/sid", {}, {"branch": "feat/b"})
+        self.assertEqual(s["branch"], "feat/b")
+        self.assertIsNone(s["worktree"])
+
+
+class BranchWorktreeOtherTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", "-b", "main", self.tmp], check=True)
+        subprocess.run(["git", "-C", self.tmp, "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env)
+        # REAL worktree whose basename == feature slug, NO session (exercises porcelain fallback)
+        self.wt = os.path.join(self.tmp, "wt", "wt-feat")
+        subprocess.run(["git", "-C", self.tmp, "worktree", "add", "-q", "-b", "feat/wt", self.wt], check=True)
+        # REAL worktree on LIVE branch feat/live; a session will record a STALE branch
+        self.swt = os.path.join(self.tmp, "wt", "stale-feat")
+        subprocess.run(["git", "-C", self.tmp, "worktree", "add", "-q", "-b", "feat/live", self.swt], check=True)
+        write(os.path.join(self.tmp, "project-roadmap", "roadmap.json"), {
+            "north_star": "ns", "objectives": [{"id": "obj-1", "name": "O1"}],
+            "features": [
+                {"slug": "linked-feat", "name": "L", "objective_id": "obj-1", "status": "in_progress"},
+                {"slug": "wt-feat", "name": "W", "objective_id": "obj-1", "status": "in_progress"},
+                {"slug": "nada-feat", "name": "N", "objective_id": "obj-1", "status": "draft"},
+                {"slug": "stale-feat", "name": "S", "objective_id": "obj-1", "status": "in_progress"},
+            ]})
+        common = subprocess.run(["git", "-C", self.tmp, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True).stdout.strip()
+        common = common if os.path.isabs(common) else os.path.join(self.tmp, common)
+        sd = os.path.join(common, "fastship", "sessions", "linked-feat")
+        write(os.path.join(sd, "orchestrator.json"),
+              {"session_id": "linked-feat", "current_step": "2.0", "branch": "feat/linked",
+               "completed_steps": ["1.0"], "skipped_steps": []})
+        write(os.path.join(sd, "gate.json"), {"forge_feature": "linked-feat"})
+        # stale DUPLICATE of linked-feat (matches via "linked-feat-" prefix) -> still linked, NOT Other
+        du = os.path.join(common, "fastship", "sessions", "linked-feat-old")
+        write(os.path.join(du, "orchestrator.json"),
+              {"session_id": "linked-feat-old", "current_step": "1.4", "completed_steps": [], "skipped_steps": []})
+        write(os.path.join(du, "gate.json"), {})
+        for _fn in ("orchestrator.json", "gate.json"):   # stale duplicate = OLDER than linked-feat
+            os.utime(os.path.join(du, _fn), (1_000_000, 1_000_000))
+        od = os.path.join(common, "fastship", "sessions", "lab-orphan")
+        write(os.path.join(od, "orchestrator.json"),
+              {"session_id": "lab-orphan", "current_step": "1.4", "branch": "feat/lab",
+               "completed_steps": [], "skipped_steps": []})
+        write(os.path.join(od, "gate.json"), {})
+        # worktree session recording a STALE branch; live worktree stale-feat is on feat/live
+        ssd = os.path.join(common, "worktrees", "stale-feat", "fastship", "sessions", "stale-feat")
+        write(os.path.join(ssd, "orchestrator.json"),
+              {"session_id": "stale-feat", "current_step": "2.0", "branch": "feat/STALE",
+               "completed_steps": ["1.0"], "skipped_steps": []})
+        write(os.path.join(ssd, "gate.json"), {"forge_feature": "stale-feat"})
+        # the 'default' placeholder must NOT appear in Other
+        dd = os.path.join(common, "fastship", "sessions", "default")
+        write(os.path.join(dd, "orchestrator.json"),
+              {"session_id": "default", "current_step": None, "completed_steps": [], "skipped_steps": []})
+
+    def _feats(self):
+        snap = fd.build_snapshot(self.tmp)
+        return snap, {f["slug"]: f for f in snap["objectives"][0]["features"]}
+
+    def test_every_feature_has_branch_and_worktree_keys(self):
+        _, feats = self._feats()
+        for f in feats.values():
+            self.assertIn("branch", f); self.assertIn("worktree", f)
+
+    def test_feature_branch_from_linked_session(self):
+        _, feats = self._feats()
+        self.assertEqual(feats["linked-feat"]["branch"], "feat/linked")
+
+    def test_feature_branch_from_real_worktree_fallback(self):
+        _, feats = self._feats()
+        self.assertEqual(feats["wt-feat"]["worktree"], "wt-feat")
+        self.assertEqual(feats["wt-feat"]["branch"], "feat/wt")   # from `git worktree list --porcelain`
+
+    def test_worktree_session_prefers_live_porcelain_branch_over_stale_record(self):
+        _, feats = self._feats()
+        self.assertEqual(feats["stale-feat"]["worktree"], "stale-feat")
+        self.assertEqual(feats["stale-feat"]["branch"], "feat/live")  # live beats recorded feat/STALE
+
+    def test_feature_no_source_branch_and_worktree_none(self):
+        _, feats = self._feats()
+        self.assertIsNone(feats["nada-feat"]["branch"])
+        self.assertIsNone(feats["nada-feat"]["worktree"])
+
+    def test_other_sessions_excludes_linked_and_default_includes_orphan(self):
+        snap, _ = self._feats()
+        ids = {s["session_id"] for s in snap["other_sessions"]}
+        self.assertIn("lab-orphan", ids)
+        self.assertNotIn("linked-feat", ids)
+        self.assertNotIn("default", ids)
+        self.assertNotIn("linked-feat-old", ids)        # stale DUPLICATE of a linked feature excluded
+        orphan = next(s for s in snap["other_sessions"] if s["session_id"] == "lab-orphan")
+        self.assertEqual(orphan["branch"], "feat/lab")
+        self.assertIn("step_progress", orphan)
+
+
+class OtherRenderTest(unittest.TestCase):
+    def test_html_wires_other_sessions_otherCard_and_dashfallback(self):
+        h = fd.render_html()
+        self.assertIn("other_sessions", h)
+        self.assertIn("otherCard", h)
+        self.assertIn("wtLine", h)
+        self.assertIn('o.branch||"—"', h)   # unknown -> visible em dash, not blank
 
 
 if __name__ == "__main__":
