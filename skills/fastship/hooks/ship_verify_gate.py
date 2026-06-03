@@ -657,31 +657,32 @@ def gate_post_edit():
     """PostToolUse: Edit/Write — 检测 plan 文件 / KNOWLEDGE.md 写入"""
     data = read_stdin()
     file_path = data.get("tool_input", {}).get("file_path", "")
-
     branch = get_current_branch()
-    st = ensure_branch_state(load_state(), branch)
     now = datetime.now().isoformat()
-    changed = False
 
-    if is_plan_file(file_path):
-        st["plan_ready"] = True
-        st["plan_file"] = normalize_path(file_path)
-        st["plan_ts"] = now
-        changed = True
-        print(f"✅ Gate: 检测到 plan 文件已写入，plan_ready=true ({file_path})")
+    with fastship_state.state_lock():
+        st = ensure_branch_state(load_state(), branch)
+        changed = False
 
-    if is_knowledge_file(file_path):
-        st["knowledge_acknowledged"] = True
-        st["knowledge_file"] = normalize_path(file_path)
-        st["knowledge_ts"] = now
-        st["knowledge_skip_reason"] = None
-        changed = True
-        print(f"✅ Gate: 检测到 KNOWLEDGE.md 更新，knowledge_acknowledged=true ({file_path})")
+        if is_plan_file(file_path):
+            st["plan_ready"] = True
+            st["plan_file"] = normalize_path(file_path)
+            st["plan_ts"] = now
+            changed = True
+            print(f"✅ Gate: 检测到 plan 文件已写入，plan_ready=true ({file_path})")
 
-    if changed:
-        if not require_branch_match(st, branch):
-            return 0
-        save_state(st)
+        if is_knowledge_file(file_path):
+            st["knowledge_acknowledged"] = True
+            st["knowledge_file"] = normalize_path(file_path)
+            st["knowledge_ts"] = now
+            st["knowledge_skip_reason"] = None
+            changed = True
+            print(f"✅ Gate: 检测到 KNOWLEDGE.md 更新，knowledge_acknowledged=true ({file_path})")
+
+        if changed:
+            if not require_branch_match(st, branch):
+                return 0
+            save_state(st)
     return 0
 
 
@@ -1195,84 +1196,85 @@ def gate_post_bash():
     cmd = data.get("tool_input", {}).get("command", "")
     output = extract_output(data)
 
-    st = ensure_branch_state(load_state(), branch)
-    if branch_mismatch(st, branch):
-        return 0
-    now = datetime.now().isoformat()
-    changed = False
+    with fastship_state.state_lock():
+        st = ensure_branch_state(load_state(), branch)
+        if branch_mismatch(st, branch):
+            return 0
+        now = datetime.now().isoformat()
+        changed = False
 
-    # 检测项目测试
-    is_test, stack = is_test_cmd(cmd)
-    if is_test:
-        if test_passed(output, stack):
-            st["test_passed"] = True
-            st["test_ts"] = now
-            st["test_tool"] = stack
-            changed = True
-            print(f"✅ Gate: {stack} test 通过，已记录")
-        else:
-            print(f"⚠️ Gate: {stack} test 已执行，但未检测到通过标志")
+        # 检测项目测试
+        is_test, stack = is_test_cmd(cmd)
+        if is_test:
+            if test_passed(output, stack):
+                st["test_passed"] = True
+                st["test_ts"] = now
+                st["test_tool"] = stack
+                changed = True
+                print(f"✅ Gate: {stack} test 通过，已记录")
+            else:
+                print(f"⚠️ Gate: {stack} test 已执行，但未检测到通过标志")
 
-    # 检测 E2E 验证（必须成功才标记）
-    if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd):
-        ok, reason = e2e_succeeded(data)
-        if ok:
-            st["e2e_executed"] = True
-            st["e2e_ts"] = now
-            st["e2e_gate_passed"] = False
-            st["e2e_gate_ts"] = None
-            st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
-            changed = True
-            # Provenance: only hash if the command matches strict runner pattern
-            result_path = e2e_result_path()
-            if is_strict_e2e_runner(cmd) and os.path.exists(result_path):
-                try:
-                    import hashlib
-                    with open(result_path, "rb") as f:
-                        st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
-                    with open(result_path, encoding="utf-8") as f:
-                        rdata = json.load(f)
-                    st["e2e_result_turns"] = sum(
-                        len(r.get("turns", []))
-                        for s in rdata.get("scenarios", [])
-                        for r in s.get("rounds", [])
-                    )
-                    st["e2e_runner_cmd"] = cmd[:200]
-                except Exception:
-                    pass
-            print(f"✅ Gate: E2E 验证通过（{reason}），loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record")
-        else:
-            print(f"⚠️ Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
-            print("   请排查问题后重跑 E2E")
+        # 检测 E2E 验证（必须成功才标记）
+        if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd):
+            ok, reason = e2e_succeeded(data)
+            if ok:
+                st["e2e_executed"] = True
+                st["e2e_ts"] = now
+                st["e2e_gate_passed"] = False
+                st["e2e_gate_ts"] = None
+                st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
+                changed = True
+                # Provenance: only hash if the command matches strict runner pattern
+                result_path = e2e_result_path()
+                if is_strict_e2e_runner(cmd) and os.path.exists(result_path):
+                    try:
+                        import hashlib
+                        with open(result_path, "rb") as f:
+                            st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
+                        with open(result_path, encoding="utf-8") as f:
+                            rdata = json.load(f)
+                        st["e2e_result_turns"] = sum(
+                            len(r.get("turns", []))
+                            for s in rdata.get("scenarios", [])
+                            for r in s.get("rounds", [])
+                        )
+                        st["e2e_runner_cmd"] = cmd[:200]
+                    except Exception:
+                        pass
+                print(f"✅ Gate: E2E 验证通过（{reason}），loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record")
+            else:
+                print(f"⚠️ Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
+                print("   请排查问题后重跑 E2E")
 
-    # 检测 E2E Gate 脚本执行结果
-    if is_e2e_gate_cmd(cmd):
-        exit_code = extract_exit_code(data)
-        if exit_code == 0:
-            st["e2e_gate_passed"] = True
-            st["e2e_gate_ts"] = now
-            changed = True
-            print("✅ Gate: E2E Gate 通过，已记录")
-        elif exit_code is None:
-            output = extract_output(data)
-            if "GATE PASSED" in output:
+        # 检测 E2E Gate 脚本执行结果
+        if is_e2e_gate_cmd(cmd):
+            exit_code = extract_exit_code(data)
+            if exit_code == 0:
                 st["e2e_gate_passed"] = True
                 st["e2e_gate_ts"] = now
                 changed = True
-                print("✅ Gate: E2E Gate 通过（via stdout），已记录")
+                print("✅ Gate: E2E Gate 通过，已记录")
+            elif exit_code is None:
+                output = extract_output(data)
+                if "GATE PASSED" in output:
+                    st["e2e_gate_passed"] = True
+                    st["e2e_gate_ts"] = now
+                    changed = True
+                    print("✅ Gate: E2E Gate 通过（via stdout），已记录")
+                else:
+                    st["e2e_gate_passed"] = False
+                    st["e2e_gate_ts"] = None
+                    changed = True
+                    print("⚠️ Gate: E2E Gate 结果不明（无 exit code 且无 GATE PASSED），已清除旧状态")
             else:
                 st["e2e_gate_passed"] = False
                 st["e2e_gate_ts"] = None
                 changed = True
-                print("⚠️ Gate: E2E Gate 结果不明（无 exit code 且无 GATE PASSED），已清除旧状态")
-        else:
-            st["e2e_gate_passed"] = False
-            st["e2e_gate_ts"] = None
-            changed = True
-            print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 已清除")
+                print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 已清除")
 
-    if changed:
-        save_state(st)
+        if changed:
+            save_state(st)
 
     # Proactive reminder
     st = load_state()

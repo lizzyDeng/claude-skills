@@ -1897,3 +1897,43 @@ class TestRegistryConcurrency:
             t.join()
         sessions = fastship_state.list_sessions()
         assert set(sessions) == set(ids), f"lost: {set(ids) - set(sessions)}"
+
+
+class TestGateStateLocking:
+    def _import_gate(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(__file__), "..", "..", "skills", "fastship", "hooks"))
+        import ship_verify_gate as gate
+        return gate
+
+    def test_gate_post_edit_rmw_serialized(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        gate = self._import_gate()
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setattr(gate, "get_current_branch", lambda: "main")
+        monkeypatch.setattr(gate, "require_branch_match", lambda st, br: True)
+        monkeypatch.setattr(gate, "is_plan_file", lambda p: p.endswith("plan.md"))
+        monkeypatch.setattr(gate, "is_knowledge_file",
+                            lambda p: os.path.basename(p).upper() == "KNOWLEDGE.MD")
+
+        tl = threading.local()
+        monkeypatch.setattr(gate, "read_stdin", lambda: getattr(tl, "data", {}))
+
+        def worker(file_path):
+            tl.data = {"tool_input": {"file_path": file_path}}
+            gate.gate_post_edit()
+
+        threads = [
+            threading.Thread(target=worker, args=("docs/plan.md",)),
+            threading.Thread(target=worker, args=("KNOWLEDGE.md",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        st = gate.ensure_branch_state(gate.load_state(), "main")
+        assert st.get("plan_ready") is True
+        assert st.get("knowledge_acknowledged") is True
