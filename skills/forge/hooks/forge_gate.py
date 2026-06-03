@@ -96,12 +96,21 @@ def _compact_is_recent() -> bool:
 # ========== Helpers ==========
 
 def get_repo_root():
+    # Honor an explicit override / the plugin-mode project signal first, then fall
+    # back to git-from-cwd. FORGE_REPO_ROOT mirrors fastship's FASTSHIP_REPO_ROOT;
+    # CLAUDE_PROJECT_DIR is set by Claude Code when the engine runs as a plugin.
+    explicit = os.environ.get("FORGE_REPO_ROOT") or os.environ.get("CLAUDE_PROJECT_DIR")
+    base = explicit if (explicit and os.path.isdir(explicit)) else None
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
+        cmd = ["git", "rev-parse", "--show-toplevel"]
+        if base:
+            cmd = ["git", "-C", base, "rev-parse", "--show-toplevel"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
     except Exception:
-        return None
+        pass
+    return os.path.realpath(base) if base else None
 
 
 def get_git_common_dir(root=None):
