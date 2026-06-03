@@ -4,5 +4,5 @@
   "author": { "name": "lizzyDeng" },
   "homepage": "https://github.com/lizzyDeng/claude-skills",
   "repository": "https://github.com/lizzyDeng/claude-skills",
-  "commands": "./.claude/commands/"
+  "commands": ["./.claude/commands/forge.md", "./.claude/commands/fastship.md"]
 }

@@ -219,9 +219,9 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 1. 启动本地 dashboard（零依赖 stdlib，端口 7575，每 5s 自动刷新）：
 
    ```bash
-   .claude/tools/forge-dashboard            # serve on http://127.0.0.1:7575
-   .claude/tools/forge-dashboard --port N   # 自定义端口
-   .claude/tools/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard            # serve on http://127.0.0.1:7575
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard --port N   # 自定义端口
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
    ```
 
 2. 页面层级：**North Star → objective 卡片**（总体进度条 + status chips + **剩余 TODO 列表**）**→ feature 行**（status 徽章 + 进度条 + fastship 18 步执行条 + 指标 baseline→target→actual）。

@@ -105,8 +105,8 @@ def _localize_cli(text: str) -> str:
     Rewrite them at print time to the orchestrator's own abspath and the resolved
     gate-script path, which are correct in every layout (source / plugin / legacy).
     """
-    if not text:
-        return text
+    if not isinstance(text, str):
+        return text  # callable/None step instructions pass through untouched
     self_cli = 'python3 "%s"' % os.path.abspath(__file__)
     gate_cli = 'python3 "%s"' % fastship_state.gate_script_path()
     text = text.replace(
