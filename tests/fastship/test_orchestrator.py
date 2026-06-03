@@ -1826,3 +1826,24 @@ class TestStep20StateNoop:
         code = "services/api/src/handlers/chat.rs"
         assert gate.is_plan_file(code) is False
         assert gate.is_knowledge_file(code) is False
+
+
+class TestAtomicSaveJson:
+    def test_save_json_no_leftover_temp_files(self, tmp_path):
+        import fastship_state
+        target = tmp_path / "state.json"
+        fastship_state.save_json(str(target), {"n": 1})
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != "state.json"]
+        assert leftovers == [], f"unexpected leftover files: {leftovers}"
+
+    def test_save_json_uses_atomic_replace(self, tmp_path, monkeypatch):
+        import fastship_state
+        calls = []
+        real_replace = os.replace
+        monkeypatch.setattr(os, "replace",
+                            lambda a, b: calls.append((a, b)) or real_replace(a, b))
+        target = tmp_path / "s.json"
+        fastship_state.save_json(str(target), {"k": "v"})
+        assert calls, "save_json must use os.replace for atomicity"
+        assert calls[0][1].endswith("s.json")
+        assert json.loads(target.read_text())["k"] == "v"
