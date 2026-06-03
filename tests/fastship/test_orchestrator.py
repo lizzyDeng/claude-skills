@@ -1847,3 +1847,33 @@ class TestAtomicSaveJson:
         assert calls, "save_json must use os.replace for atomicity"
         assert calls[0][1].endswith("s.json")
         assert json.loads(target.read_text())["k"] == "v"
+
+
+class TestStateLock:
+    def test_lock_serializes_concurrent_increments(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        counter = tmp_path / "counter.json"
+        counter.write_text(json.dumps({"n": 0}))
+
+        def bump():
+            for _ in range(50):
+                with fastship_state.state_lock():
+                    d = json.loads(counter.read_text())
+                    d["n"] += 1
+                    counter.write_text(json.dumps(d))
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert json.loads(counter.read_text())["n"] == 200
+
+    def test_lock_is_reentrant_within_thread(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        with fastship_state.state_lock():
+            with fastship_state.state_lock():
+                assert True

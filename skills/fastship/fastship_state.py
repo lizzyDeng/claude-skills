@@ -18,6 +18,8 @@ The registry only stores pointers and metadata. The actual flow state for one
 requirement never shares a JSON document with another requirement.
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -329,6 +332,38 @@ def load_project_config() -> dict:
 
 def current_branch() -> Optional[str]:
     return _run_git(["branch", "--show-current"], repo_root())
+
+
+_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive across processes (fcntl.flock on {state_home}/.lock), reentrant
+    within a thread. Wrap registry/gate read-modify-write in this."""
+    depth = getattr(_LOCAL, "depth", 0)
+    if depth > 0:
+        _LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCAL.depth -= 1
+        return
+
+    home = ensure_state_home()
+    f = open(os.path.join(home, ".lock"), "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    _LOCAL.depth = 1
+    _LOCAL.fd = f
+    try:
+        yield
+    finally:
+        _LOCAL.depth = 0
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+            _LOCAL.fd = None
 
 
 def load_json(path: str) -> Optional[dict]:
