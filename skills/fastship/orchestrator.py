@@ -201,7 +201,7 @@ class Step:
 
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
-E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"
 E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"

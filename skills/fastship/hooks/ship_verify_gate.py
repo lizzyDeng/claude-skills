@@ -203,7 +203,7 @@ def extract_exit_code(data):
     return None
 
 
-E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"
 E2E_MIN_TURNS = 10
 
 

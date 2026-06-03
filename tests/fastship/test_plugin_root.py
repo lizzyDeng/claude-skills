@@ -52,3 +52,31 @@ def test_claude_project_dir_beats_installed_tool_fallback(tmp_path, monkeypatch)
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", project)
     monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
     assert fastship_state.repo_root() == project
+
+
+def test_e2e_result_default_is_repo_relative(tmp_path, monkeypatch):
+    """AC4: orchestrator retires the /tmp default → repo-relative .claude/ path."""
+    import importlib
+    proj = _mk_git_repo(str(tmp_path / "proj"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", proj)
+    monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
+    import orchestrator
+    importlib.reload(orchestrator)
+    path = orchestrator._e2e_result_path()
+    assert not path.startswith("/tmp/")
+    assert path == os.path.join(proj, ".claude", "fastship-e2e-result.json")
+
+
+def test_ship_verify_gate_e2e_result_default_repo_relative(tmp_path, monkeypatch):
+    """AC4: the OTHER engine (ship_verify_gate) must also retire /tmp."""
+    import importlib
+    proj = _mk_git_repo(str(tmp_path / "proj2"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", proj)
+    monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
+    svg_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks')
+    sys.path.insert(0, os.path.abspath(svg_dir))
+    import ship_verify_gate
+    importlib.reload(ship_verify_gate)
+    path = ship_verify_gate.e2e_result_path()
+    assert not path.startswith("/tmp/")
+    assert path == os.path.join(proj, ".claude", "fastship-e2e-result.json")
