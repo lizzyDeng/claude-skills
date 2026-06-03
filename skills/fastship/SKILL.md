@@ -12,7 +12,7 @@ E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifa
 🧠 **Context 预检**（软建议）：`start` 命令会检查最近 2 分钟内是否执行过 `/compact`。未 compact → 打印建议但**继续启动**（不阻断）；大需求前建议主动 `/compact` 保持 context 干净，是否执行由用户决定。
 
 收到需求后立即运行：
-  "${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" start "<需求>"
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" start "<需求>"
 
 fastship 支持并行多个活跃需求。每个需求有独立 session/state：
 `{git-dir}/fastship/sessions/<session-id>/orchestrator.json` + `gate.json`。
@@ -27,14 +27,14 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
 18 步中多数步骤由 hook 自动推进，少数确认/决策步骤需手动：
-  "${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" done [--flags]
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
 
 无 hook，agent 手动驱动每一步：
-  1. `"${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" next` → 读当前步骤指令
+  1. `python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" next` → 读当前步骤指令
   2. 执行步骤
-  3. `"${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" done [--flags]` → 验证 + 推进
+  3. `python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" done [--flags]` → 验证 + 推进
   4. 重复
 
 全部 18 步需手动 done，但 protected validators 不允许 filesystem fallback。
@@ -82,24 +82,24 @@ Plan 确认后（步骤 1.6 完成），orchestrator 自动输出 `/goal` 命令
 
 生成 /goal 条件（手动场景）：
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship" goal
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" goal
 ```
 
 ## 常用命令
 
 ```bash
-FASTSHIP="${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship"
-"$FASTSHIP" start "<需求>"   # 启动
-"$FASTSHIP" start --session <id> "<需求>"  # 指定需求/feature 维度
-"$FASTSHIP" next             # 当前步骤
-"$FASTSHIP" done [--flags]   # 完成 + 验证
-"$FASTSHIP" status           # 全部状态
-"$FASTSHIP" list             # 列出全部需求 sessions
-"$FASTSHIP" use <id>         # 切换 hook/CLI 默认 session
-"$FASTSHIP" goal             # 生成 /goal 条件（Phase 2+ 可用）
-"$FASTSHIP" adopt-branch     # 将活跃 session 迁移到当前分支
-"$FASTSHIP" reset            # 重置当前 session
-"$FASTSHIP" reset --all      # 清空全部 sessions
+FASTSHIP="python3 ${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py"
+$FASTSHIP start "<需求>"   # 启动
+$FASTSHIP start --session <id> "<需求>"  # 指定需求/feature 维度
+$FASTSHIP next             # 当前步骤
+$FASTSHIP done [--flags]   # 完成 + 验证
+$FASTSHIP status           # 全部状态
+$FASTSHIP list             # 列出全部需求 sessions
+$FASTSHIP use <id>         # 切换 hook/CLI 默认 session
+$FASTSHIP goal             # 生成 /goal 条件（Phase 2+ 可用）
+$FASTSHIP adopt-branch     # 将活跃 session 迁移到当前分支
+$FASTSHIP reset            # 重置当前 session
+$FASTSHIP reset --all      # 清空全部 sessions
 ```
 
 ## 项目级 E2E 配置
@@ -112,9 +112,9 @@ FASTSHIP="${CLAUDE_PLUGIN_ROOT}/skills/fastship/fastship"
 {
   "e2e": {
     "setup_commands": ["./dev_local.sh"],
-    "runner_command": "python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health --scenario tests/e2e_scenarios/core.json -o /tmp/e2e_result.json",
-    "gate_command": "python3 tests/e2e_gate.py --result /tmp/e2e_result.json --min-turns 10",
-    "result_path": "/tmp/e2e_result.json",
+    "runner_command": "python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health --scenario tests/e2e_scenarios/core.json -o .claude/fastship-e2e-result.json",
+    "gate_command": "python3 tests/e2e_gate.py --result .claude/fastship-e2e-result.json --min-turns 10",
+    "result_path": ".claude/fastship-e2e-result.json",
     "min_turns": 10,
     "notes": ["Use the project local dev script so E2E runs against the same services as development."]
   }

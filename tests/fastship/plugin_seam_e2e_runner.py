@@ -23,6 +23,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 FASTSHIP_DIR = os.path.abspath(os.path.join(_HERE, "..", "..", "skills", "fastship"))
 FASTSHIP_HOOKS_DIR = os.path.join(FASTSHIP_DIR, "hooks")
 FORGE_HOOKS_DIR = os.path.abspath(os.path.join(_HERE, "..", "..", "skills", "forge", "hooks"))
+ORCH = os.path.join(FASTSHIP_DIR, "orchestrator.py")
 
 
 def _git(cwd, *a):
@@ -44,6 +45,18 @@ def _run(snippet, env_overrides, cwd):
         env.pop(k, None)
     env.update(env_overrides)
     p = subprocess.run([sys.executable, "-c", snippet], cwd=cwd, env=env,
+                       capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def _run_orch(args, env_overrides, cwd):
+    """Invoke the packaged command path (python3 orchestrator.py ...) directly."""
+    env = dict(os.environ)
+    for k in ("CLAUDE_PROJECT_DIR", "FASTSHIP_REPO_ROOT", "FORGE_REPO_ROOT",
+              "FASTSHIP_STATE_HOME", "FASTSHIP_SESSION"):
+        env.pop(k, None)
+    env.update(env_overrides)
+    p = subprocess.run([sys.executable, ORCH, *args], cwd=cwd, env=env,
                        capture_output=True, text=True)
     return p.returncode, (p.stdout + p.stderr).strip()
 
@@ -138,6 +151,9 @@ def run():
             ("ship_verify_gate e2e_result_path under CLAUDE_PROJECT_DIR (retired /tmp, both engines)",
              f"== {e2e_default}",
              lambda: _eq(_run(_s_svg_e2e_path(), {"CLAUDE_PROJECT_DIR": project}, elsewhere), e2e_default)),
+            ("packaged command path is invocable (python3 orchestrator.py, NOT the broken fastship wrapper)",
+             "usage printed; no 'No such file' / ModuleNotFound",
+             lambda: _invocable(_run_orch([], {"CLAUDE_PROJECT_DIR": project}, elsewhere))),
         ]
         for action, expect, fn in cases:
             all_ok &= turn(action, expect, fn)
@@ -166,6 +182,16 @@ def _eq(run_out, expected):
 def _not_tmp(run_out):
     rc, out = run_out
     return (rc == 0 and not out.startswith("/tmp/"), f"rc={rc} | {out}")
+
+
+def _invocable(run_out):
+    """The packaged command path must run the orchestrator (usage banner), not fail
+    like the broken wrapper would (missing fastship_orchestrator.py / import error)."""
+    rc, out = run_out
+    bad = ("No such file" in out or "ModuleNotFoundError" in out
+           or "can't open file" in out)
+    has_usage = ("Usage" in out or "CLI mode" in out or "start" in out)
+    return (not bad and has_usage, f"rc={rc} | {out[:160]}")
 
 
 def _stable(project):
