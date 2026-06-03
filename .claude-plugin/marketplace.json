@@ -1,5 +1,6 @@
 {
   "name": "claude-skills",
+  "description": "lizzyDeng's claude-skills marketplace — forge + fastship engine and related skills",
   "owner": { "name": "lizzyDeng" },
   "plugins": [
     {
