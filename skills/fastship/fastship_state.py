@@ -206,27 +206,28 @@ def list_sessions() -> dict:
 
 def set_current_session_id(session_id: str, requirement: str = None, state: dict = None) -> str:
     sid = normalize_session_id(session_id) or DEFAULT_SESSION_ID
-    registry = load_registry()
-    sessions = registry.setdefault("sessions", {})
-    rec = dict(sessions.get(sid) or {})
-    rec.update({
-        "id": sid,
-        "updated_at": _now_iso(),
-        "repo_root": repo_root(),
-    })
-    if requirement:
-        rec["requirement"] = requirement
-    if state:
-        rec["current_step"] = state.get("current_step")
-        rec["phase"] = state.get("phase")
-        rec["branch"] = state.get("branch")
-        rec["status"] = _status_from_state(state)
-        if state.get("requirement"):
-            rec["requirement"] = state.get("requirement")
-    rec.setdefault("created_at", rec["updated_at"])
-    sessions[sid] = rec
-    registry["current_session"] = sid
-    save_registry(registry)
+    with state_lock():
+        registry = load_registry()
+        sessions = registry.setdefault("sessions", {})
+        rec = dict(sessions.get(sid) or {})
+        rec.update({
+            "id": sid,
+            "updated_at": _now_iso(),
+            "repo_root": repo_root(),
+        })
+        if requirement:
+            rec["requirement"] = requirement
+        if state:
+            rec["current_step"] = state.get("current_step")
+            rec["phase"] = state.get("phase")
+            rec["branch"] = state.get("branch")
+            rec["status"] = _status_from_state(state)
+            if state.get("requirement"):
+                rec["requirement"] = state.get("requirement")
+        rec.setdefault("created_at", rec["updated_at"])
+        sessions[sid] = rec
+        registry["current_session"] = sid
+        save_registry(registry)
     return sid
 
 
@@ -234,12 +235,13 @@ def unregister_session(session_id: str) -> None:
     sid = normalize_session_id(session_id)
     if not sid:
         return
-    registry = load_registry()
-    registry.get("sessions", {}).pop(sid, None)
-    if registry.get("current_session") == sid:
-        remaining = sorted(registry.get("sessions", {}).keys())
-        registry["current_session"] = remaining[0] if len(remaining) == 1 else None
-    save_registry(registry)
+    with state_lock():
+        registry = load_registry()
+        registry.get("sessions", {}).pop(sid, None)
+        if registry.get("current_session") == sid:
+            remaining = sorted(registry.get("sessions", {}).keys())
+            registry["current_session"] = remaining[0] if len(remaining) == 1 else None
+        save_registry(registry)
 
 
 def update_session_from_state(state: dict, session_id: str = None) -> None:

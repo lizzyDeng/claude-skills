@@ -1877,3 +1877,23 @@ class TestStateLock:
         with fastship_state.state_lock():
             with fastship_state.state_lock():
                 assert True
+
+
+class TestRegistryConcurrency:
+    def test_concurrent_session_registration_keeps_all(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        ids = [f"sess-{i:03d}" for i in range(20)]
+
+        def register(sid):
+            fastship_state.set_current_session_id(
+                sid, f"req {sid}", {"current_step": "1.0"})
+
+        threads = [threading.Thread(target=register, args=(sid,)) for sid in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        sessions = fastship_state.list_sessions()
+        assert set(sessions) == set(ids), f"lost: {set(ids) - set(sessions)}"
