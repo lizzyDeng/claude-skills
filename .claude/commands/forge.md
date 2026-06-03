@@ -168,6 +168,30 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 1. `python3 .claude/hooks/forge_gate.py status`
 2. 输出全局 roadmap 状态 + 到期提醒 + 可清理的孤儿 worktree 计数（如有 → 提示 `/forge sweep-worktrees`）
 
+### `/forge doctor`
+
+**前置**：无
+
+**流程**：
+
+1. `python3 .claude/hooks/forge_gate.py doctor`
+2. 若失败，先修复 roadmap / metric artifact，禁止继续 plan/dev/ship
+3. 若只有 warning，明确告诉用户风险点（例如 metric 存在但未登记进 roadmap）
+
+### `/forge audit-month <YYYY-MM>`
+
+**前置**：无
+
+**流程**：
+
+1. `python3 .claude/hooks/forge_gate.py audit-month <YYYY-MM>`
+2. 对比当月 `docs/superpowers/plans/YYYY-MM-*.md`、`project-roadmap/features/*/metric.json`、`roadmap.json`
+3. 输出三类缺口：
+   - plan 有但缺 metric.json
+   - metric.json 有但未登记进 roadmap
+   - roadmap feature 缺 metric.json
+4. 月度复盘 / 合并前审计可加 `--strict`：`python3 .claude/hooks/forge_gate.py audit-month <YYYY-MM> --strict`，任何 plan 缺 metric 直接失败
+
 ### `/forge sweep-worktrees [--dry-run]`
 
 **前置**：无
@@ -181,6 +205,24 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 3. 额外跑 `git worktree prune` 清理「工作目录已被手动删除」的失联 admin 记录（绝不丢提交）
 
 **安全契约（绝不丢失代码）**：只删除「工作区干净 + 分支已真合并进 trunk（origin/main…，`git merge-base --is-ancestor`）」的 worktree。脏的 / 未合并的 / 当前所在的 / 主工作区 / 不在 `.claude/worktrees/` 下的一律保留。squash-merge 检测不到，保守保留。删 worktree 不带 `--force`、删分支用 `git branch -d` —— 三层独立兜底。`/forge ship` 成功后也会自动跑一次。
+
+### `/forge dashboard`
+
+可视化进度页面（只读 Web UI），看 forge 目标 + 每个 feature 的 fastship 执行进度。
+
+**前置**：无
+
+**流程**：
+
+1. 启动本地 dashboard（零依赖 stdlib，端口 7575，每 5s 自动刷新）：
+
+   ```bash
+   .claude/tools/forge-dashboard            # serve on http://127.0.0.1:7575
+   .claude/tools/forge-dashboard --port N   # 自定义端口
+   .claude/tools/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
+   ```
+
+2. 页面层级：**North Star → objective 卡片**（总体进度条 + status chips + **剩余 TODO 列表**）**→ feature 行**（status 徽章 + 进度条 + fastship 18 步执行条 + 指标 baseline→target→actual）。
 
 ---
 

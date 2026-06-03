@@ -20,7 +20,7 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **pre_edit**: Phase 1 阻止编辑代码，打印当前步骤
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
-16 步中 12 步自动推进，4 步需手动：
+18 步中多数自动推进，关键关卡需手动：
   "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
@@ -31,13 +31,13 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
   3. `"$(git rev-parse --show-toplevel)/.claude/tools/fastship" done [--flags]` → 验证 + 推进
   4. 重复
 
-全部 16 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
+全部 18 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
 Validators 自动检测环境：有 hook state 用 hook state，没有则直接扫文件系统。
 
 ## 流程概览
 
 ```
-Phase 1: Brainstorm (8 步)
+Phase 1: Brainstorm (9 步)
   1.0  需求分类         [CC:auto | Codex:done] classify CLI
   1.1  上下文+recall    [CC:auto | Codex:done] knowledge_recall CLI
   1.2  并行 Explore     [CC:done  | Codex:done] done --agents N (≥3)
@@ -45,10 +45,12 @@ Phase 1: Brainstorm (8 步)
   1.3d Bug 诊断         [CC:auto | Codex:done] fix_verified (仅 bugfix)
   1.4  写计划           [CC:auto | Codex:done] plan 文件 + writing-plans 签名
   1.5  Grill            [CC:auto | Codex:done] .fastship-grill-result.md 验证
+  1.5c Codex Review     [CC:done  | Codex:done] .fastship-codex-review.md GATE:PASS
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
 
-Phase 2: Execution (1 步)
+Phase 2: Execution (2 步)
   2.0  执行计划         [CC:done  | Codex:done]
+  2.5  Code Review      [CC:done  | Codex:done] .fastship-code-review.md gate
 
 Phase 3: Verification (7 步)
   3.0  冒烟测试         [CC:done  | Codex:done]
