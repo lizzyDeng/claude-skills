@@ -80,3 +80,11 @@ def test_ship_verify_gate_e2e_result_default_repo_relative(tmp_path, monkeypatch
     path = ship_verify_gate.e2e_result_path()
     assert not path.startswith("/tmp/")
     assert path == os.path.join(proj, ".claude", "fastship-e2e-result.json")
+
+
+def test_gate_script_path_resolves_engine_relative():
+    """AC6: gate_script_path resolves to the real skills/fastship/hooks copy
+    (engine-relative), so deleting the stale .claude/hooks duplicate is safe."""
+    p = fastship_state.gate_script_path()
+    assert p.endswith(os.path.join("skills", "fastship", "hooks", "ship_verify_gate.py")), p
+    assert os.path.exists(p), p

@@ -336,7 +336,18 @@ def legacy_gate_state_path() -> str:
 
 
 def gate_script_path() -> str:
-    return os.path.join(script_repo_root(), ".claude", "hooks", "ship_verify_gate.py")
+    # ship_verify_gate.py is delegated by orchestrator via subprocess. Resolve it
+    # relative to the engine's own location first — works for the source tree AND a
+    # plugin install (both: <engine>/hooks/ship_verify_gate.py) — then fall back to
+    # the legacy installed layout (.claude/hooks/ beside .claude/tools/).
+    candidates = [
+        os.path.join(_tools_dir(), "hooks", "ship_verify_gate.py"),
+        os.path.join(script_repo_root(), ".claude", "hooks", "ship_verify_gate.py"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
 
 
 def fastship_cli_path() -> str:
