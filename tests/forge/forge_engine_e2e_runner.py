@@ -19,7 +19,10 @@ import tempfile
 import time
 from datetime import datetime
 
-HOOKS = os.path.join(os.path.dirname(__file__), "..", "..", "skills", "forge", "hooks")
+# Absolutise paths up front: turns run gate subprocesses with cwd=<tmp repo>, so a
+# relative script/hook path would resolve under the throwaway repo and break.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+HOOKS = os.path.abspath(os.path.join(_HERE, "..", "..", "skills", "forge", "hooks"))
 sys.path.insert(0, HOOKS)
 import forge_gate  # noqa: E402
 
@@ -30,6 +33,11 @@ VALID_METRIC = {"metric_name": "m", "event_name": "e", "baseline": 0,
 
 def _git(cwd, *a):
     subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True, text=True)
+
+
+def _snip(out):
+    """One-line snippet of observed stdout for the result artifact."""
+    return " ⏎ ".join(line for line in out.strip().splitlines() if line.strip())[:200]
 
 
 def _run_gate(cwd, *args):
@@ -106,34 +114,34 @@ def run():
         _roadmap(repo, [("f1", "planned")]); _metric(repo, "f1")
         rc, out = _run_gate(repo, "doctor")
         all_ok &= turn("doctor: valid roadmap", "exit 0 + 'Forge doctor passed (1'",
-                       lambda: (rc == 0 and "Forge doctor passed (1" in out, f"rc={rc}"))
+                       lambda: (rc == 0 and "Forge doctor passed (1" in out, f"rc={rc} | {_snip(out)}"))
         _roadmap(repo, [("f1", "bogus")])
         rc, out = _run_gate(repo, "doctor")
         all_ok &= turn("doctor: invalid status", "exit 1 + \"invalid status 'bogus'\"",
-                       lambda: (rc == 1 and "invalid status 'bogus'" in out, f"rc={rc}"))
+                       lambda: (rc == 1 and "invalid status 'bogus'" in out, f"rc={rc} | {_snip(out)}"))
         _roadmap(repo, [("f1", "planned")]); _metric(repo, "f1", {"metric_name": "m"})
         rc, out = _run_gate(repo, "doctor")
         all_ok &= turn("doctor: bad G1 metric", "exit 1 + 'Gate 1'",
-                       lambda: (rc == 1 and "Gate 1" in out, f"rc={rc}"))
+                       lambda: (rc == 1 and "Gate 1" in out, f"rc={rc} | {_snip(out)}"))
         _metric(repo, "f1"); _metric(repo, "orphan")
         rc, out = _run_gate(repo, "doctor")
         all_ok &= turn("doctor: orphan metric", "exit 0 + 'not listed in roadmap.json'",
-                       lambda: (rc == 0 and "not listed in roadmap.json" in out, f"rc={rc}"))
+                       lambda: (rc == 0 and "not listed in roadmap.json" in out, f"rc={rc} | {_snip(out)}"))
         empty = _mk_repo(base, "doctor-empty")
         rc, out = _run_gate(empty, "doctor")
         all_ok &= turn("doctor: missing roadmap", "exit 1 + 'roadmap.json not found'",
-                       lambda: (rc == 1 and "roadmap.json not found" in out, f"rc={rc}"))
+                       lambda: (rc == 1 and "roadmap.json not found" in out, f"rc={rc} | {_snip(out)}"))
 
         # ---------- audit-month ----------
         a = _mk_repo(base, "audit")
         _roadmap(a, [("f1", "planned")]); _metric(a, "f1"); _plan(a, "2026-05-10-f1.md")
         rc, out = _run_gate(a, "audit-month", "2026-05")
         all_ok &= turn("audit: aligned month", "exit 0 + 'Forge audit completed' + 'plans:   1'",
-                       lambda: (rc == 0 and "Forge audit completed" in out and "plans:   1" in out, f"rc={rc}"))
+                       lambda: (rc == 0 and "Forge audit completed" in out and "plans:   1" in out, f"rc={rc} | {_snip(out)}"))
         _roadmap(a, [("f1", "planned"), ("f2", "planned")])
         rc, out = _run_gate(a, "audit-month", "2026-05")
         all_ok &= turn("audit: roadmap feature without metric", "exit 1 + 'roadmap feature missing metric.json' + 'f2'",
-                       lambda: (rc == 1 and "roadmap feature missing metric.json" in out and "f2" in out, f"rc={rc}"))
+                       lambda: (rc == 1 and "roadmap feature missing metric.json" in out and "f2" in out, f"rc={rc} | {_snip(out)}"))
         b = _mk_repo(base, "audit-strict")
         _roadmap(b, []); _plan(b, "2026-05-10-x.md")
         rc0, _ = _run_gate(b, "audit-month", "2026-05")
