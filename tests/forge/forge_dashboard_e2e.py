@@ -224,8 +224,12 @@ def main():
                 pass
         shutil.rmtree(fixture, ignore_errors=True)
 
+    passed = all(t["expect_ok"] for t in turns)
     result = {"scenario": "forge_dashboard_e2e", "turns": turns,
-              "passed": all(t["expect_ok"] for t in turns), "turn_count": len(turns)}
+              "passed": passed, "turn_count": len(turns),
+              # nested mirror so the fastship orchestrator e2e-report validator
+              # (scenarios[].rounds[].turns) counts turns; flat keys above serve forge_dashboard_gate.
+              "scenarios": [{"name": "forge_dashboard_e2e", "rounds": [{"turns": turns}]}]}
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(json.dumps(result, ensure_ascii=False, indent=2))
