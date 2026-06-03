@@ -57,7 +57,7 @@ Phase 1: Brainstorm (8 步)
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
 
 Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
-  2.0  执行计划         [/goal 自主驱动] ultracode implement→review pipeline（执行+并发对抗 review）
+  2.0  执行计划         [/goal 自主驱动] dynamic workflow：依赖感知扇出（≥2 不相交组 parallel，同 worktree 只编辑不 commit）→ implement→review pipeline
   2.5  Code Review      [硬 gate] .fastship-code-review.md PASS/FAIL
                         FAIL → 修复实现后重新 review（留在 2.5，不回退 plan）
   3.0  冒烟测试         [/goal 自主驱动]
@@ -133,6 +133,9 @@ FASTSHIP="$(git rev-parse --show-toplevel)/.claude/tools/fastship"
 - 执行必须走 executing-plans / subagent-driven-development
 - 关键步骤禁止 fallback：没有当前 step artifact 记录或 gate state → validator 必须返回 false
 - 主线程禁止亲自 grep/find（改为 1.2 并行 Explore）
+- 一 session 一 worktree：并行需求放各自 git worktree。同 state-home 内 start 第二个活跃 session 默认被拒，须 --shared / --session 显式开；多活跃 session 时 hook 停止自动推进以防串台。
+- Phase 2 implement 扇出由 Claude 读 plan 决定：文件不相交的 task 才在同 worktree 内并行编辑（不各自 commit，主线程逐组 commit），相交/依赖的串行；禁止并行跑测试套件/E2E（只编辑+编译检查）。
+- Implement verdict 落 session 绑定的 ledger（sessions/<sid>/implement-verdicts.md），喂 Step 2.5。
 - Phase 1 编辑代码文件 → hook 自动 BLOCK + 打印当前步骤（Claude Code only）
 - E2E 阶段禁止 DB 写入（gate 拦截）
 - Loop 上限 3 次（gate 锁死）
