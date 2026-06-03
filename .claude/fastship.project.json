@@ -1,0 +1,13 @@
+{
+  "e2e": {
+    "result_path": "tmp/session_radar_e2e_result.json",
+    "min_turns": 10,
+    "setup_commands": [],
+    "runner_command": "python3 tests/session_radar/session_radar_e2e_runner.py -o tmp/session_radar_e2e_result.json",
+    "gate_command": "python3 skills/fastship/e2e/e2e_gate.py --result tmp/session_radar_e2e_result.json --min-turns 10",
+    "notes": [
+      "Pure-Python stdlib skill: no HTTP service of its own; the runner boots session_dashboard.py against a fake ~/.claude home and asserts business results.",
+      "result_path is repo-local (resolved to <repo_root>/tmp via _absolute_project_path) to avoid shared /tmp collisions with parallel jobs."
+    ]
+  }
+}
