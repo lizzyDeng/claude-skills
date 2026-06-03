@@ -115,8 +115,20 @@ def _build_home():
     ])
     old2 = time.time() - 30 * 24 * 3600
     os.utime(op, (old2, old2))
+    # FG session sitting in aifriends but whose CURRENT command operates on another
+    # repo (WT=/.../claude-skills-a4-s) -> grouped under aifriends, marked acting_on
+    cross = "cccccccc-7777-8888-9999-aaaaaaaaaaaa"
+    _jsonl(os.path.join(proj, cross + ".jsonl"), [
+        {"type": "user", "cwd": "/Users/me/works/aifriends", "gitBranch": "main",
+         "message": {"role": "user", "content": "给 claude-skills 做个 UI"}},
+        {"type": "assistant", "cwd": "/Users/me/works/aifriends", "gitBranch": "main",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Bash",
+              "input": {"command": "WT=/Users/me/works/claude-skills-a4-s git -C $WT add -A"}}]}},
+    ])
     return home, {"fg": fg[:8], "bg": bg[:8], "err": err[:8], "wt": wt[:8],
-                  "done": done[:8], "blk": blk[:8], "nost": nost[:8], "oldfg": oldfg[:8]}
+                  "done": done[:8], "blk": blk[:8], "nost": nost[:8], "oldfg": oldfg[:8],
+                  "cross": cross[:8]}
 
 
 def main():
@@ -140,12 +152,27 @@ def main():
     snap = sd.build_snapshot(home, window_min=120)
     byshort = {s["short"]: s for s in snap["sessions"]}
 
-    turn("snapshot has 7 sessions (2 fg + 1 worktree fg + 4 bg)",
-         lambda: (snap["counts"]["total"] == 7, f"total={snap['counts']['total']}"))
+    turn("snapshot has 8 sessions (3 aifriends fg/bg + worktree fg + err + 2 other bg + stale)",
+         lambda: (snap["counts"]["total"] == 8, f"total={snap['counts']['total']}"))
     turn("P0-4 scope: fg + all 4 bg kinds present; counts.bg == 4",
          lambda: (all(ids[k] in byshort for k in ("fg", "bg", "done", "blk", "nost"))
                   and snap["counts"]["bg"] == 4,
                   f"bg={snap['counts']['bg']} shorts={sorted(byshort)}"))
+    turn("GROUP: sessions grouped by git project; aifriends group holds fg+bg+cross",
+         lambda: (
+             (lambda pm: "aifriends" in pm and "claude-skills" in pm
+              and {ids["fg"], ids["bg"], ids["cross"]} <= {s["short"] for s in pm["aifriends"]["sessions"]}
+              and ids["wt"] in {s["short"] for s in pm["claude-skills"]["sessions"]})(
+                 {g["project"]: g for g in snap["projects"]}),
+             f"projects={[g['project'] for g in snap['projects']]}"))
+    turn("STALE: no-metadata bg collapsed into stale_unknown, excluded from groups",
+         lambda: (snap["stale_unknown"] >= 1
+                  and ids["nost"] not in {s["short"] for g in snap["projects"] for s in g["sessions"]},
+                  f"stale_unknown={snap['stale_unknown']}"))
+    turn("CROSS-REPO: session in aifriends operating on another repo is marked acting_on",
+         lambda: (byshort[ids["cross"]]["project"] == "aifriends"
+                  and byshort[ids["cross"]]["acting_on"] == "claude-skills-a4-s",
+                  f"cross project={byshort[ids['cross']]['project']} acting_on={byshort[ids['cross']]['acting_on']}"))
     turn("P0-4 done bg job (no transcript) surfaces with liveness 'done' + intent opening",
          lambda: (byshort[ids["done"]]["liveness"] == "done"
                   and byshort[ids["done"]]["is_bg"] is True
@@ -206,8 +233,10 @@ def main():
         st, body = _get(base + "/api/state")
         api = json.loads(body)
         apibyshort = {s["short"]: s for s in api["sessions"]}
-        turn("P0-5 /api/state 200 + all 7 sessions over HTTP",
-             lambda: (st == 200 and api["counts"]["total"] == 7, f"total={api['counts']['total']}"))
+        turn("P0-5 /api/state 200 + all 8 sessions + project groups over HTTP",
+             lambda: (st == 200 and api["counts"]["total"] == 8
+                      and api["counts"]["projects"] == len(api["projects"])
+                      and api["stale_unknown"] >= 1, f"total={api['counts']['total']}"))
         turn("P0-5 /api/state preserves working+done+blocked+unknown+errored+worktree over HTTP",
              lambda: (
                  apibyshort[ids["bg"]]["liveness"] == "working"
@@ -218,9 +247,10 @@ def main():
                  and apibyshort[ids["wt"]]["worktree"] == "session-radar",
                  "http snapshot coherent across all derived states"))
         sh, html = _get(base + "/")
-        turn("P0-5 GET / serves HTML that fetches /api/state",
+        turn("P0-5 GET / serves grouped HTML (project header + stale line wired)",
              lambda: (sh == 200 and "/api/state" in html and "<!DOCTYPE html>" in html
-                      and "Session Radar" in html, "html ok"))
+                      and "Session Radar" in html and "grpHead" in html
+                      and "stale_unknown" in html, "html ok"))
     finally:
         proc.terminate()
         try:
@@ -234,16 +264,18 @@ def main():
     try:
         once = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--once"],
                               capture_output=True, text=True, timeout=30)
-        turn("P0-5 --once table shows real rows: repo + DRIFT marker + worktree",
-             lambda: (once.returncode == 0 and "aifriends" in once.stdout
-                      and "DRIFT" in once.stdout and "session-radar" in once.stdout,
-                      f"once rows present"))
+        turn("P0-5 --once table groups by project (📁 header) + DRIFT + worktree + stale line",
+             lambda: (once.returncode == 0 and "📁 aifriends" in once.stdout
+                      and "DRIFT" in once.stdout and "session-radar" in once.stdout
+                      and "无元数据的旧后台任务" in once.stdout,
+                      f"once grouped rows present"))
         jrun = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--json"],
                               capture_output=True, text=True, timeout=30)
-        turn("P0-5 --json snapshot carries the derived fields (7 sessions, bg=4)",
+        turn("P0-5 --json snapshot carries the derived fields (8 sessions, bg=4, projects)",
              lambda: (jrun.returncode == 0
-                      and json.loads(jrun.stdout)["counts"]["total"] == 7
-                      and json.loads(jrun.stdout)["counts"]["bg"] == 4,
+                      and json.loads(jrun.stdout)["counts"]["total"] == 8
+                      and json.loads(jrun.stdout)["counts"]["bg"] == 4
+                      and len(json.loads(jrun.stdout)["projects"]) >= 1,
                       "json business fields present"))
     finally:
         shutil.rmtree(home2, ignore_errors=True)

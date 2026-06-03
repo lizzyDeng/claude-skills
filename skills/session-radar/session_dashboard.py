@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -239,6 +240,74 @@ def repo_of(cwd):
     return f"{base} ⟨wt:{wt}⟩" if wt else base
 
 
+def _git(args, cwd):
+    """Run a git subprocess in cwd; return stripped stdout or None."""
+    try:
+        r = subprocess.run(["git", "-C", cwd] + args,
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+_PROJECT_CACHE = {}
+_PATH_RE = re.compile(r"/(?:[^/]+/)*[^/]+/\.claude/worktrees/")
+
+
+def _project_from_path(cwd):
+    """Path-only fallback: the repo dir before /.claude/worktrees, else basename."""
+    m = re.search(r"/([^/]+)/\.claude/worktrees/", cwd)
+    return m.group(1) if m else (os.path.basename(cwd.rstrip("/")) or cwd)
+
+
+def project_of(cwd):
+    """The MAIN git repo a cwd belongs to — worktrees collapse to their parent
+    repo via `git rev-parse --git-common-dir` (so a worktree placed under another
+    repo's tree still attributes to its true owner). Falls back to path parsing
+    when git is unavailable (e.g. fake test cwds). Cached per cwd."""
+    if not cwd:
+        return "(no cwd)"
+    if cwd in _PROJECT_CACHE:
+        return _PROJECT_CACHE[cwd]
+    proj = None
+    gcd = _git(["rev-parse", "--git-common-dir"], cwd)
+    if gcd:
+        if not os.path.isabs(gcd):
+            gcd = os.path.normpath(os.path.join(cwd, gcd))
+        proj = os.path.basename(os.path.dirname(gcd)) or None
+    if not proj:
+        proj = _project_from_path(cwd)
+    _PROJECT_CACHE[cwd] = proj
+    return proj
+
+
+_WTCD_RE = re.compile(r"(?:\bWT=|\bcd\s+)(/(?:Users|home)/[^\s;&|'\"]+)")
+
+
+def _now_other_repo(objs, project):
+    """If the MOST RECENT assistant tool action explicitly switches to another
+    repo (a `WT=<abs>` or `cd <abs>` in a Bash command), return that repo's name
+    when it differs from `project`. This is concrete evidence taken from the
+    command text — not a guess. Surfaces the 'sits in repo A, operating on repo
+    B' case (e.g. a claude-skills task launched inside an aifriends worktree)."""
+    if not project:
+        return None
+    for o in reversed(objs):
+        if o.get("type") != "assistant":
+            continue
+        content = (o.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    cmd = str((b.get("input") or {}).get("command", ""))
+                    for p in _WTCD_RE.findall(cmd):
+                        other = project_of(p.rstrip("/"))
+                        if other and other != project and other != "(no cwd)":
+                            return other
+        return None  # only inspect the single latest assistant turn
+    return None
+
+
 # Latin words (>=3 chars) AND individual CJK ideographs (which are not
 # whitespace-separated). Without the CJK class a Chinese opening like
 # "做 session 维度可视化雷达" would yield zero tokens and drift would never fire.
@@ -293,6 +362,11 @@ def _row_from_objs(sid, age, objs, job):
         cwd = job["cwd"]
     live = liveness(age, is_bg, bg_state, errored)
     now_text = activity or (f"[bg:{bg_state}]" if bg_state else "—")
+    project = project_of(cwd)
+    # A "stale" row is a background job with no usable metadata at all (no cwd,
+    # no intent) — a cleaned-up / aborted ~/.claude/jobs entry. Collapsed in the
+    # UI instead of shown as an empty row.
+    is_stale = is_bg and not cwd and not opening
     return {
         "session_id": sid,
         "short": sid[:8],
@@ -301,6 +375,8 @@ def _row_from_objs(sid, age, objs, job):
         "liveness_label": LIVENESS_LABELS.get(live, live),
         "is_bg": is_bg,
         "bg_state": bg_state,
+        "project": project,
+        "acting_on": _now_other_repo(objs, project),
         "repo": repo_of(cwd),
         "cwd": cwd,
         "worktree": worktree_of(cwd),
@@ -309,6 +385,7 @@ def _row_from_objs(sid, age, objs, job):
         "now": now_text,
         "errored": errored,
         "drift": compute_drift(opening, activity),
+        "is_stale": is_stale,
     }
 
 
@@ -354,17 +431,34 @@ def build_snapshot(home, window_min=WINDOW_MIN_DEFAULT, now=None):
         rows.append(_row_from_objs(sid, age, objs, job))
         seen.add(short)
     rows.sort(key=lambda r: r["age_s"])
+    # Group the metadata-bearing rows by their MAIN git repo; collapse the
+    # no-metadata stale jobs into a single count.
+    stale = [r for r in rows if r["is_stale"]]
+    visible = [r for r in rows if not r["is_stale"]]
+    by_project = {}
+    for r in visible:
+        by_project.setdefault(r["project"], []).append(r)
+    projects = [{"project": p,
+                 "sessions": sorted(sess, key=lambda r: r["age_s"]),
+                 "count": len(sess)}
+                for p, sess in by_project.items()]
+    # Freshest project first (smallest min-age in the group).
+    projects.sort(key=lambda g: min(s["age_s"] for s in g["sessions"]))
     counts = {
         "total": len(rows),
         "bg": sum(1 for r in rows if r["is_bg"]),
         "errored": sum(1 for r in rows if r["errored"]),
         "drift": sum(1 for r in rows if r["drift"]),
+        "projects": len(projects),
+        "stale_unknown": len(stale),
     }
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "claude_home": home,
         "window_min": window_min,
         "counts": counts,
+        "projects": projects,
+        "stale_unknown": len(stale),
         "sessions": rows,
     }
 
@@ -390,35 +484,53 @@ th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;lett
 .now{color:var(--fg)}.err td{background:rgba(248,81,73,.06)}
 .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;border:1px solid var(--line)}
 .clip{max-width:38ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
+tr.grp td{background:#11161f;border-bottom:1px solid var(--line);padding-top:14px}
+.grp .pname{font-weight:700;font-size:13px;color:var(--fg)}
+.grp .pcount{color:var(--mut);font-size:12px;margin-left:8px}
+tr.stale td{color:var(--mut);font-size:12px;font-style:italic;background:transparent}
+.act{display:inline-block;margin-left:8px;color:var(--blue);font-size:11px;font-weight:600;
+white-space:nowrap}
 </style></head><body>
 <header><h1>📡 Session Radar</h1>
 <span class="sub" id="meta">loading…</span></header>
 <main><table><thead><tr>
-<th>Live</th><th>BG</th><th>Repo / Worktree</th><th>Branch</th>
+<th>Live</th><th>BG</th><th>Worktree</th><th>Branch</th>
 <th>Opening → Now</th><th>Drift</th></tr></thead>
 <tbody id="rows"></tbody></table></main>
 <script>
 function esc(s){return (s==null?"":""+s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function grpHead(g){
+  return '<tr class="grp"><td colspan="6">'
+    +'<span class="pname">📁 '+esc(g.project)+'</span>'
+    +'<span class="pcount">'+g.count+' session'+(g.count>1?'s':'')+'</span></td></tr>';
+}
 function row(s){
-  var wt = s.worktree ? '<div class="br">⟨wt:'+esc(s.worktree)+'⟩</div>' : '';
+  var wt = s.worktree ? '<span class="br">⟨wt:'+esc(s.worktree)+'⟩</span>' : '<span class="br">—</span>';
+  var act = s.acting_on ? '<span class="act" title="current command operates on another repo">↗ '+esc(s.acting_on)+'</span>' : '';
   var drift = s.drift ? '<span class="drift">⤳ DRIFT</span>' : '';
   return '<tr class="'+(s.errored?'err':'')+'">'
     +'<td class="live">'+esc(s.liveness_label)+'</td>'
     +'<td class="bg">'+(s.is_bg?'🤖':'')+'</td>'
-    +'<td><span class="repo">'+esc(s.repo)+'</span>'+wt+'</td>'
+    +'<td>'+wt+'</td>'
     +'<td class="br">'+esc(s.branch)+'</td>'
     +'<td><span class="clip" title="'+esc(s.opening)+'">'+esc(s.opening)+'</span>'
       +'<span class="flow"> → </span>'
-      +'<span class="now clip" title="'+esc(s.now)+'">'+esc(s.now)+'</span></td>'
+      +'<span class="now clip" title="'+esc(s.now)+'">'+esc(s.now)+'</span>'+act+'</td>'
     +'<td>'+drift+'</td></tr>';
 }
 function load(){
   fetch("/api/state").then(r=>r.json()).then(d=>{
     var c=d.counts||{};
     document.getElementById("meta").textContent=
-      (c.total||0)+" sessions · "+(c.bg||0)+" bg · "+(c.errored||0)+" errored · "
-      +(c.drift||0)+" drifted · "+esc(d.generated_at);
-    document.getElementById("rows").innerHTML=(d.sessions||[]).map(row).join("");
+      (c.total||0)+" sessions · "+(c.projects||0)+" projects · "+(c.bg||0)+" bg · "
+      +(c.errored||0)+" errored · "+(c.drift||0)+" drifted · "+esc(d.generated_at);
+    var html="";
+    (d.projects||[]).forEach(function(g){ html += grpHead(g) + g.sessions.map(row).join(""); });
+    if((d.stale_unknown||0)>0){
+      html += '<tr class="stale"><td colspan="6">+ '+d.stale_unknown
+        +' 无元数据的旧后台任务（jobs/ 里无 state.json，已折叠）</td></tr>';
+    }
+    document.getElementById("rows").innerHTML=html;
   }).catch(e=>{document.getElementById("meta").textContent="error: "+e;});
 }
 load(); setInterval(load, 5000);
@@ -431,17 +543,26 @@ def render_html():
 
 def render_table(snap):
     c = snap.get("counts", {})
-    out = [f"📡 Session Radar — {c.get('total',0)} sessions "
+    out = [f"📡 Session Radar — {c.get('total',0)} sessions in {c.get('projects',0)} projects "
            f"({c.get('bg',0)} bg, {c.get('errored',0)} errored, {c.get('drift',0)} drifted)"
-           f"  @ {snap.get('generated_at','')}", "-" * 104,
-           f"{'LIVE':<11} {'BG':<3} {'REPO/WT':<26} {'BRANCH':<22} OPENING → NOW"]
-    for r in snap.get("sessions", []):
-        bg = "🤖" if r.get("is_bg") else "  "
-        repo = (r.get("repo") or "—")[:25]
-        br = (r.get("branch") or "—")[:21]
-        drift = "  ⤳DRIFT" if r.get("drift") else ""
-        out.append(f"{r.get('liveness_label',''):<11} {bg:<3} {repo:<26} {br:<22} "
-                   f"{(r.get('opening') or '—')[:32]} → {(r.get('now') or '—')[:32]}{drift}")
+           f"  @ {snap.get('generated_at','')}"]
+    for g in snap.get("projects", []):
+        out.append("")
+        out.append(f"📁 {g['project']}  ({g['count']})")
+        out.append("  " + "-" * 100)
+        out.append(f"  {'LIVE':<11} {'BG':<3} {'WORKTREE':<22} {'BRANCH':<20} OPENING → NOW")
+        for r in g.get("sessions", []):
+            bg = "🤖" if r.get("is_bg") else "  "
+            wt = (r.get("worktree") or "—")[:21]
+            br = (r.get("branch") or "—")[:19]
+            act = f"  ↗{r['acting_on']}" if r.get("acting_on") else ""
+            drift = "  ⤳DRIFT" if r.get("drift") else ""
+            out.append(f"  {r.get('liveness_label',''):<11} {bg:<3} {wt:<22} {br:<20} "
+                       f"{(r.get('opening') or '—')[:30]} → {(r.get('now') or '—')[:30]}{act}{drift}")
+    stale = snap.get("stale_unknown", 0)
+    if stale:
+        out.append("")
+        out.append(f"+ {stale} 无元数据的旧后台任务（jobs/ 里无 state.json，已折叠）")
     return "\n".join(out)
 
 

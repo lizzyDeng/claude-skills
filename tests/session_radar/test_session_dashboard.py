@@ -194,6 +194,31 @@ class DriftTest(unittest.TestCase):
         self.assertFalse(sd.compute_drift("修复 重试 逻辑 backoff", "Edit 修复 重试 逻辑 jitter"))
 
 
+class ProjectAttributionTest(unittest.TestCase):
+    def test_project_of_path_fallback(self):
+        # git unavailable for these fake paths -> path fallback
+        self.assertEqual(sd.project_of("/Users/me/works/aifriends"), "aifriends")
+        # a worktree placed under another repo's tree -> the repo BEFORE /.claude/worktrees
+        self.assertEqual(sd.project_of("/x/aifriends/.claude/worktrees/forge-dashboard"), "aifriends")
+        self.assertEqual(sd.project_of(None), "(no cwd)")
+
+    def test_now_other_repo_detects_explicit_cross_repo_command(self):
+        # latest action runs a WT=<abs path> targeting a different repo
+        objs = [{"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "WT=/Users/zz/works/claude-skills-a4-s git -C $WT push"}}]}}]
+        self.assertEqual(sd._now_other_repo(objs, "aifriends"), "claude-skills-a4-s")
+
+    def test_now_other_repo_none_for_same_repo_or_no_switch(self):
+        objs = [{"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "sdk.py"}}]}}]
+        self.assertIsNone(sd._now_other_repo(objs, "aifriends"))
+        objs2 = [{"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "cd /Users/zz/works/aifriends && ls"}}]}}]
+        self.assertIsNone(sd._now_other_repo(objs2, "aifriends"))  # same repo -> no marker
+
+
 def _jsonl(path, objs):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -273,11 +298,34 @@ class BuildSnapshotTest(unittest.TestCase):
 
     def test_top_level_shape(self):
         snap = sd.build_snapshot(self.home, window_min=120)
-        for k in ("generated_at", "claude_home", "counts", "sessions", "window_min"):
+        for k in ("generated_at", "claude_home", "counts", "sessions", "window_min",
+                  "projects", "stale_unknown"):
             self.assertIn(k, snap)
         # 2 plain fg + 1 worktree fg + 4 bg (active, done, blocked, stateless) = 7
         self.assertEqual(snap["counts"]["total"], 7)
         self.assertEqual(snap["counts"]["bg"], 4)
+        self.assertEqual(snap["counts"]["projects"], len(snap["projects"]))
+
+    def test_sessions_grouped_by_git_project(self):
+        snap = sd.build_snapshot(self.home, window_min=120)
+        pmap = {g["project"]: g for g in snap["projects"]}
+        # the two aifriends-cwd sessions (drifted fg + alive bg) group together
+        self.assertIn("aifriends", pmap)
+        aif = {s["short"] for s in pmap["aifriends"]["sessions"]}
+        self.assertIn("aaaaaaaa", aif)
+        self.assertIn("32ea05ca", aif)
+        # the worktree session attributes to its main repo (claude-skills)
+        self.assertIn("claude-skills", pmap)
+        self.assertIn("dddddddd", {s["short"] for s in pmap["claude-skills"]["sessions"]})
+        # each group carries a count matching its session list
+        self.assertTrue(all(g["count"] == len(g["sessions"]) for g in snap["projects"]))
+
+    def test_stateless_job_collapsed_into_stale_count(self):
+        snap = sd.build_snapshot(self.home, window_min=120)
+        self.assertEqual(snap["stale_unknown"], 1)  # the no-state 0d0d0d0d job
+        grouped = {s["short"] for g in snap["projects"] for s in g["sessions"]}
+        self.assertNotIn("0d0d0d0d", grouped)        # collapsed, not in any group
+        self.assertIn("0d0d0d0d", {s["short"] for s in snap["sessions"]})  # still in flat list
 
     def test_p0_2_worktree_row_exposes_worktree_and_repo(self):  # P0-2
         snap = sd.build_snapshot(self.home, window_min=120)
@@ -386,15 +434,23 @@ class RenderAndCliTest(unittest.TestCase):
         self.assertIn("/api/state", html)
         self.assertIn("Session Radar", html)
 
-    def test_render_table_has_header_and_rows(self):
-        snap = {"generated_at": "t", "counts": {"total": 1, "bg": 1, "errored": 0, "drift": 1},
-                "sessions": [{"liveness_label": "🟢 working", "is_bg": True, "repo": "aifriends",
-                              "branch": "main", "opening": "review F4", "now": "Read(sdk.py)",
-                              "drift": True}]}
+    def test_render_table_groups_by_project_with_rows(self):
+        snap = {"generated_at": "t",
+                "counts": {"total": 1, "bg": 1, "errored": 0, "drift": 1,
+                           "projects": 1, "stale_unknown": 2},
+                "stale_unknown": 2,
+                "projects": [{"project": "aifriends", "count": 1, "sessions": [
+                    {"liveness_label": "🟢 working", "is_bg": True, "worktree": "forge-dashboard",
+                     "branch": "main", "opening": "review F4", "now": "Read(sdk.py)",
+                     "acting_on": "claude-skills", "drift": True}]}],
+                "sessions": []}
         out = sd.render_table(snap)
         self.assertIn("Session Radar", out)
-        self.assertIn("aifriends", out)
+        self.assertIn("📁 aifriends", out)          # project group header
+        self.assertIn("forge-dashboard", out)        # worktree shown per row
+        self.assertIn("↗claude-skills", out)         # cross-repo marker
         self.assertIn("DRIFT", out)
+        self.assertIn("+ 2", out)                    # collapsed stale count line
 
     def test_main_json_prints_snapshot(self):
         import io, contextlib
