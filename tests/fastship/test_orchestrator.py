@@ -2039,3 +2039,34 @@ class TestImplementVerdictsPath:
         monkeypatch.setenv("FASTSHIP_SESSION", "gamma")
         assert fastship_state.implement_verdicts_path().endswith(
             "sessions/gamma/implement-verdicts.md")
+
+
+class TestStep20Contract:
+    def _instr(self):
+        from orchestrator import STEPS
+        s = next(s for s in STEPS if s.id == "2.0")
+        return s.instruction({}) if callable(s.instruction) else s.instruction
+
+    def test_dependency_aware_partition(self):
+        i = self._instr()
+        assert "不相交" in i and "parallel" in i
+
+    def test_shared_worktree_edit_only_no_commit(self):
+        i = self._instr()
+        assert "不各自 commit" in i or "不要各自 commit" in i
+        assert "merge" not in i.lower()  # merge-back removed
+
+    def test_no_parallel_tests_during_implement(self):
+        i = self._instr()
+        assert "编译检查" in i
+        assert "测试套件" in i or "E2E" in i
+
+    def test_conditional_workflow_and_sequential_fallback(self):
+        i = self._instr()
+        assert "≥2" in i or ">=2" in i
+        assert "串行" in i
+
+    def test_session_scoped_verdict_ledger_feeds_2_5(self):
+        i = self._instr()
+        assert "implement-verdicts" in i
+        assert "2.5" in i

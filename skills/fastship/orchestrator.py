@@ -1107,18 +1107,28 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
   运行: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" goal
   将输出的 /goal 命令呈现给用户，请用户执行。
 
-/goal 模式下 Claude 自主驱动 —— execute 与 code review 同时跑（ultracode）：
-  1. 选择开发方式（worktree / 新分支 / 当前分支）
-  2. 用 Workflow（ultracode）跑 implement→review pipeline 执行 plan：
-       pipeline(tasks, implement, review)
-     每个 plan task 实现完，立刻被对抗性 review（设计稿保真度 / spec 合同 / 质量三视角），
-     review 不过当场打回重做 —— 不要全做完才 review。
-     （单线程场景退化为 subagent-driven-development 的逐 task 两段 review。）
-  3. 逐 task review 的 verdict 累积下来，留给 Step 2.5 合并成 code-review 产物。
-  4. 每步完成后运行 status 命令，让 /goal 评估器看到 [FASTSHIP_GOAL] 进度。
+/goal 模式下用 dynamic workflow（ultracode）执行 plan —— 由你读 plan 自主决定扇出：
+  1. 选择开发方式（worktree / 新分支 / 当前分支）。整个 implement 在【同一个 session worktree】里跑。
+  2. 读已确认 plan 的 task 列表，做【依赖感知拆分】：
+       - 文件【不相交】的 task → 可并行组；有先后依赖或改同一批文件的 → 串行链。
+       - 不相交组【数量 ≥2】才用 Workflow parallel() 并行实现；只有一条链时直接
+         subagent-driven 串行实现（不开 Workflow，省开销）。
+       - 并行 agent 在【同一 worktree】内只编辑各自不相交的文件，【不各自 commit】
+         （commit 由主线程逐组统一发，避免并行写 git index）。不开 per-agent worktree。
+       - 并行 implement agent 只允许【编辑 + 编译检查】（cargo check / tsc）；
+         【禁止跑项目测试套件 / E2E】——那是 step 3.1/3.2、主线程、串行干的
+         （并行跑测试会撞 gate 状态写，语义上也错：要的是全部完成后跑全量）。
+  3. implement→review pipeline：每个 task 实现完立刻被对抗性 review
+       （设计稿保真度 / spec 合同 / 质量三视角），review 不过当场打回重做。
+  4. 逐 task 的结构化 verdict（task / files_changed / 三视角结论）写入【session 绑定】的
+       ledger：{git-dir}/fastship/sessions/<sid>/implement-verdicts.md
+       （路径用 fastship_state.implement_verdicts_path() 解析；非门禁，作 2.5 的输入证据）。
+       Step 2.5 读这个 ledger，合成 .claude/.fastship-code-review.md gate。
+  5. 每步完成后运行 status，让 /goal 评估器看到 [FASTSHIP_GOAL] 进度。
 
-🔴 禁止主线程凭直觉写代码。execute 必须带并发 review，不是先写完再说。
-🔴 每完成一个关键步骤后运行 status，确保 /goal 评估器能跟踪进度。
+🔴 一 session 一 worktree：多个并行需求 = 多个 git worktree。同一 worktree 内并行多 session 时，
+   hook 会停止自动推进以防串台，须用 FASTSHIP_SESSION / use <session> 显式锁定。
+🔴 禁止主线程凭直觉写代码；禁止并行 agent 改重叠文件或各自 commit。
 
 执行完成 → done 进入 2.5 Code Review 合并 gate。
 手动模式（不用 /goal）: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done"""),
