@@ -92,11 +92,26 @@ def _parse_worktree_list(output):
     return out
 
 
-def _worktrees(repo_root):
-    """basename(worktree path) -> {path, branch} from `git worktree list --porcelain`."""
+def _branches(repo_root):
+    out = _git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], repo_root)
+    return [b for b in (out or "").splitlines() if b]
+
+
+def _branch_matches_slug(branch, slug):
+    """A git branch 'belongs' to a feature when the slug is its trailing component."""
+    if not slug or not branch:
+        return False
+    return (branch == "feat/" + slug or branch.split("/")[-1] == slug
+            or branch.endswith("/" + slug) or branch.endswith("-" + slug))
+
+
+def _git_context(repo_root):
+    """Worktree + branch facts for resolving a feature's branch/worktree occupancy."""
     rows = _parse_worktree_list(_git(["worktree", "list", "--porcelain"], repo_root))
-    return {os.path.basename(r["path"].rstrip("/")): {"path": r["path"], "branch": r["branch"]}
-            for r in rows if r.get("path")}
+    by_name = {os.path.basename(r["path"].rstrip("/")): r for r in rows if r.get("path")}
+    branch_to_wt = {r["branch"]: os.path.basename(r["path"].rstrip("/"))
+                    for r in rows if r.get("branch") and r.get("path")}
+    return {"by_name": by_name, "branch_to_wt": branch_to_wt, "branches": _branches(repo_root)}
 
 
 # ---------------------------------------------------------------------------
@@ -207,28 +222,34 @@ def _link_session(slug, sessions):
 # Forge roadmap aggregation
 # ---------------------------------------------------------------------------
 
-def _feature_branch_worktree(slug, fs, worktrees):
-    # worktree-session: prefer LIVE porcelain branch (recorded branch may be stale)
+def _feature_branch_worktree(slug, fs, ctx):
+    by_name, branch_to_wt, branches = ctx["by_name"], ctx["branch_to_wt"], ctx["branches"]
+    # 1. linked worktree-session: prefer LIVE porcelain branch (recorded may be stale)
     if fs and fs.get("worktree"):
-        wt = worktrees.get(fs["worktree"])
+        wt = by_name.get(fs["worktree"])
         return ((wt["branch"] if wt and wt.get("branch") else fs.get("branch")), fs["worktree"])
-    # main-checkout session
+    # 2. main-checkout session branch (may itself be checked out in a worktree)
     if fs and fs.get("branch"):
-        return fs.get("branch"), None
-    # fallback: a worktree whose basename == feature slug
-    if slug and slug in worktrees:
-        return worktrees[slug]["branch"], slug
+        return fs["branch"], branch_to_wt.get(fs["branch"])
+    # 3. a worktree whose basename == feature slug
+    if slug and slug in by_name:
+        return by_name[slug].get("branch"), slug
+    # 4. a git branch named after the slug; worktree = where it's checked out (if any)
+    if slug:
+        cand = next((b for b in branches if _branch_matches_slug(b, slug)), None)
+        if cand:
+            return cand, branch_to_wt.get(cand)
     return None, None
 
 
-def _feature_record(repo_root, feat, sessions, worktrees):
+def _feature_record(repo_root, feat, sessions, ctx):
     slug = feat.get("slug")
     fdir = os.path.join(repo_root, "project-roadmap", "features", slug or "")
     metric = _read_json(os.path.join(fdir, "metric.json")) or None
     harvest = _read_json(os.path.join(fdir, "harvest.json")) or None
     gates = _read_json(os.path.join(repo_root, ".claude", "forge-state", "features", slug or "", "state.json")) or None
     fs = _link_session(slug, sessions)
-    branch, worktree = _feature_branch_worktree(slug, fs, worktrees)
+    branch, worktree = _feature_branch_worktree(slug, fs, ctx)
     return {
         "slug": slug, "name": feat.get("name"), "objective_id": feat.get("objective_id"),
         "status": feat.get("status"), "created_at": feat.get("created_at"),
@@ -293,7 +314,7 @@ def build_snapshot(repo_root):
         objectives.append(rec)
         by_obj[obj.get("id")] = rec
 
-    worktrees = _worktrees(repo_root)
+    ctx = _git_context(repo_root)
     linked_ids = set()
     orphans = []
     total_features = 0
@@ -301,7 +322,7 @@ def build_snapshot(repo_root):
         if not isinstance(feat, dict):
             continue
         total_features += 1
-        rec = _feature_record(repo_root, feat, sessions, worktrees)
+        rec = _feature_record(repo_root, feat, sessions, ctx)
         # EVERY session matching this slug is linked (not just the freshest _link_session pick)
         for s in sessions.values():
             if _session_matches_slug(s, feat.get("slug")):
@@ -345,7 +366,9 @@ HTML = r"""<!DOCTYPE html>
   header{padding:18px 24px;border-bottom:1px solid var(--bd);display:flex;
     align-items:baseline;gap:16px;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:1}
   h1{font-size:18px;margin:0}.ns{color:var(--mut)}.counts{margin-left:auto;color:var(--mut);font-size:12px}
-  main{padding:24px;max-width:1100px;margin:0 auto}
+  main{padding:24px 40px}
+  .clamp2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  td.sx{max-width:60vw}
   .obj{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:18px;margin-bottom:20px}
   .obj h2{font-size:16px;margin:0 0 4px}.tm{color:var(--mut);font-size:12px;margin-bottom:12px}
   .bar{height:8px;background:var(--bar);border-radius:4px;overflow:hidden;margin:6px 0}
@@ -388,7 +411,7 @@ function metricCell(f){if(!f.metric)return '<span class="mut">--</span>';
 function wtLine(o){return `<div class="wt">⎇ ${esc(o.branch||"—")} · 🗂 ${esc(o.worktree||"—")}</div>`;}
 function otherCard(list){if(!list||!list.length)return "";
   const rows=list.map(s=>`<tr>
-    <td><b>${esc(s.requirement||s.session_id)}</b><div class="mut">${esc(s.session_id)}</div>${wtLine(s)}</td>
+    <td class="sx"><div class="clamp2"><b>${esc(s.requirement||s.session_id)}</b></div><div class="mut">${esc(s.session_id)}</div>${wtLine(s)}</td>
     <td><span class="badge b-${esc(s.status)}">${esc(s.status)}</span></td>
     <td style="min-width:120px">${bar(s.step_progress)}<span class="mut">${s.step_progress}%</span></td>
     <td>${fsCell(s)}</td><td><span class="mut">--</span></td></tr>`).join("");

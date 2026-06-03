@@ -287,6 +287,47 @@ class BranchWorktreeOtherTest(unittest.TestCase):
         self.assertIn("step_progress", orphan)
 
 
+class BranchMatchTest(unittest.TestCase):
+    """A feature with no session and no slug-named worktree still resolves its
+    branch (and the worktree that branch is checked out in) from `git branch`."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", "-b", "main", self.tmp], check=True)
+        subprocess.run(["git", "-C", self.tmp, "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env)
+        # plain branch feat/<slug>, NOT checked out anywhere
+        subprocess.run(["git", "-C", self.tmp, "branch", "feat/lonely-feat"], check=True)
+        # branch checked out in a DIFFERENTLY-named worktree
+        subprocess.run(["git", "-C", self.tmp, "worktree", "add", "-q", "-b", "feat/inwt-feat",
+                        os.path.join(self.tmp, "wt", "some-dir")], check=True)
+        write(os.path.join(self.tmp, "project-roadmap", "roadmap.json"), {
+            "north_star": "ns", "objectives": [{"id": "obj-1", "name": "O"}],
+            "features": [
+                {"slug": "lonely-feat", "name": "L", "objective_id": "obj-1", "status": "in_progress"},
+                {"slug": "inwt-feat", "name": "I", "objective_id": "obj-1", "status": "in_progress"},
+                {"slug": "ghost-feat", "name": "G", "objective_id": "obj-1", "status": "draft"},
+            ]})
+
+    def _f(self):
+        return {f["slug"]: f for f in fd.build_snapshot(self.tmp)["objectives"][0]["features"]}
+
+    def test_branch_only_feature_resolves_branch_no_worktree(self):
+        f = self._f()["lonely-feat"]
+        self.assertEqual(f["branch"], "feat/lonely-feat")
+        self.assertIsNone(f["worktree"])
+
+    def test_feature_branch_checked_out_in_other_named_worktree(self):
+        f = self._f()["inwt-feat"]
+        self.assertEqual(f["branch"], "feat/inwt-feat")
+        self.assertEqual(f["worktree"], "some-dir")
+
+    def test_no_branch_no_worktree_stays_none(self):
+        f = self._f()["ghost-feat"]
+        self.assertIsNone(f["branch"])
+        self.assertIsNone(f["worktree"])
+
+
 class OtherRenderTest(unittest.TestCase):
     def test_html_wires_other_sessions_otherCard_and_dashfallback(self):
         h = fd.render_html()
