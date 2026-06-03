@@ -18,12 +18,16 @@ The registry only stores pointers and metadata. The actual flow state for one
 requirement never shares a JSON document with another requirement.
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -200,29 +204,41 @@ def list_sessions() -> dict:
     return load_registry().get("sessions", {})
 
 
+def active_session_ids() -> list:
+    """Session ids whose flow is still active (not done/stopped)."""
+    out = []
+    for sid, rec in (list_sessions() or {}).items():
+        if (rec or {}).get("status") not in ("done", "stopped"):
+            n = normalize_session_id(sid)
+            if n:
+                out.append(n)
+    return sorted(out)
+
+
 def set_current_session_id(session_id: str, requirement: str = None, state: dict = None) -> str:
     sid = normalize_session_id(session_id) or DEFAULT_SESSION_ID
-    registry = load_registry()
-    sessions = registry.setdefault("sessions", {})
-    rec = dict(sessions.get(sid) or {})
-    rec.update({
-        "id": sid,
-        "updated_at": _now_iso(),
-        "repo_root": repo_root(),
-    })
-    if requirement:
-        rec["requirement"] = requirement
-    if state:
-        rec["current_step"] = state.get("current_step")
-        rec["phase"] = state.get("phase")
-        rec["branch"] = state.get("branch")
-        rec["status"] = _status_from_state(state)
-        if state.get("requirement"):
-            rec["requirement"] = state.get("requirement")
-    rec.setdefault("created_at", rec["updated_at"])
-    sessions[sid] = rec
-    registry["current_session"] = sid
-    save_registry(registry)
+    with state_lock():
+        registry = load_registry()
+        sessions = registry.setdefault("sessions", {})
+        rec = dict(sessions.get(sid) or {})
+        rec.update({
+            "id": sid,
+            "updated_at": _now_iso(),
+            "repo_root": repo_root(),
+        })
+        if requirement:
+            rec["requirement"] = requirement
+        if state:
+            rec["current_step"] = state.get("current_step")
+            rec["phase"] = state.get("phase")
+            rec["branch"] = state.get("branch")
+            rec["status"] = _status_from_state(state)
+            if state.get("requirement"):
+                rec["requirement"] = state.get("requirement")
+        rec.setdefault("created_at", rec["updated_at"])
+        sessions[sid] = rec
+        registry["current_session"] = sid
+        save_registry(registry)
     return sid
 
 
@@ -230,12 +246,13 @@ def unregister_session(session_id: str) -> None:
     sid = normalize_session_id(session_id)
     if not sid:
         return
-    registry = load_registry()
-    registry.get("sessions", {}).pop(sid, None)
-    if registry.get("current_session") == sid:
-        remaining = sorted(registry.get("sessions", {}).keys())
-        registry["current_session"] = remaining[0] if len(remaining) == 1 else None
-    save_registry(registry)
+    with state_lock():
+        registry = load_registry()
+        registry.get("sessions", {}).pop(sid, None)
+        if registry.get("current_session") == sid:
+            remaining = sorted(registry.get("sessions", {}).keys())
+            registry["current_session"] = remaining[0] if len(remaining) == 1 else None
+        save_registry(registry)
 
 
 def update_session_from_state(state: dict, session_id: str = None) -> None:
@@ -290,6 +307,10 @@ def gate_state_path(session_id: str = None) -> str:
     return os.path.join(session_state_dir(session_id), "gate.json")
 
 
+def implement_verdicts_path(session_id: str = None) -> str:
+    return os.path.join(session_state_dir(session_id), "implement-verdicts.md")
+
+
 def legacy_single_orchestrator_state_path() -> str:
     return os.path.join(ensure_state_home(), "orchestrator.json")
 
@@ -330,6 +351,38 @@ def current_branch() -> Optional[str]:
     return _run_git(["branch", "--show-current"], repo_root())
 
 
+_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive across processes (fcntl.flock on {state_home}/.lock), reentrant
+    within a thread. Wrap registry/gate read-modify-write in this."""
+    depth = getattr(_LOCAL, "depth", 0)
+    if depth > 0:
+        _LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCAL.depth -= 1
+        return
+
+    home = ensure_state_home()
+    f = open(os.path.join(home, ".lock"), "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    _LOCAL.depth = 1
+    _LOCAL.fd = f
+    try:
+        yield
+    finally:
+        _LOCAL.depth = 0
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+            _LOCAL.fd = None
+
+
 def load_json(path: str) -> Optional[dict]:
     if not os.path.exists(path):
         return None
@@ -342,9 +395,21 @@ def load_json(path: str) -> Optional[dict]:
 
 
 def save_json(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def migrate_legacy_state(kind: str, session_id: str = None) -> bool:

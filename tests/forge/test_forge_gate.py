@@ -587,3 +587,91 @@ class TestRoadmapMdGeneration:
         md = forge_gate.generate_roadmap_md(roadmap)
         assert "# Empty Roadmap" in md
         assert "No features yet" in md
+
+
+# ── cmd_transition delivery integration: worktree cleanup (AC7) ───────────────
+
+def _init_repo_with_origin_main(tmp_path):
+    def g(*a):
+        subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True, text=True)
+    g("init", "-q", "-b", "main"); g("config", "user.email", "t@t.io"); g("config", "user.name", "t")
+    (tmp_path / "README.md").write_text("base\n"); g("add", "-A"); g("commit", "-q", "-m", "base")
+    g("update-ref", "refs/remotes/origin/main", "HEAD")
+
+
+def _roadmap_in_progress(base, slug="test-feature"):
+    fdir = base / "project-roadmap" / "features" / slug
+    fdir.mkdir(parents=True)
+    (fdir / "metric.json").write_text(json.dumps(
+        {"metric_name": "C", "event_name": "c", "baseline": 0.3, "target": 0.5,
+         "harvest_days": 7, "data_source": "manual"}))
+    return {"project": {"name": "t", "north_star": "g", "created_at": "2026-05-06"},
+            "objectives": [{"id": "obj-1", "name": "O", "target_metric": "c>=0.5", "features": [slug]}],
+            "features": [{"slug": slug, "name": "F", "objective_id": "obj-1", "status": "in_progress",
+                          "created_at": "2026-05-06", "shipped_at": None, "harvest_due": None,
+                          "concluded_at": None, "previous_feature": None, "next_feature": None}]}
+
+
+def _write_g4_state(base, slug="test-feature"):
+    gate, orch = make_fastship_done_state(base, slug)
+    sdir = forge_gate.fastship_session_dir(slug)
+    os.makedirs(sdir, exist_ok=True)
+    with open(forge_gate.fastship_state_path(slug), "w") as f:
+        json.dump(gate, f)
+    with open(forge_gate.fastship_orchestrator_state_path(slug), "w") as f:
+        json.dump(orch, f)
+
+
+def test_cmd_transition_triggers_sweep_and_reaps_orphan(tmp_path):
+    """AC7: a delivery transition runs the sweep and removes a clean+merged orphan,
+    exercised through the real cmd_transition path (not the helper directly)."""
+    _init_repo_with_origin_main(tmp_path)
+    wt = tmp_path / ".claude" / "worktrees" / "old-feat"
+    wt.parent.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(tmp_path), "worktree", "add", "-q", "-b", "feat/old", str(wt), "main"],
+                   check=True, capture_output=True)
+    with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+        forge_gate.save_roadmap(_roadmap_in_progress(tmp_path))
+        _write_g4_state(tmp_path)
+        forge_gate.cmd_transition("test-feature", "shipped")
+        rm = forge_gate.load_roadmap()
+        assert forge_gate.find_feature(rm, "test-feature")["status"] == "measuring"  # transition applied
+    assert not wt.exists()  # delivery swept the clean+merged orphan
+
+
+def test_cmd_transition_cleanup_failure_does_not_block(tmp_path, monkeypatch):
+    """AC7: a cleanup error must never block the transition."""
+    _init_repo_with_origin_main(tmp_path)
+    with patch.object(forge_gate, "get_repo_root", return_value=str(tmp_path)):
+        forge_gate.save_roadmap(_roadmap_in_progress(tmp_path))
+        _write_g4_state(tmp_path)
+        def boom(*a, **k):
+            raise RuntimeError("cleanup boom")
+        monkeypatch.setattr(forge_gate, "sweep_worktrees", boom)
+        forge_gate.cmd_transition("test-feature", "shipped")  # must NOT raise
+        rm = forge_gate.load_roadmap()
+        assert forge_gate.find_feature(rm, "test-feature")["status"] == "measuring"  # never blocked
+
+
+def test_cmd_transition_from_linked_worktree_reaps_sibling_keeps_self(tmp_path):
+    """AC7 / P1#1: shipping from INSIDE a linked feature worktree still reaps a
+    clean+merged SIBLING orphan (managed scope anchored at the main worktree),
+    while never removing the current worktree itself."""
+    _init_repo_with_origin_main(tmp_path)
+    wt_dir = tmp_path / ".claude" / "worktrees"
+    wt_dir.mkdir(parents=True)
+    cur = wt_dir / "current-feature"
+    sib = wt_dir / "old-sibling"
+    subprocess.run(["git", "-C", str(tmp_path), "worktree", "add", "-q", "-b", "feat/cur", str(cur), "main"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "worktree", "add", "-q", "-b", "feat/sib", str(sib), "main"],
+                   check=True, capture_output=True)
+    # forge runs from the CURRENT linked worktree; roadmap + G4 state live there.
+    with patch.object(forge_gate, "get_repo_root", return_value=str(cur)):
+        forge_gate.save_roadmap(_roadmap_in_progress(cur))
+        _write_g4_state(cur)
+        forge_gate.cmd_transition("test-feature", "shipped")
+        rm = forge_gate.load_roadmap()
+        assert forge_gate.find_feature(rm, "test-feature")["status"] == "measuring"
+    assert not sib.exists()   # sibling orphan reaped despite running from a linked worktree
+    assert cur.exists()       # current worktree never self-removed

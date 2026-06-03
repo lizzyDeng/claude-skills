@@ -72,6 +72,52 @@ def codex_review_content(plan_sha256="test-plan-sha", **overrides):
     )
 
 
+def code_review_content(**overrides):
+    gate = {
+        "gate": "PASS",
+        "reviewed_against": "design.html",
+        "reviewed_files": ["src.py"],
+        "design_fidelity_reviewed": True,
+        "spec_compliance_reviewed": True,
+        "quality_reviewed": True,
+        "design_deviations": [],
+        "spec_gaps": [],
+        "quality_issues": [],
+        "unverified_claims": [],
+    }
+    gate.update(overrides)
+    text_gate = gate.get("gate", "PASS")
+    return (
+        "## Code Review\n"
+        "### Per-task verdicts\n"
+        "- Task 1: design fidelity OK, spec OK, quality OK\n"
+        "### Design Fidelity\n"
+        "- Implementation matches the design source pixel treatment\n"
+        "### Contract Gate\n"
+        "```json\n"
+        f"{json.dumps(gate, ensure_ascii=False, indent=2)}\n"
+        "```\n"
+        f"### GATE: {text_gate}\n"
+    )
+
+
+def make_trusted_code_review(tmp_path, monkeypatch, **overrides):
+    monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+    claude = tmp_path / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    design = tmp_path / "design.html"
+    design.write_text("<html>design board</html>")
+    src = tmp_path / "src.py"
+    src.write_text("print('x')")
+    fields = {"reviewed_against": str(design), "reviewed_files": [str(src)]}
+    fields.update(overrides)
+    review = claude / ".fastship-code-review.md"
+    review.write_text(code_review_content(**fields))
+    orch = {"artifacts": {"code_review_path": str(review)}}
+    trust_artifact(orch, "2.5", review)
+    return orch, review
+
+
 # ━━━━━━━━━━━━ Task 1: Core Infrastructure ━━━━━━━━━━━━
 
 class TestStateManagement:
@@ -425,6 +471,103 @@ class TestValidatorsPhase2:
         assert validate_execute({}, {})[0] is True
 
 
+class TestCodeReviewGate:
+    def test_rejects_filesystem_fallback(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        review = tmp_path / ".claude" / ".fastship-code-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(code_review_content())
+        # path not recorded by current step → must refuse filesystem fallback
+        ok, msg = validate_code_review({"artifacts": {}}, {})
+        assert ok is False
+        assert "fallback" in msg
+
+    def test_rejects_text_only_pass(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review, CODE_REVIEW_FILENAME
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True)
+        review = claude / CODE_REVIEW_FILENAME
+        review.write_text("## Code Review\n### GATE: PASS\n" + "x " * 120)  # no JSON gate
+        orch = {"artifacts": {"code_review_path": str(review)}}
+        trust_artifact(orch, "2.5", review)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "JSON gate" in msg
+
+    def test_rejects_nonempty_design_deviations(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(
+            tmp_path, monkeypatch, design_deviations=["头像不是径向渐变，背景缺页面径向渐变"])
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "未解决问题" in msg
+
+    def test_rejects_unconfirmed_fidelity(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, design_fidelity_reviewed=False)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "硬审查项" in msg
+
+    def test_rejects_empty_reviewed_against(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_against="")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "reviewed_against" in msg
+
+    def test_rejects_nonexistent_reviewed_against(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_against="/nope/missing-board.html")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "不存在" in msg
+
+    def test_rejects_nonexistent_reviewed_files(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, reviewed_files=["/nope/missing.py"])
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "reviewed_files" in msg
+
+    def test_rejects_fail_verdict(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch, gate="FAIL")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert "FAIL" in msg
+
+    def test_rejects_tamper_after_record(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, review = make_trusted_code_review(tmp_path, monkeypatch)
+        review.write_text(review.read_text() + "\n<!-- tampered after record -->\n")
+        ok, msg = validate_code_review(orch, {})
+        assert ok is False
+        assert ("修改" in msg) or ("mismatch" in msg)
+
+    def test_passes_with_current_step_artifact(self, tmp_path, monkeypatch):
+        from orchestrator import validate_code_review
+        orch, _ = make_trusted_code_review(tmp_path, monkeypatch)
+        ok, msg = validate_code_review(orch, {})
+        assert ok is True
+
+    def test_detect_code_review_post_edit(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/.fastship-code-review.md"}}
+        assert detect_completion_post_edit("2.5", data) == "2.5"
+
+    def test_no_detect_code_review_wrong_step(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/.fastship-code-review.md"}}
+        assert detect_completion_post_edit("1.5c", data) is None
+
+    def test_code_review_flag_registered(self):
+        from orchestrator import VALUED_FLAGS
+        assert "--code-review" in VALUED_FLAGS
+
+
 class TestValidatorsPhase3:
     def test_tests_pass(self):
         from orchestrator import validate_tests
@@ -547,7 +690,7 @@ class TestValidatorsFallbackDenied:
 class TestSteps:
     def test_step_count(self):
         from orchestrator import STEPS
-        assert len(STEPS) == 17
+        assert len(STEPS) == 18
 
     def test_phase_order(self):
         from orchestrator import STEPS
@@ -570,7 +713,7 @@ class TestSteps:
         from orchestrator import STEPS
         ids = {s.id for s in STEPS}
         for expected in ["1.0", "1.1", "1.2", "1.3", "1.3d", "1.4", "1.5", "1.5c", "1.6",
-                         "2.0", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]:
+                         "2.0", "2.5", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]:
             assert expected in ids, f"Missing step {expected}"
 
 
@@ -762,6 +905,22 @@ class TestCLI:
         assert "1.0" in output
         assert "classify" in output
 
+    def test_start_proceeds_without_recent_compact(self, tmp_path, monkeypatch, capsys):
+        # Compact is a SOFT advisory, not a hard gate: a stale context must warn but
+        # NOT block start (rc != 1). Regression guard for the gate→advisory change.
+        from orchestrator import cmd_start
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "soft compact test")
+        monkeypatch.setattr("orchestrator._compact_is_recent", lambda: False)
+        monkeypatch.setattr("orchestrator.load_orch_state", lambda *a, **k: None)
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr("orchestrator.gate_script_path", lambda: str(tmp_path / "absent_gate.py"))
+        rc = cmd_start("soft compact test")
+        out = capsys.readouterr().out
+        assert rc == 0           # not blocked
+        assert "SUGGESTION" in out
+        assert "Fastship started" in out
+
 
 # ━━━━━━━━━━━━ Task 6: Integration ━━━━━━━━━━━━
 
@@ -887,7 +1046,8 @@ class TestIntegrationFullFlow:
             orch_state=st, gate_path=str(fake_gate))
         assert result == 0
 
-        # 2.0 + 3.0: manual done
+        # 2.0 → 2.5 → 3.0 → 3.1: manual done (validators bypassed via _advance_state)
+        st = _advance_state(st)  # → 2.5
         st = _advance_state(st)  # → 3.0
         st = _advance_state(st)  # → 3.1
         save_orch_state(st, orch_file)
@@ -1004,14 +1164,24 @@ class TestIntegrationFullFlow:
         st = {
             "current_step": "3.5", "phase": 3, "loop_count": 1,
             "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6",
-                                "2.0", "3.0", "3.1", "3.2", "3.3", "3.4"],
+                                "2.0", "2.5", "3.0", "3.1", "3.2", "3.3", "3.4"],
             "skipped_steps": ["1.3d"], "request_type": "feature",
-            "artifacts": {"loop_outcome": "fail", "loop_decision": "continue"},
+            "artifacts": {
+                "loop_outcome": "fail", "loop_decision": "continue",
+                "code_review_path": "/proj/.claude/.fastship-code-review.md",
+                "trusted_artifacts": {"2.5": {"step_id": "2.5", "sha256": "x"}},
+            },
         }
         _handle_loop_decision(st)
-        assert st["current_step"] == "3.1"
+        # Loop continue must re-review: re-enter at 2.5 (phase 2), clearing 2.5 + 3.x
+        # and dropping the stale code-review artifact so a fresh review is forced.
+        assert st["current_step"] == "2.5"
+        assert st["phase"] == 2
+        assert "2.5" not in st["completed_steps"]
         assert "3.1" not in st["completed_steps"]
         assert "1.0" in st["completed_steps"]
+        assert "code_review_path" not in st["artifacts"]
+        assert "2.5" not in st["artifacts"].get("trusted_artifacts", {})
 
     def test_loop_fail_escalate_via_done(self):
         from orchestrator import _handle_loop_decision
@@ -1601,3 +1771,302 @@ class TestStepArtifactGuard:
         assert _artifact_owner_step("/repo/docs/superpowers/plans/2026-test.md") == "1.4"
         assert _artifact_owner_step("/repo/docs/KNOWLEDGE.MD") == "3.6"
         assert _artifact_owner_step("/repo/src/main.rs") is None
+
+
+class TestWorktreeStateIsolation:
+    """Premise 1: state_home is per-worktree — different worktrees are isolated."""
+
+    def _git(self, *args, cwd):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       check=True, capture_output=True, text=True)
+
+    def test_worktree_resolves_to_separate_state_home(self, tmp_path, monkeypatch):
+        import fastship_state
+
+        monkeypatch.delenv("FASTSHIP_STATE_HOME", raising=False)
+        monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+
+        main = tmp_path / "main"
+        main.mkdir()
+        self._git("init", "-q", cwd=main)
+        self._git("config", "user.email", "t@t.io", cwd=main)
+        self._git("config", "user.name", "t", cwd=main)
+        (main / "README.md").write_text("x")
+        self._git("add", "-A", cwd=main)
+        self._git("commit", "-qm", "init", cwd=main)
+
+        wt = tmp_path / "wt"
+        self._git("worktree", "add", "-q", str(wt), "-b", "feat", cwd=main)
+
+        monkeypatch.chdir(main)
+        home_main = fastship_state.state_home()
+        monkeypatch.chdir(wt)
+        home_wt = fastship_state.state_home()
+
+        assert home_wt != home_main
+        assert "worktrees" in home_wt
+
+
+class TestStep20StateNoop:
+    """Premise 2: at step 2.0 a code-file edit writes no state in EITHER the
+    orchestrator or the gate. This is what makes same-worktree parallel
+    implement safe."""
+
+    def test_orchestrator_post_edit_noop_for_code_at_2_0(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "services/api/src/handlers/chat.rs"}}
+        assert detect_completion_post_edit("2.0", data) is None
+
+    def test_gate_does_not_treat_code_file_as_artifact(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(__file__), "..", "..", "skills", "fastship", "hooks"))
+        import ship_verify_gate as gate
+        code = "services/api/src/handlers/chat.rs"
+        assert gate.is_plan_file(code) is False
+        assert gate.is_knowledge_file(code) is False
+
+
+class TestAtomicSaveJson:
+    def test_save_json_no_leftover_temp_files(self, tmp_path):
+        import fastship_state
+        target = tmp_path / "state.json"
+        fastship_state.save_json(str(target), {"n": 1})
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != "state.json"]
+        assert leftovers == [], f"unexpected leftover files: {leftovers}"
+
+    def test_save_json_uses_atomic_replace(self, tmp_path, monkeypatch):
+        import fastship_state
+        calls = []
+        real_replace = os.replace
+        monkeypatch.setattr(os, "replace",
+                            lambda a, b: calls.append((a, b)) or real_replace(a, b))
+        target = tmp_path / "s.json"
+        fastship_state.save_json(str(target), {"k": "v"})
+        assert calls, "save_json must use os.replace for atomicity"
+        assert calls[0][1].endswith("s.json")
+        assert json.loads(target.read_text())["k"] == "v"
+
+
+class TestStateLock:
+    def test_lock_serializes_concurrent_increments(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        counter = tmp_path / "counter.json"
+        counter.write_text(json.dumps({"n": 0}))
+
+        def bump():
+            for _ in range(50):
+                with fastship_state.state_lock():
+                    d = json.loads(counter.read_text())
+                    d["n"] += 1
+                    counter.write_text(json.dumps(d))
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert json.loads(counter.read_text())["n"] == 200
+
+    def test_lock_is_reentrant_within_thread(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        with fastship_state.state_lock():
+            with fastship_state.state_lock():
+                assert True
+
+
+class TestRegistryConcurrency:
+    def test_concurrent_session_registration_keeps_all(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        ids = [f"sess-{i:03d}" for i in range(20)]
+
+        def register(sid):
+            fastship_state.set_current_session_id(
+                sid, f"req {sid}", {"current_step": "1.0"})
+
+        threads = [threading.Thread(target=register, args=(sid,)) for sid in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        sessions = fastship_state.list_sessions()
+        assert set(sessions) == set(ids), f"lost: {set(ids) - set(sessions)}"
+
+
+class TestGateStateLocking:
+    def _import_gate(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(__file__), "..", "..", "skills", "fastship", "hooks"))
+        import ship_verify_gate as gate
+        return gate
+
+    def test_gate_post_edit_rmw_serialized(self, tmp_path, monkeypatch):
+        import threading
+        import fastship_state
+        gate = self._import_gate()
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setattr(gate, "get_current_branch", lambda: "main")
+        monkeypatch.setattr(gate, "require_branch_match", lambda st, br: True)
+        monkeypatch.setattr(gate, "is_plan_file", lambda p: p.endswith("plan.md"))
+        monkeypatch.setattr(gate, "is_knowledge_file",
+                            lambda p: os.path.basename(p).upper() == "KNOWLEDGE.MD")
+
+        tl = threading.local()
+        monkeypatch.setattr(gate, "read_stdin", lambda: getattr(tl, "data", {}))
+
+        def worker(file_path):
+            tl.data = {"tool_input": {"file_path": file_path}}
+            gate.gate_post_edit()
+
+        threads = [
+            threading.Thread(target=worker, args=("docs/plan.md",)),
+            threading.Thread(target=worker, args=("KNOWLEDGE.md",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        st = gate.ensure_branch_state(gate.load_state(), "main")
+        assert st.get("plan_ready") is True
+        assert st.get("knowledge_acknowledged") is True
+
+
+class TestAmbiguousSessionGuard:
+    def _seed_two_active(self):
+        import fastship_state
+        fastship_state.set_current_session_id("alpha", "feature alpha", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("beta", "feature beta", {"current_step": "1.4"})
+
+    def test_active_session_ids_excludes_done(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("a", "ra", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("b", "rb", {"current_step": "done"})
+        assert fastship_state.active_session_ids() == ["a"]
+
+    def test_ambiguous_when_two_active_no_pin(self, tmp_path, monkeypatch):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+        self._seed_two_active()
+        assert orchestrator._hook_session_ambiguous() is True
+
+    def test_not_ambiguous_when_pinned(self, tmp_path, monkeypatch):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "alpha")
+        self._seed_two_active()
+        assert orchestrator._hook_session_ambiguous() is False
+
+    def test_post_bash_no_advance_when_ambiguous(self, tmp_path, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+        self._seed_two_active()
+        rc = orchestrator.hook_post_bash_logic(
+            {"tool_input": {"command": "x"}}, hook_state={"request_classified": True})
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "多个活跃 session" in out
+
+    def test_pre_edit_failopen_via_ambiguous_param(self, capsys):
+        import orchestrator
+        orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
+        rc_code = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state,
+            "/nonexistent-gate.py", ambiguous=True)
+        assert rc_code == 0
+        rc_state = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "x/fastship/orchestrator.json"}},
+            orch_state, "/nonexistent-gate.py", ambiguous=True)
+        assert rc_state == 1
+
+    def test_pre_edit_default_not_ambiguous_preserves_blocking(self):
+        import orchestrator
+        orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
+        rc = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state, "/nonexistent-gate.py")
+        assert rc == 1
+
+
+class TestStartSecondSessionRefusal:
+    def test_other_active_sessions_excludes_self_and_done(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("self", "mine", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("other", "theirs", {"current_step": "1.4"})
+        fastship_state.set_current_session_id("old", "done", {"current_step": "done"})
+        assert orchestrator._other_active_sessions("self") == ["other"]
+
+    def test_blocking_message_lists_other_and_mentions_shared(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("other", "theirs", {"current_step": "1.4"})
+        msg = orchestrator._blocking_active_session_msg("newcomer")
+        assert msg is not None
+        assert "other" in msg
+        assert "--shared" in msg
+        assert "worktree" in msg.lower()
+
+    def test_no_block_when_no_other_active(self, tmp_path, monkeypatch):
+        import orchestrator, fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("solo", "only", {"current_step": "1.0"})
+        assert orchestrator._blocking_active_session_msg("solo") is None
+
+
+class TestImplementVerdictsPath:
+    def test_path_is_under_session_dir(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        p_a = fastship_state.implement_verdicts_path("alpha")
+        p_b = fastship_state.implement_verdicts_path("beta")
+        assert p_a.endswith("sessions/alpha/implement-verdicts.md")
+        assert p_b.endswith("sessions/beta/implement-verdicts.md")
+        assert p_a != p_b
+
+    def test_path_follows_current_session_when_unspecified(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "gamma")
+        assert fastship_state.implement_verdicts_path().endswith(
+            "sessions/gamma/implement-verdicts.md")
+
+
+class TestStep20Contract:
+    def _instr(self):
+        from orchestrator import STEPS
+        s = next(s for s in STEPS if s.id == "2.0")
+        return s.instruction({}) if callable(s.instruction) else s.instruction
+
+    def test_dependency_aware_partition(self):
+        i = self._instr()
+        assert "不相交" in i and "parallel" in i
+
+    def test_shared_worktree_edit_only_no_commit(self):
+        i = self._instr()
+        assert "不各自 commit" in i or "不要各自 commit" in i
+        assert "merge" not in i.lower()  # merge-back removed
+
+    def test_no_parallel_tests_during_implement(self):
+        i = self._instr()
+        assert "编译检查" in i
+        assert "测试套件" in i or "E2E" in i
+
+    def test_conditional_workflow_and_sequential_fallback(self):
+        i = self._instr()
+        assert "≥2" in i or ">=2" in i
+        assert "串行" in i
+
+    def test_session_scoped_verdict_ledger_feeds_2_5(self):
+        i = self._instr()
+        assert "implement-verdicts" in i
+        assert "2.5" in i
