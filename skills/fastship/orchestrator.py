@@ -31,19 +31,44 @@ import fastship_state
 COMPACT_RECENCY_SECS = int(os.environ.get("FASTSHIP_COMPACT_RECENCY", "120"))
 
 
+def _compaction_log_paths() -> list:
+    """Candidate compaction.log locations, most-authoritative first.
+
+    /compact writes to the MAIN worktree's .claude/checkpoints/compaction.log.
+    Inside a linked worktree, _repo_root() points at the worktree whose own log
+    is stale; consult the shared (main-worktree) log via git-common-dir as well
+    and take the most recent across both. Main-repo behaviour is unchanged since
+    the two paths coincide there. Mirrors the forge_gate fix for the same bug.
+    """
+    paths = []
+    seen = set()
+
+    def _add(p):
+        if p and p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    common = fastship_state.git_common_dir()
+    if common:
+        _add(os.path.join(os.path.dirname(common), ".claude", "checkpoints", "compaction.log"))
+    _add(os.path.join(_repo_root(), ".claude", "checkpoints", "compaction.log"))
+    return paths
+
+
 def _last_compaction_epoch() -> float:
-    log = os.path.join(_repo_root(), ".claude", "checkpoints", "compaction.log")
-    try:
-        with open(log, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 256))
-            last_line = f.read().decode().strip().rsplit("\n", 1)[-1]
-            ts = last_line.split(" ", 1)[0]
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.timestamp()
-    except Exception:
-        return 0.0
+    best = 0.0
+    for log in _compaction_log_paths():
+        try:
+            with open(log, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 256))
+                last_line = f.read().decode().strip().rsplit("\n", 1)[-1]
+                ts = last_line.split(" ", 1)[0]
+                best = max(best, datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            continue
+    return best
 
 
 def _compact_is_recent() -> bool:

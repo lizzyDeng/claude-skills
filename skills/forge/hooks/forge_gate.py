@@ -38,11 +38,9 @@ import time as _time
 COMPACT_RECENCY_SECS = int(os.environ.get("FORGE_COMPACT_RECENCY", "120"))
 
 
-def _last_compaction_epoch() -> float:
-    root = get_repo_root() or "."
-    log = os.path.join(root, ".claude", "checkpoints", "compaction.log")
+def _read_compaction_log_epoch(log_path: str) -> float:
     try:
-        with open(log, "rb") as f:
+        with open(log_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 256))
@@ -52,6 +50,42 @@ def _last_compaction_epoch() -> float:
             return dt.timestamp()
     except Exception:
         return 0.0
+
+
+def _compaction_log_paths() -> list:
+    """Candidate compaction.log locations, most-authoritative first.
+
+    /compact's post-compact hook writes to the MAIN worktree's
+    .claude/checkpoints/compaction.log (the parent of git-common-dir). Inside a
+    linked worktree, get_repo_root() points at the worktree whose own log is
+    stale, so the per-worktree path alone never sees the compact. Consult the
+    shared (main-worktree) log as well and take the most recent across both —
+    main-repo behaviour is unchanged since the two paths coincide there.
+    Mirrors the fastship fix for the same worktree gate bug.
+    """
+    paths = []
+    seen = set()
+
+    def _add(p):
+        if p and p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    common = get_git_common_dir()
+    if common:
+        main_root = os.path.dirname(common)
+        _add(os.path.join(main_root, ".claude", "checkpoints", "compaction.log"))
+
+    root = get_repo_root() or "."
+    _add(os.path.join(root, ".claude", "checkpoints", "compaction.log"))
+    return paths
+
+
+def _last_compaction_epoch() -> float:
+    return max(
+        (_read_compaction_log_epoch(p) for p in _compaction_log_paths()),
+        default=0.0,
+    )
 
 
 def _compact_is_recent() -> bool:
@@ -1326,6 +1360,135 @@ def cmd_reset():
     print("✅ Active feature cleared.")
 
 
+def cmd_doctor():
+    """Validate forge installation and roadmap gate inputs without mutation."""
+    root = get_repo_root()
+    if not root:
+        print("🚫 Forge doctor: cannot determine repo root")
+        sys.exit(1)
+
+    roadmap = load_roadmap()
+    if not roadmap:
+        print("🚫 Forge doctor: project-roadmap/roadmap.json not found")
+        sys.exit(1)
+
+    errors = []
+    warnings = []
+    features = roadmap.get("features", [])
+
+    for feature in features:
+        slug = feature.get("slug")
+        status = feature.get("status")
+        if not slug:
+            errors.append("roadmap feature missing slug")
+            continue
+        if status not in VALID_STATUSES:
+            errors.append(f"{slug}: invalid status '{status}'")
+        ok, reason = check_g1_metric(slug, root)
+        if not ok:
+            errors.append(reason)
+
+    features_dir = os.path.join(root, "project-roadmap", "features")
+    roadmap_slugs = {f.get("slug") for f in features}
+    if os.path.isdir(features_dir):
+        for entry in sorted(os.listdir(features_dir)):
+            metric_path = os.path.join(features_dir, entry, "metric.json")
+            if os.path.isdir(os.path.join(features_dir, entry)) and os.path.exists(metric_path):
+                if entry not in roadmap_slugs:
+                    warnings.append(f"{entry}: metric.json exists but feature is not listed in roadmap.json")
+
+    if warnings:
+        print("⚠️  Forge doctor warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+    if errors:
+        print("🚫 Forge doctor failed:")
+        for error in errors:
+            print(f"  - {error}")
+        sys.exit(1)
+
+    print(f"✅ Forge doctor passed ({len(features)} roadmap feature(s) checked)")
+
+
+def cmd_audit_month(month, strict=False):
+    """Audit monthly plan files against Forge metric artifacts."""
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        print("Usage: forge_gate.py audit-month YYYY-MM [--strict]")
+        sys.exit(1)
+
+    root = get_repo_root()
+    if not root:
+        print("🚫 Forge audit: cannot determine repo root")
+        sys.exit(1)
+
+    roadmap = load_roadmap()
+    if not roadmap:
+        print("🚫 Forge audit: project-roadmap/roadmap.json not found")
+        sys.exit(1)
+
+    plans = month_plan_slugs(root, month)
+    metrics = metric_slugs(root)
+    roadmap_slugs = sorted(f.get("slug") for f in roadmap.get("features", []) if f.get("slug"))
+
+    missing_metric_for_plan = [slug for slug in plans if slug not in metrics]
+    metric_not_in_roadmap = [slug for slug in metrics if slug not in roadmap_slugs]
+    roadmap_without_metric = [slug for slug in roadmap_slugs if slug not in metrics]
+
+    print(f"📊 Forge audit {month}")
+    print(f"  plans:   {len(plans)}")
+    print(f"  metrics: {len(metrics)}")
+    print(f"  roadmap: {len(roadmap_slugs)}")
+
+    if missing_metric_for_plan:
+        label = "🚫 Missing metric.json for plan" if strict else "⚠️  Plans without metric.json"
+        print(f"\n{label}:")
+        for slug in missing_metric_for_plan:
+            print(f"  - {slug}")
+
+    if metric_not_in_roadmap:
+        print("\n⚠️  metric.json exists but feature is not listed in roadmap.json:")
+        for slug in metric_not_in_roadmap:
+            print(f"  - {slug}")
+
+    if roadmap_without_metric:
+        print("\n🚫 roadmap feature missing metric.json:")
+        for slug in roadmap_without_metric:
+            print(f"  - {slug}")
+
+    if roadmap_without_metric or (strict and missing_metric_for_plan):
+        print("\n🚫 Forge audit failed")
+        sys.exit(1)
+
+    print("\n✅ Forge audit completed")
+
+
+def month_plan_slugs(root, month):
+    """Return slugs from docs/superpowers/plans/YYYY-MM-DD-*.md."""
+    plans_dir = os.path.join(root, "docs", "superpowers", "plans")
+    if not os.path.isdir(plans_dir):
+        return []
+    pattern = re.compile(rf"^{re.escape(month)}-\d{{2}}-(.+)\.md$")
+    slugs = []
+    for name in sorted(os.listdir(plans_dir)):
+        match = pattern.match(name)
+        if match:
+            slugs.append(match.group(1))
+    return slugs
+
+
+def metric_slugs(root):
+    features_dir = os.path.join(root, "project-roadmap", "features")
+    if not os.path.isdir(features_dir):
+        return []
+    slugs = []
+    for entry in sorted(os.listdir(features_dir)):
+        metric_path = os.path.join(features_dir, entry, "metric.json")
+        if os.path.isdir(os.path.join(features_dir, entry)) and os.path.exists(metric_path):
+            slugs.append(entry)
+    return slugs
+
+
 # ========== Hook Handlers ==========
 
 def hook_pre_edit():
@@ -1422,6 +1585,13 @@ def main():
             sys.exit(1)
     elif action == "status":
         cmd_status()
+    elif action == "doctor":
+        cmd_doctor()
+    elif action == "audit-month":
+        if len(sys.argv) < 3:
+            print("Usage: forge_gate.py audit-month YYYY-MM [--strict]")
+            sys.exit(1)
+        cmd_audit_month(sys.argv[2], strict="--strict" in sys.argv[3:])
     elif action == "activate":
         if len(sys.argv) < 3:
             print("Usage: forge_gate.py activate <slug>")
