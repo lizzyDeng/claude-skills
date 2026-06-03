@@ -1771,3 +1771,58 @@ class TestStepArtifactGuard:
         assert _artifact_owner_step("/repo/docs/superpowers/plans/2026-test.md") == "1.4"
         assert _artifact_owner_step("/repo/docs/KNOWLEDGE.MD") == "3.6"
         assert _artifact_owner_step("/repo/src/main.rs") is None
+
+
+class TestWorktreeStateIsolation:
+    """Premise 1: state_home is per-worktree — different worktrees are isolated."""
+
+    def _git(self, *args, cwd):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       check=True, capture_output=True, text=True)
+
+    def test_worktree_resolves_to_separate_state_home(self, tmp_path, monkeypatch):
+        import fastship_state
+
+        monkeypatch.delenv("FASTSHIP_STATE_HOME", raising=False)
+        monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+
+        main = tmp_path / "main"
+        main.mkdir()
+        self._git("init", "-q", cwd=main)
+        self._git("config", "user.email", "t@t.io", cwd=main)
+        self._git("config", "user.name", "t", cwd=main)
+        (main / "README.md").write_text("x")
+        self._git("add", "-A", cwd=main)
+        self._git("commit", "-qm", "init", cwd=main)
+
+        wt = tmp_path / "wt"
+        self._git("worktree", "add", "-q", str(wt), "-b", "feat", cwd=main)
+
+        monkeypatch.chdir(main)
+        home_main = fastship_state.state_home()
+        monkeypatch.chdir(wt)
+        home_wt = fastship_state.state_home()
+
+        assert home_wt != home_main
+        assert "worktrees" in home_wt
+
+
+class TestStep20StateNoop:
+    """Premise 2: at step 2.0 a code-file edit writes no state in EITHER the
+    orchestrator or the gate. This is what makes same-worktree parallel
+    implement safe."""
+
+    def test_orchestrator_post_edit_noop_for_code_at_2_0(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "services/api/src/handlers/chat.rs"}}
+        assert detect_completion_post_edit("2.0", data) is None
+
+    def test_gate_does_not_treat_code_file_as_artifact(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(__file__), "..", "..", "skills", "fastship", "hooks"))
+        import ship_verify_gate as gate
+        code = "services/api/src/handlers/chat.rs"
+        assert gate.is_plan_file(code) is False
+        assert gate.is_knowledge_file(code) is False
