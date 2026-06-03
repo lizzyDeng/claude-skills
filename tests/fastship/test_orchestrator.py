@@ -2021,3 +2021,21 @@ class TestStartSecondSessionRefusal:
         monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
         fastship_state.set_current_session_id("solo", "only", {"current_step": "1.0"})
         assert orchestrator._blocking_active_session_msg("solo") is None
+
+
+class TestImplementVerdictsPath:
+    def test_path_is_under_session_dir(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        p_a = fastship_state.implement_verdicts_path("alpha")
+        p_b = fastship_state.implement_verdicts_path("beta")
+        assert p_a.endswith("sessions/alpha/implement-verdicts.md")
+        assert p_b.endswith("sessions/beta/implement-verdicts.md")
+        assert p_a != p_b
+
+    def test_path_follows_current_session_when_unspecified(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "gamma")
+        assert fastship_state.implement_verdicts_path().endswith(
+            "sessions/gamma/implement-verdicts.md")

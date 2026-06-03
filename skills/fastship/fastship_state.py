@@ -307,6 +307,10 @@ def gate_state_path(session_id: str = None) -> str:
     return os.path.join(session_state_dir(session_id), "gate.json")
 
 
+def implement_verdicts_path(session_id: str = None) -> str:
+    return os.path.join(session_state_dir(session_id), "implement-verdicts.md")
+
+
 def legacy_single_orchestrator_state_path() -> str:
     return os.path.join(ensure_state_home(), "orchestrator.json")
 
