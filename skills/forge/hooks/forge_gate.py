@@ -1360,6 +1360,57 @@ def cmd_reset():
     print("✅ Active feature cleared.")
 
 
+def cmd_doctor():
+    """Validate forge installation and roadmap gate inputs without mutation."""
+    root = get_repo_root()
+    if not root:
+        print("🚫 Forge doctor: cannot determine repo root")
+        sys.exit(1)
+
+    roadmap = load_roadmap()
+    if not roadmap:
+        print("🚫 Forge doctor: project-roadmap/roadmap.json not found")
+        sys.exit(1)
+
+    errors = []
+    warnings = []
+    features = roadmap.get("features", [])
+
+    for feature in features:
+        slug = feature.get("slug")
+        status = feature.get("status")
+        if not slug:
+            errors.append("roadmap feature missing slug")
+            continue
+        if status not in VALID_STATUSES:
+            errors.append(f"{slug}: invalid status '{status}'")
+        ok, reason = check_g1_metric(slug, root)
+        if not ok:
+            errors.append(reason)
+
+    features_dir = os.path.join(root, "project-roadmap", "features")
+    roadmap_slugs = {f.get("slug") for f in features}
+    if os.path.isdir(features_dir):
+        for entry in sorted(os.listdir(features_dir)):
+            metric_path = os.path.join(features_dir, entry, "metric.json")
+            if os.path.isdir(os.path.join(features_dir, entry)) and os.path.exists(metric_path):
+                if entry not in roadmap_slugs:
+                    warnings.append(f"{entry}: metric.json exists but feature is not listed in roadmap.json")
+
+    if warnings:
+        print("⚠️  Forge doctor warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+    if errors:
+        print("🚫 Forge doctor failed:")
+        for error in errors:
+            print(f"  - {error}")
+        sys.exit(1)
+
+    print(f"✅ Forge doctor passed ({len(features)} roadmap feature(s) checked)")
+
+
 # ========== Hook Handlers ==========
 
 def hook_pre_edit():
@@ -1456,6 +1507,8 @@ def main():
             sys.exit(1)
     elif action == "status":
         cmd_status()
+    elif action == "doctor":
+        cmd_doctor()
     elif action == "activate":
         if len(sys.argv) < 3:
             print("Usage: forge_gate.py activate <slug>")
