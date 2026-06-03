@@ -578,30 +578,37 @@ class TestAmbiguousSessionGuard:
         monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
         monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
         self._seed_two_active()
-        monkeypatch.setattr("orchestrator.detect_completion_post_bash",
-                            lambda *a, **k: "1.0")
+        # Guard is the FIRST thing in the logic (before load_orch_state), so an
+        # orch_path=None call under ambiguity fails safe without advancing.
         rc = orchestrator.hook_post_bash_logic(
             {"tool_input": {"command": "x"}}, hook_state={"request_classified": True})
         out = capsys.readouterr().out
         assert rc == 0
         assert "多个活跃 session" in out
 
-    def test_pre_edit_failopen_skips_phase_block_but_keeps_state_block(self, tmp_path, monkeypatch, capsys):
+    def test_pre_edit_failopen_via_ambiguous_param(self, capsys):
         import orchestrator
-        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
-        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
-        self._seed_two_active()
-        # Wrong-session orch_state says phase 1; a code edit would normally be blocked.
+        # ambiguous is passed explicitly by the production entry; tests pass it
+        # directly so they never depend on the real registry.
         orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
-        # Session-specific block is skipped (fail-open) -> allowed.
+        # Fail-open: a code edit that phase-1 would normally block is allowed.
         rc_code = orchestrator.hook_pre_edit_logic(
-            {"tool_input": {"file_path": "src/app.rs"}}, orch_state, "/nonexistent-gate.py")
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state,
+            "/nonexistent-gate.py", ambiguous=True)
         assert rc_code == 0
-        # Session-independent block still fires: editing fastship state is blocked.
+        # Session-independent block still fires under ambiguity: state files blocked.
         rc_state = orchestrator.hook_pre_edit_logic(
             {"tool_input": {"file_path": "x/fastship/orchestrator.json"}},
-            orch_state, "/nonexistent-gate.py")
+            orch_state, "/nonexistent-gate.py", ambiguous=True)
         assert rc_state == 1
+
+    def test_pre_edit_default_not_ambiguous_preserves_blocking(self):
+        import orchestrator
+        # Default ambiguous=False: phase-1 code edit is still blocked (existing behavior).
+        orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
+        rc = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state, "/nonexistent-gate.py")
+        assert rc == 1
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -646,7 +653,7 @@ _AMBIGUOUS_HINT = (
 )
 ```
 
-At the top of `hook_post_bash_logic`, right after its `orch = load_orch_state(orch_path)` / early-return block (before `detected = detect_completion_post_bash(...)`, line 1539):
+Place the guard as the FIRST statements of `hook_post_bash_logic` (BEFORE `orch = load_orch_state(orch_path)`), so an ambiguous context fails safe without even loading state:
 
 ```python
     if orch_path is None and _hook_session_ambiguous():
@@ -654,7 +661,7 @@ At the top of `hook_post_bash_logic`, right after its `orch = load_orch_state(or
         return 0
 ```
 
-At the top of `hook_post_edit_logic`, after its `orch = load_orch_state(orch_path)` / early-return block (line 1588-1589, before `current = orch.get("current_step")`):
+Same as the FIRST statements of `hook_post_edit_logic` (BEFORE `orch = load_orch_state(orch_path)`):
 
 ```python
     if orch_path is None and _hook_session_ambiguous():
@@ -662,13 +669,15 @@ At the top of `hook_post_edit_logic`, after its `orch = load_orch_state(orch_pat
         return 0
 ```
 
-- [ ] **Step 5: Add the pre-hook fail-open guards**
+- [ ] **Step 5: Add the pre-hook fail-open guards via an `ambiguous` parameter**
 
-In `hook_pre_edit_logic`: the **state-file-write block** (lines 1437-1449) must run first (session-independent — keep it), then the fail-open guard, then the rest. Move/confirm ordering so the guard sits **after** the state-file block and **before** the branch-mismatch check (line 1431) — i.e. relocate the branch-mismatch check to after the guard. Concretely, restructure the top of `hook_pre_edit_logic` to:
+Add an `ambiguous: bool = False` parameter to BOTH `hook_pre_edit_logic` and `hook_pre_bash_logic`. The production entry functions compute and pass it; tests default to False (so existing pre-hook tests, which call the logic directly without the param, are completely unaffected and never touch the real registry). This mirrors the `orch_path is None` discriminator used for the post hooks.
+
+Restructure the top of `hook_pre_edit_logic` so the session-INDEPENDENT state-file block runs first, then the fail-open guard, then the (session-specific) branch-mismatch + out-of-order + phase-1 blocks:
 
 ```python
 def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
-                        gate_path: str) -> int:
+                        gate_path: str, ambiguous: bool = False) -> int:
     file_path = data.get("tool_input", {}).get("file_path", "")
 
     if not orch_state:
@@ -695,7 +704,7 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
         return 1
 
     # Fail-open under ambiguous multi-session: skip session-specific blocks.
-    if _hook_session_ambiguous():
+    if ambiguous:
         print(_AMBIGUOUS_HINT)
         return 0
 
@@ -705,18 +714,40 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
         return 1
 
     # ... (the existing out-of-order artifact block + phase-1 code block + gate
-    #      delegation follow unchanged, with the now-removed duplicate state-file
-    #      block deleted from its old position)
+    #      delegation follow UNCHANGED; the original state-file block at its old
+    #      position and the original branch-mismatch check are deleted so each
+    #      appears exactly once in the new order above)
 ```
 
-Delete the original state-file block at its old location (old lines 1436-1449) and the original branch-mismatch check at old line 1431 (now relocated below the guard) so each appears exactly once.
+Delete the original state-file block (old position) and the original branch-mismatch check (old position) so each appears exactly once in the new order.
 
-In `hook_pre_bash_logic`, add the fail-open guard right after the `if not orch_state:` block (before the branch-mismatch check at line 1509):
+Add the parameter + guard to `hook_pre_bash_logic` too (it has no state-file block; the guard goes right after the `if not orch_state:` block, before the branch-mismatch check):
 
 ```python
-    if _hook_session_ambiguous():
+def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
+                        gate_path: str, ambiguous: bool = False) -> int:
+    ...  # the existing `if not orch_state:` block stays first
+    if ambiguous:
         print(_AMBIGUOUS_HINT)
         return 0
+    ...  # existing branch-mismatch + gate delegation unchanged
+```
+
+Wire the entries to compute and pass `ambiguous` (these entry functions are not directly unit-tested, so production gets the guard while `_logic` tests stay inert):
+
+```python
+def hook_pre_edit():
+    data = read_stdin()
+    orch = load_orch_state()
+    return hook_pre_edit_logic(data, orch, gate_script_path(),
+                               ambiguous=_hook_session_ambiguous())
+
+
+def hook_pre_bash():
+    data = read_stdin()
+    orch = load_orch_state()
+    return hook_pre_bash_logic(data, orch, gate_script_path(),
+                               ambiguous=_hook_session_ambiguous())
 ```
 
 - [ ] **Step 6: Run to verify it passes**
@@ -727,14 +758,16 @@ Expected: PASS (all).
 - [ ] **Step 7: Full suite to confirm existing hook tests unaffected**
 
 Run: `cd /Users/apple/works/claude-skills && python3 -m pytest tests/fastship/test_orchestrator.py -q`
-Expected: all pass. Existing pre/post hook tests register ≤1 session (or pass `orch_path`), so `_hook_session_ambiguous()` is False and the guards are inert.
+Expected: `164 passed, 2 failed` (this task adds 6 tests). Existing post-hook tests pass an explicit `orch_path` (so `orch_path is None` is False → guard skipped); existing pre-hook tests call `_logic` without the `ambiguous` param (defaults False → guard inert). Neither path touches the real registry.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 cd /Users/apple/works/claude-skills
 git add skills/fastship/fastship_state.py skills/fastship/orchestrator.py tests/fastship/test_orchestrator.py
-git commit -m "feat(fastship): ambiguous-session guard (post no-advance, pre fail-open)"
+git commit -m "feat(fastship): ambiguous-session guard (post no-advance, pre fail-open)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
