@@ -1937,3 +1937,61 @@ class TestGateStateLocking:
         st = gate.ensure_branch_state(gate.load_state(), "main")
         assert st.get("plan_ready") is True
         assert st.get("knowledge_acknowledged") is True
+
+
+class TestAmbiguousSessionGuard:
+    def _seed_two_active(self):
+        import fastship_state
+        fastship_state.set_current_session_id("alpha", "feature alpha", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("beta", "feature beta", {"current_step": "1.4"})
+
+    def test_active_session_ids_excludes_done(self, tmp_path, monkeypatch):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        fastship_state.set_current_session_id("a", "ra", {"current_step": "2.0"})
+        fastship_state.set_current_session_id("b", "rb", {"current_step": "done"})
+        assert fastship_state.active_session_ids() == ["a"]
+
+    def test_ambiguous_when_two_active_no_pin(self, tmp_path, monkeypatch):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+        self._seed_two_active()
+        assert orchestrator._hook_session_ambiguous() is True
+
+    def test_not_ambiguous_when_pinned(self, tmp_path, monkeypatch):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "alpha")
+        self._seed_two_active()
+        assert orchestrator._hook_session_ambiguous() is False
+
+    def test_post_bash_no_advance_when_ambiguous(self, tmp_path, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+        self._seed_two_active()
+        rc = orchestrator.hook_post_bash_logic(
+            {"tool_input": {"command": "x"}}, hook_state={"request_classified": True})
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "多个活跃 session" in out
+
+    def test_pre_edit_failopen_via_ambiguous_param(self, capsys):
+        import orchestrator
+        orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
+        rc_code = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state,
+            "/nonexistent-gate.py", ambiguous=True)
+        assert rc_code == 0
+        rc_state = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "x/fastship/orchestrator.json"}},
+            orch_state, "/nonexistent-gate.py", ambiguous=True)
+        assert rc_state == 1
+
+    def test_pre_edit_default_not_ambiguous_preserves_blocking(self):
+        import orchestrator
+        orch_state = {"current_step": "1.4", "phase": 1, "branch": None}
+        rc = orchestrator.hook_pre_edit_logic(
+            {"tool_input": {"file_path": "src/app.rs"}}, orch_state, "/nonexistent-gate.py")
+        assert rc == 1

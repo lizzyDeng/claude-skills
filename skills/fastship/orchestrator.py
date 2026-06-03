@@ -1417,7 +1417,7 @@ def _handle_loop_decision(orch: dict):
 # ━━━━━━━━━━━━ Hook Handlers (Logic) ━━━━━━━━━━━━
 
 def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
-                        gate_path: str) -> int:
+                        gate_path: str, ambiguous: bool = False) -> int:
     file_path = data.get("tool_input", {}).get("file_path", "")
 
     if not orch_state:
@@ -1428,12 +1428,7 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
             return code
         return 0
 
-    if _is_active(orch_state) and _branch_mismatch(orch_state):
-        print("🔴 BLOCKED: Fastship branch mismatch")
-        print(_branch_mismatch_text(orch_state))
-        return 1
-
-    # Block edits to any fastship state file
+    # Session-INDEPENDENT block: editing fastship state files is always forbidden.
     normalized = _normalize(file_path)
     if (
         any(pat in normalized for pat in (
@@ -1446,6 +1441,16 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
         or ("fastship/sessions/" in normalized and normalized.endswith(("/gate.json", "/orchestrator.json")))
     ):
         print("🔴 BLOCKED: fastship state 由系统管理，禁止手动编辑")
+        return 1
+
+    # Fail-open under ambiguous multi-session: skip session-specific blocks.
+    if ambiguous:
+        print(_AMBIGUOUS_HINT)
+        return 0
+
+    if _is_active(orch_state) and _branch_mismatch(orch_state):
+        print("🔴 BLOCKED: Fastship branch mismatch")
+        print(_branch_mismatch_text(orch_state))
         return 1
 
     # Block out-of-order step artifact writes
@@ -1497,13 +1502,17 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
 
 
 def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
-                        gate_path: str) -> int:
+                        gate_path: str, ambiguous: bool = False) -> int:
     if not orch_state:
         if os.path.exists(gate_path):
             code, stdout = delegate_to_gate(gate_path, "pre_bash", data)
             if stdout:
                 print(stdout, end="")
             return code
+        return 0
+
+    if ambiguous:
+        print(_AMBIGUOUS_HINT)
         return 0
 
     if _is_active(orch_state) and _branch_mismatch(orch_state):
@@ -1527,8 +1536,27 @@ def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
     return 0
 
 
+def _hook_session_ambiguous() -> bool:
+    """True when ≥2 sessions are active in this state-home and none is pinned via
+    FASTSHIP_SESSION — the editing context can't be mapped to one session."""
+    if os.environ.get(fastship_state.SESSION_ENV):
+        return False
+    return len(fastship_state.active_session_ids()) >= 2
+
+
+_AMBIGUOUS_HINT = (
+    "⚠️ fastship: 检测到多个活跃 session 且未用 FASTSHIP_SESSION 锁定，为避免串台，"
+    "本次 hook 不应用 session 专属逻辑。\n"
+    "   并行需求请放各自 git worktree，或用 "
+    "\"$(git rev-parse --show-toplevel)/.claude/tools/fastship\" use <session> 指定。"
+)
+
+
 def hook_post_bash_logic(data: dict, orch_path: str = None,
                          hook_state: dict = None) -> int:
+    if orch_path is None and _hook_session_ambiguous():
+        print(_AMBIGUOUS_HINT)
+        return 0
     orch = load_orch_state(orch_path)
     if not orch or orch.get("current_step") in ("done", "stopped"):
         return 0
@@ -1584,6 +1612,9 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
 
 
 def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
+    if orch_path is None and _hook_session_ambiguous():
+        print(_AMBIGUOUS_HINT)
+        return 0
     orch = load_orch_state(orch_path)
     if not orch or orch.get("current_step") in ("done", "stopped"):
         return 0
@@ -1732,13 +1763,15 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
 def hook_pre_edit():
     data = read_stdin()
     orch = load_orch_state()
-    return hook_pre_edit_logic(data, orch, gate_script_path())
+    return hook_pre_edit_logic(data, orch, gate_script_path(),
+                               ambiguous=_hook_session_ambiguous())
 
 
 def hook_pre_bash():
     data = read_stdin()
     orch = load_orch_state()
-    return hook_pre_bash_logic(data, orch, gate_script_path())
+    return hook_pre_bash_logic(data, orch, gate_script_path(),
+                               ambiguous=_hook_session_ambiguous())
 
 
 def hook_post_bash():

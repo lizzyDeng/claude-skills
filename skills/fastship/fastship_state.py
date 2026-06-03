@@ -204,6 +204,17 @@ def list_sessions() -> dict:
     return load_registry().get("sessions", {})
 
 
+def active_session_ids() -> list:
+    """Session ids whose flow is still active (not done/stopped)."""
+    out = []
+    for sid, rec in (list_sessions() or {}).items():
+        if (rec or {}).get("status") not in ("done", "stopped"):
+            n = normalize_session_id(sid)
+            if n:
+                out.append(n)
+    return sorted(out)
+
+
 def set_current_session_id(session_id: str, requirement: str = None, state: dict = None) -> str:
     sid = normalize_session_id(session_id) or DEFAULT_SESSION_ID
     with state_lock():
