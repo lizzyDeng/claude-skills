@@ -110,61 +110,65 @@ def test_branch_mismatch_lines_emit_engine_relative_python_invocation():
     assert ".claude/tools/fastship\"" not in joined, joined
 
 
-def test_branch_recovery_command_recognizes_packaged_orchestrator():
-    """The recovery whitelist must accept the packaged python3 .../orchestrator.py
-    form (plugin/source) AND the legacy fastship_orchestrator.py / wrapper forms,
+def test_branch_recovery_command_recognizes_real_engine_invocation():
+    """The recovery whitelist must accept the canonical hint branch_mismatch_lines
+    prints — `python3 "<real orchestrator path>" <sub>` — and the git escape hatches,
     so plugin-mode recovery is never blocked during a branch mismatch."""
     f = fastship_state.is_branch_recovery_command
-    # plugin / source canonical form (what branch_mismatch_lines now prints)
-    assert f('python3 "/x/plugins/forge/skills/fastship/orchestrator.py" adopt-branch')
-    assert f('python3 "/repo/skills/fastship/orchestrator.py" reset')
-    assert f('python3 /repo/skills/fastship/orchestrator.py status')
-    # legacy installed layouts
-    assert f('python3 .claude/tools/fastship_orchestrator.py adopt-branch')
-    assert f('.claude/tools/fastship reset')
-    # still recognizes git escape hatches; rejects unrelated commands
+    orch = fastship_state.orchestrator_script_path()
+    gate = fastship_state.gate_script_path()
+    # plugin / source canonical form (exactly what branch_mismatch_lines emits)
+    assert f(f'python3 "{orch}" adopt-branch')
+    assert f(f'python3 "{orch}" reset')
+    assert f(f'python3 {orch} status')
+    assert f(f'python3 {orch} reset --all')  # trailing flags after the subcommand are fine
+    # the gate script is also a valid recovery target
+    assert f(f'python3 "{gate}" status')
+    # git escape hatches; rejects unrelated commands
     assert f('git switch feat/x')
     assert f('git status')
     assert not f('rm -rf /')
 
 
-def test_branch_recovery_command_rejects_substring_and_comment_bypasses():
-    """argv parsing (not substring) must reject commands that merely contain an
-    engine-looking substring + a recovery word — the bypasses codex R4 found:
-    a real non-recovery subcommand with a recovery word in a comment, and a
-    look-alike path that is not the engine."""
+def test_branch_recovery_command_requires_real_engine_path_not_basename():
+    """codex R6: basename-only matching let an attacker-named /tmp/orchestrator.py
+    pass. The script must RESOLVE to the real engine path."""
     f = fastship_state.is_branch_recovery_command
-    # runs `next`; `status` only appears in a trailing comment -> NOT recovery
-    assert not f('python3 skills/fastship/orchestrator.py next # status')
-    # look-alike basename (not-orchestrator.py) must not qualify via substring
+    # look-alike basename at an arbitrary path -> NOT the engine
+    assert not f('python3 /tmp/orchestrator.py reset')
     assert not f('python3 /tmp/not-orchestrator.py reset')
-    # `git reset` is intentionally NOT an escape hatch (only status/branch/switch/checkout)
+    # real engine basename but runs `next`; `status` only in a comment -> NOT recovery
+    orch = fastship_state.orchestrator_script_path()
+    assert not f(f'python3 {orch} next # status')
+    # `git reset` is intentionally NOT an escape hatch
     assert not f('git reset --hard')
 
 
-def test_branch_recovery_command_rejects_compound_and_misplaced(monkeypatch):
-    """codex R5: must validate a SINGLE simple command. The engine/recovery pair
-    must be the actual program+subcommand, not just an adjacent pair anywhere in
-    argv, and any shell control operator / substitution disqualifies the command."""
+def test_branch_recovery_command_rejects_compound_and_misplaced():
+    """codex R5: must validate a SINGLE simple command — any shell control operator /
+    substitution / redirection disqualifies it, and the program must be git/python/the
+    engine, not merely an adjacent pair anywhere in argv."""
     f = fastship_state.is_branch_recovery_command
+    orch = fastship_state.orchestrator_script_path()
     # adjacent pair but the program is `echo`/`touch`, not the engine/git
     assert not f('echo orchestrator.py reset')
     assert not f('touch blocked git status')
-    # chaining a second command past a real recovery invocation
-    assert not f('python3 skills/fastship/orchestrator.py reset && rm -rf /')
+    # chaining / substitution / redirection past a real recovery invocation
+    assert not f(f'python3 {orch} reset && rm -rf /')
     assert not f('git switch saved; rm -rf /')
-    assert not f('python3 skills/fastship/orchestrator.py reset $(rm -rf /)')
-    assert not f('python3 skills/fastship/orchestrator.py reset | tee /etc/x')
-    # backtick substitution
+    assert not f(f'python3 {orch} reset $(rm -rf /)')
+    assert not f(f'python3 {orch} reset | tee /etc/x')
     assert not f('git switch `whoami`')
 
 
-def test_branch_recovery_command_allows_env_and_sudo_prefixes():
-    """Single simple recovery commands stay allowed even with common harmless
-    prefixes (env assignments, sudo)."""
+def test_branch_recovery_command_rejects_env_and_sudo_prefixes():
+    """codex R6: leading env-assignment / sudo prefixes can redirect command lookup
+    (PATH=.) or run startup scripts (BASH_ENV=.x), so they must NOT be stripped — the
+    program has to be the recovery program directly."""
     f = fastship_state.is_branch_recovery_command
-    assert f('FOO=bar python3 /repo/skills/fastship/orchestrator.py reset')
-    assert f('sudo .claude/tools/fastship adopt-branch')
-    # trailing flags after the subcommand are fine (e.g. reset --all)
-    assert f('python3 /repo/skills/fastship/orchestrator.py reset --all')
-    assert f('git switch feat/some-branch')
+    orch = fastship_state.orchestrator_script_path()
+    assert not f(f'PATH=. python3 {orch} reset')
+    assert not f('PATH=. git status')
+    assert not f(f'BASH_ENV=.x python3 {orch} reset')
+    assert not f(f'sudo python3 {orch} reset')
+    assert not f(f'FOO=bar python3 {orch} reset')

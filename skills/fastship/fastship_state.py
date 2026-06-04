@@ -498,18 +498,8 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
     ]
 
 
-_ENGINE_SCRIPT_BASENAMES = frozenset({
-    # source/plugin orchestrator, legacy installed orchestrator, legacy bash wrapper,
-    # and the gate script — matched on the argv token's basename so substrings like
-    # "not-orchestrator.py" never qualify.
-    "orchestrator.py",
-    "fastship_orchestrator.py",
-    "fastship",
-    "ship_verify_gate.py",
-})
 _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
 _GIT_RECOVERY_SUBCOMMANDS = frozenset({"status", "branch", "switch", "checkout"})
-
 
 # Shell metacharacters that can chain, redirect, background, or substitute extra
 # commands. A recovery command must be a SINGLE simple invocation, so any of these in
@@ -518,13 +508,38 @@ _GIT_RECOVERY_SUBCOMMANDS = frozenset({"status", "branch", "switch", "checkout"}
 # second command past the branch-mismatch pause. Legitimate hints (git switch <branch>,
 # python3 "<abspath>" <sub>, <wrapper> <sub>) contain none of these.
 _SHELL_METACHARS = (";", "|", "&", "<", ">", "`", "$", "(", ")", "\n")
-_ENV_PREFIX_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+
+def _resolve_token(tok: str) -> str:
+    try:
+        return os.path.realpath(tok)
+    except OSError:
+        return os.path.abspath(tok)
+
+
+def recovery_engine_script_paths() -> set:
+    """Resolved abspaths of the only scripts a branch-recovery command may invoke:
+    this engine's orchestrator + gate, plus the legacy bash wrapper if it sits beside
+    the engine. Path identity (not basename) is required so an attacker-controlled
+    /tmp/orchestrator.py can never pass the branch-mismatch escape hatch."""
+    paths = set()
+    for p in (orchestrator_script_path(), gate_script_path()):
+        if p:
+            paths.add(_resolve_token(p))
+    wrapper = os.path.join(_tools_dir(), "fastship")
+    if os.path.exists(wrapper):
+        paths.add(_resolve_token(wrapper))
+    return paths
 
 
 def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
     raw = command.strip()
+    # Single simple command only: no chaining/redirection/substitution/background, and
+    # NO leading env-assignment or sudo prefixes (PATH=./BASH_ENV= can redirect command
+    # lookup or run a startup script). The printed recovery hints are bare commands, so
+    # demanding tokens[0] be the program directly costs nothing and closes that hole.
     if any(ch in raw for ch in _SHELL_METACHARS):
         return False
     try:
@@ -533,25 +548,24 @@ def is_branch_recovery_command(command: str) -> bool:
         tokens = shlex.split(raw, comments=True)
     except ValueError:
         return False
-    # Strip leading `sudo` and NAME=value env-assignment prefixes — harmless, common.
-    i = 0
-    while i < len(tokens) and (tokens[i] == "sudo" or _ENV_PREFIX_RE.fullmatch(tokens[i])):
-        i += 1
-    rest = tokens[i:]
-    if not rest:
+    if not tokens:
         return False
-    prog = os.path.basename(rest[0])
+    prog = tokens[0]
     # git escape hatch: `git <status|branch|switch|checkout> [args]`
-    if prog == "git":
-        return len(rest) >= 2 and rest[1] in _GIT_RECOVERY_SUBCOMMANDS
-    # interpreter form: `python3 <engine-script> <status|adopt-branch|reset> [args]`
-    if prog in ("python", "python3"):
+    if os.path.basename(prog) == "git":
+        return len(tokens) >= 2 and tokens[1] in _GIT_RECOVERY_SUBCOMMANDS
+    engine_paths = recovery_engine_script_paths()
+    # interpreter form: `python3 <engine-script> <status|adopt-branch|reset> [args]` —
+    # the script must RESOLVE to the real engine path, not merely share its basename,
+    # and must not be a flag (rejects `python3 -c ...` / `python3 -m ...`).
+    if os.path.basename(prog) in ("python", "python3"):
         return (
-            len(rest) >= 3
-            and os.path.basename(rest[1]) in _ENGINE_SCRIPT_BASENAMES
-            and rest[2] in _RECOVERY_SUBCOMMANDS
+            len(tokens) >= 3
+            and not tokens[1].startswith("-")
+            and _resolve_token(tokens[1]) in engine_paths
+            and tokens[2] in _RECOVERY_SUBCOMMANDS
         )
-    # direct wrapper form: `<engine-script> <status|adopt-branch|reset> [args]`
-    if prog in _ENGINE_SCRIPT_BASENAMES:
-        return len(rest) >= 2 and rest[1] in _RECOVERY_SUBCOMMANDS
+    # direct form: `<engine-script-or-wrapper> <status|adopt-branch|reset> [args]`
+    if _resolve_token(prog) in engine_paths:
+        return len(tokens) >= 2 and tokens[1] in _RECOVERY_SUBCOMMANDS
     return False
