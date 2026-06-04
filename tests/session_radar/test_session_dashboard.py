@@ -1,4 +1,5 @@
 import json, os, tempfile, time, unittest, importlib.util
+from collections import Counter
 
 MOD = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -493,3 +494,458 @@ class RenderAndCliTest(unittest.TestCase):
             rc = sd.main(["--claude-home", home, "--once"])
         self.assertEqual(rc, 0)
         self.assertIn("Session Radar", buf.getvalue())
+
+
+def _asst(blocks, cwd=None, branch=None):
+    o = {"type": "assistant", "message": {"role": "assistant", "content": blocks}}
+    if cwd:
+        o["cwd"], o["gitBranch"] = cwd, branch
+    return o
+
+
+def _tool(name, inp):
+    return {"type": "tool_use", "name": name, "input": inp}
+
+
+class WorkHelpersTest(unittest.TestCase):
+    def test_humanize_strips_date_and_seps(self):
+        self.assertEqual(sd._humanize("2026-06-03-session-radar-work-summary.md"),
+                         "session radar work summary")
+        self.assertEqual(sd._humanize("feat_provider_429"), "feat provider 429")
+
+    def test_commit_subject_inline_and_heredoc_and_none(self):
+        self.assertEqual(sd._commit_subject('git commit -m "feat: add radar summary"'),
+                         "feat: add radar summary")
+        cmd = "git commit -m \"$(cat <<'EOF'\nfix: provider 429 ejection\n\nbody\nEOF\n)\""
+        self.assertEqual(sd._commit_subject(cmd), "fix: provider 429 ejection")
+        self.assertIsNone(sd._commit_subject("git status"))
+
+    def test_work_type_branch_then_commit_then_opening(self):
+        self.assertEqual(sd.work_type("feat/session-radar", [], "")[0], "feature")
+        self.assertEqual(sd.work_type("fix/x", [], "")[0], "bugfix")
+        self.assertEqual(sd.work_type("refactor/x", [], "")[0], "refactor")
+        self.assertEqual(sd.work_type("main", ["fix: crash"], "")[0], "bugfix")
+        self.assertEqual(sd.work_type("main", [], "修复 重试 backoff")[0], "bugfix")
+        self.assertEqual(sd.work_type("main", [], "just chatting")[0], "task")
+
+    def test_work_title_branch_then_plan_then_opening(self):
+        self.assertEqual(sd.work_title("feat/session-radar-dashboard", [], "x"),
+                         "session radar dashboard")
+        self.assertEqual(sd.work_title("main", ["2026-06-03-pay-bridge.md"], "x"), "pay bridge")
+        self.assertEqual(sd.work_title("main", [], "build the thing"), "build the thing")
+
+    def test_reconstruct_tasks_from_create_and_update(self):
+        creates = [{"subject": "scaffold", "activeForm": "Scaffolding"},
+                   {"subject": "wire", "activeForm": "Wiring"},
+                   {"subject": "render", "activeForm": "Rendering"}]
+        updates = [{"taskId": "1", "status": "in_progress"},
+                   {"taskId": "1", "status": "completed"},
+                   {"taskId": "2", "status": "in_progress"}]
+        tasks = sd._reconstruct_tasks(creates, updates)
+        self.assertEqual([t["status"] for t in tasks],
+                         ["completed", "in_progress", "pending"])
+        self.assertEqual(tasks[1]["activeForm"], "Wiring")
+
+    def test_work_doing_picks_in_progress_then_pending(self):
+        todos = [{"status": "completed", "content": "a", "activeForm": "Doing a"},
+                 {"status": "in_progress", "content": "b", "activeForm": "Doing b"}]
+        self.assertEqual(sd.work_doing(todos), "Doing b")
+        self.assertEqual(sd.work_doing([{"status": "pending", "activeForm": "Doing only"}]),
+                         "Doing only")
+        self.assertEqual(sd.work_doing([]), "")
+
+    def test_work_progress_counts_completed(self):
+        self.assertEqual(sd.work_progress([{"status": "completed"}, {"status": "in_progress"},
+                                           {"status": "pending"}]), "1/3")
+        self.assertEqual(sd.work_progress([]), "")
+
+    def test_work_detail_focus_file_and_commits(self):
+        ec = Counter({"session_dashboard.py": 6, "test_x.py": 1})
+        self.assertEqual(sd.work_detail(ec, ["c1", "c2"]),
+                         "session_dashboard.py×6(+1) · 2 commits")
+        self.assertEqual(sd.work_detail(Counter(), []), "")
+
+
+class CollectSignalsTest(unittest.TestCase):
+    def test_collects_taskflow_commits_edits_plans(self):
+        objs = [
+            _asst([_tool("Edit", {"file_path": "/r/session_dashboard.py"})]),
+            _asst([_tool("Edit", {"file_path": "/r/session_dashboard.py"})]),
+            _asst([_tool("Write", {"file_path": "/r/tests/test_x.py"})]),
+            _asst([_tool("TaskCreate", {"subject": "scaffold", "activeForm": "Scaffolding"})]),
+            _asst([_tool("TaskCreate", {"subject": "wire", "activeForm": "把 NOW 改成工作单元摘要"})]),
+            _asst([_tool("TaskUpdate", {"taskId": "1", "status": "completed"})]),
+            _asst([_tool("TaskUpdate", {"taskId": "2", "status": "in_progress"})]),
+            _asst([_tool("Bash", {"command": 'git commit -m "feat: distill work unit"'})]),
+            _asst([_tool("Read", {"file_path": "/r/docs/superpowers/plans/2026-06-03-radar.md"})]),
+        ]
+        sig = sd._collect_signals(objs)
+        self.assertEqual(sig["edit_counts"]["session_dashboard.py"], 2)
+        self.assertIn("feat: distill work unit", sig["commits"])
+        self.assertEqual([t["status"] for t in sig["todos"]], ["completed", "in_progress"])
+        self.assertEqual(sd.work_doing(sig["todos"]), "把 NOW 改成工作单元摘要")
+        self.assertIn("2026-06-03-radar.md", sig["plan_refs"])
+
+    def test_todowrite_snapshot_also_supported(self):
+        objs = [_asst([_tool("TodoWrite", {"todos": [
+            {"status": "in_progress", "content": "x", "activeForm": "Doing x"}]})])]
+        sig = sd._collect_signals(objs)
+        self.assertEqual(sd.work_doing(sig["todos"]), "Doing x")
+
+    def test_latest_task_source_wins_over_stale_todowrite(self):
+        # an early TodoWrite snapshot, then a LATER TaskCreate/TaskUpdate lifecycle
+        objs = [
+            _asst([_tool("TodoWrite", {"todos": [
+                {"status": "in_progress", "content": "stale", "activeForm": "stale step"}]})]),
+            _asst([_tool("TaskCreate", {"subject": "real", "activeForm": "real current step"})]),
+            _asst([_tool("TaskUpdate", {"taskId": "1", "status": "in_progress"})]),
+        ]
+        sig = sd._collect_signals(objs)
+        self.assertEqual(sd.work_doing(sig["todos"]), "real current step")
+
+
+class SummarizeSessionTest(unittest.TestCase):
+    def _rich_objs(self):
+        return [
+            {"type": "user", "message": {"role": "user", "content": "build the radar"}},
+            _asst([_tool("Edit", {"file_path": "/r/session_dashboard.py"})]),
+            _asst([_tool("Edit", {"file_path": "/r/session_dashboard.py"})]),
+            _asst([_tool("TaskCreate", {"subject": "scaffold", "activeForm": "Scaffolding"})]),
+            _asst([_tool("TaskCreate", {"subject": "wire", "activeForm": "把 NOW 改成工作单元摘要"})]),
+            _asst([_tool("TaskUpdate", {"taskId": "1", "status": "completed"})]),
+            _asst([_tool("TaskUpdate", {"taskId": "2", "status": "in_progress"})]),
+            _asst([_tool("Bash", {"command": 'git commit -m "feat: work unit summary"'})]),
+            _asst([_tool("Bash", {"command": 'git commit -m "feat: render badge"'})]),
+            _asst([{"type": "text", "text": "好的，我接着改下一处。"}]),  # chatter tail
+        ]
+
+    def test_distills_unit_of_work_not_last_message(self):
+        w = sd.summarize_session(self._rich_objs(), None, "build the radar",
+                                 "feat/work-unit-summary", False, "💬 好的")
+        self.assertEqual(w["type"], "feature")
+        self.assertEqual(w["source"], "heuristic")
+        self.assertEqual(w["title"], "work unit summary")          # branch slug
+        self.assertEqual(w["doing"], "把 NOW 改成工作单元摘要")       # in-progress task
+        self.assertEqual(w["progress"], "1/2")
+        self.assertIn("session_dashboard.py", w["detail"])
+        self.assertIn("2 commits", w["detail"])
+        self.assertNotIn("好的", w["summary"])                      # NOT the chatter
+        self.assertIn("work unit summary", w["summary"])
+
+    def test_bg_job_summarizes_from_intent_no_llm(self):
+        job = {"state": "active", "intent": "review F4 SDK alignment", "cwd": "/r"}
+        w = sd.summarize_session([], job, "review F4 SDK alignment", "main", False, "")
+        self.assertEqual(w["title"], "review F4 SDK alignment")
+        self.assertIn("bg:active", w["detail"])
+
+    def test_degrades_to_fallback_when_no_signal(self):
+        objs = [{"type": "user", "message": {"role": "user", "content": ""}}]
+        w = sd.summarize_session(objs, None, "", "main", False, "Read(sdk.py)")
+        self.assertEqual(w["title"], "Read(sdk.py)")
+
+
+class LlmLayerTest(unittest.TestCase):
+    def setUp(self):
+        sd._LLM_CACHE.clear()
+        sd._LLM_PENDING.clear()
+
+    def test_claim_pending_is_atomic_and_cache_helpers_lock(self):
+        fp = "sid|feature|t|d|x"
+        self.assertTrue(sd._claim_pending(fp))     # first claim wins
+        self.assertFalse(sd._claim_pending(fp))    # already pending → no duplicate job
+        sd._cache_set(fp, "短语")
+        self.assertEqual(sd._cache_get(fp), "短语")
+        sd._release_pending(fp)
+        # already cached → claim refuses (no re-compute of a known fingerprint)
+        self.assertFalse(sd._claim_pending(fp))
+
+    def test_prompt_includes_signals(self):
+        work = {"type": "feature", "title": "work summary", "doing": "wiring",
+                "detail": "session_dashboard.py×6 · 2 commits"}
+        p = sd.build_llm_prompt(work, "build the radar", "feat/x", "claude-skills")
+        self.assertIn("work summary", p)
+        self.assertIn("wiring", p)
+        self.assertIn("build the radar", p)
+
+    def test_llm_refine_replaces_summary_and_marks_source(self):
+        work = {"type": "feature", "icon": "🟢", "title": "work summary", "doing": "wiring",
+                "detail": "d", "progress": "1/2", "summary": "🟢 feature · work summary",
+                "source": "heuristic"}
+        out = sd.llm_refine("sid1", work, "open", "feat/x", "repo",
+                            llm=lambda prompt: "为雷达增加工作单元摘要")
+        self.assertEqual(out["summary"], "为雷达增加工作单元摘要")
+        self.assertEqual(out["source"], "llm")
+        self.assertEqual(out["type"], "feature")          # badge preserved
+        self.assertEqual(out["detail"], "d")              # detail preserved
+
+    def test_llm_refine_falls_back_when_llm_returns_none(self):
+        work = {"type": "feature", "icon": "🟢", "title": "t", "doing": "", "detail": "",
+                "progress": "", "summary": "🟢 feature · t", "source": "heuristic"}
+        out = sd.llm_refine("sid2", work, "open", "feat/x", "repo", llm=lambda prompt: None)
+        self.assertEqual(out["summary"], "🟢 feature · t")
+        self.assertEqual(out["source"], "heuristic")
+
+    def test_llm_refine_is_cached_by_signal_fingerprint(self):
+        calls = []
+
+        def llm(prompt):
+            calls.append(prompt)
+            return "缓存短语"
+
+        work = {"type": "feature", "icon": "🟢", "title": "t", "doing": "d1", "detail": "x",
+                "progress": "", "summary": "s", "source": "heuristic"}
+        sd.llm_refine("sidC", dict(work), "o", "b", "r", llm=llm)
+        sd.llm_refine("sidC", dict(work), "o", "b", "r", llm=llm)  # same fingerprint → cached
+        self.assertEqual(len(calls), 1)
+        work2 = dict(work, doing="d2")                            # changed signal → re-call
+        sd.llm_refine("sidC", work2, "o", "b", "r", llm=llm)
+        self.assertEqual(len(calls), 2)
+
+
+def build_home_snapshot_helper(test, use_llm=False, llm=None, llm_block=False):
+    """Build a tiny fake ~/.claude home (one foreground transcript with a TaskCreate
+    + a couple of Edits, plus one background state.json) and return a snapshot over
+    it. Modeled on BuildSnapshotTest.setUp; the key assertions are work.source and
+    the now override, not the home layout."""
+    home = tempfile.mkdtemp()
+    test.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+    proj = os.path.join(home, "projects", "-Users-me-works-claude-skills")
+    cwd, branch = "/Users/me/works/claude-skills", "feat/work-unit-summary"
+    fg = "f0f0f0f0-1111-2222-3333-444444444444"
+    _jsonl(os.path.join(proj, fg + ".jsonl"), [
+        {"type": "user", "cwd": cwd, "gitBranch": branch,
+         "message": {"role": "user", "content": "build the work unit summary"}},
+        _asst([_tool("Edit", {"file_path": cwd + "/session_dashboard.py"})], cwd, branch),
+        _asst([_tool("Edit", {"file_path": cwd + "/session_dashboard.py"})], cwd, branch),
+        _asst([_tool("TaskCreate", {"subject": "wire", "activeForm": "wiring the summary"})],
+              cwd, branch),
+        _asst([_tool("TaskUpdate", {"taskId": "1", "status": "in_progress"})], cwd, branch),
+    ])
+    # BG job: alive state so it always surfaces; non-stale bg rows are distilled.
+    bg = "32ea05ca-71ef-40de-8b31-b1c929992902"
+    bgp = os.path.join(proj, bg + ".jsonl")
+    _jsonl(bgp, [
+        {"type": "user", "cwd": "/Users/me/works/aifriends", "gitBranch": "main",
+         "message": {"role": "user", "content": "review F4 alignment"}},
+        _asst([_tool("Read", {"file_path": "sdk.py"})], "/Users/me/works/aifriends", "main"),
+    ])
+    _write(os.path.join(home, "jobs", "32ea05ca", "state.json"),
+           {"state": "active", "intent": "review F4 alignment",
+            "cwd": "/Users/me/works/aifriends",
+            "updatedAt": "2026-06-03T09:00:00Z", "linkScanPath": bgp})
+    return sd.build_snapshot(home, window_min=0, now=1_700_000_000.0,
+                             use_llm=use_llm, llm=llm, llm_block=llm_block)
+
+
+class RowWorkFieldTest(unittest.TestCase):
+    def _objs(self, opening="build the work unit summary", branch="feat/work-unit-summary"):
+        return [
+            {"type": "user", "message": {"role": "user", "content": opening},
+             "cwd": "/r", "gitBranch": branch},
+            _asst([_tool("Edit", {"file_path": "/r/session_dashboard.py"})], "/r", branch),
+            _asst([_tool("TaskCreate", {"subject": "wire", "activeForm": "wiring the summary"})],
+                  "/r", branch),
+            _asst([_tool("TaskUpdate", {"taskId": "1", "status": "in_progress"})], "/r", branch),
+            _asst([{"type": "text", "text": "完成了，等你确认。"}], "/r", branch),
+        ]
+
+    def test_row_now_is_work_summary_not_chatter(self):
+        row = sd._row_from_objs("sid12345", 10.0, self._objs(), None)
+        self.assertIn("work", row)
+        self.assertEqual(row["work"]["type"], "feature")
+        self.assertEqual(row["work"]["doing"], "wiring the summary")
+        self.assertNotIn("完成了", row["now"])
+        self.assertEqual(row["now"], row["work"]["summary"])
+
+    def test_row_drift_false_when_aligned(self):
+        # opening shares tokens (work/unit/summary) with the work-unit title → no drift
+        row = sd._row_from_objs("sid12345", 10.0, self._objs(), None)
+        self.assertFalse(row["drift"])
+
+    def test_row_drift_true_when_diverged(self):
+        # opening about login auth; work unit is the summary feature → diverged
+        objs = self._objs(opening="fix the login auth token bug")
+        row = sd._row_from_objs("sid12345", 10.0, objs, None)
+        self.assertTrue(row["drift"])
+
+
+class SnapshotLlmTest(unittest.TestCase):
+    def setUp(self):
+        sd._LLM_CACHE.clear()
+
+    def test_build_snapshot_default_is_heuristic_no_llm(self):
+        snap = build_home_snapshot_helper(self)   # see helper note below
+        for s in snap["sessions"]:
+            self.assertEqual(s["work"]["source"], "heuristic")
+
+    def test_build_snapshot_with_injected_llm_refines_fg_and_bg(self):
+        snap = build_home_snapshot_helper(self, use_llm=True,
+                                          llm=lambda p: "注入的LLM摘要", llm_block=True)
+        fg = [s for s in snap["sessions"] if not s["is_bg"]]
+        self.assertTrue(fg)
+        self.assertTrue(any(s["work"]["source"] == "llm"
+                            and s["now"] == "注入的LLM摘要" for s in fg))
+        # bg rows are distilled too now (user directive: a verbatim intent echo
+        # has no value). Only info-less stale jobs stay heuristic.
+        bg = [s for s in snap["sessions"] if s["is_bg"] and not s["is_stale"]]
+        self.assertTrue(bg)
+        for s in bg:
+            self.assertEqual(s["work"]["source"], "llm")
+            self.assertEqual(s["now"], "注入的LLM摘要")
+
+
+class RenderWorkTest(unittest.TestCase):
+    def test_html_has_manual_refresh_and_no_5s_interval_and_workcell(self):
+        html = sd.render_html()
+        self.assertIn('id="refresh"', html)
+        self.assertNotIn("setInterval(load, 5000)", html)
+        self.assertIn("workCell", html)
+
+    def test_render_table_shows_summary_and_progress(self):
+        snap = {
+            "counts": {"total": 1, "projects": 1, "bg": 0, "errored": 0, "drift": 0},
+            "generated_at": "now", "stale_unknown": 0,
+            "projects": [{"project": "claude-skills", "count": 1, "sessions": [{
+                "liveness_label": "🟢 active", "is_bg": False, "worktree": None,
+                "branch": "feat/x", "opening": "build the radar",
+                "now": "为雷达增加工作单元摘要",
+                "work": {"type": "feature", "icon": "🟢", "title": "work summary",
+                         "doing": "wiring", "detail": "session_dashboard.py×6",
+                         "progress": "2/5", "summary": "为雷达增加工作单元摘要",
+                         "source": "llm"},
+                "acting_on": "aon-main", "drift": False}]}]}
+        out = sd.render_table(snap)
+        self.assertIn("为雷达增加工作单元摘要", out)
+        self.assertIn("2/5", out)
+        self.assertIn("↗aon-main", out)
+
+    def test_main_no_llm_flag_parses(self):
+        # --no-llm + --once on an empty home must not raise and must print a table
+        import io
+        from contextlib import redirect_stdout
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = sd.main(["--claude-home", d, "--once", "--no-llm"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Session Radar", buf.getvalue())
+
+
+class RadarHelperExclusionTest(unittest.TestCase):
+    """The radar's own `claude -p` summary calls write transcripts into
+    ~/.claude/projects; scanning them would summarize-the-summarizer (feedback loop)."""
+
+    def test_detects_helper_session_by_prompt_signature(self):
+        helper = [{"type": "user", "message": {"role": "user",
+                   "content": sd.build_llm_prompt({"type": "feature", "title": "t"},
+                                                  "o", "feat/x", "repo")}}]
+        self.assertTrue(sd._is_radar_helper_session(helper))
+        real = [{"type": "user", "message": {"role": "user",
+                 "content": "帮我修一下登录的 bug"}}]
+        self.assertFalse(sd._is_radar_helper_session(real))
+
+    def test_build_snapshot_excludes_helper_sessions(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        proj = os.path.join(home, "projects", "-Users-me-works-claude-skills")
+        cwd, branch = "/Users/me/works/claude-skills", "feat/x"
+        # a real session
+        _jsonl(os.path.join(proj, "aaaaaaaa-0000-0000-0000-000000000000.jsonl"), [
+            {"type": "user", "cwd": cwd, "gitBranch": branch,
+             "message": {"role": "user", "content": "build the radar"}}])
+        # a radar helper session (our own prompt) — must be excluded
+        _jsonl(os.path.join(proj, "bbbbbbbb-0000-0000-0000-000000000000.jsonl"), [
+            {"type": "user", "cwd": cwd, "gitBranch": branch,
+             "message": {"role": "user", "content": sd.build_llm_prompt(
+                 {"type": "feature", "title": "t"}, "o", branch, "repo")}}])
+        snap = sd.build_snapshot(home, window_min=0, now=1_700_000_000.0)
+        shorts = {s["short"] for s in snap["sessions"]}
+        self.assertIn("aaaaaaaa", shorts)
+        self.assertNotIn("bbbbbbbb", shorts)
+
+
+class HandlerLlmBindingTest(unittest.TestCase):
+    """Regression: a plain function assigned as a bare class attribute becomes a
+    BOUND METHOD on instance access (self.llm), injecting `self` as a phantom first
+    arg → every server LLM call raised TypeError and silently fell back to heuristic.
+    serve() must wrap it in staticmethod. (Direct build_snapshot(llm=...) calls never
+    bind, so the rest of the suite couldn't catch this — only the server path did.)"""
+
+    def tearDown(self):
+        sd._Handler.llm = None
+
+    def test_handler_llm_access_does_not_bind_self(self):
+        calls = []
+
+        def fn(prompt):
+            calls.append(prompt)
+            return "提炼短语"
+
+        sd._Handler.llm = staticmethod(fn) if fn else None   # mirror serve()
+        inst = sd._Handler.__new__(sd._Handler)              # no __init__ (skips socket)
+        got = inst.llm                                        # the do_GET access pattern
+        self.assertTrue(callable(got))
+        self.assertEqual(got("p"), "提炼短语")                 # 1 positional arg, no phantom self
+        self.assertEqual(calls, ["p"])
+
+    def test_bare_function_attr_would_bind(self):
+        # documents the trap: WITHOUT staticmethod, self.llm binds and raises
+        def fn(prompt):
+            return "x"
+        sd._Handler.llm = fn
+        inst = sd._Handler.__new__(sd._Handler)
+        with self.assertRaises(TypeError):
+            inst.llm("p")   # becomes fn(inst, "p") -> too many args
+
+
+class ConsolidateWorkUnitsTest(unittest.TestCase):
+    """N session windows on the same work unit (project+branch) collapse to one row."""
+
+    def _row(self, short, project, branch, liveness, age, is_bg=False, drift=False):
+        return {"short": short, "project": project, "branch": branch,
+                "liveness": liveness, "age_s": age, "is_bg": is_bg, "drift": drift}
+
+    def test_same_project_branch_merge_with_count(self):
+        rows = [
+            self._row("a1", "claude-skills", "feat/radar", "dormant", 50, drift=False),
+            self._row("a2", "claude-skills", "feat/radar", "active", 10, drift=True),
+            self._row("a3", "claude-skills", "feat/radar", "idle", 30),
+        ]
+        out = sd.consolidate_work_units(rows)
+        self.assertEqual(len(out), 1)
+        m = out[0]
+        self.assertEqual(m["session_count"], 3)
+        self.assertEqual(m["short"], "a2")          # liveliest (active) represents
+        self.assertEqual(m["age_s"], 10)            # freshest age
+        self.assertTrue(m["drift"])                 # drift unioned
+        self.assertEqual(set(m["merged_shorts"]), {"a1", "a2", "a3"})
+
+    def test_singletons_and_bg_and_generic_pass_through(self):
+        rows = [
+            self._row("s1", "p", "feat/x", "active", 5),                 # singleton unit
+            self._row("s2", "p", "main", "active", 5),                   # generic branch
+            self._row("b1", "p", "feat/x", "working", 5, is_bg=True),    # bg never merged
+            self._row("s3", "q", "feat/x", "active", 5),                 # different project
+        ]
+        out = sd.consolidate_work_units(rows)
+        self.assertEqual(len(out), 4)               # nothing merges
+        for r in out:
+            self.assertEqual(r["session_count"], 1)
+
+    def test_build_snapshot_consolidates_and_keeps_total(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        proj = os.path.join(home, "projects", "-Users-me-works-claude-skills")
+        cwd, branch = "/Users/me/works/claude-skills", "feat/radar"
+        for i in range(3):
+            _jsonl(os.path.join(proj, f"{i}{i}{i}{i}{i}{i}{i}{i}-0000-0000-0000-000000000000.jsonl"), [
+                {"type": "user", "cwd": cwd, "gitBranch": branch,
+                 "message": {"role": "user", "content": f"window {i} of the radar work"}}])
+        snap = sd.build_snapshot(home, window_min=0, now=1_700_000_000.0)
+        self.assertEqual(snap["counts"]["total"], 3)            # 3 real sessions
+        g = next(p for p in snap["projects"] if p["project"] == "claude-skills")
+        self.assertEqual(len(g["sessions"]), 1)                 # one consolidated row
+        self.assertEqual(g["sessions"][0]["session_count"], 3)
+        self.assertEqual(g["count"], 3)                         # header still totals sessions
+        self.assertEqual(g["units"], 1)

@@ -126,9 +126,66 @@ def _build_home():
              {"type": "tool_use", "name": "Bash",
               "input": {"command": "WT=/Users/me/works/claude-skills-a4-s git -C $WT add -A"}}]}},
     ])
+    # SIGNAL-RICH foreground session: TaskCreate/TaskUpdate lifecycle + 6 edits +
+    # 2 commits + a chatter tail. Drives the heuristic work-unit summarizer and the
+    # injected-LLM headline turns (WORK-1..WORK-14). The CHATTER tail proves `now`
+    # is the distilled unit of work, NOT the latest message.
+    rich = "f1f1f1f1"
+    rcwd, rbr = "/Users/me/works/claude-skills", "feat/work-unit-summary"
+    rich_objs = [
+        {"type": "user", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "user", "content": "给雷达加工作单元摘要"}},
+    ]
+    for _ in range(6):
+        rich_objs.append(
+            {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+             "message": {"role": "assistant", "content": [
+                 {"type": "tool_use", "name": "Edit",
+                  "input": {"file_path": rcwd + "/skills/session-radar/session_dashboard.py"}}]}})
+    rich_objs += [
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "TaskCreate",
+              "input": {"subject": "scaffold summarizer", "activeForm": "Scaffolding"}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "TaskCreate",
+              "input": {"subject": "wire row", "activeForm": "把 NOW 改成工作单元摘要"}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "TaskUpdate",
+              "input": {"taskId": "1", "status": "completed"}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "TaskUpdate",
+              "input": {"taskId": "2", "status": "in_progress"}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Bash",
+              "input": {"command": 'git commit -m "feat: distill session work unit"'}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Bash",
+              "input": {"command": 'git commit -m "feat: render work badge"'}}]}},
+        {"type": "assistant", "cwd": rcwd, "gitBranch": rbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "好了，等你看效果。"}]}},
+    ]
+    _jsonl(os.path.join(proj, rich + ".jsonl"), rich_objs)
+    # BARE foreground session: an opening but NO task / commit / edit signals —
+    # exercises P0-4 graceful degradation (title falls back to the opening, never crash).
+    bare = "b2b2b2b2"
+    bcwd, bbr = "/Users/me/works/claude-skills", "main"
+    _jsonl(os.path.join(proj, bare + ".jsonl"), [
+        {"type": "user", "cwd": bcwd, "gitBranch": bbr,
+         "message": {"role": "user", "content": "看一下这个问题怎么回事"}},
+        {"type": "assistant", "cwd": bcwd, "gitBranch": bbr,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "我先看看上下文。"}]}},
+    ])
     return home, {"fg": fg[:8], "bg": bg[:8], "err": err[:8], "wt": wt[:8],
                   "done": done[:8], "blk": blk[:8], "nost": nost[:8], "oldfg": oldfg[:8],
-                  "cross": cross[:8]}
+                  "cross": cross[:8], "rich": rich[:8], "bare": bare[:8]}
 
 
 def main():
@@ -152,8 +209,8 @@ def main():
     snap = sd.build_snapshot(home, window_min=120)
     byshort = {s["short"]: s for s in snap["sessions"]}
 
-    turn("snapshot has 8 sessions (3 aifriends fg/bg + worktree fg + err + 2 other bg + stale)",
-         lambda: (snap["counts"]["total"] == 8, f"total={snap['counts']['total']}"))
+    turn("snapshot has 10 sessions (3 aifriends fg/bg + worktree fg + err + 2 other bg + stale + rich + bare)",
+         lambda: (snap["counts"]["total"] == 10, f"total={snap['counts']['total']}"))
     turn("P0-4 scope: fg + all 4 bg kinds present; counts.bg == 4",
          lambda: (all(ids[k] in byshort for k in ("fg", "bg", "done", "blk", "nost"))
                   and snap["counts"]["bg"] == 4,
@@ -214,10 +271,96 @@ def main():
                   and snap["counts"]["errored"] >= 1,
                   f"live={byshort[ids['err']]['liveness']}"))
 
+    # ---- work-unit summary assertions (P0-1..P0-5), heuristic default (no LLM) ----
+    rich = byshort[ids["rich"]]
+    w = rich.get("work") or {}
+    turn("WORK-1 type=feature + icon from branch prefix (feature/bugfix dimension)",
+         lambda: (w.get("type") == "feature" and w.get("icon") == "🟢",
+                  f"type={w.get('type')} icon={w.get('icon')}"))
+    turn("WORK-2 doing = in-progress TaskUpdate item (agent's own current step)",
+         lambda: ("摘要" in (w.get("doing") or ""), f"doing={w.get('doing')}"))
+    turn("WORK-3 progress event-sourced from TaskCreate/TaskUpdate",
+         lambda: (w.get("progress") == "1/2", f"progress={w.get('progress')}"))
+    turn("WORK-4 detail distills focus file + commits across events",
+         lambda: ("session_dashboard.py" in (w.get("detail") or "")
+                  and "commit" in (w.get("detail") or ""), f"detail={w.get('detail')}"))
+    turn("WORK-5 now synthesizes >=2 self-authored signals (branch title AND "
+         "in-progress task), NOT the chatter tail",
+         lambda: ("好了" not in rich.get("now", "")
+                  and "work unit summary" in rich.get("now", "")      # signal 1: branch-derived title
+                  and "摘要" in rich.get("now", ""),                   # signal 2: in-progress task
+                  f"now={rich.get('now')}"))
+    turn("WORK-6 default snapshot uses heuristic (no LLM dependency in E2E)",
+         lambda: (w.get("source") == "heuristic", f"source={w.get('source')}"))
+    bare = byshort[ids["bare"]]
+    bw = bare.get("work") or {}
+    turn("WORK-7 P0-4 graceful degradation: no task/commit/edit signal → title "
+         "falls back to opening, no crash",
+         lambda: (bw.get("source") == "heuristic"
+                  and "看一下这个问题" in (bw.get("title") or "") and bw.get("doing") == "",
+                  f"bare title={bw.get('title')} doing={bw.get('doing')}"))
+
+    # ---- injected-stub-LLM work-unit assertions (deterministic LLM plumbing) ----
+    sd._LLM_CACHE.clear(); sd._LLM_PENDING.clear()
+    # Capture the heuristic drift BEFORE the LLM pass, to prove drift is LLM-independent.
+    heur_rich = byshort[ids["rich"]]
+    heur_drift = heur_rich["drift"]
+    llm_snap = sd.build_snapshot(home, window_min=0,
+                                 use_llm=True, llm=lambda p: "注入摘要：提炼工作单元",
+                                 llm_block=True)
+    lb = {s["short"]: s for s in llm_snap["sessions"]}
+    rich_llm = lb[ids["rich"]]
+    turn("WORK-8 injected LLM replaces the headline + marks source=llm",
+         lambda: (rich_llm["now"] == "注入摘要：提炼工作单元"
+                  and (rich_llm.get("work") or {}).get("source") == "llm",
+                  f"now={rich_llm.get('now')} src={(rich_llm.get('work') or {}).get('source')}"))
+    turn("WORK-9 non-stale background rows ARE distilled by the LLM too "
+         "(a verbatim intent echo has no value); only info-less stale jobs stay heuristic",
+         lambda: (
+             any((lb[k].get("work") or {}).get("source") == "llm"
+                 and lb[k].get("now") == "注入摘要：提炼工作单元"
+                 for k in lb if lb[k]["is_bg"] and not lb[k].get("is_stale"))
+             and all((lb[k].get("work") or {}).get("source") == "heuristic"
+                     for k in lb if lb[k]["is_bg"] and lb[k].get("is_stale")),
+             "non-stale bg distilled by LLM; stale bg stays heuristic"))
+    turn("WORK-10 P0-5 drift is LLM-INDEPENDENT (fed heuristic title+doing)",
+         lambda: (rich_llm["drift"] == heur_drift, f"llm_drift={rich_llm['drift']} heur={heur_drift}"))
+
+    # P0-5 non-blocking: a SLOW LLM must NOT block /api/state — the first
+    # non-blocking call returns the heuristic immediately and schedules the work.
+    sd._LLM_CACHE.clear(); sd._LLM_PENDING.clear()
+    def _slow_llm(prompt):
+        raise AssertionError("non-blocking path must NOT call the LLM inline")
+    nb_snap = sd.build_snapshot(home, window_min=0,
+                                use_llm=True, llm=_slow_llm, llm_block=False)
+    nb_rich = next(s for s in nb_snap["sessions"] if s["short"] == ids["rich"])
+    turn("WORK-11 P0-5 non-blocking /api/state returns heuristic immediately "
+         "(slow LLM scheduled, never inlined)",
+         lambda: ((nb_rich.get("work") or {}).get("source") == "heuristic",
+                  f"non-blocking src={(nb_rich.get('work') or {}).get('source')}"))
+
+    # P0-3 LLM unavailable/error → fall back to the deterministic heuristic headline.
+    sd._LLM_CACHE.clear(); sd._LLM_PENDING.clear()
+    fb_snap = sd.build_snapshot(home, window_min=0,
+                                use_llm=True, llm=lambda p: None, llm_block=True)
+    fb_rich = next(s for s in fb_snap["sessions"] if s["short"] == ids["rich"])
+    turn("WORK-12 P0-3 LLM error/unavailable → heuristic fallback (source=heuristic, "
+         "now == heuristic summary)",
+         lambda: ((fb_rich.get("work") or {}).get("source") == "heuristic"
+                  and "work unit summary" in fb_rich.get("now", ""),
+                  f"fallback src={(fb_rich.get('work') or {}).get('source')} now={fb_rich.get('now')}"))
+
+    # P0-5 --once terminal table renders the work-unit summary + progress.
+    once_out = sd.render_table(llm_snap)
+    turn("WORK-13 P0-5 --once table renders the work-unit summary + progress",
+         lambda: ("注入摘要：提炼工作单元" in once_out and "1/2" in once_out,
+                  "once table carries summary+progress"))
+
     # ---- live HTTP server assertions (P0-5) ----
     port = _free_port()
     proc = subprocess.Popen(
-        [sys.executable, MODULE, "--claude-home", home, "--port", str(port), "--window-min", "120"],
+        [sys.executable, MODULE, "--claude-home", home, "--port", str(port),
+         "--window-min", "120", "--no-llm"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = f"http://127.0.0.1:{port}"
     try:
@@ -233,8 +376,8 @@ def main():
         st, body = _get(base + "/api/state")
         api = json.loads(body)
         apibyshort = {s["short"]: s for s in api["sessions"]}
-        turn("P0-5 /api/state 200 + all 8 sessions + project groups over HTTP",
-             lambda: (st == 200 and api["counts"]["total"] == 8
+        turn("P0-5 /api/state 200 + all 10 sessions + project groups over HTTP",
+             lambda: (st == 200 and api["counts"]["total"] == 10
                       and api["counts"]["projects"] == len(api["projects"])
                       and api["stale_unknown"] >= 1, f"total={api['counts']['total']}"))
         turn("P0-5 /api/state preserves working+done+blocked+unknown+errored+worktree over HTTP",
@@ -246,6 +389,11 @@ def main():
                  and apibyshort[ids["err"]]["liveness"] == "errored"
                  and apibyshort[ids["wt"]]["worktree"] == "session-radar",
                  "http snapshot coherent across all derived states"))
+        rich_http = apibyshort.get(ids["rich"])
+        turn("WORK-14 work-unit summary preserved over HTTP /api/state",
+             lambda: (bool(rich_http) and (rich_http.get("work") or {}).get("type") == "feature"
+                      and "摘要" in ((rich_http.get("work") or {}).get("doing") or ""),
+                      "http work summary coherent"))
         sh, html = _get(base + "/")
         turn("P0-5 GET / serves grouped HTML (project header + stale line wired)",
              lambda: (sh == 200 and "/api/state" in html and "<!DOCTYPE html>" in html
@@ -262,18 +410,18 @@ def main():
     # ---- --once / --json CLI smoke over a real subprocess ----
     home2, _ = _build_home()
     try:
-        once = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--once"],
+        once = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--once", "--no-llm"],
                               capture_output=True, text=True, timeout=30)
         turn("P0-5 --once table groups by project (📁 header) + DRIFT + worktree + stale line",
              lambda: (once.returncode == 0 and "📁 aifriends" in once.stdout
                       and "DRIFT" in once.stdout and "session-radar" in once.stdout
                       and "无元数据的旧后台任务" in once.stdout,
                       f"once grouped rows present"))
-        jrun = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--json"],
+        jrun = subprocess.run([sys.executable, MODULE, "--claude-home", home2, "--json", "--no-llm"],
                               capture_output=True, text=True, timeout=30)
-        turn("P0-5 --json snapshot carries the derived fields (8 sessions, bg=4, projects)",
+        turn("P0-5 --json snapshot carries the derived fields (10 sessions, bg=4, projects)",
              lambda: (jrun.returncode == 0
-                      and json.loads(jrun.stdout)["counts"]["total"] == 8
+                      and json.loads(jrun.stdout)["counts"]["total"] == 10
                       and json.loads(jrun.stdout)["counts"]["bg"] == 4
                       and len(json.loads(jrun.stdout)["projects"]) >= 1,
                       "json business fields present"))
