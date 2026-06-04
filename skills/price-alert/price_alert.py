@@ -91,15 +91,19 @@ def add_price(history, asset, price, ts=None):
 # ---------- 价格获取 ----------
 
 def fetch_btc_price():
-    """从 Binance 获取 BTC/USDT 价格"""
+    """从 OKX 获取 BTC/USDT 价格"""
     try:
         resp = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "BTCUSDT"},
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": "BTC-USDT"},
             timeout=10,
         )
         resp.raise_for_status()
-        return float(resp.json()["price"])
+        data = resp.json()
+        if data.get("code") == "0" and data.get("data"):
+            return float(data["data"][0]["last"])
+        print(f"[WARN] OKX 返回异常: {data}")
+        return None
     except Exception as e:
         print(f"[WARN] 获取 BTC 价格失败: {e}")
         return None

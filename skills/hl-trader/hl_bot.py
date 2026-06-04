@@ -99,14 +99,15 @@ def run_trader(*args):
 def get_prices():
     """获取当前价格"""
     results = []
-    # BTC
+    # BTC (OKX API)
     try:
         r = subprocess.run(
             ["curl", "-s", "--max-time", "10",
-             "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"],
+             "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"],
             capture_output=True, text=True, timeout=15,
         )
-        btc = float(json.loads(r.stdout)["price"])
+        data = json.loads(r.stdout)
+        btc = float(data["data"][0]["last"])
         results.append(f"₿ BTC/USDT: ${btc:,.2f}")
     except Exception:
         results.append("₿ BTC: 获取失败")
