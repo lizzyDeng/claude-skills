@@ -62,6 +62,24 @@ for path in (TOOLS_DIR, SOURCE_DIR):
 import fastship_state
 
 
+def _localize_cli(text):
+    """Rewrite printed CLI hints to this gate's REAL resolved abspath.
+
+    Hints are authored as ``python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py"``,
+    a path that does not exist when the engine is installed as a Claude Code
+    plugin (it lives under the plugin cache) and whose legacy ``.claude/hooks``
+    copy has been removed. Rewrite to this file's abspath, correct in every
+    layout (source / plugin / legacy), so direct-CLI and orchestrator-delegated
+    output both point at a runnable path.
+    """
+    if not isinstance(text, str):
+        return text
+    self_cli = 'python3 "%s"' % os.path.abspath(__file__)
+    return text.replace(
+        'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py"',
+        self_cli)
+
+
 # ---------- 基础工具 ----------
 
 def get_repo_root():
@@ -203,7 +221,7 @@ def extract_exit_code(data):
     return None
 
 
-E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"
 E2E_MIN_TURNS = 10
 
 
@@ -647,7 +665,7 @@ def gate_pre_edit():
             "   非 /fastship 流程可临时放行 Plan Gate：",
             '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" plan_bypass',
         ]
-        print("\n".join(lines))
+        print(_localize_cli("\n".join(lines)))
         return 1
 
     return 0
@@ -1169,7 +1187,7 @@ def gate_knowledge_skip():
             break
     if not reason or not reason.strip():
         print("🔴 必须给一个非空 --reason 才能跳过 KNOWLEDGE.md 更新")
-        print('   例：python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip \\')
+        print(_localize_cli('   例：python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip \\'))
         print("         --reason '纯文档改动，未触及代码或行为'")
         return 1
     if len(reason.strip()) < 10:
@@ -1363,7 +1381,7 @@ def gate_pre_bash():
             "   如果需要前置数据，请通过 API 调用产生",
             "   如果需要查询验证，请使用 SELECT（不会被拦截）",
         ]
-        print("\n".join(lines))
+        print(_localize_cli("\n".join(lines)))
         return 1
 
     # --- Gate 2: 跑 E2E Gate 前必须测试 + E2E Runner 都完成 ---
@@ -1378,7 +1396,7 @@ def gate_pre_bash():
             lines = ["🔴 BLOCKED: 验证未完成，禁止执行 E2E Gate"]
             for b in blocks:
                 lines.append(f"   ❌ {b}")
-            print("\n".join(lines))
+            print(_localize_cli("\n".join(lines)))
             return 1
         return 0  # Gate 2 passed, skip Gate 1
 
@@ -1399,7 +1417,7 @@ def gate_pre_bash():
             f"   请先运行项目测试: {hint}",
             "   测试通过后 Gate 自动放行 E2E",
         ]
-        print("\n".join(lines))
+        print(_localize_cli("\n".join(lines)))
         return 1
 
     # --- Gate 5: 重跑 E2E 前必须先 loop_record，失败时必须有 reflection ---
@@ -1419,7 +1437,7 @@ def gate_pre_bash():
                 "   失败时 reflection 路径推荐：",
                 "     docs/superpowers/plans/<plan-name>.reflections/loop-N.md",
             ]
-            print("\n".join(lines))
+            print(_localize_cli("\n".join(lines)))
             return 1
 
         if last_outcome == "fail" and loop_count >= LOOP_LIMIT:
@@ -1434,7 +1452,7 @@ def gate_pre_bash():
                 "   如用户决定换方向、回阶段 1，先 reset：",
                 '     python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" reset',
             ]
-            print("\n".join(lines))
+            print(_localize_cli("\n".join(lines)))
             return 1
 
     # --- Gate 3 + 4: commit/merge/push 前必须全部完成 + KNOWLEDGE.md 已表态 ---
@@ -1479,7 +1497,7 @@ def gate_pre_bash():
             lines.append("      - 确实无新教训 → 显式声明跳过：")
             lines.append('          python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py" knowledge_skip \\')
             lines.append("            --reason '<≥10 字的原因，例：纯文档改动，未触及代码或行为>'")
-            print("\n".join(lines))
+            print(_localize_cli("\n".join(lines)))
             return 1
 
         print("✅ Gate: 验证已完成，允许操作")

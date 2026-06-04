@@ -1,6 +1,21 @@
 # /fastship skill 安装指南
 
-推荐使用 `/fastship-setup` 一键安装。以下是手动安装步骤：
+推荐使用 source-linked 安装。它只在目标项目里放 symlink/稳定入口，fastship 引擎代码始终来自 `claude-skills` 源树；后续 fastship 改动只需要改 `claude-skills`，不需要再更新业务工程里的复制文件。
+
+```bash
+# 进入目标项目
+cd /path/to/your/project
+
+# 只安装 fastship
+python3 /path/to/claude-skills/skills/fastship/scripts/install_source_link.py --project . --replace
+
+# aifriends 这类同时使用 forge + fastship 的项目
+python3 /path/to/claude-skills/skills/fastship/scripts/install_source_link.py --project . --replace --with-forge
+```
+
+`--replace` 会把旧的 copied `.claude/commands/fastship.md`、`.claude/tools/fastship_orchestrator.py`、`.claude/hooks/ship_verify_gate.py` 等文件替换成 symlink。`.claude/settings.local.json` 里的 hook 仍调用项目本地稳定路径，但这些路径最终解析到 `claude-skills` 源文件。
+
+下面是依赖和手动安装细节。
 
 ## 0. 前置依赖
 
@@ -34,7 +49,7 @@ ls ~/.claude/plugins/cache/claude-plugins-official/superpowers/
 
 未装 superpowers → fastship 的 Plan Gate 仍会生效，但你没有对应 skill 可调，等于卡死。
 
-## 1. 复制 skill 定义到目标项目
+## 1. Source-linked 安装 skill 定义到目标项目
 
 ```bash
 # 进入目标项目
@@ -43,34 +58,34 @@ cd /path/to/your/project
 # 创建 commands 目录
 mkdir -p .claude/commands
 
-# 复制 skill 定义
-cp /path/to/claude-skills/skills/fastship/SKILL.md .claude/commands/fastship.md
+# 链接 skill 定义
+ln -sfn /path/to/claude-skills/skills/fastship/SKILL.md .claude/commands/fastship.md
 ```
 
-## 2. 复制 hooks 脚本到目标项目
+## 2. Source-linked 安装 hooks 脚本到目标项目
 
 ```bash
 # 创建 hooks 目录
 mkdir -p .claude/hooks
 
-# 复制 gate 脚本（orchestrator 内部委托调用）
-cp /path/to/claude-skills/skills/fastship/hooks/ship_verify_gate.py .claude/hooks/
+# 链接 gate 脚本（orchestrator 内部委托调用）
+ln -sfn /path/to/claude-skills/skills/fastship/hooks/ship_verify_gate.py .claude/hooks/ship_verify_gate.py
 ```
 
-## 2.5 复制 orchestrator + state locator + CLI wrapper
+## 2.5 Source-linked 安装 orchestrator + state locator + CLI wrapper
 
 ```bash
 # 创建 tools 目录
 mkdir -p .claude/tools
 
-# 复制 orchestrator（hook 入口 + CLI 工具）
-cp /path/to/claude-skills/skills/fastship/orchestrator.py .claude/tools/fastship_orchestrator.py
+# 链接 orchestrator（hook 入口 + CLI 工具）
+ln -sfn /path/to/claude-skills/skills/fastship/orchestrator.py .claude/tools/fastship_orchestrator.py
 
-# 复制共享状态定位模块（orchestrator 和 gate 都依赖它）
-cp /path/to/claude-skills/skills/fastship/fastship_state.py .claude/tools/fastship_state.py
+# 链接共享状态定位模块（orchestrator 和 gate 都依赖它）
+ln -sfn /path/to/claude-skills/skills/fastship/fastship_state.py .claude/tools/fastship_state.py
 
-# 复制稳定 CLI wrapper（支持从子目录调用）
-cp /path/to/claude-skills/skills/fastship/fastship .claude/tools/fastship
+# 链接稳定 CLI wrapper（支持从子目录调用）
+ln -sfn /path/to/claude-skills/skills/fastship/fastship .claude/tools/fastship
 chmod +x .claude/tools/fastship
 ```
 

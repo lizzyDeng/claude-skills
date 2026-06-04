@@ -94,6 +94,30 @@ def gate_script_path():
     return fastship_state.gate_script_path()
 
 
+def _localize_cli(text: str) -> str:
+    """Rewrite printed CLI hints to the engine's REAL resolved location.
+
+    The step instructions and prompts are authored with the source/legacy
+    invocation forms (``"$(git rev-parse --show-toplevel)/.claude/tools/fastship"``
+    and ``.claude/hooks/ship_verify_gate.py``). Those paths do not exist when the
+    engine is installed as a Claude Code plugin (it lives under the plugin cache),
+    and the legacy ``.claude/hooks/ship_verify_gate.py`` copy has been removed.
+    Rewrite them at print time to the orchestrator's own abspath and the resolved
+    gate-script path, which are correct in every layout (source / plugin / legacy).
+    """
+    if not isinstance(text, str):
+        return text  # callable/None step instructions pass through untouched
+    self_cli = 'python3 "%s"' % os.path.abspath(__file__)
+    gate_cli = 'python3 "%s"' % fastship_state.gate_script_path()
+    text = text.replace(
+        'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/ship_verify_gate.py"',
+        gate_cli)
+    text = text.replace(
+        '"$(git rev-parse --show-toplevel)/.claude/tools/fastship"',
+        self_cli)
+    return text
+
+
 def _current_branch() -> Optional[str]:
     return fastship_state.current_branch()
 
@@ -201,7 +225,7 @@ class Step:
 
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
-E2E_RESULT_PATH = "/tmp/e2e_result.json"
+E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"
 E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
@@ -1480,7 +1504,7 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
 
     # Fail-open under ambiguous multi-session: skip session-specific blocks.
     if ambiguous:
-        print(_AMBIGUOUS_HINT)
+        print(_localize_cli(_AMBIGUOUS_HINT))
         return 0
 
     if _is_active(orch_state) and _branch_mismatch(orch_state):
@@ -1504,7 +1528,7 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
             if cur:
                 print(f"\n📋 当前步骤指令:")
                 print(f"{'─' * 50}")
-                print(cur.instruction)
+                print(_localize_cli(cur.instruction))
             return 1
 
     if orch_state.get("phase", 1) == 1 and _is_code_file(file_path) and not _is_orchestrator_allowed_file(file_path):
@@ -1518,7 +1542,7 @@ def hook_pre_edit_logic(data: dict, orch_state: Optional[dict],
         if current:
             lines.append(f"📋 当前步骤: {current.id} {current.name}")
             lines.append(f"{'─' * 50}")
-            lines.append(current.instruction)
+            lines.append(_localize_cli(current.instruction))
         print("\n".join(lines))
         return 1
 
@@ -1547,7 +1571,7 @@ def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
         return 0
 
     if ambiguous:
-        print(_AMBIGUOUS_HINT)
+        print(_localize_cli(_AMBIGUOUS_HINT))
         return 0
 
     if _is_active(orch_state) and _branch_mismatch(orch_state):
@@ -1611,7 +1635,7 @@ def _blocking_active_session_msg(current_sid: str):
 def hook_post_bash_logic(data: dict, orch_path: str = None,
                          hook_state: dict = None) -> int:
     if orch_path is None and _hook_session_ambiguous():
-        print(_AMBIGUOUS_HINT)
+        print(_localize_cli(_AMBIGUOUS_HINT))
         return 0
     orch = load_orch_state(orch_path)
     if not orch or orch.get("current_step") in ("done", "stopped"):
@@ -1646,7 +1670,7 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
                 orch.setdefault("artifacts", {})["loop_outcome"] = "fail"
                 save_orch_state(orch, orch_path)
                 print(f"\n📝 Loop {orch['loop_count']} FAIL 已检测。需要手动指定路由：")
-                print('  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done \\')
+                print(_localize_cli('  "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done \\'))
                 print(f"    --outcome fail --decision <continue|escalate|stop>")
                 print(f"")
                 print(f"  continue  → 回 3.1 重试 (先写 reflection)")
@@ -1669,7 +1693,7 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
 
 def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
     if orch_path is None and _hook_session_ambiguous():
-        print(_AMBIGUOUS_HINT)
+        print(_localize_cli(_AMBIGUOUS_HINT))
         return 0
     orch = load_orch_state(orch_path)
     if not orch or orch.get("current_step") in ("done", "stopped"):
@@ -1943,6 +1967,7 @@ def format_next(orch: dict) -> str:
         prefix = "\n".join(fastship_state.branch_mismatch_lines(orch)) + "\n\n"
 
     instruction = step.instruction(orch) if callable(step.instruction) else step.instruction
+    instruction = _localize_cli(instruction)
 
     return (
         prefix +
@@ -1986,8 +2011,8 @@ def cmd_start(requirement: str, argv: list = None) -> int:
         print(f"⚠️  session 已活跃: {session_id}")
         print(f"   需求: \"{existing.get('requirement')}\"")
         print(f"   当前: {existing.get('current_step')}")
-        print(f'   查看: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} status')
-        print(f'   重来: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} reset')
+        print(_localize_cli(f'   查看: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} status'))
+        print(_localize_cli(f'   重来: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" --session {session_id} reset'))
         return 1
     # Allow a second session only when the user explicitly opts in via --shared or
     # --session <id> (the latter is detected by SESSION_ENV being set before this

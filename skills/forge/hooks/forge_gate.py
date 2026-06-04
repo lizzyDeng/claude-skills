@@ -93,15 +93,36 @@ def _compact_is_recent() -> bool:
     return 0 <= age < COMPACT_RECENCY_SECS
 
 
+def _activate_requires_compact() -> bool:
+    """Repo policy knob: hard-block `/forge activate` when no recent /compact.
+
+    Default False → advisory only (engine default). A consumer repo that wants
+    the hard gate sets FORGE_ACTIVATE_REQUIRES_COMPACT=1|true|yes|on (e.g. in its
+    .claude/settings.json hook env) — config, not a forked cmd_activate. Matches
+    the FORGE_COMPACT_RECENCY env convention.
+    """
+    return os.environ.get("FORGE_ACTIVATE_REQUIRES_COMPACT", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 # ========== Helpers ==========
 
 def get_repo_root():
+    # Honor an explicit override / the plugin-mode project signal first, then fall
+    # back to git-from-cwd. FORGE_REPO_ROOT mirrors fastship's FASTSHIP_REPO_ROOT;
+    # CLAUDE_PROJECT_DIR is set by Claude Code when the engine runs as a plugin.
+    explicit = os.environ.get("FORGE_REPO_ROOT") or os.environ.get("CLAUDE_PROJECT_DIR")
+    base = explicit if (explicit and os.path.isdir(explicit)) else None
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
+        cmd = ["git", "rev-parse", "--show-toplevel"]
+        if base:
+            cmd = ["git", "-C", base, "rev-parse", "--show-toplevel"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
     except Exception:
-        return None
+        pass
+    return os.path.realpath(base) if base else None
 
 
 def get_git_common_dir(root=None):
@@ -1244,6 +1265,10 @@ def reset_fastship_state_for_feature(slug):
 def cmd_activate(slug):
     """Set active feature."""
     if not _compact_is_recent():
+        if _activate_requires_compact():
+            print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
+            print("   运行 /compact 后重试。")
+            sys.exit(1)
         print("🧠 SUGGESTION: 建议新 feature 前先 /compact，确保 context 干净。")
         print("   未检测到最近 2 分钟内 /compact；继续 activate。")
     roadmap = load_roadmap()

@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -68,6 +69,14 @@ def repo_root() -> str:
     explicit = os.environ.get("FASTSHIP_REPO_ROOT")
     if explicit:
         return os.path.realpath(explicit)
+
+    # Plugin-mode signal: when the engine runs as an installed Claude Code plugin,
+    # CLAUDE_PROJECT_DIR points at the user's project root (the engine lives under
+    # ~/.claude/plugins/cache/...). It wins over the installed-tool / cwd fallbacks
+    # but stays below the explicit FASTSHIP_REPO_ROOT override above.
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project_dir and os.path.isdir(project_dir):
+        return os.path.realpath(project_dir)
 
     script_root = script_repo_root()
     script_git_root = _run_git(["rev-parse", "--show-toplevel"], script_root)
@@ -328,11 +337,33 @@ def legacy_gate_state_path() -> str:
 
 
 def gate_script_path() -> str:
-    return os.path.join(script_repo_root(), ".claude", "hooks", "ship_verify_gate.py")
+    # ship_verify_gate.py is delegated by orchestrator via subprocess. Resolve it
+    # relative to the engine's own location first — works for the source tree AND a
+    # plugin install (both: <engine>/hooks/ship_verify_gate.py) — then fall back to
+    # the legacy installed layout (.claude/hooks/ beside .claude/tools/).
+    candidates = [
+        os.path.join(_tools_dir(), "hooks", "ship_verify_gate.py"),
+        os.path.join(script_repo_root(), ".claude", "hooks", "ship_verify_gate.py"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
 
 
-def fastship_cli_path() -> str:
-    return os.path.join(script_repo_root(), ".claude", "tools", "fastship")
+def orchestrator_script_path() -> str:
+    # Resolve the orchestrator relative to the engine's own location so recovery
+    # hints are correct in every layout: source/plugin keep the file as
+    # orchestrator.py beside this module; the legacy installer renames it to
+    # fastship_orchestrator.py under .claude/tools/.
+    candidates = [
+        os.path.join(_tools_dir(), "orchestrator.py"),
+        os.path.join(_tools_dir(), "fastship_orchestrator.py"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
 
 
 PROJECT_CONFIG_REL_PATH = os.path.join(".claude", "fastship.project.json")
@@ -455,30 +486,139 @@ def branch_mismatch(state: Optional[dict], current: Optional[str] = None) -> boo
 def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]:
     saved = state.get("branch") or "-"
     current = current_branch() or "-"
-    cli = fastship_cli_path()
+    orch = orchestrator_script_path()
     return [
         f"⚠️ {tool_name} session belongs to branch: {saved}",
         f"   Current branch: {current}",
         "",
         "   The flow is paused on this branch. Choose one:",
-        f"     git switch {saved}",
-        f"     \"{cli}\" adopt-branch",
-        f"     \"{cli}\" reset",
+        # shlex.quote so a branch name with shell-special chars yields a copy-pasteable,
+        # injection-safe command that the recovery hatch also accepts.
+        f"     git switch {shlex.quote(saved)}",
+        f'     python3 "{orch}" adopt-branch',
+        f'     python3 "{orch}" reset',
     ]
+
+
+_RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
+
+# A recovery command must be a single, simple invocation whose shell parse cannot
+# diverge from how the shell would execute it. Rather than blacklist metacharacters one
+# bypass at a time, accept ONLY: runs of literal-safe unquoted characters, single-quoted
+# segments, and double-quoted segments. Unquoted chars are alnum, space, and punctuation
+# that is BOTH valid in git refs/paths/flags AND inert to the shell (/ . _ - @ + , = : %);
+# shell-active chars (# $ ; & | < > ` ( ) * ? [ ] { } ~ !) are excluded from unquoted
+# text, so comments (incl. glued `HEAD#`), substitution, chaining, redirection, glob, and
+# expansion cannot appear. Every shell metacharacter / IFS char is ASCII, so any codepoint
+# >= U+0080 is shell-inert and safe unquoted — this admits unicode branch names (分支,
+# feat/é) which git allows. Single quotes make ANY content fully shell-literal (so a git
+# branch with shell-special ASCII chars recovers via a single-quoted hint); double quotes
+# are honored only when they contain no $ ` \ (which still expand inside dquotes). The
+# printed hints — git switch <shlex.quote(branch)>, python3 "<abspath>" <sub> — fit this.
+# An unquoted character is allowed when it is safe ASCII (alnum, space, and the
+# punctuation valid in git refs/paths/flags) OR any non-ASCII codepoint: every shell
+# metacharacter and IFS char is ASCII, so [^\x00-\x7f] is always shell-inert and
+# admits unicode branch names (分支, feat/é) that git allows.
+_SAFE_UNQUOTED = r"[A-Za-z0-9 _./@+,=:%-]|[^\x00-\x7f]"
+_SAFE_COMMAND_RE = re.compile(
+    "^(?:" + _SAFE_UNQUOTED
+    + r"|'[^'\n]*'"        # single-quoted: fully literal in the shell
+    + r'|"[^"`$\\\n]*"'    # double-quoted: literal except $ ` \ (which still expand)
+    + ")+$"
+)
+
+
+def _resolve_token(tok: str) -> str:
+    try:
+        return os.path.realpath(tok)
+    except OSError:
+        return os.path.abspath(tok)
+
+
+def _is_bare_command(tok: str) -> bool:
+    """True when tok is a plain command name resolved through PATH — no path separator.
+    Rejects `./python3`, `/tmp/python3`, `bin/git`, etc. so an attacker-controlled local
+    interpreter/git executable can never stand in for the trusted PATH command."""
+    if not tok:
+        return False
+    if os.sep in tok:
+        return False
+    return not (os.altsep and os.altsep in tok)
+
+
+def _is_safe_git_recovery(args: list) -> bool:
+    """Allow only the minimal git shapes the recovery flow actually needs, each
+    provably non-destructive. The printed hint emits exactly `git switch <saved>`;
+    status/bare-branch are read-only inspection. `checkout` is deliberately EXCLUDED:
+    its operand is ambiguous (branch vs pathspec), so `git checkout .` / `git checkout
+    <file>` discard working-tree changes — `git switch` never interprets a pathspec, so
+    it is the only safe branch-changing verb here. Flag/extra-arg forms (`switch -c`,
+    `branch -D x`) are rejected too."""
+    if not args:
+        return False
+    sub, rest = args[0], args[1:]
+    if sub == "status":
+        return True  # always read-only
+    if sub == "branch":
+        return not rest  # bare list only; `git branch -D x` has args -> rejected
+    if sub == "switch":
+        # exactly one positional branch arg, no flags (rejects -c/-C/--detach/--merge)
+        return len(rest) == 1 and not rest[0].startswith("-")
+    return False
+
+
+def recovery_engine_script_paths() -> set:
+    """Resolved abspaths of the only scripts a branch-recovery command may invoke:
+    this engine's orchestrator + gate, plus the legacy bash wrapper if it sits beside
+    the engine. Path identity (not basename) is required so an attacker-controlled
+    /tmp/orchestrator.py can never pass the branch-mismatch escape hatch."""
+    paths = set()
+    for p in (orchestrator_script_path(), gate_script_path()):
+        if p:
+            paths.add(_resolve_token(p))
+    wrapper = os.path.join(_tools_dir(), "fastship")
+    if os.path.exists(wrapper):
+        paths.add(_resolve_token(wrapper))
+    return paths
 
 
 def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
-    recovery_tokens = (
-        "fastship_orchestrator.py status",
-        "fastship_orchestrator.py adopt-branch",
-        "fastship_orchestrator.py reset",
-        "ship_verify_gate.py status",
-        "ship_verify_gate.py reset",
-        "git status",
-        "git branch",
-        "git switch",
-        "git checkout",
-    )
-    return any(token in command for token in recovery_tokens)
+    raw = command.strip()
+    # Reject anything outside the literal-safe whitelist (see _SAFE_COMMAND_RE) so the
+    # shlex parse below cannot diverge from how the shell would execute the line, and so
+    # NO leading env-assignment / sudo prefix can redirect command lookup (PATH=. is
+    # rejected by the '=' exclusion; sudo is rejected structurally as a non-program tok).
+    if not _SAFE_COMMAND_RE.match(raw):
+        return False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    prog = tokens[0]
+    # git escape hatch: bare PATH-resolved `git` (not ./git, /tmp/git) and only the
+    # safe non-mutating shapes.
+    if _is_bare_command(prog) and prog == "git":
+        return _is_safe_git_recovery(tokens[1:])
+    engine_paths = recovery_engine_script_paths()
+    # interpreter form: a BARE python/python3 (PATH-resolved — never ./python3 or
+    # /tmp/python3) running the REAL engine script (path identity, not basename) with a
+    # recovery subcommand. tokens[1] must not be a flag (rejects `python3 -c`/`-m`).
+    if _is_bare_command(prog) and prog in ("python", "python3"):
+        # Exactly `python3 <engine> <subcommand>` — NO trailing args. Trailing options
+        # (reset --all, reset/adopt-branch/status --session <other>) would broaden the
+        # hatch beyond the printed current-session recovery commands, so reject them.
+        return (
+            len(tokens) == 3
+            and not tokens[1].startswith("-")
+            and _resolve_token(tokens[1]) in engine_paths
+            and tokens[2] in _RECOVERY_SUBCOMMANDS
+        )
+    # direct form: the program itself RESOLVES to the engine orchestrator/gate/wrapper.
+    # Exactly `<engine> <subcommand>` — no trailing args (same reason as above).
+    if _resolve_token(prog) in engine_paths:
+        return len(tokens) == 2 and tokens[1] in _RECOVERY_SUBCOMMANDS
+    return False

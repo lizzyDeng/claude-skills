@@ -1,8 +1,29 @@
 #!/usr/bin/env bash
 # Forge + Fastship progress dashboard launcher.
-# Usage: .claude/tools/forge-dashboard            # serve on :7575, auto-refresh
-#        .claude/tools/forge-dashboard --port N   # custom port
-#        .claude/tools/forge-dashboard --once     # print snapshot JSON and exit
+# Usage: forge-dashboard            # serve on :7575, auto-refresh
+#        forge-dashboard --port N   # custom port
+#        forge-dashboard --once     # print snapshot JSON and exit
 set -euo pipefail
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-exec python3 "$ROOT/.claude/tools/forge_dashboard.py" --repo-root "$ROOT" "$@"
+
+# The python payload is resolved ENGINE-RELATIVE (beside this launcher) so the
+# dashboard runs in every layout: source/plugin (skills/forge/forge_dashboard.py)
+# and the legacy installed copy (.claude/tools/forge_dashboard.py — the launcher
+# sits there too). Never resolve the payload from the consumer repo root.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --repo-root is the DATA the dashboard reads — the consumer PROJECT, not the
+# engine. Mirror forge_gate.get_repo_root precedence: FORGE_REPO_ROOT >
+# CLAUDE_PROJECT_DIR > git toplevel of cwd > cwd.
+ROOT="${FORGE_REPO_ROOT:-${CLAUDE_PROJECT_DIR:-}}"
+if [ -z "$ROOT" ]; then
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
+
+for cand in "$HERE/forge_dashboard.py" "$ROOT/.claude/tools/forge_dashboard.py"; do
+  if [ -f "$cand" ]; then
+    exec python3 "$cand" --repo-root "$ROOT" "$@"
+  fi
+done
+
+echo "forge-dashboard: cannot locate forge_dashboard.py (looked beside launcher: $HERE)" >&2
+exit 1

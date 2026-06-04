@@ -13,6 +13,13 @@ skills/price-alert/price_alert.log
 skills/hl-trader/.env
 skills/hl-trader/hl_bot.log
 
+# Python bytecode
+__pycache__/
+*.pyc
+
+# fastship runtime artifacts
+.claude/fastship-e2e-result.json
+
 # session-radar E2E artifacts (generated)
 /tmp/
 tmp/

@@ -5,6 +5,8 @@ description: "Project-level harness. Wraps /fastship with roadmap management, be
 
 # /forge — 项目级 Harness
 
+> 引擎路径用 `${CLAUDE_PLUGIN_ROOT}`（插件安装后由 Claude Code 注入）。源/dev 调试（非插件模式）时直接运行源树 `skills/forge/hooks/forge_gate.py`。
+
 以终极目标（North Star）为驱动，管理 roadmap → 拆分 feature → 用 /fastship 交付 → 收益回收 → 反哺下一轮迭代。
 
 核心原则：**产物约束优于流程约束。** 每个状态转换都由可验证的 artifact 把关。
@@ -46,7 +48,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    - `target_metric`（可量化的目标指标表达式）
 3. 创建 `project-roadmap/` 目录
 4. 写入 `project-roadmap/roadmap.json`
-5. 生成 `project-roadmap/roadmap.md`（调用 `python3 .claude/hooks/forge_gate.py generate-view`）
+5. 生成 `project-roadmap/roadmap.md`（调用 `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py generate-view`）
 6. 输出确认信息
 
 ### `/forge add <feature-name>`
@@ -66,7 +68,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    - `harvest_days`：上线后多少天回收数据？（默认 7）
    - `data_query_hint`：获取数据的方式提示？（SQL / 仪表盘 URL / CLI 命令，可选）
 5. 写入 `project-roadmap/features/<slug>/metric.json`
-6. **Gate 1 校验**：`python3 .claude/hooks/forge_gate.py check-g1 <slug>`
+6. **Gate 1 校验**：`python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py check-g1 <slug>`
    - 如果 metric.json 校验失败 → 提示修正，不加入 roadmap
 7. 将 feature 加入 `roadmap.json`（status=draft）
 8. 重新生成 roadmap.md
@@ -77,7 +79,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. 激活 feature：`python3 .claude/hooks/forge_gate.py activate <slug>`
+1. 激活 feature：`python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py activate <slug>`
 2. 读取 `metric.json` + 从 roadmap 获取所属 objective 信息
 3. 向用户展示上下文摘要：
    ```
@@ -90,7 +92,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    - "本 feature 的交付 AC 必须包含：埋点事件 `<event_name>` 的实现"
    - "本 feature 服务于子目标：<objective_name> — <objective_description>"
 5. fastship Phase 1 完成后（plan 落库 + grill 通过 + 用户 sign-off）：
-   - `python3 .claude/hooks/forge_gate.py transition <slug> planned`
+   - `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py transition <slug> planned`
 
 ### `/forge dev <feature>`
 
@@ -98,8 +100,8 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. 激活 feature：`python3 .claude/hooks/forge_gate.py activate <slug>`
-2. `python3 .claude/hooks/forge_gate.py transition <slug> in_progress`
+1. 激活 feature：`python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py activate <slug>`
+2. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py transition <slug> in_progress`
 3. 调用 `/fastship` Phase 2+3（执行 + 验证）
 4. fastship 流程自行运转，forge 不干预
 
@@ -109,7 +111,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. `python3 .claude/hooks/forge_gate.py transition <slug> shipped`
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py transition <slug> shipped`
    - Gate 4 自动检查 `.ship-verify-state.json`
    - Gate 5 自动从 shipped 转入 measuring
 2. 如果通过 → 输出：
@@ -150,7 +152,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
    - `iterate` → 基于当前结果开始新一轮迭代
    - `pivot` → 子目标需要重新评估
 7. 写入 `project-roadmap/features/<slug>/harvest.json`
-8. `python3 .claude/hooks/forge_gate.py transition <slug> concluded`
+8. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py transition <slug> concluded`
 9. **如果 next_action == "iterate"**：
    - 自动创建新 feature（slug: `<original>-v2`）
    - 继承 metric.json（baseline 更新为本次 actual，target 不变）
@@ -165,7 +167,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. `python3 .claude/hooks/forge_gate.py status`
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py status`
 2. 输出全局 roadmap 状态 + 到期提醒 + 可清理的孤儿 worktree 计数（如有 → 提示 `/forge sweep-worktrees`）
 
 ### `/forge doctor`
@@ -174,7 +176,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. `python3 .claude/hooks/forge_gate.py doctor`
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py doctor`
 2. 若失败，先修复 roadmap / metric artifact，禁止继续 plan/dev/ship
 3. 若只有 warning，明确告诉用户风险点（例如 metric 存在但未登记进 roadmap）
 
@@ -184,13 +186,13 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. `python3 .claude/hooks/forge_gate.py audit-month <YYYY-MM>`
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py audit-month <YYYY-MM>`
 2. 对比当月 `docs/superpowers/plans/YYYY-MM-*.md`、`project-roadmap/features/*/metric.json`、`roadmap.json`
 3. 输出三类缺口：
    - plan 有但缺 metric.json
    - metric.json 有但未登记进 roadmap
    - roadmap feature 缺 metric.json
-4. 月度复盘 / 合并前审计可加 `--strict`：`python3 .claude/hooks/forge_gate.py audit-month <YYYY-MM> --strict`，任何 plan 缺 metric 直接失败
+4. 月度复盘 / 合并前审计可加 `--strict`：`python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py audit-month <YYYY-MM> --strict`，任何 plan 缺 metric 直接失败
 
 ### `/forge sweep-worktrees [--dry-run]`
 
@@ -200,7 +202,7 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **流程**：
 
-1. `python3 .claude/hooks/forge_gate.py sweep-worktrees [--dry-run]`
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py sweep-worktrees [--dry-run]`
 2. 扫描 `<main-worktree>/.claude/worktrees/` 下所有 worktree，逐个判定并输出 removed/kept 摘要
 3. 额外跑 `git worktree prune` 清理「工作目录已被手动删除」的失联 admin 记录（绝不丢提交）
 
@@ -217,9 +219,9 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 1. 启动本地 dashboard（零依赖 stdlib，端口 7575，每 5s 自动刷新）：
 
    ```bash
-   .claude/tools/forge-dashboard            # serve on http://127.0.0.1:7575
-   .claude/tools/forge-dashboard --port N   # 自定义端口
-   .claude/tools/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard            # serve on http://127.0.0.1:7575
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard --port N   # 自定义端口
+   ${CLAUDE_PLUGIN_ROOT}/skills/forge/forge-dashboard --once     # 打印 JSON 快照后退出（CI/脚本用）
    ```
 
 2. 页面层级：**North Star → objective 卡片**（总体进度条 + status chips + **剩余 TODO 列表**）**→ feature 行**（status 徽章 + 进度条 + fastship 18 步执行条 + 指标 baseline→target→actual）。

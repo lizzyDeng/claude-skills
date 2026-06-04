@@ -1,0 +1,8 @@
+{
+  "name": "forge",
+  "description": "forge feature-shipping state machine + fastship 18-step ship orchestrator (hooks, slash commands, skills)",
+  "author": { "name": "lizzyDeng" },
+  "homepage": "https://github.com/lizzyDeng/claude-skills",
+  "repository": "https://github.com/lizzyDeng/claude-skills",
+  "commands": ["./.claude/commands/forge.md", "./.claude/commands/fastship.md"]
+}

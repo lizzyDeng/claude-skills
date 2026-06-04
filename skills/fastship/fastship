@@ -2,6 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-export FASTSHIP_REPO_ROOT="${FASTSHIP_REPO_ROOT:-$PROJECT_ROOT}"
-exec python3 "$SCRIPT_DIR/fastship_orchestrator.py" "$@"
+
+if [ -f "$SCRIPT_DIR/fastship_orchestrator.py" ]; then
+  ORCH="$SCRIPT_DIR/fastship_orchestrator.py"
+elif [ -f "$SCRIPT_DIR/orchestrator.py" ]; then
+  ORCH="$SCRIPT_DIR/orchestrator.py"
+else
+  echo "fastship: cannot locate orchestrator.py beside $SCRIPT_DIR" >&2
+  exit 1
+fi
+
+if [ "$(basename "$SCRIPT_DIR")" = "tools" ] && [ "$(basename "$(dirname "$SCRIPT_DIR")")" = ".claude" ]; then
+  PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+  export FASTSHIP_REPO_ROOT="${FASTSHIP_REPO_ROOT:-$PROJECT_ROOT}"
+fi
+
+exec python3 "$ORCH" "$@"
