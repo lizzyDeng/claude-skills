@@ -93,6 +93,18 @@ def _compact_is_recent() -> bool:
     return 0 <= age < COMPACT_RECENCY_SECS
 
 
+def _activate_requires_compact() -> bool:
+    """Repo policy knob: hard-block `/forge activate` when no recent /compact.
+
+    Default False → advisory only (engine default). A consumer repo that wants
+    the hard gate sets FORGE_ACTIVATE_REQUIRES_COMPACT=1|true|yes|on (e.g. in its
+    .claude/settings.json hook env) — config, not a forked cmd_activate. Matches
+    the FORGE_COMPACT_RECENCY env convention.
+    """
+    return os.environ.get("FORGE_ACTIVATE_REQUIRES_COMPACT", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 # ========== Helpers ==========
 
 def get_repo_root():
@@ -1253,6 +1265,10 @@ def reset_fastship_state_for_feature(slug):
 def cmd_activate(slug):
     """Set active feature."""
     if not _compact_is_recent():
+        if _activate_requires_compact():
+            print("🧠 BLOCKED: 新 feature 前必须先 /compact，确保 context 干净。")
+            print("   运行 /compact 后重试。")
+            sys.exit(1)
         print("🧠 SUGGESTION: 建议新 feature 前先 /compact，确保 context 干净。")
         print("   未检测到最近 2 分钟内 /compact；继续 activate。")
     roadmap = load_roadmap()
