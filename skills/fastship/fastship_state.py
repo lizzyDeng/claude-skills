@@ -531,9 +531,13 @@ def _is_bare_command(tok: str) -> bool:
 
 
 def _is_safe_git_recovery(args: list) -> bool:
-    """Only non-mutating git shapes count as branch recovery. `git checkout -- <file>`
-    discards changes, `git switch -c` / `git checkout -b` create branches, and
-    `git branch -D` deletes them — none are recovery, so they must be rejected."""
+    """Allow only the minimal git shapes the recovery flow actually needs, each
+    provably non-destructive. The printed hint emits exactly `git switch <saved>`;
+    status/bare-branch are read-only inspection. `checkout` is deliberately EXCLUDED:
+    its operand is ambiguous (branch vs pathspec), so `git checkout .` / `git checkout
+    <file>` discard working-tree changes — `git switch` never interprets a pathspec, so
+    it is the only safe branch-changing verb here. Flag/extra-arg forms (`switch -c`,
+    `branch -D x`) are rejected too."""
     if not args:
         return False
     sub, rest = args[0], args[1:]
@@ -541,8 +545,8 @@ def _is_safe_git_recovery(args: list) -> bool:
         return True  # always read-only
     if sub == "branch":
         return not rest  # bare list only; `git branch -D x` has args -> rejected
-    if sub in ("switch", "checkout"):
-        # exactly one positional branch arg, no flags, no `--` pathspec separator
+    if sub == "switch":
+        # exactly one positional branch arg, no flags (rejects -c/-C/--detach/--merge)
         return len(rest) == 1 and not rest[0].startswith("-")
     return False
 

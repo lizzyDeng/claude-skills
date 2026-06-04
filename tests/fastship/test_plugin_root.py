@@ -179,22 +179,26 @@ def test_branch_recovery_command_requires_bare_interpreter_and_git():
 
 
 def test_branch_recovery_command_restricts_git_to_safe_shapes():
-    """codex R7: the git hatch was too broad — file-discarding / branch-creating /
-    branch-deleting shapes are NOT recovery and must be rejected."""
+    """codex R7/R9: the git hatch was too broad — file-discarding / branch-creating /
+    branch-deleting / pathspec-ambiguous shapes are NOT recovery and must be rejected.
+    `git checkout` is excluded entirely because its operand is ambiguous (branch vs
+    pathspec): `git checkout .` / `git checkout <file>` discard working-tree changes."""
     f = fastship_state.is_branch_recovery_command
     # mutating / destructive -> rejected
-    assert not f('git checkout -- skills/fastship/orchestrator.py')
-    assert not f('git checkout HEAD -- skills/fastship/orchestrator.py')
     assert not f('git switch -c newbranch')
-    assert not f('git checkout -b newbranch')
     assert not f('git branch -D main')
     assert not f('git switch --detach')
+    # checkout is dropped wholesale — every form rejected (R9)
+    assert not f('git checkout saved')
+    assert not f('git checkout .')
+    assert not f('git checkout skills/fastship/fastship_state.py')
+    assert not f('git checkout -b newbranch')
+    assert not f('git checkout -- skills/fastship/orchestrator.py')
     # safe recovery shapes -> allowed
     assert f('git status')
     assert f('git status --porcelain')
     assert f('git branch')          # bare list, read-only
     assert f('git switch saved')
-    assert f('git checkout saved')
 
 
 def test_branch_recovery_command_rejects_glued_comment_and_expansions():
