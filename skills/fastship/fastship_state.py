@@ -350,8 +350,19 @@ def gate_script_path() -> str:
     return candidates[0]
 
 
-def fastship_cli_path() -> str:
-    return os.path.join(script_repo_root(), ".claude", "tools", "fastship")
+def orchestrator_script_path() -> str:
+    # Resolve the orchestrator relative to the engine's own location so recovery
+    # hints are correct in every layout: source/plugin keep the file as
+    # orchestrator.py beside this module; the legacy installer renames it to
+    # fastship_orchestrator.py under .claude/tools/.
+    candidates = [
+        os.path.join(_tools_dir(), "orchestrator.py"),
+        os.path.join(_tools_dir(), "fastship_orchestrator.py"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
 
 
 PROJECT_CONFIG_REL_PATH = os.path.join(".claude", "fastship.project.json")
@@ -474,30 +485,31 @@ def branch_mismatch(state: Optional[dict], current: Optional[str] = None) -> boo
 def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]:
     saved = state.get("branch") or "-"
     current = current_branch() or "-"
-    cli = fastship_cli_path()
+    orch = orchestrator_script_path()
     return [
         f"⚠️ {tool_name} session belongs to branch: {saved}",
         f"   Current branch: {current}",
         "",
         "   The flow is paused on this branch. Choose one:",
         f"     git switch {saved}",
-        f"     \"{cli}\" adopt-branch",
-        f"     \"{cli}\" reset",
+        f'     python3 "{orch}" adopt-branch',
+        f'     python3 "{orch}" reset',
     ]
 
 
 def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
-    recovery_tokens = (
-        "fastship_orchestrator.py status",
-        "fastship_orchestrator.py adopt-branch",
-        "fastship_orchestrator.py reset",
-        "ship_verify_gate.py status",
-        "ship_verify_gate.py reset",
-        "git status",
-        "git branch",
-        "git switch",
-        "git checkout",
-    )
-    return any(token in command for token in recovery_tokens)
+    # git escape hatches — always allowed during a branch mismatch.
+    if any(t in command for t in ("git status", "git branch", "git switch", "git checkout")):
+        return True
+    # Engine recovery: the command must reference the orchestrator/gate AND carry a
+    # recovery subcommand. Matched independently (not as an adjacent "<engine> <sub>"
+    # substring) because the printed hints quote the path —
+    # `python3 "<...>/orchestrator.py" adopt-branch` — so a closing quote sits between
+    # the path and the subcommand. The engine token covers every layout: source/plugin
+    # orchestrator.py, legacy fastship_orchestrator.py (superstring), and the
+    # .claude/tools/fastship wrapper.
+    engine_tokens = ("orchestrator.py", "tools/fastship", "ship_verify_gate.py")
+    subcommands = ("status", "adopt-branch", "reset")
+    return any(e in command for e in engine_tokens) and any(s in command for s in subcommands)

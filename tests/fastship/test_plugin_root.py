@@ -88,3 +88,40 @@ def test_gate_script_path_resolves_engine_relative():
     p = fastship_state.gate_script_path()
     assert p.endswith(os.path.join("skills", "fastship", "hooks", "ship_verify_gate.py")), p
     assert os.path.exists(p), p
+
+
+def test_orchestrator_script_path_resolves_engine_relative():
+    """Branch-recovery hints must point at the engine's own orchestrator
+    (source/plugin: orchestrator.py beside fastship_state.py), not the legacy
+    .claude/tools/fastship wrapper that does not exist in those layouts."""
+    p = fastship_state.orchestrator_script_path()
+    assert p.endswith(os.path.join("skills", "fastship", "orchestrator.py")), p
+    assert os.path.exists(p), p
+
+
+def test_branch_mismatch_lines_emit_engine_relative_python_invocation():
+    """branch_mismatch_lines must print `python3 "<orch>" adopt-branch/reset`
+    using the resolved engine path — never the non-existent .claude/tools/fastship."""
+    lines = fastship_state.branch_mismatch_lines({"branch": "feat/x"})
+    orch = fastship_state.orchestrator_script_path()
+    joined = "\n".join(lines)
+    assert f'python3 "{orch}" adopt-branch' in joined, joined
+    assert f'python3 "{orch}" reset' in joined, joined
+    assert ".claude/tools/fastship\"" not in joined, joined
+
+
+def test_branch_recovery_command_recognizes_packaged_orchestrator():
+    """The recovery whitelist must accept the packaged python3 .../orchestrator.py
+    form (plugin/source) AND the legacy fastship_orchestrator.py / wrapper forms,
+    so plugin-mode recovery is never blocked during a branch mismatch."""
+    f = fastship_state.is_branch_recovery_command
+    # plugin / source canonical form (what branch_mismatch_lines now prints)
+    assert f('python3 "/x/plugins/forge/skills/fastship/orchestrator.py" adopt-branch')
+    assert f('python3 "/repo/skills/fastship/orchestrator.py" reset')
+    assert f('python3 /repo/skills/fastship/orchestrator.py status')
+    # legacy installed layouts
+    assert f('python3 .claude/tools/fastship_orchestrator.py adopt-branch')
+    assert f('.claude/tools/fastship reset')
+    # still recognizes git escape hatches; rejects unrelated commands
+    assert f('git switch feat/x')
+    assert not f('rm -rf /')
