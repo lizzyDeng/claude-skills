@@ -500,13 +500,16 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
 
 _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
 
-# Shell metacharacters that can chain, redirect, background, or substitute extra
-# commands. A recovery command must be a SINGLE simple invocation, so any of these in
-# the raw string disqualifies it — scanning argv tokens is not enough because
-# `git switch x && rm -rf /` or `python3 orch.py reset $(...)` would otherwise slip a
-# second command past the branch-mismatch pause. Legitimate hints (git switch <branch>,
-# python3 "<abspath>" <sub>, <wrapper> <sub>) contain none of these.
-_SHELL_METACHARS = (";", "|", "&", "<", ">", "`", "$", "(", ")", "\n")
+# A recovery command must be a single, simple, fully-literal invocation. Restrict the
+# raw string to a conservative whitelist — letters, digits, space, quotes, and the
+# punctuation that appears in real paths / branch names / flags (/ . _ -). This
+# fail-closed approach eliminates EVERY shell-vs-parser divergence at once instead of
+# blacklisting them one bypass at a time: comments (#, incl. glued `HEAD#` which
+# shlex(comments=True) would mis-strip), command substitution ($(...) / backticks),
+# chaining (; | &), redirection (< >), glob (* ? [ ]), brace/tilde/history expansion
+# ({ } ~ !), and env-assignment (=). The printed hints (git switch <branch>,
+# python3 "<abspath>" <sub>, <wrapper> <sub>) use only whitelisted characters.
+_SAFE_COMMAND_RE = re.compile(r"""^[A-Za-z0-9 _./"'-]+$""")
 
 
 def _resolve_token(tok: str) -> str:
@@ -563,16 +566,14 @@ def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
     raw = command.strip()
-    # Single simple command only: no chaining/redirection/substitution/background, and
-    # NO leading env-assignment or sudo prefixes (PATH=./BASH_ENV= can redirect command
-    # lookup or run a startup script). The printed recovery hints are bare commands, so
-    # demanding tokens[0] be the program directly costs nothing and closes that hole.
-    if any(ch in raw for ch in _SHELL_METACHARS):
+    # Reject anything outside the literal-safe whitelist (see _SAFE_COMMAND_RE) so the
+    # shlex parse below cannot diverge from how the shell would execute the line, and so
+    # NO leading env-assignment / sudo prefix can redirect command lookup (PATH=. is
+    # rejected by the '=' exclusion; sudo is rejected structurally as a non-program tok).
+    if not _SAFE_COMMAND_RE.match(raw):
         return False
     try:
-        # comments=True drops a trailing `# ...` so a recovery word in a comment
-        # cannot whitelist a non-recovery run.
-        tokens = shlex.split(raw, comments=True)
+        tokens = shlex.split(raw)
     except ValueError:
         return False
     if not tokens:

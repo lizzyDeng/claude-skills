@@ -197,6 +197,24 @@ def test_branch_recovery_command_restricts_git_to_safe_shapes():
     assert f('git checkout saved')
 
 
+def test_branch_recovery_command_rejects_glued_comment_and_expansions():
+    """codex R8: shlex(comments=True) stripped a glued '#' — `git checkout HEAD# -- file`
+    parsed as `git checkout HEAD` (looks safe) but the shell runs `git checkout HEAD#
+    -- file`, discarding working-tree changes. A literal-safe character whitelist rejects
+    '#' and all shell-expansion metacharacters so the parse can never diverge."""
+    f = fastship_state.is_branch_recovery_command
+    assert not f('git checkout HEAD# -- skills/fastship/fastship_state.py')
+    assert not f('git switch saved#')              # glued comment char
+    assert not f('git switch {saved,--detach}')    # brace expansion -> flag injection
+    assert not f('git switch sav*')                # glob
+    assert not f('git switch ~root')               # tilde expansion
+    assert not f('git status\t&& rm -rf /')        # tab + control operators
+    # the canonical literal hints still pass
+    orch = fastship_state.orchestrator_script_path()
+    assert f(f'python3 "{orch}" adopt-branch')
+    assert f('git switch feat/recovery-branch')
+
+
 def test_branch_recovery_command_rejects_env_and_sudo_prefixes():
     """codex R6: leading env-assignment / sudo prefixes can redirect command lookup
     (PATH=.) or run startup scripts (BASH_ENV=.x), so they must NOT be stripped — the
