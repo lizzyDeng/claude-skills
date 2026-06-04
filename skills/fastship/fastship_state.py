@@ -499,7 +499,6 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
 
 
 _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
-_GIT_RECOVERY_SUBCOMMANDS = frozenset({"status", "branch", "switch", "checkout"})
 
 # Shell metacharacters that can chain, redirect, background, or substitute extra
 # commands. A recovery command must be a SINGLE simple invocation, so any of these in
@@ -515,6 +514,34 @@ def _resolve_token(tok: str) -> str:
         return os.path.realpath(tok)
     except OSError:
         return os.path.abspath(tok)
+
+
+def _is_bare_command(tok: str) -> bool:
+    """True when tok is a plain command name resolved through PATH — no path separator.
+    Rejects `./python3`, `/tmp/python3`, `bin/git`, etc. so an attacker-controlled local
+    interpreter/git executable can never stand in for the trusted PATH command."""
+    if not tok:
+        return False
+    if os.sep in tok:
+        return False
+    return not (os.altsep and os.altsep in tok)
+
+
+def _is_safe_git_recovery(args: list) -> bool:
+    """Only non-mutating git shapes count as branch recovery. `git checkout -- <file>`
+    discards changes, `git switch -c` / `git checkout -b` create branches, and
+    `git branch -D` deletes them — none are recovery, so they must be rejected."""
+    if not args:
+        return False
+    sub, rest = args[0], args[1:]
+    if sub == "status":
+        return True  # always read-only
+    if sub == "branch":
+        return not rest  # bare list only; `git branch -D x` has args -> rejected
+    if sub in ("switch", "checkout"):
+        # exactly one positional branch arg, no flags, no `--` pathspec separator
+        return len(rest) == 1 and not rest[0].startswith("-")
+    return False
 
 
 def recovery_engine_script_paths() -> set:
@@ -551,21 +578,22 @@ def is_branch_recovery_command(command: str) -> bool:
     if not tokens:
         return False
     prog = tokens[0]
-    # git escape hatch: `git <status|branch|switch|checkout> [args]`
-    if os.path.basename(prog) == "git":
-        return len(tokens) >= 2 and tokens[1] in _GIT_RECOVERY_SUBCOMMANDS
+    # git escape hatch: bare PATH-resolved `git` (not ./git, /tmp/git) and only the
+    # safe non-mutating shapes.
+    if _is_bare_command(prog) and prog == "git":
+        return _is_safe_git_recovery(tokens[1:])
     engine_paths = recovery_engine_script_paths()
-    # interpreter form: `python3 <engine-script> <status|adopt-branch|reset> [args]` —
-    # the script must RESOLVE to the real engine path, not merely share its basename,
-    # and must not be a flag (rejects `python3 -c ...` / `python3 -m ...`).
-    if os.path.basename(prog) in ("python", "python3"):
+    # interpreter form: a BARE python/python3 (PATH-resolved — never ./python3 or
+    # /tmp/python3) running the REAL engine script (path identity, not basename) with a
+    # recovery subcommand. tokens[1] must not be a flag (rejects `python3 -c`/`-m`).
+    if _is_bare_command(prog) and prog in ("python", "python3"):
         return (
             len(tokens) >= 3
             and not tokens[1].startswith("-")
             and _resolve_token(tokens[1]) in engine_paths
             and tokens[2] in _RECOVERY_SUBCOMMANDS
         )
-    # direct form: `<engine-script-or-wrapper> <status|adopt-branch|reset> [args]`
+    # direct form: the program itself RESOLVES to the engine orchestrator/gate/wrapper.
     if _resolve_token(prog) in engine_paths:
         return len(tokens) >= 2 and tokens[1] in _RECOVERY_SUBCOMMANDS
     return False

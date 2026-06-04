@@ -161,6 +161,42 @@ def test_branch_recovery_command_rejects_compound_and_misplaced():
     assert not f('git switch `whoami`')
 
 
+def test_branch_recovery_command_requires_bare_interpreter_and_git():
+    """codex R7: the program token (python3 / git) was matched by basename, so a local
+    attacker-controlled `./python3` / `/tmp/python3` / `bin/python` / `./git` would be
+    whitelisted. The interpreter/git must be a BARE PATH-resolved command."""
+    f = fastship_state.is_branch_recovery_command
+    orch = fastship_state.orchestrator_script_path()
+    gate = fastship_state.gate_script_path()
+    assert not f(f'./python3 {orch} reset')
+    assert not f(f'/tmp/python3 {orch} reset')
+    assert not f(f'bin/python {gate} status')
+    assert not f('./git switch saved')
+    assert not f('/tmp/git status')
+    # bare interpreter/git still accepted
+    assert f(f'python3 {orch} reset')
+    assert f('git switch saved')
+
+
+def test_branch_recovery_command_restricts_git_to_safe_shapes():
+    """codex R7: the git hatch was too broad — file-discarding / branch-creating /
+    branch-deleting shapes are NOT recovery and must be rejected."""
+    f = fastship_state.is_branch_recovery_command
+    # mutating / destructive -> rejected
+    assert not f('git checkout -- skills/fastship/orchestrator.py')
+    assert not f('git checkout HEAD -- skills/fastship/orchestrator.py')
+    assert not f('git switch -c newbranch')
+    assert not f('git checkout -b newbranch')
+    assert not f('git branch -D main')
+    assert not f('git switch --detach')
+    # safe recovery shapes -> allowed
+    assert f('git status')
+    assert f('git status --porcelain')
+    assert f('git branch')          # bare list, read-only
+    assert f('git switch saved')
+    assert f('git checkout saved')
+
+
 def test_branch_recovery_command_rejects_env_and_sudo_prefixes():
     """codex R6: leading env-assignment / sudo prefixes can redirect command lookup
     (PATH=.) or run startup scripts (BASH_ENV=.x), so they must NOT be stripped — the
