@@ -492,7 +492,9 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
         f"   Current branch: {current}",
         "",
         "   The flow is paused on this branch. Choose one:",
-        f"     git switch {saved}",
+        # shlex.quote so a branch name with shell-special chars yields a copy-pasteable,
+        # injection-safe command that the recovery hatch also accepts.
+        f"     git switch {shlex.quote(saved)}",
         f'     python3 "{orch}" adopt-branch',
         f'     python3 "{orch}" reset',
     ]
@@ -500,16 +502,24 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
 
 _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
 
-# A recovery command must be a single, simple, fully-literal invocation. Restrict the
-# raw string to a conservative whitelist — letters, digits, space, quotes, and the
-# punctuation that appears in real paths / branch names / flags (/ . _ -). This
-# fail-closed approach eliminates EVERY shell-vs-parser divergence at once instead of
-# blacklisting them one bypass at a time: comments (#, incl. glued `HEAD#` which
-# shlex(comments=True) would mis-strip), command substitution ($(...) / backticks),
-# chaining (; | &), redirection (< >), glob (* ? [ ]), brace/tilde/history expansion
-# ({ } ~ !), and env-assignment (=). The printed hints (git switch <branch>,
-# python3 "<abspath>" <sub>, <wrapper> <sub>) use only whitelisted characters.
-_SAFE_COMMAND_RE = re.compile(r"""^[A-Za-z0-9 _./"'-]+$""")
+# A recovery command must be a single, simple invocation whose shell parse cannot
+# diverge from how the shell would execute it. Rather than blacklist metacharacters one
+# bypass at a time, accept ONLY: runs of literal-safe unquoted characters, single-quoted
+# segments, and double-quoted segments. Unquoted chars are alnum, space, and punctuation
+# that is BOTH valid in git refs/paths/flags AND inert to the shell (/ . _ - @ + , = : %);
+# shell-active chars (# $ ; & | < > ` ( ) * ? [ ] { } ~ !) are excluded from unquoted
+# text, so comments (incl. glued `HEAD#`), substitution, chaining, redirection, glob, and
+# expansion cannot appear. Single quotes make ANY content fully shell-literal (so a git
+# branch with shell-special chars recovers via a single-quoted hint); double quotes are
+# honored only when they contain no $ ` \ (which still expand inside dquotes). The printed
+# hints — git switch <shlex.quote(branch)>, python3 "<abspath>" <sub> — fit this grammar.
+_SAFE_UNQUOTED_CHARS = r"A-Za-z0-9 _./@+,=:%-"
+_SAFE_COMMAND_RE = re.compile(
+    "^(?:[" + _SAFE_UNQUOTED_CHARS + "]"
+    + r"|'[^'\n]*'"        # single-quoted: fully literal in the shell
+    + r'|"[^"`$\\\n]*"'    # double-quoted: literal except $ ` \ (which still expand)
+    + ")+$"
+)
 
 
 def _resolve_token(tok: str) -> str:

@@ -201,6 +201,37 @@ def test_branch_recovery_command_restricts_git_to_safe_shapes():
     assert f('git switch saved')
 
 
+def test_branch_recovery_command_allows_valid_branch_name_chars():
+    """codex R10: valid git branch names contain shell-inert chars (@ + , =) that the
+    earlier whitelist wrongly rejected, blocking the canonical recovery hint."""
+    f = fastship_state.is_branch_recovery_command
+    assert f('git switch feature/foo@bar')
+    assert f('git switch feature/foo+bar')
+    assert f('git switch feature/foo,bar')
+    assert f('git switch release/v1.0=rc1')
+    assert f('git switch feat/foo-bar_baz.1')
+
+
+def test_branch_recovery_command_allows_quoted_special_branch_but_not_unquoted():
+    """A branch with shell-special chars recovers via a single-quoted hint (literal,
+    injection-safe), while the same chars UNQUOTED stay rejected."""
+    f = fastship_state.is_branch_recovery_command
+    assert f("git switch 'feature/foo#bar'")
+    assert f("git switch 'weird;name'")        # single-quoted -> shell-literal -> safe
+    assert not f('git switch feature/foo#bar')  # unquoted '#' is a shell comment
+    assert not f('git switch weird;name')       # unquoted ';' chains
+
+
+def test_branch_mismatch_lines_quote_special_branch():
+    """The printed `git switch` hint must shlex.quote the branch so a shell-special
+    branch name yields a copy-pasteable, injection-safe command the hatch also accepts."""
+    lines = fastship_state.branch_mismatch_lines({"branch": "feat/foo#bar"})
+    switch_line = next(l for l in lines if "git switch" in l)
+    assert "git switch 'feat/foo#bar'" in switch_line, switch_line
+    # and that exact emitted command is accepted by the recovery whitelist
+    assert fastship_state.is_branch_recovery_command(switch_line.strip())
+
+
 def test_branch_recovery_command_rejects_glued_comment_and_expansions():
     """codex R8: shlex(comments=True) stripped a glued '#' — `git checkout HEAD# -- file`
     parsed as `git checkout HEAD` (looks safe) but the shell runs `git checkout HEAD#
