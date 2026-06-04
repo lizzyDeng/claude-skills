@@ -124,4 +124,21 @@ def test_branch_recovery_command_recognizes_packaged_orchestrator():
     assert f('.claude/tools/fastship reset')
     # still recognizes git escape hatches; rejects unrelated commands
     assert f('git switch feat/x')
+    assert f('git status')
     assert not f('rm -rf /')
+
+
+def test_branch_recovery_command_rejects_substring_and_comment_bypasses():
+    """argv parsing (not substring) must reject commands that merely contain an
+    engine-looking substring + a recovery word — the bypasses codex R4 found:
+    a real non-recovery subcommand with a recovery word in a comment, and a
+    look-alike path that is not the engine."""
+    f = fastship_state.is_branch_recovery_command
+    # runs `next`; `status` only appears in a trailing comment -> NOT recovery
+    assert not f('python3 skills/fastship/orchestrator.py next # status')
+    # look-alike basename (not-orchestrator.py) must not qualify via substring
+    assert not f('python3 /tmp/not-orchestrator.py reset')
+    # recovery word present but no engine path token at all
+    assert not f('echo reset && python3 build.py')
+    # `git reset` is intentionally NOT an escape hatch (only status/branch/switch/checkout)
+    assert not f('git reset --hard')

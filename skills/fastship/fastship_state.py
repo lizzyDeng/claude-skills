@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -497,19 +498,39 @@ def branch_mismatch_lines(state: dict, tool_name: str = "Fastship") -> list[str]
     ]
 
 
+_ENGINE_SCRIPT_BASENAMES = frozenset({
+    # source/plugin orchestrator, legacy installed orchestrator, legacy bash wrapper,
+    # and the gate script — matched on the argv token's basename so substrings like
+    # "not-orchestrator.py" never qualify.
+    "orchestrator.py",
+    "fastship_orchestrator.py",
+    "fastship",
+    "ship_verify_gate.py",
+})
+_RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
+_GIT_RECOVERY_SUBCOMMANDS = frozenset({"status", "branch", "switch", "checkout"})
+
+
 def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
-    # git escape hatches — always allowed during a branch mismatch.
-    if any(t in command for t in ("git status", "git branch", "git switch", "git checkout")):
-        return True
-    # Engine recovery: the command must reference the orchestrator/gate AND carry a
-    # recovery subcommand. Matched independently (not as an adjacent "<engine> <sub>"
-    # substring) because the printed hints quote the path —
-    # `python3 "<...>/orchestrator.py" adopt-branch` — so a closing quote sits between
-    # the path and the subcommand. The engine token covers every layout: source/plugin
-    # orchestrator.py, legacy fastship_orchestrator.py (superstring), and the
-    # .claude/tools/fastship wrapper.
-    engine_tokens = ("orchestrator.py", "tools/fastship", "ship_verify_gate.py")
-    subcommands = ("status", "adopt-branch", "reset")
-    return any(e in command for e in engine_tokens) and any(s in command for s in subcommands)
+    # Parse as a real argv so a path token is matched as a whole token (by basename)
+    # and the recovery subcommand must be the *next* discrete token. Substring matching
+    # let `python3 not-orchestrator.py reset` and `... orchestrator.py next # status`
+    # bypass the branch-mismatch pause; argv parsing closes that. comments=True drops a
+    # trailing `# ...` so a recovery word in a comment can't whitelist a non-recovery run.
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        tokens = command.split()
+    for i, tok in enumerate(tokens):
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is None:
+            continue
+        # git escape hatches: `git <status|branch|switch|checkout>`
+        if tok == "git" and nxt in _GIT_RECOVERY_SUBCOMMANDS:
+            return True
+        # engine recovery: <engine-path-token> <status|adopt-branch|reset>
+        if os.path.basename(tok) in _ENGINE_SCRIPT_BASENAMES and nxt in _RECOVERY_SUBCOMMANDS:
+            return True
+    return False
