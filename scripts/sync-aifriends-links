@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALLER="$ROOT/skills/fastship/scripts/install_source_link.py"
+PROJECT="${AIFRIENDS_ROOT:-/Users/apple/works/viber-code/aifriends}"
+MERGE_HOOKS=0
+ARGS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --project)
+      if [ "$#" -lt 2 ]; then
+        echo "sync-aifriends-links: --project requires a path" >&2
+        exit 2
+      fi
+      PROJECT="$2"
+      shift 2
+      ;;
+    --project=*)
+      PROJECT="${1#--project=}"
+      shift
+      ;;
+    --merge-hooks)
+      MERGE_HOOKS=1
+      shift
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage: scripts/sync-aifriends-links [--project PATH] [--merge-hooks] [installer flags]
+
+Refresh aifriends forge/fastship source links so project-local Claude entries
+point at this claude-skills checkout.
+
+Defaults:
+  project: ${PROJECT}
+  hooks:   unchanged (pass --merge-hooks to let installer merge hook settings)
+
+Common:
+  scripts/sync-aifriends-links --dry-run
+  scripts/sync-aifriends-links
+  AIFRIENDS_ROOT=/path/to/aifriends scripts/sync-aifriends-links
+EOF
+      exit 0
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+CMD=(python3 "$INSTALLER" --project "$PROJECT" --replace --with-forge)
+if [ "$MERGE_HOOKS" -eq 0 ]; then
+  CMD+=(--no-hooks)
+fi
+if [ "${#ARGS[@]}" -gt 0 ]; then
+  CMD+=("${ARGS[@]}")
+fi
+
+exec "${CMD[@]}"
