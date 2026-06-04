@@ -19,3 +19,7 @@ __pycache__/
 
 # fastship runtime artifacts
 .claude/fastship-e2e-result.json
+
+# session-radar E2E artifacts (generated)
+/tmp/
+tmp/
