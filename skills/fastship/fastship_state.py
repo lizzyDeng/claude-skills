@@ -602,13 +602,17 @@ def is_branch_recovery_command(command: str) -> bool:
     # /tmp/python3) running the REAL engine script (path identity, not basename) with a
     # recovery subcommand. tokens[1] must not be a flag (rejects `python3 -c`/`-m`).
     if _is_bare_command(prog) and prog in ("python", "python3"):
+        # Exactly `python3 <engine> <subcommand>` — NO trailing args. Trailing options
+        # (reset --all, reset/adopt-branch/status --session <other>) would broaden the
+        # hatch beyond the printed current-session recovery commands, so reject them.
         return (
-            len(tokens) >= 3
+            len(tokens) == 3
             and not tokens[1].startswith("-")
             and _resolve_token(tokens[1]) in engine_paths
             and tokens[2] in _RECOVERY_SUBCOMMANDS
         )
     # direct form: the program itself RESOLVES to the engine orchestrator/gate/wrapper.
+    # Exactly `<engine> <subcommand>` — no trailing args (same reason as above).
     if _resolve_token(prog) in engine_paths:
-        return len(tokens) >= 2 and tokens[1] in _RECOVERY_SUBCOMMANDS
+        return len(tokens) == 2 and tokens[1] in _RECOVERY_SUBCOMMANDS
     return False

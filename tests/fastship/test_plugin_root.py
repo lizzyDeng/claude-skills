@@ -121,13 +121,29 @@ def test_branch_recovery_command_recognizes_real_engine_invocation():
     assert f(f'python3 "{orch}" adopt-branch')
     assert f(f'python3 "{orch}" reset')
     assert f(f'python3 {orch} status')
-    assert f(f'python3 {orch} reset --all')  # trailing flags after the subcommand are fine
     # the gate script is also a valid recovery target
     assert f(f'python3 "{gate}" status')
     # git escape hatches; rejects unrelated commands
     assert f('git switch feat/x')
     assert f('git status')
     assert not f('rm -rf /')
+
+
+def test_branch_recovery_command_rejects_engine_trailing_args():
+    """codex R11: trailing options after the subcommand broaden the hatch beyond the
+    printed current-session recovery commands (reset --all wipes all sessions;
+    --session <other> targets a different session). The engine forms must be EXACTLY
+    `python3 <engine> <sub>` / `<engine> <sub>` with no trailing args."""
+    f = fastship_state.is_branch_recovery_command
+    orch = fastship_state.orchestrator_script_path()
+    assert not f(f'python3 "{orch}" reset --all')
+    assert not f(f'python3 "{orch}" reset --session victim')
+    assert not f(f'python3 "{orch}" adopt-branch --session victim')
+    assert not f(f'python3 "{orch}" status --session victim')
+    assert not f(f'"{orch}" reset --all')         # direct form, trailing arg
+    # the bare canonical forms still pass
+    assert f(f'python3 "{orch}" reset')
+    assert f(f'python3 "{orch}" adopt-branch')
 
 
 def test_branch_recovery_command_requires_real_engine_path_not_basename():
