@@ -228,6 +228,22 @@ def test_branch_recovery_command_allows_valid_branch_name_chars():
     assert f('git switch feat/foo-bar_baz.1')
 
 
+def test_branch_recovery_command_allows_unicode_branch_names():
+    """codex R12: unicode branch names (valid git refs) must not be blocked — every
+    shell metachar is ASCII, so non-ASCII chars are shell-inert and allowed unquoted.
+    Especially relevant in a Chinese-language project."""
+    f = fastship_state.is_branch_recovery_command
+    assert f('git switch 分支')
+    assert f('git switch feat/é-accent')
+    assert f("git switch '分支'")  # shlex.quote form also accepted
+    # the printed hint for a unicode branch round-trips through the hatch
+    lines = fastship_state.branch_mismatch_lines({"branch": "功能/登录"})
+    switch_line = next(l for l in lines if "git switch" in l).strip()
+    assert f(switch_line), switch_line
+    # injection still rejected even adjacent to unicode
+    assert not f('git switch 分支; rm -rf /')
+
+
 def test_branch_recovery_command_allows_quoted_special_branch_but_not_unquoted():
     """A branch with shell-special chars recovers via a single-quoted hint (literal,
     injection-safe), while the same chars UNQUOTED stay rejected."""

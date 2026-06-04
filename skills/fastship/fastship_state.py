@@ -509,13 +509,19 @@ _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
 # that is BOTH valid in git refs/paths/flags AND inert to the shell (/ . _ - @ + , = : %);
 # shell-active chars (# $ ; & | < > ` ( ) * ? [ ] { } ~ !) are excluded from unquoted
 # text, so comments (incl. glued `HEAD#`), substitution, chaining, redirection, glob, and
-# expansion cannot appear. Single quotes make ANY content fully shell-literal (so a git
-# branch with shell-special chars recovers via a single-quoted hint); double quotes are
-# honored only when they contain no $ ` \ (which still expand inside dquotes). The printed
-# hints — git switch <shlex.quote(branch)>, python3 "<abspath>" <sub> — fit this grammar.
-_SAFE_UNQUOTED_CHARS = r"A-Za-z0-9 _./@+,=:%-"
+# expansion cannot appear. Every shell metacharacter / IFS char is ASCII, so any codepoint
+# >= U+0080 is shell-inert and safe unquoted — this admits unicode branch names (分支,
+# feat/é) which git allows. Single quotes make ANY content fully shell-literal (so a git
+# branch with shell-special ASCII chars recovers via a single-quoted hint); double quotes
+# are honored only when they contain no $ ` \ (which still expand inside dquotes). The
+# printed hints — git switch <shlex.quote(branch)>, python3 "<abspath>" <sub> — fit this.
+# An unquoted character is allowed when it is safe ASCII (alnum, space, and the
+# punctuation valid in git refs/paths/flags) OR any non-ASCII codepoint: every shell
+# metacharacter and IFS char is ASCII, so [^\x00-\x7f] is always shell-inert and
+# admits unicode branch names (分支, feat/é) that git allows.
+_SAFE_UNQUOTED = r"[A-Za-z0-9 _./@+,=:%-]|[^\x00-\x7f]"
 _SAFE_COMMAND_RE = re.compile(
-    "^(?:[" + _SAFE_UNQUOTED_CHARS + "]"
+    "^(?:" + _SAFE_UNQUOTED
     + r"|'[^'\n]*'"        # single-quoted: fully literal in the shell
     + r'|"[^"`$\\\n]*"'    # double-quoted: literal except $ ` \ (which still expand)
     + ")+$"
