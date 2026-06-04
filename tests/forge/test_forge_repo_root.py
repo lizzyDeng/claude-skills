@@ -33,3 +33,24 @@ def test_forge_repo_root_beats_claude_project_dir(tmp_path):
     override = _mk_git_repo(str(tmp_path / "override"))
     with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": project, "FORGE_REPO_ROOT": override}, clear=False):
         assert forge_gate.get_repo_root() == override
+
+
+def test_dashboard_launcher_resolves_payload_engine_relative(tmp_path):
+    """codex R5: the forge-dashboard launcher must exec its python payload
+    relative to the launcher (engine-relative), and read the consumer PROJECT via
+    --repo-root. Invoke it by abspath from an unrelated cwd with CLAUDE_PROJECT_DIR
+    set — the snapshot's repo_root must be the project, not the engine."""
+    import json
+    launcher = os.path.realpath(os.path.join(
+        os.path.dirname(__file__), '..', '..', 'skills', 'forge', 'forge-dashboard'))
+    assert os.path.exists(launcher), launcher
+    project = _mk_git_repo(str(tmp_path / "consumer"))
+    env = dict(os.environ)
+    env.pop("FORGE_REPO_ROOT", None)
+    env["CLAUDE_PROJECT_DIR"] = project
+    # run from a cwd that is NOT the engine and NOT the project
+    r = subprocess.run([launcher, "--once"], cwd=str(tmp_path), env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr
+    snap = json.loads(r.stdout)
+    assert snap["repo_root"] == project, snap["repo_root"]

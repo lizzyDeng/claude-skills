@@ -138,7 +138,33 @@ def test_branch_recovery_command_rejects_substring_and_comment_bypasses():
     assert not f('python3 skills/fastship/orchestrator.py next # status')
     # look-alike basename (not-orchestrator.py) must not qualify via substring
     assert not f('python3 /tmp/not-orchestrator.py reset')
-    # recovery word present but no engine path token at all
-    assert not f('echo reset && python3 build.py')
     # `git reset` is intentionally NOT an escape hatch (only status/branch/switch/checkout)
     assert not f('git reset --hard')
+
+
+def test_branch_recovery_command_rejects_compound_and_misplaced(monkeypatch):
+    """codex R5: must validate a SINGLE simple command. The engine/recovery pair
+    must be the actual program+subcommand, not just an adjacent pair anywhere in
+    argv, and any shell control operator / substitution disqualifies the command."""
+    f = fastship_state.is_branch_recovery_command
+    # adjacent pair but the program is `echo`/`touch`, not the engine/git
+    assert not f('echo orchestrator.py reset')
+    assert not f('touch blocked git status')
+    # chaining a second command past a real recovery invocation
+    assert not f('python3 skills/fastship/orchestrator.py reset && rm -rf /')
+    assert not f('git switch saved; rm -rf /')
+    assert not f('python3 skills/fastship/orchestrator.py reset $(rm -rf /)')
+    assert not f('python3 skills/fastship/orchestrator.py reset | tee /etc/x')
+    # backtick substitution
+    assert not f('git switch `whoami`')
+
+
+def test_branch_recovery_command_allows_env_and_sudo_prefixes():
+    """Single simple recovery commands stay allowed even with common harmless
+    prefixes (env assignments, sudo)."""
+    f = fastship_state.is_branch_recovery_command
+    assert f('FOO=bar python3 /repo/skills/fastship/orchestrator.py reset')
+    assert f('sudo .claude/tools/fastship adopt-branch')
+    # trailing flags after the subcommand are fine (e.g. reset --all)
+    assert f('python3 /repo/skills/fastship/orchestrator.py reset --all')
+    assert f('git switch feat/some-branch')

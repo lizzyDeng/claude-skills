@@ -511,26 +511,47 @@ _RECOVERY_SUBCOMMANDS = frozenset({"status", "adopt-branch", "reset"})
 _GIT_RECOVERY_SUBCOMMANDS = frozenset({"status", "branch", "switch", "checkout"})
 
 
+# Shell metacharacters that can chain, redirect, background, or substitute extra
+# commands. A recovery command must be a SINGLE simple invocation, so any of these in
+# the raw string disqualifies it — scanning argv tokens is not enough because
+# `git switch x && rm -rf /` or `python3 orch.py reset $(...)` would otherwise slip a
+# second command past the branch-mismatch pause. Legitimate hints (git switch <branch>,
+# python3 "<abspath>" <sub>, <wrapper> <sub>) contain none of these.
+_SHELL_METACHARS = (";", "|", "&", "<", ">", "`", "$", "(", ")", "\n")
+_ENV_PREFIX_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+
 def is_branch_recovery_command(command: str) -> bool:
     if not command:
         return False
-    # Parse as a real argv so a path token is matched as a whole token (by basename)
-    # and the recovery subcommand must be the *next* discrete token. Substring matching
-    # let `python3 not-orchestrator.py reset` and `... orchestrator.py next # status`
-    # bypass the branch-mismatch pause; argv parsing closes that. comments=True drops a
-    # trailing `# ...` so a recovery word in a comment can't whitelist a non-recovery run.
+    raw = command.strip()
+    if any(ch in raw for ch in _SHELL_METACHARS):
+        return False
     try:
-        tokens = shlex.split(command, comments=True)
+        # comments=True drops a trailing `# ...` so a recovery word in a comment
+        # cannot whitelist a non-recovery run.
+        tokens = shlex.split(raw, comments=True)
     except ValueError:
-        tokens = command.split()
-    for i, tok in enumerate(tokens):
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-        if nxt is None:
-            continue
-        # git escape hatches: `git <status|branch|switch|checkout>`
-        if tok == "git" and nxt in _GIT_RECOVERY_SUBCOMMANDS:
-            return True
-        # engine recovery: <engine-path-token> <status|adopt-branch|reset>
-        if os.path.basename(tok) in _ENGINE_SCRIPT_BASENAMES and nxt in _RECOVERY_SUBCOMMANDS:
-            return True
+        return False
+    # Strip leading `sudo` and NAME=value env-assignment prefixes — harmless, common.
+    i = 0
+    while i < len(tokens) and (tokens[i] == "sudo" or _ENV_PREFIX_RE.fullmatch(tokens[i])):
+        i += 1
+    rest = tokens[i:]
+    if not rest:
+        return False
+    prog = os.path.basename(rest[0])
+    # git escape hatch: `git <status|branch|switch|checkout> [args]`
+    if prog == "git":
+        return len(rest) >= 2 and rest[1] in _GIT_RECOVERY_SUBCOMMANDS
+    # interpreter form: `python3 <engine-script> <status|adopt-branch|reset> [args]`
+    if prog in ("python", "python3"):
+        return (
+            len(rest) >= 3
+            and os.path.basename(rest[1]) in _ENGINE_SCRIPT_BASENAMES
+            and rest[2] in _RECOVERY_SUBCOMMANDS
+        )
+    # direct wrapper form: `<engine-script> <status|adopt-branch|reset> [args]`
+    if prog in _ENGINE_SCRIPT_BASENAMES:
+        return len(rest) >= 2 and rest[1] in _RECOVERY_SUBCOMMANDS
     return False
