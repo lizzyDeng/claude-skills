@@ -181,6 +181,11 @@ class TestStateManagement:
         fake_state.write_text("# test path only\n")
         monkeypatch.setattr(fastship_state, "__file__", str(fake_state))
         monkeypatch.chdir(other)
+        # This test exercises the installed-tool vs cwd tier, which sits BELOW the
+        # FASTSHIP_REPO_ROOT / CLAUDE_PROJECT_DIR overrides — drop them (the conftest
+        # pins FASTSHIP_REPO_ROOT to an empty dir) so the lower tier is reached.
+        monkeypatch.delenv("FASTSHIP_REPO_ROOT", raising=False)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 
         assert fastship_state.repo_root() == str(project.resolve())
 
