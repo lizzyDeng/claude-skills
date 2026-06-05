@@ -992,7 +992,9 @@ def verify_history_evidence(kind, oid):
         rp = row.get("raw_path")
         if not rp:
             return (False, f"row {i} missing raw_path")
-        _, raw = _resolve_owner_raw(root, kind, oid, rp)
+        owner, raw = _resolve_owner_raw(root, kind, oid, rp)
+        if not raw.startswith(owner + os.sep):
+            return (False, f"row {i} raw_path escapes owner dir: {rp}")
         if not os.path.exists(raw):
             return (False, f"row {i} raw_path gone: {rp}")
         digest, _ = _sha256_file(raw)
@@ -1911,14 +1913,26 @@ def main():
         cmd_generate_view()
     elif action == "track":
         a = sys.argv[2:]
-        kind, oid, rest = ("objectives", a[1], a[2:]) if a[:1] == ["--objective"] else ("features", a[0] if a else "", a[1:])
-        if len(rest) < 2:
+        if a[:1] == ["--objective"]:
+            kind, oid, rest = "objectives", (a[1] if len(a) > 1 else ""), a[2:]
+        else:
+            kind, oid, rest = "features", (a[0] if a else ""), a[1:]
+        if not oid or len(rest) < 2:
             print("Usage: track <slug> <metric_id> <as_of> | track --objective <id> <metric_id> <as_of>")
             sys.exit(1)
         sys.exit(cmd_track(kind, oid, rest[0], rest[1]))
     elif action == "analyze":
         a = sys.argv[2:]
-        sys.exit(cmd_analyze("objectives", a[1]) if a[:1] == ["--objective"] else cmd_analyze("features", a[0]) if a else (print("Usage: analyze <slug> | analyze --objective <id>") or 1))
+        if a[:1] == ["--objective"]:
+            oid = a[1] if len(a) > 1 else ""
+            kind = "objectives"
+        else:
+            oid = a[0] if a else ""
+            kind = "features"
+        if not oid:
+            print("Usage: analyze <slug> | analyze --objective <id>")
+            sys.exit(1)
+        sys.exit(cmd_analyze(kind, oid))
     elif action == "sweep-worktrees":
         cmd_sweep_worktrees(dry_run="--dry-run" in sys.argv)
     elif action == "reset":

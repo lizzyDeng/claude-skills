@@ -172,3 +172,28 @@ def test_analyze_workflow_script_lint():
     if node:  # 有 node 才做语法门，无则跳过（lint 仍验形状）
         r=subprocess.run([node,"--check",p],capture_output=True,text=True)
         assert r.returncode==0, f"node --check failed: {r.stderr}"
+
+
+# --- Phase 2.5 hardening (G1/G2): analyze-side containment re-check + --objective missing-id guard ---
+
+def test_verify_history_rejects_escaping_rawpath(tmp_path, monkeypatch):
+    g = load_gate(); monkeypatch.setattr(g, "get_repo_root", lambda: str(tmp_path))
+    o = _owner(tmp_path, "features", "fesc"); (o/"snapshots"/"r.json").write_text("b")
+    assert g.append_metric_snapshot("features", "fesc", {"metric_id":"m1","as_of":"d1","value":1,"baseline":0,"target":1,"direction":"up","evidence":_ev("b")})[0]
+    hp = g.metric_history_path("features", "fesc")
+    rows = [json.loads(l) for l in open(hp) if l.strip()]
+    rows[-1]["raw_path"] = "../../../../etc/passwd"          # hand-edit jsonl to escape owner dir
+    with open(hp, "w") as f:
+        for r in rows: f.write(json.dumps(r) + "\n")
+    ok, why = g.verify_history_evidence("features", "fesc")
+    assert not ok and "escapes" in why                       # analyze-side containment now enforced
+
+def test_cli_objective_missing_id_no_crash(tmp_path):
+    import subprocess, sys
+    GATE = os.path.join(os.path.dirname(__file__), "..", "..", "skills", "forge", "hooks", "forge_gate.py")
+    for args in (["track", "--objective"], ["analyze", "--objective"]):
+        r = subprocess.run([sys.executable, GATE, *args], capture_output=True, text=True,
+                           env={**os.environ, "FORGE_REPO_ROOT": str(tmp_path)})
+        assert r.returncode == 1, (args, r.returncode, r.stderr)
+        assert "Traceback" not in r.stderr, (args, r.stderr)   # no IndexError
+        assert "Usage" in (r.stdout + r.stderr), (args, r.stdout, r.stderr)
