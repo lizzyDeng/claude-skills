@@ -339,5 +339,20 @@ class OtherRenderTest(unittest.TestCase):
         self.assertIn("started_at", h)
 
 
+def test_dashboard_normalizes_target_metric_display(tmp_path):
+    import importlib.util, os, json
+    DP=os.path.join(os.path.dirname(__file__),"..","..","skills","forge","forge_dashboard.py")
+    s=importlib.util.spec_from_file_location("fd",DP); fd=importlib.util.module_from_spec(s); s.loader.exec_module(fd)
+    rmdir=tmp_path/"project-roadmap"; rmdir.mkdir()
+    (rmdir/"roadmap.json").write_text(json.dumps({"project":{"name":"P","north_star":"NS"},
+        "objectives":[{"id":"obj-1","name":"G","target_metric":{"metric_id":"m1","baseline":0,"target":100,"direction":"up"}},
+                      {"id":"obj-2","name":"L","target_metric":"reach X"}],"features":[]}))
+    snap=fd.build_snapshot(str(tmp_path))
+    o1,o2=snap["objectives"][0],snap["objectives"][1]
+    assert o1["target_metric_display"]=="m1: 0→100" and o2["target_metric_display"]=="reach X"
+    src=open(DP,encoding="utf-8").read()  # JS 模板内嵌在 .py 源里，读源断言（避开 render_html 签名）
+    assert "o.target_metric_display" in src and "esc(o.target_metric)" not in src  # JS 渲 display 字段，不裸渲 dict
+
+
 if __name__ == "__main__":
     unittest.main()
