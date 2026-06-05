@@ -87,6 +87,38 @@ def test_parse_extracts_mermaid():
     assert "flowchart TD" in model.mermaid_blocks[0]
 
 
+def test_parse_ignores_tables_inside_code_fences():
+    # A meta-plan that shows EXAMPLE tables inside ```code``` must not have those
+    # example rows leak into the auto-derived panels.
+    m = load_mod()
+    md = SAMPLE + """
+
+## Task 9: example
+
+```python
+# example only — NOT real structure
+table = '''
+| AC | x | E2E |
+|----|---|-----|
+| FAKE1 | z | S.fake |
+| FAKE2 | z | S.fake |
+'''
+```
+
+```text
+| File | Responsibility | Change |
+|------|----------------|--------|
+| `fake/x.py` | f | Create |
+```
+"""
+    model = m.parse_plan(md)
+    assert len(model.ac_rows) == 2  # only the real AC1/AC2, not FAKE1/FAKE2
+    assert all(r["ac"].startswith("AC") for r in model.ac_rows)
+    paths = {x["path"] for x in model.modules}
+    assert "fake/x.py" not in paths  # fenced File Structure example excluded
+    assert {"a/b.py", "c/d.py", "tests/t.py"} <= paths
+
+
 # ── Task 2: markdown → HTML ──
 
 def test_md_headings_and_inline():

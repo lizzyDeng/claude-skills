@@ -49,8 +49,19 @@ def _extract_tables(md: str) -> List[List[List[str]]]:
 
     tables: List[List[List[str]]] = []
     cur: List[List[str]] = []
+    in_fence = False
     for line in md.split("\n"):
         s = line.strip()
+        if s.startswith("```"):
+            # Fenced code blocks may contain EXAMPLE markdown tables (esp. in
+            # meta-plans). They are not real structure — skip their interior.
+            in_fence = not in_fence
+            if cur:
+                tables.append(cur)
+                cur = []
+            continue
+        if in_fence:
+            continue
         if s.startswith("|") and s.count("|") >= 2:
             cells = [c.strip() for c in s.strip("|").split("|")]
             if is_sep(cells):
