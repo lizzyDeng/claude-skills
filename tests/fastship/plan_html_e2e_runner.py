@@ -101,6 +101,7 @@ def run():
         env.pop("FASTSHIP_SESSION", None)
         env["FASTSHIP_REPO_ROOT"] = str(repo)
         env["FASTSHIP_STATE_HOME"] = str(repo / ".state")
+        env["FASTSHIP_PLAN_HTML_OPEN"] = "never"  # E2E must not pop a browser
         r = subprocess.run([sys.executable, str(ORCH), "render-plan", str(plan)],
                            capture_output=True, text=True, env=env)
         check("cli render-plan: exit 0", r.returncode == 0, r.stderr[-300:])

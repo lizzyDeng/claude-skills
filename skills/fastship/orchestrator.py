@@ -2334,6 +2334,11 @@ def cmd_render_plan(argv: list) -> int:
     if not out:
         return 1
     print(out)
+    try:
+        if _load_plan_html_mod().open_in_browser(out):
+            print("   ↳ 已在浏览器打开（关闭：export FASTSHIP_PLAN_HTML_OPEN=never）")
+    except Exception:  # noqa: BLE001 — opening is best-effort
+        pass
     return 0
 
 
