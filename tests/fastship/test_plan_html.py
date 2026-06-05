@@ -131,6 +131,21 @@ def test_md_xss_escaped():
     assert "<script>alert" not in h
 
 
+def test_md_xss_fenced_info_string_escaped():
+    m = load_mod()
+    payload = 'python"></code></pre><script>alert(1)</script>'
+    h = m.md_to_html("```" + payload + "\nx=1\n```\n")
+    assert "<script>alert(1)</script>" not in h  # info string can't break out of class attr
+
+
+def test_md_xss_link_href_no_breakout():
+    m = load_mod()
+    h = m.md_to_html('[a](http://x?q=") autofocus onfocus=alert(1) x=)\n')
+    # the `"` in the URL must be neutralized so it can't break out of href=""
+    assert "onfocus=alert" not in h or "&quot;" in h
+    assert 'href="http://x?q="' not in h  # no premature attribute close
+
+
 # ── Task 3: panels + assembly ──
 
 def test_coverage_matrix_marks_covered_and_uncovered():

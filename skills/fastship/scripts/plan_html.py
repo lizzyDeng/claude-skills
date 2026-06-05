@@ -146,7 +146,13 @@ def _inline(text: str) -> str:
     out = _html.escape(text, quote=False)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", out)
     out = re.sub(r"(?<!\*)\*([^*\s][^*]*?)\*(?!\*)", r"<em>\1</em>", out)
-    out = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', out)
+
+    def _link(mm):
+        # `out` is already escaped with quote=False, so only the attribute-breakout
+        # char `"` remains; neutralize it so a crafted URL can't escape the href.
+        return '<a href="%s">%s</a>' % (mm.group(2).replace('"', "&quot;"), mm.group(1))
+
+    out = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _link, out)
     for i, c in enumerate(codes):
         out = out.replace(_CODE_TOKEN % i, c)
     return out
@@ -200,7 +206,7 @@ def md_to_html(md: str) -> str:
             if info == "mermaid":
                 out.append('<pre class="mermaid">' + _html.escape(code, quote=False) + "</pre>")
             else:
-                cls = (' class="language-%s"' % info) if info else ""
+                cls = (' class="language-%s"' % _html.escape(info, quote=True)) if info else ""
                 out.append("<pre><code%s>" % cls + _html.escape(code, quote=False) + "</code></pre>")
             i = j + 1
             continue
