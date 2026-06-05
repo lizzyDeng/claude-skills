@@ -306,9 +306,13 @@ def build_snapshot(repo_root):
     for obj in objectives_raw:
         if not isinstance(obj, dict):
             continue
+        tm = obj.get("target_metric")
+        display = (f"{tm.get('metric_id')}: {tm.get('baseline')}→{tm.get('target')}"
+                   if isinstance(tm, dict) else str(tm or ""))
         rec = {
             "id": obj.get("id"), "name": obj.get("name"),
-            "description": obj.get("description"), "target_metric": obj.get("target_metric"),
+            "description": obj.get("description"), "target_metric": tm,
+            "target_metric_display": display,
             "features": [], "rollup": {},
         }
         objectives.append(rec)
@@ -437,7 +441,7 @@ function objCard(o){const r=o.rollup||{};
   const chips=Object.entries(r.by_status||{}).map(([k,v])=>`<span class="chip">${esc(k)}: ${v}</span>`).join("");
   const todo=(r.todo||[]).map(t=>`<b>${esc(t.name)}</b> <span class="mut">(${esc(t.status)})</span>`).join(" / ");
   return `<section class="obj"><h2>${esc(o.name)} <span class="mut">${esc(o.id)}</span></h2>
-    <div class="tm">${esc(o.target_metric)||""}</div>
+    <div class="tm">${esc(o.target_metric_display)||""}</div>
     ${bar(r.overall_progress)}<div class="mut">total ${r.overall_progress||0}% / ${r.done||0}/${r.total||0} done</div>
     <div class="chips">${chips}</div>
     <table><thead><tr><th>Feature</th><th>status</th><th>progress</th><th>fastship</th><th>metric</th></tr></thead>

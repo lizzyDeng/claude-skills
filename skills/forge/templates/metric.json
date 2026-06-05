@@ -5,5 +5,7 @@
   "target": null,
   "harvest_days": 7,
   "data_source": "manual",
-  "data_query_hint": ""
+  "data_query_hint": "",
+  "metric_id": "",
+  "direction": "up"
 }

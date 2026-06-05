@@ -10,6 +10,8 @@ Internal CLI (called by /forge skill, not by users directly):
   activate <slug>        — Set active feature
   transition <slug> <status> — Attempt state transition with gate check
   generate-view          — Regenerate roadmap.md from roadmap.json
+  track <slug> <metric_id> <as_of> — Append a metric snapshot via metrics.project.json resolver
+  analyze <slug>         — Direction-aware trend analysis over re-verified snapshots
   reset                  — Clear active feature state
 
 Hook handlers (called by Claude Code hooks):
@@ -27,6 +29,7 @@ import sys
 import os
 import json
 import re
+import shlex
 import subprocess
 import hashlib
 from datetime import datetime, timedelta
@@ -876,6 +879,270 @@ def check_g6_harvest(slug, repo_root):
     return (True, "")
 
 
+# ========== Metrics Tracking ==========
+
+METRICS_PROJECT_REL = os.path.join(".claude", "metrics.project.json")
+RESOLVER_PLACEHOLDERS = ("{metric_id}", "{as_of}", "{out}")
+SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]+$")  # 白名单：占位符值禁 shell 元字符
+
+
+def _safe_owner_id(oid):  # owner id 进文件路径，比 token 更严：禁 ".."、"/"、前导点（堵 path traversal）
+    return bool(oid) and ".." not in oid and "/" not in oid and not oid.startswith(".") and SAFE_TOKEN_RE.match(oid) is not None
+
+
+def metrics_project_path():
+    root = get_repo_root()
+    return os.path.join(root, METRICS_PROJECT_REL) if root else None
+
+
+def load_metrics_project_config():
+    p = metrics_project_path()
+    if not p or not os.path.exists(p):
+        return (None, f"metrics.project.json not found at {p}")
+    data = _load_json(p)
+    cmd = data.get("resolver_command")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return (None, "resolver_command missing/not a string")
+    missing = [ph for ph in RESOLVER_PLACEHOLDERS if ph not in cmd]
+    if missing:
+        return (None, "resolver_command missing placeholders: " + ", ".join(missing))
+    return (data, "")
+
+
+def is_improvement(cur, prev, direction):
+    return cur > prev if (direction or "up") == "up" else cur < prev
+
+
+def metric_owner_dir(repo_root, kind, oid):
+    return os.path.join(repo_root, "project-roadmap", kind, oid)
+
+
+def metric_history_path(kind, oid):
+    root = get_repo_root()
+    return os.path.join(metric_owner_dir(root, kind, oid), "metric-history.jsonl") if root else None
+
+
+def load_metric_history(kind, oid):
+    p = metric_history_path(kind, oid)
+    if not p or not os.path.exists(p):
+        return []
+    out = []
+    with open(p, encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln:
+                try:
+                    out.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    continue
+    return out
+
+
+def _resolve_owner_raw(repo_root, kind, oid, raw_path):
+    owner = os.path.realpath(metric_owner_dir(repo_root, kind, oid))
+    raw = os.path.realpath(os.path.join(owner, raw_path))
+    return (owner, raw)
+
+
+def _verify_snapshot_evidence(repo_root, kind, oid, ev):
+    for f in ("source", "collected_at", "raw_path", "raw_sha256"):
+        if not ev.get(f):
+            return (False, f"evidence.{f} missing")
+    owner, raw = _resolve_owner_raw(repo_root, kind, oid, ev["raw_path"])
+    if not raw.startswith(owner + os.sep) or not os.path.exists(raw):
+        return (False, f"evidence raw_path bad: {ev.get('raw_path')}")
+    digest, size = _sha256_file(raw)
+    if size <= 0:
+        return (False, "evidence raw_path empty")
+    if digest != ev["raw_sha256"]:
+        return (False, "evidence raw_sha256 mismatch")
+    return (True, "")
+
+
+def append_metric_snapshot(kind, oid, snap):
+    root = get_repo_root()
+    if not root:
+        return (False, "no repo root")
+    for f in ("metric_id", "as_of", "value", "baseline", "target", "direction", "evidence"):
+        if snap.get(f) is None:
+            return (False, f"snapshot.{f} missing (caller must enrich definition)")
+    if not isinstance(snap["value"], (int, float)):
+        return (False, "value must be numeric")
+    ok, err = _verify_snapshot_evidence(root, kind, oid, snap["evidence"])
+    if not ok:
+        return (False, err)
+    prev = load_metric_history(kind, oid)
+    regression = bool(prev) and isinstance(prev[-1].get("value"), (int, float)) and not is_improvement(snap["value"], prev[-1]["value"], snap["direction"]) and snap["value"] != prev[-1]["value"]
+    row = {"metric_id": snap["metric_id"], "as_of": snap["as_of"], "value": snap["value"],
+           "baseline": snap["baseline"], "target": snap["target"], "direction": snap["direction"],
+           "source": snap["evidence"]["source"], "raw_path": snap["evidence"]["raw_path"],
+           "collected_at": snap["evidence"]["collected_at"], "evidence_sha256": snap["evidence"]["raw_sha256"],
+           "regression": regression, "recorded_at": datetime.now().isoformat()}
+    p = metric_history_path(kind, oid)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return (True, "")
+
+
+def verify_history_evidence(kind, oid):
+    """Re-hash every row's raw_path vs stored evidence_sha256. (False, idx) on first mismatch."""
+    root = get_repo_root()
+    for i, row in enumerate(load_metric_history(kind, oid)):
+        rp = row.get("raw_path")
+        if not rp:
+            return (False, f"row {i} missing raw_path")
+        owner, raw = _resolve_owner_raw(root, kind, oid, rp)
+        if not raw.startswith(owner + os.sep):
+            return (False, f"row {i} raw_path escapes owner dir: {rp}")
+        if not os.path.exists(raw):
+            return (False, f"row {i} raw_path gone: {rp}")
+        digest, _ = _sha256_file(raw)
+        if digest != row.get("evidence_sha256"):
+            return (False, f"row {i} evidence tampered: {rp}")
+    return (True, "")
+
+
+def _owner_metric_def(kind, oid, metric_id):
+    """Curated definition: feature → metric.json; objective → roadmap objective.target_metric. Returns (def, err)."""
+    root = get_repo_root()
+    if kind == "features":
+        mp = os.path.join(root, "project-roadmap", "features", oid, "metric.json")
+        if not os.path.exists(mp):
+            return (None, f"metric.json not found for feature {oid}")
+        m = _load_json(mp)
+        return ({"metric_id": m.get("metric_id") or metric_id, "baseline": m.get("baseline"),
+                 "target": m.get("target"), "direction": m.get("direction", "up")}, "")
+    rm = load_roadmap() or {}
+    for obj in rm.get("objectives", []):
+        if obj.get("id") == oid:
+            tm = obj.get("target_metric")
+            if isinstance(tm, dict):
+                return ({"metric_id": tm.get("metric_id") or metric_id, "baseline": tm.get("baseline"),
+                         "target": tm.get("target"), "direction": tm.get("direction", "up")}, "")
+            return (None, f"objective {oid} target_metric not structured (legacy string)")
+    return (None, f"objective {oid} not found")
+
+
+def cmd_track(kind, oid, metric_id, as_of):
+    if not (_safe_owner_id(oid) and SAFE_TOKEN_RE.match(metric_id) and SAFE_TOKEN_RE.match(as_of)):
+        print("🚫 forge track: unsafe owner/metric_id/as_of (owner blocks '..' and '/'; tokens whitelist-only)")
+        return 1
+    cfg, err = load_metrics_project_config()
+    if cfg is None:
+        print(f"🚫 forge track: {err}")
+        return 1
+    mdef, e1 = _owner_metric_def(kind, oid, metric_id)
+    if mdef is None:
+        print(f"🚫 forge track: {e1}")
+        return 1
+    if mdef["metric_id"] and mdef["metric_id"] != metric_id:   # 防"取 X 记成 Y"
+        print(f"🚫 forge track: CLI metric_id '{metric_id}' != curated '{mdef['metric_id']}'")
+        return 1
+    root = get_repo_root()
+    out = os.path.join(metric_owner_dir(root, kind, oid), ".resolver-out.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    argv = [(metric_id if t == "{metric_id}" else as_of if t == "{as_of}" else out if t == "{out}" else t)
+            for t in shlex.split(cfg["resolver_command"])]   # argv 替换，禁 shell=True
+    try:
+        r = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print(f"🚫 forge track: resolver run failed — {e}")
+        return 1
+    if r.returncode != 0:
+        print(f"🚫 forge track: resolver exit {r.returncode} — {(r.stderr or '').strip()[:200]}")
+        return 1
+    out_data = _load_json(out)
+    if not out_data or out_data.get("value") is None:
+        print("🚫 forge track: resolver bad output")
+        return 1
+    snap = {**out_data, "baseline": mdef["baseline"], "target": mdef["target"], "direction": mdef["direction"],
+            "metric_id": mdef["metric_id"]}   # enrich：定义来自 curate，不来自 resolver
+    ok, e2 = append_metric_snapshot(kind, oid, snap)
+    if not ok:
+        print(f"🚫 forge track: snapshot rejected — {e2}")
+        return 1
+    last = load_metric_history(kind, oid)[-1]
+    print(f"✅ forge track {kind}/{oid} {last['metric_id']}={last['value']} @ {last['as_of']}" + ("  ⚠️ regression" if last['regression'] else ""))
+    return 0
+
+
+ALIGN_ON_TRACK = 80.0
+ALIGN_AT_RISK = 40.0
+
+
+def _target_metric_struct(obj):
+    tm = obj.get("target_metric")
+    return tm if isinstance(tm, dict) else None
+
+
+def compute_objective_alignment(obj):
+    tm = _target_metric_struct(obj)
+    if not tm:
+        return None  # 旧 string → 不渲染对齐（向后兼容）
+    hist = load_metric_history("objectives", obj.get("id", ""))
+    cur = hist[-1]["value"] if hist else None
+    as_of = hist[-1]["as_of"] if hist else None
+    base, target = tm.get("baseline"), tm.get("target")
+    pct, status = None, "no_data"
+    if cur is not None and isinstance(base, (int, float)) and isinstance(target, (int, float)) and target != base:
+        pct = round((cur - base) / (target - base) * 100.0, 1)  # 方向无关（base/target 编码方向）
+        status = "on_track" if pct >= ALIGN_ON_TRACK else ("at_risk" if pct >= ALIGN_AT_RISK else "off_track")
+    return {"metric_id": tm.get("metric_id"), "baseline": base, "target": target, "current": cur, "pct": pct, "status": status, "as_of": as_of}
+
+
+def _linear_slope(vals):
+    n = len(vals)
+    if n < 2:
+        return 0.0
+    xs = list(range(n))
+    mx = sum(xs) / n
+    my = sum(vals) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    return 0.0 if den == 0 else round(sum((xs[i] - mx) * (vals[i] - my) for i in range(n)) / den, 4)
+
+
+def cmd_analyze(kind, oid):
+    if not _safe_owner_id(oid):
+        print("🚫 forge analyze: unsafe owner id (blocks '..' and '/')")
+        return 1
+    ok, why = verify_history_evidence(kind, oid)          # F6：先复验，篡改即拒
+    if not ok:
+        print(f"🚫 forge analyze: history evidence check failed — {why}")
+        return 1
+    root = get_repo_root()
+    hist = load_metric_history(kind, oid)
+    if not hist:
+        print(f"🚫 forge analyze: no history for {kind}/{oid}")
+        return 1
+    vals = [h["value"] for h in hist if isinstance(h.get("value"), (int, float))]
+    last = hist[-1]
+    slope = _linear_slope(vals)
+    trend = "up" if slope > 0 else ("down" if slope < 0 else "flat")
+    target = last.get("target")
+    direction = last.get("direction", "up")
+    projected = None
+    if isinstance(target, (int, float)):
+        if not is_improvement(target, vals[-1], direction):   # latest 已达/越过 target（含相等）
+            projected = {"periods_to_target": 0, "reachable": True, "achieved": True}
+        elif slope != 0:
+            periods = round((target - vals[-1]) / slope, 1)
+            reachable = is_improvement(vals[-1] + slope, vals[-1], direction)  # 朝改善方向移动即可达
+            projected = {"periods_to_target": periods, "reachable": reachable, "achieved": False}
+    analysis = {"owner": f"{kind}/{oid}", "metric_id": last.get("metric_id"), "samples": len(vals),
+                "first": vals[0], "latest": vals[-1], "baseline": last.get("baseline"), "target": target,
+                "direction": direction, "slope": slope, "trend": trend, "regressions": sum(1 for h in hist if h.get("regression")),
+                "projected": projected,
+                "provenance": {"source_tier": last.get("source") or "resolver", "as_of": last.get("as_of"),
+                               "owner": f"{kind}/{oid}", "raw_path": last.get("raw_path"), "evidence_sha256": last.get("evidence_sha256"),
+                               "note": "deterministic trend over re-verified evidence-bound snapshots; adversarial attribution via skills/forge/workflows/analyze.workflow.js"}}
+    out = os.path.join(metric_owner_dir(root, kind, oid), "analysis.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(analysis, f, indent=2, ensure_ascii=False)
+    print(f"✅ forge analyze {kind}/{oid}: {trend} (slope={slope}, {vals[-1]}/{target}) → {out}")
+    return 0
+
+
 def can_transition(slug, current_status, target_status, repo_root, fastship_state=None, fastship_orch_state=None):
     """Check if a state transition is allowed. Returns (ok, reason)."""
     if (current_status, target_status) not in TRANSITIONS:
@@ -1101,9 +1368,12 @@ def generate_roadmap_md(roadmap):
     features = roadmap.get("features", [])
     root = get_repo_root()  # Hoist outside loop
 
+    def _tm_display(tm):
+        return f"{tm.get('metric_id')}: {tm.get('baseline')}→{tm.get('target')}" if isinstance(tm, dict) else str(tm)
+
     for obj in objectives:
         lines.append(f"## {obj.get('name', '(unnamed)')}")
-        lines.append(f"Target: {obj.get('target_metric', '(undefined)')}")
+        lines.append(f"Target: {_tm_display(obj.get('target_metric', '(undefined)'))}")
         lines.append("")
         lines.append("| Feature | Status | Shipped | Harvest |")
         lines.append("|---------|--------|---------|---------|")
@@ -1132,6 +1402,18 @@ def generate_roadmap_md(roadmap):
             lines.append(f"| {f.get('name', f['slug'])} | {emoji} {status} | {shipped} | {harvest} |")
 
         lines.append("")
+
+    # Objective 对齐
+    align = []
+    for obj in objectives:
+        a = compute_objective_alignment(obj)
+        if a:
+            cur = "—" if a["current"] is None else a["current"]
+            pct = "—" if a["pct"] is None else f"{a['pct']}%"
+            align.append(f"| {obj.get('id')} | {a['metric_id']} | {a['baseline']}→{a['target']} | {cur} | {pct} | {a['status']} | {a['as_of'] or '—'} |")
+    if align:
+        lines += ["## Objective 对齐", "| Objective | Metric | Baseline→Target | Current | Progress | Status | As-of |",
+                  "|---|---|---|---|---|---|---|", *align, ""]
 
     # Summary
     counts = {}
@@ -1629,6 +1911,28 @@ def main():
         cmd_transition(sys.argv[2], sys.argv[3])
     elif action == "generate-view":
         cmd_generate_view()
+    elif action == "track":
+        a = sys.argv[2:]
+        if a[:1] == ["--objective"]:
+            kind, oid, rest = "objectives", (a[1] if len(a) > 1 else ""), a[2:]
+        else:
+            kind, oid, rest = "features", (a[0] if a else ""), a[1:]
+        if not oid or len(rest) < 2:
+            print("Usage: track <slug> <metric_id> <as_of> | track --objective <id> <metric_id> <as_of>")
+            sys.exit(1)
+        sys.exit(cmd_track(kind, oid, rest[0], rest[1]))
+    elif action == "analyze":
+        a = sys.argv[2:]
+        if a[:1] == ["--objective"]:
+            oid = a[1] if len(a) > 1 else ""
+            kind = "objectives"
+        else:
+            oid = a[0] if a else ""
+            kind = "features"
+        if not oid:
+            print("Usage: analyze <slug> | analyze --objective <id>")
+            sys.exit(1)
+        sys.exit(cmd_analyze(kind, oid))
     elif action == "sweep-worktrees":
         cmd_sweep_worktrees(dry_run="--dry-run" in sys.argv)
     elif action == "reset":

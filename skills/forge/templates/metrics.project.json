@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "resolver_command": "python3 tools/forge_metric_resolver.py --metric {metric_id} --as-of {as_of} --out {out}",
+  "notes": ["forge never runs SQL and never shell-interpolates; it splits resolver_command with shlex and execs argv. The resolver reads the project's governed analytics and writes {value, as_of, evidence} to --out"]
+}
