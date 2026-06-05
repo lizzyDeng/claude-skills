@@ -20,6 +20,9 @@ __pycache__/
 # fastship runtime artifacts
 .claude/fastship-e2e-result.json
 
+# fastship-generated plan visualization (derived from plan.md)
+docs/superpowers/plans/*.plan.html
+
 # session-radar E2E artifacts (generated)
 /tmp/
 tmp/
