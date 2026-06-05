@@ -231,6 +231,40 @@ GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
 CODE_REVIEW_FILENAME = ".fastship-code-review.md"
 
+# ── plan.html visualization (derived, non-gating view of the 1.4 plan) ──
+_PLAN_HTML_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "plan_html.py")
+
+
+def _load_plan_html_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("plan_html", _PLAN_HTML_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def generate_plan_html(plan_path: str):
+    """Render plan.md -> sibling .plan.html. Best-effort: returns out path or None.
+    Never raises — a render failure must NOT block the 1.4 step (visualization is
+    a derived view, not a gated deliverable)."""
+    try:
+        if not plan_path or not os.path.exists(plan_path):
+            return None
+        mod = _load_plan_html_mod()
+        return mod.render_plan_file(plan_path)
+    except Exception as e:  # noqa: BLE001 — visualization is non-critical
+        print(f"⚠️ plan.html 生成失败（不阻断）: {e}")
+        return None
+
+
+def attach_plan_html(orch: dict, plan_path: str):
+    """Generate the HTML and record its path in NON-trusted artifacts (never the ledger)."""
+    out = generate_plan_html(plan_path)
+    if out:
+        orch.setdefault("artifacts", {})["plan_html_path"] = out
+        print(f"🖼️  plan.html: {out}")
+    return out
+
 STEP_ARTIFACT_OWNERS = {
     BRIEF_FILENAME: "1.3",
     GRILL_RESULT_FILENAME: "1.5",
@@ -1080,8 +1114,12 @@ STEPS = [
   Skill(skill="writing-plans")
 
 计划必须包含 AC 清单 + E2E 验证方案 + 影响范围 + 任务拆分。
+🔴 为让自动生成的 plan.html 直观可视，请额外：
+  - 加 `## 验收清单（AC）→ E2E 映射` 管道表（| AC | 可观察断言 | E2E scenario |），每条 AC 必有 E2E
+  - 加 `## File Structure` 管道表（| File | Responsibility | Change |，Change ∈ Create/Modify/Test）
+  - 加 `## 图示` 一个 ```mermaid flowchart（核心流程），可选模块依赖图
 🔴 必须通过 Skill 工具调用，不要自己拆步骤。
-产物: docs/superpowers/plans/YYYY-MM-DD-{feature}.md
+产物: docs/superpowers/plans/YYYY-MM-DD-{feature}.md（plan 通过后自动生成同名 .plan.html）
 orchestrator 自动检测 plan 文件写入 + 验证 writing-plans 签名。"""),
 
     Step("1.5", "Grill", 1, validator=validate_grill,
@@ -1731,6 +1769,7 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 print(f"⚠️ Plan 写入已检测，但验证未通过: {msg}")
                 save_orch_state(orch, orch_path)
                 return 0
+            attach_plan_html(orch, file_path)
             for stale in (GRILL_RESULT_FILENAME, CODEX_REVIEW_FILENAME):
                 p = os.path.join(_repo_root(), ".claude", stale)
                 if os.path.exists(p):
@@ -2152,6 +2191,10 @@ def cmd_done(argv: list) -> int:
         save_orch_state(st)
         return 1
 
+    # CLI parity with hook mode: render the plan visualization once 1.4 validates.
+    if step.id == "1.4":
+        attach_plan_html(st, st.get("plan_path"))
+
     # 3.5 loop fail → route by decision
     if step.id == "3.5" and artifacts.get("loop_outcome") == "fail":
         if not artifacts.get("loop_decision"):
@@ -2267,6 +2310,23 @@ def cmd_reset(argv: list = None) -> int:
         os.rmdir(session_dir)
     fastship_state.unregister_session(session_id)
     print(f"✅ Fastship session cleared: {session_id}")
+    return 0
+
+
+def cmd_render_plan(argv: list) -> int:
+    """Render a plan.md to self-contained HTML on demand. Defaults to the active
+    session's plan_path when no path is given."""
+    plan_path = argv[0] if argv else None
+    if not plan_path:
+        st = load_orch_state()
+        plan_path = (st or {}).get("plan_path")
+    if not plan_path or not os.path.exists(plan_path):
+        print("❌ 无 plan 文件。用法: render-plan <plan.md> 或在活跃 session 内 render-plan")
+        return 1
+    out = generate_plan_html(plan_path)
+    if not out:
+        return 1
+    print(out)
     return 0
 
 
@@ -2398,6 +2458,8 @@ def main():
         sys.exit(cmd_use(argv[1]))
     elif cmd == "reset":
         sys.exit(cmd_reset(argv[1:]))
+    elif cmd == "render-plan":
+        sys.exit(cmd_render_plan(argv[1:]))
     elif cmd in handlers:
         sys.exit(handlers[cmd]())
     else:
