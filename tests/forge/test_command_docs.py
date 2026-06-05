@@ -16,8 +16,18 @@ def _read(rel):
 
 def test_forge_md_documents_new_commands():
     md = _read(".claude/commands/forge.md")
-    for cmd in ("/forge dashboard", "/forge doctor", "/forge audit-month"):
+    for cmd in ("/forge dashboard", "/forge doctor", "/forge audit-month",
+                "/forge track", "/forge analyze"):
         assert cmd in md, f"forge.md missing section for {cmd}"
+
+
+def test_forge_docs_cover_metrics_tracking_contract():
+    """track/analyze must document the contract + safety + dynamic-workflow seam."""
+    fm = _read(".claude/commands/forge.md")
+    sk = _read("skills/forge/SKILL.md")
+    for token in ("metrics.project.json", "dynamic workflow", "provenance", "direction", "metric-history.jsonl"):
+        assert token in fm, f"forge.md missing metrics-tracking token: {token}"
+        assert token in sk, f"SKILL.md missing metrics-tracking token: {token}"
 
 
 def test_fastship_docs_cover_all_orchestrator_steps():

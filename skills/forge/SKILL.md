@@ -225,6 +225,14 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 **它读什么**（全只读）：`project-roadmap/roadmap.json` + 每个 feature 的 `metric.json`/`harvest.json` + `.claude/forge-state/` gate 缓存；并扫描当前 repo 全部 worktree 的 fastship session（`<git-common-dir>/fastship` + `worktrees/*/fastship`），按 slug 把 session 关联到 feature。一个大目标拆成多个 feature（如 obj-4 的 F1-F7）时，objective 卡片给出**总体进展 + TODO**。
 
+### `/forge track` / `/forge analyze`（持续指标追踪）
+
+把一次性 harvest 升级为**连续、方向感知、证据可复验**的追踪。
+
+- `/forge track <feature>`（或 `--objective <id>`）：经 `.claude/metrics.project.json` 声明的 resolver 取「数字 + 证据」，用 metric.json/objective 的 curate 定义 enrich（baseline/target/`direction`），evidence sha256 校验后 append 进 `metric-history.jsonl`；方向感知 regression（`up` 跌破 / `down` 升破）。
+- `/forge analyze <feature>`：先复验 history evidence（被改即拒），产 `analysis.json`（trend/slope/方向感知 projection/**provenance footer**）；深度对抗归因走 **dynamic workflow** `skills/forge/workflows/analyze.workflow.js`。
+- **🔴 forge 自身零 SQL、零 shell 注入**：只 `shlex.split` + argv 调 resolver（取数在消费方实现），占位符白名单校验、`..`/`/` 拒。resolver 只产 `{metric_id,value,as_of,evidence}`，定义人工 curate（"curate, don't auto-generate"）。详见 `.claude/commands/forge.md`。
+
 ---
 
 ## 🚫 Red Flags（禁止行为）

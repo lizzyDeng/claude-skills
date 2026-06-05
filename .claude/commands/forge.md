@@ -226,6 +226,33 @@ draft ──→ planned ──→ in_progress ──→ shipped ──→ measur
 
 2. 页面层级：**North Star → objective 卡片**（总体进度条 + status chips + **剩余 TODO 列表**）**→ feature 行**（status 徽章 + 进度条 + fastship 18 步执行条 + 指标 baseline→target→actual）。
 
+### `/forge track <feature>` / `/forge track --objective <id>`
+
+上线后**持续**采集指标快照——把一次性 harvest 升级为连续、方向感知、证据可复验的追踪。
+
+**前置**：项目根有 `.claude/metrics.project.json`（声明取数 resolver 命令）；feature 的 `metric.json` 含 `metric_id` + `direction`（或 objective 的 `target_metric` 结构化为 `{metric_id,baseline,target,direction}`）。
+
+**🔴 铁律**：forge **自己绝不跑 SQL、绝不连数据库、绝不 shell 插值**。它只 `shlex.split` + argv 调用 `metrics.project.json` 声明的 resolver（取数逻辑由消费项目实现），占位符值（metric_id/as_of/owner）经白名单校验、`..`/`/` 一律拒。
+
+**流程**：
+
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py track <slug> <metric_id> <as_of>`
+2. forge 调 resolver 取「数字 + 证据」→ 用 metric.json/objective 的 curate 定义 **enrich**（baseline/target/`direction`，**不取自 resolver**）→ evidence sha256 校验 → append 进 `project-roadmap/features/<slug>/metric-history.jsonl`（append-only，逐条 sha256 绑定）。
+3. 方向感知 regression：`direction:up`（越高越好）value 跌破上条、`direction:down`（越低越好）value 升破上条 → 标 `regression`。
+
+### `/forge analyze <feature>` / `/forge analyze --objective <id>`
+
+对历史快照做趋势 + 对抗归因分析。
+
+**流程**：
+
+1. `python3 ${CLAUDE_PLUGIN_ROOT}/skills/forge/hooks/forge_gate.py analyze <slug>`
+2. 先**复验全部 history evidence**（被手改即拒），再产 `analysis.json`：trend / slope / 方向感知 projection（含已达标判定）/ **provenance footer**（source_tier + as_of + owner + raw_path + evidence_sha256，供复核）。
+3. 确定性 CLI 产出作 spine；深度对抗归因走 **dynamic workflow** `skills/forge/workflows/analyze.workflow.js`（fan-out 趋势解读 → 对抗 refuter → 合成带 provenance footer 的 cited verdict）——由 `/forge analyze` 在 skill 层用 Workflow 工具触发。
+
+> **契约**：`.claude/metrics.project.json` = `{"version":1,"resolver_command":"... --metric {metric_id} --as-of {as_of} --out {out}"}`。resolver 只产 `{metric_id,value,as_of,evidence}`（**不产 baseline/target**——定义人工 curate 在 metric.json/objective，呼应 "curate, don't auto-generate"）。
+> **supersede**：本能力有意解除 `docs/superpowers/specs/2026-05-06-forge-design.md` 的「harvest 数据仅手动（v1）」非目标，但保留「forge 不做数据引擎」精神（resolver 在消费方）。
+
 ---
 
 ## 🚫 Red Flags（禁止行为）
