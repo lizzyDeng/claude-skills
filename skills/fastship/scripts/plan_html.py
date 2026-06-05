@@ -430,16 +430,48 @@ def render_plan_file(plan_path: str, out_path: Optional[str] = None) -> str:
     return out_path
 
 
+def open_in_browser(path: str) -> bool:
+    """Best-effort: open `path` in the default browser. Never raises.
+
+    Gated by env FASTSHIP_PLAN_HTML_OPEN:
+      'never'/'0'/'no'/'false'/'off' → skip;
+      'always'/'1'/'yes'/'true'/'on' → always open;
+      unset/'auto'                   → open unless headless (CI / FASTSHIP_HEADLESS).
+    """
+    mode = (os.environ.get("FASTSHIP_PLAN_HTML_OPEN") or "auto").strip().lower()
+    if mode in ("0", "no", "false", "never", "off"):
+        return False
+    if mode in ("", "auto"):
+        if os.environ.get("CI") or os.environ.get("FASTSHIP_HEADLESS"):
+            return False
+    try:
+        import subprocess
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]  # noqa: SIM115
+        else:
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Render a fastship plan.md to self-contained HTML")
     ap.add_argument("plan", help="path to plan markdown")
     ap.add_argument("-o", "--out", help="output html path (default: <plan>.plan.html)")
+    ap.add_argument("--no-open", action="store_true", help="do not open the result in a browser")
     args = ap.parse_args(argv)
     if not os.path.exists(args.plan):
         print("plan not found: %s" % args.plan, file=sys.stderr)
         return 1
     out = render_plan_file(args.plan, args.out)
     print(out)
+    if not args.no_open:
+        open_in_browser(out)
     return 0
 
 

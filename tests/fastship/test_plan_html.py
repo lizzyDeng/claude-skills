@@ -232,3 +232,50 @@ def test_render_plan_file_writes_html(tmp_path):
     assert out.endswith("2026-06-05-x.plan.html")
     assert os.path.exists(out)
     assert "My Feature Implementation Plan" in open(out, encoding="utf-8").read()
+
+
+# ── auto-open (all monkeypatch Popen — never opens a real browser) ──
+
+def test_open_in_browser_respects_never(monkeypatch):
+    m = load_mod()
+    import subprocess
+    called = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: called.append(a))
+    monkeypatch.setenv("FASTSHIP_PLAN_HTML_OPEN", "never")
+    assert m.open_in_browser("/tmp/x.html") is False
+    assert called == []
+
+
+def test_open_in_browser_auto_skips_in_ci(monkeypatch):
+    m = load_mod()
+    import subprocess
+    called = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: called.append(a))
+    monkeypatch.delenv("FASTSHIP_PLAN_HTML_OPEN", raising=False)
+    monkeypatch.setenv("CI", "1")
+    assert m.open_in_browser("/tmp/x.html") is False
+    assert called == []
+
+
+def test_open_in_browser_darwin_command(monkeypatch):
+    m = load_mod()
+    import subprocess
+    captured = {}
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda cmd, *a, **k: captured.__setitem__("cmd", cmd))
+    monkeypatch.setenv("FASTSHIP_PLAN_HTML_OPEN", "always")
+    monkeypatch.setattr(m.sys, "platform", "darwin")
+    assert m.open_in_browser("/tmp/x.html") is True
+    assert captured["cmd"] == ["open", "/tmp/x.html"]
+
+
+def test_open_in_browser_linux_command(monkeypatch):
+    m = load_mod()
+    import subprocess
+    captured = {}
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda cmd, *a, **k: captured.__setitem__("cmd", cmd))
+    monkeypatch.setenv("FASTSHIP_PLAN_HTML_OPEN", "always")
+    monkeypatch.setattr(m.sys, "platform", "linux")
+    assert m.open_in_browser("/tmp/x.html") is True
+    assert captured["cmd"] == ["xdg-open", "/tmp/x.html"]

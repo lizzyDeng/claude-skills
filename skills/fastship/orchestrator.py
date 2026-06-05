@@ -258,11 +258,18 @@ def generate_plan_html(plan_path: str):
 
 
 def attach_plan_html(orch: dict, plan_path: str):
-    """Generate the HTML and record its path in NON-trusted artifacts (never the ledger)."""
+    """Generate the HTML, record its path in NON-trusted artifacts (never the ledger),
+    and best-effort auto-open it in the browser so the plan is shown, not just written.
+    Opening is gated by FASTSHIP_PLAN_HTML_OPEN (auto/never/always) and never blocks."""
     out = generate_plan_html(plan_path)
     if out:
         orch.setdefault("artifacts", {})["plan_html_path"] = out
         print(f"🖼️  plan.html: {out}")
+        try:
+            if _load_plan_html_mod().open_in_browser(out):
+                print("   ↳ 已在浏览器打开（关闭自动打开：export FASTSHIP_PLAN_HTML_OPEN=never）")
+        except Exception:  # noqa: BLE001 — opening is best-effort
+            pass
     return out
 
 STEP_ARTIFACT_OWNERS = {

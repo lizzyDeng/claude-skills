@@ -61,7 +61,8 @@ def test_generate_plan_html_failure_returns_none(orch_mod, tmp_path, monkeypatch
     assert out is None  # swallowed, no raise
 
 
-def test_plan_html_not_in_trusted_ledger(orch_mod, tmp_path):
+def test_plan_html_not_in_trusted_ledger(orch_mod, tmp_path, monkeypatch):
+    monkeypatch.setenv("FASTSHIP_PLAN_HTML_OPEN", "never")  # don't pop a browser in tests
     p = _write_plan(tmp_path)
     st = orch_mod.empty_orchestrator_state("x")
     orch_mod.record_step_artifact(st, "1.4", str(p))
