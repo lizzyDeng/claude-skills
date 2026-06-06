@@ -234,6 +234,44 @@ def test_render_plan_file_writes_html(tmp_path):
     assert "My Feature Implementation Plan" in open(out, encoding="utf-8").read()
 
 
+# ── ELK flowchart + Graphviz DOT architecture diagrams ──
+
+def test_parse_extracts_dot():
+    m = load_mod()
+    md = SAMPLE + "\n## Arch\n```dot\ndigraph{A->B}\n```\n```graphviz\ndigraph{C->D}\n```\n"
+    model = m.parse_plan(md)
+    assert len(model.dot_blocks) == 2
+    assert "A->B" in model.dot_blocks[0]
+    assert "C->D" in model.dot_blocks[1]
+
+
+def test_md_dot_block_is_graphviz_not_plain_code():
+    m = load_mod()
+    h = m.md_to_html("```dot\ndigraph{A->B}\n```\n")
+    assert '<pre class="graphviz">' in h
+    assert "digraph{A-&gt;B}" in h          # escaped; browser decodes for graphviz
+    assert 'class="language-dot"' not in h   # not a plain code block
+    assert 'class="mermaid"' not in h
+
+
+def test_render_uses_elk_layout_for_mermaid():
+    m = load_mod()
+    h = m.render_plan_html(SAMPLE)  # SAMPLE has a mermaid block
+    assert m.MERMAID_ELK_SRC in h
+    assert "registerLayoutLoaders" in h
+    assert 'layout:"elk"' in h
+
+
+def test_render_includes_graphviz_only_when_dot_present():
+    m = load_mod()
+    h_no = m.render_plan_html(SAMPLE)  # no dot block
+    assert m.GRAPHVIZ_SRC not in h_no
+    h_yes = m.render_plan_html(SAMPLE + "\n## Arch\n```dot\ndigraph{A->B}\n```\n")
+    assert m.GRAPHVIZ_SRC in h_yes
+    assert "Graphviz.load()" in h_yes
+    assert 'querySelectorAll("pre.graphviz")' in h_yes
+
+
 # ── auto-open (all monkeypatch Popen — never opens a real browser) ──
 
 def test_open_in_browser_respects_never(monkeypatch):

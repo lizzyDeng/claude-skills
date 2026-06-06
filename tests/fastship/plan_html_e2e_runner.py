@@ -45,6 +45,9 @@ FULL = """# E2E Demo Implementation Plan
 flowchart TD
   A --> B
 ```
+```dot
+digraph { core -> wire; wire -> t }
+```
 
 ## Task 1: thing
 - [ ] **Step 1: do** with `<script>alert(1)</script>` in text
@@ -79,6 +82,9 @@ def run():
     check("render full: coverage matrix", 'id="coverage"' in full and "covered" in full and "uncovered" in full)
     check("render full: module map", 'id="modules"' in full and "core.py" in full and "wire.py" in full and "t.py" in full)
     check("render full: mermaid block", 'class="mermaid"' in full and "flowchart TD" in full)
+    check("render full: mermaid uses ELK layout", m.MERMAID_ELK_SRC in full and 'layout:"elk"' in full)
+    check("render full: graphviz dot block", 'class="graphviz"' in full and "digraph" in full)
+    check("render full: graphviz wasm script", m.GRAPHVIZ_SRC in full and "Graphviz.load()" in full)
     check("render full: heading tag", "<h1" in full)
     check("render full: xss escaped", "&lt;script&gt;" in full and "<script>alert" not in full)
 

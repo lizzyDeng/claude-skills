@@ -16,7 +16,15 @@ from typing import List, Dict, Optional
 
 # Single point of control for the mermaid library source. To vendor for full
 # offline use, swap this for an inline <script>...</script> with mermaid.min.js.
-MERMAID_SRC = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.0/mermaid.min.js"
+# Single point of control for diagram libraries. To vendor for full offline use,
+# download these and point the constants at local paths.
+#  - Mermaid v11 ESM + the ELK layout engine (clearer layered flowcharts than the
+#    default dagre renderer).
+#  - Graphviz compiled to WASM (@hpcc-js/wasm-graphviz) for crisp architecture /
+#    dependency graphs authored as DOT.
+MERMAID_SRC = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+MERMAID_ELK_SRC = "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0/dist/mermaid-layout-elk.esm.min.mjs"
+GRAPHVIZ_SRC = "https://cdn.jsdelivr.net/npm/@hpcc-js/wasm-graphviz@1/+esm"
 
 
 @dataclass
@@ -28,6 +36,7 @@ class PlanModel:
     ac_rows: List[Dict[str, str]] = field(default_factory=list)
     modules: List[Dict[str, str]] = field(default_factory=list)
     mermaid_blocks: List[str] = field(default_factory=list)
+    dot_blocks: List[str] = field(default_factory=list)
     body_md: str = ""
 
 
@@ -124,6 +133,12 @@ def _extract_mermaid(md: str) -> List[str]:
     return [m.group(1).strip() for m in re.finditer(r"```mermaid\s*\n(.*?)```", md, re.DOTALL)]
 
 
+def _extract_dot(md: str) -> List[str]:
+    # Graphviz DOT, authored as ```dot or ```graphviz fences.
+    return [m.group(1).strip()
+            for m in re.finditer(r"```(?:dot|graphviz)\s*\n(.*?)```", md, re.DOTALL)]
+
+
 def parse_plan(md: str) -> PlanModel:
     title_m = re.search(r"^#\s+(.+)$", md, re.MULTILINE)
     return PlanModel(
@@ -134,6 +149,7 @@ def parse_plan(md: str) -> PlanModel:
         ac_rows=_find_ac_table(md),
         modules=_find_modules(md),
         mermaid_blocks=_extract_mermaid(md),
+        dot_blocks=_extract_dot(md),
         body_md=md,
     )
 
@@ -216,6 +232,9 @@ def md_to_html(md: str) -> str:
             code = "\n".join(buf)
             if info == "mermaid":
                 out.append('<pre class="mermaid">' + _html.escape(code, quote=False) + "</pre>")
+            elif info in ("dot", "graphviz"):
+                # Rendered to SVG by Graphviz-WASM at load; degrades to source if offline.
+                out.append('<pre class="graphviz">' + _html.escape(code, quote=False) + "</pre>")
             else:
                 cls = (' class="language-%s"' % _html.escape(info, quote=True)) if info else ""
                 out.append("<pre><code%s>" % cls + _html.escape(code, quote=False) + "</code></pre>")
@@ -345,7 +364,8 @@ def render_module_map(modules: List[Dict[str, str]]) -> str:
                         for p in groups[key] if p)
         cols.append('<div class="mod-col mod-%s"><h3>%s</h3><ul>%s</ul></div>' % (
             key.lower(), key, items or "<li class=\"empty\">—</li>"))
-    return ('<section id="modules" class="panel"><h2>模块架构图</h2>'
+    return ('<section id="modules" class="panel"><h2>改动文件（按操作分组）'
+            '<span class="count">真正的架构图见正文 ## 图示 的 dot 块</span></h2>'
             '<div class="mod-grid">' + "".join(cols) + "</div></section>")
 
 
@@ -381,7 +401,10 @@ li.task{list-style:none;margin-left:-22px;} .cb{color:var(--accent);}
 .mod-create h3{color:#7fe0a3;} .mod-modify h3{color:#ffd479;} .mod-test h3{color:#6ea8fe;}
 .mod-col ul{margin:0;padding-left:18px;} .mod-col li{margin:4px 0;word-break:break-all;}
 .mod-col li.empty{list-style:none;color:var(--muted);}
-.toc{font-size:13px;color:var(--muted);} pre.mermaid{background:#0b0d12;text-align:center;}
+.toc{font-size:13px;color:var(--muted);} pre.mermaid,pre.graphviz{background:#0b0d12;text-align:center;}
+.graphviz{margin:14px 0;text-align:center;overflow:auto;} .graphviz svg{max-width:100%;height:auto;}
+.graphviz svg .node polygon,.graphviz svg .node ellipse{fill:#171a23;stroke:#6ea8fe;}
+.graphviz svg text{fill:#e6e6e6;} .graphviz svg .edge path{stroke:#9aa0aa;} .graphviz svg .edge polygon{fill:#9aa0aa;stroke:#9aa0aa;}
 """
 
 
@@ -394,16 +417,37 @@ def _meta_block(model: "PlanModel") -> str:
     return ('<div class="meta">' + "".join(parts) + "</div>") if parts else ""
 
 
+def _diagram_scripts(model: "PlanModel") -> str:
+    """Client-side diagram renderers. Each wrapped in try/catch so that, offline,
+    the <pre> source remains visible (graceful degradation) instead of breaking."""
+    scripts = []
+    if model.mermaid_blocks:
+        # Mermaid v11 ESM + ELK layout (clearer layered flowcharts than dagre).
+        scripts.append(
+            '<script type="module">try{'
+            'const m=await import("%s");'
+            'try{const e=await import("%s");m.default.registerLayoutLoaders(e.default);}catch(_){}'
+            'm.default.initialize({startOnLoad:false,theme:"dark",layout:"elk",securityLevel:"strict"});'
+            'await m.default.run({querySelector:"pre.mermaid"});'
+            '}catch(e){}</script>' % (MERMAID_SRC, MERMAID_ELK_SRC))
+    if model.dot_blocks:
+        # Graphviz (WASM) renders DOT to SVG — best-in-class architecture/dependency layout.
+        scripts.append(
+            '<script type="module">try{'
+            'const {Graphviz}=await import("%s");'
+            'const gv=await Graphviz.load();'
+            'document.querySelectorAll("pre.graphviz").forEach(function(el){'
+            'try{var d=document.createElement("div");d.className="graphviz";'
+            'd.innerHTML=gv.dot(el.textContent);el.replaceWith(d);}catch(_){}'
+            '});}catch(e){}</script>' % GRAPHVIZ_SRC)
+    return "".join(scripts)
+
+
 def render_plan_html(md: str, title: Optional[str] = None) -> str:
     model = parse_plan(md)
     page_title = title or model.title or "Plan"
     body_html = md_to_html(md)
-    mermaid_init = ""
-    if model.mermaid_blocks:
-        mermaid_init = (
-            '<script src="%s"></script>'
-            '<script>try{mermaid.initialize({startOnLoad:true,theme:"dark"});}'
-            'catch(e){}</script>' % MERMAID_SRC)
+    diagram_scripts = _diagram_scripts(model)
     return (
         "<!DOCTYPE html>\n<html lang=\"zh\"><head><meta charset=\"utf-8\"/>"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>"
@@ -414,7 +458,7 @@ def render_plan_html(md: str, title: Optional[str] = None) -> str:
         + render_coverage(model.ac_rows)
         + render_module_map(model.modules)
         + "<section class=\"body\">" + body_html + "</section>"
-        "</div>" + mermaid_init + "</body></html>"
+        "</div>" + diagram_scripts + "</body></html>"
     )
 
 

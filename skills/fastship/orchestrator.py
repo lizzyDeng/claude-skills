@@ -1124,7 +1124,8 @@ STEPS = [
 🔴 为让自动生成的 plan.html 直观可视，请额外：
   - 加 `## 验收清单（AC）→ E2E 映射` 管道表（| AC | 可观察断言 | E2E scenario |），每条 AC 必有 E2E
   - 加 `## File Structure` 管道表（| File | Responsibility | Change |，Change ∈ Create/Modify/Test）
-  - 加 `## 图示` 一个 ```mermaid flowchart（核心流程），可选模块依赖图
+  - 加 `## 图示`：核心流程用 ```mermaid flowchart（ELK 布局自动更清晰）；
+    模块/架构依赖图用 ```dot（Graphviz，`digraph{A->B}`，层级布局最清楚）
 🔴 必须通过 Skill 工具调用，不要自己拆步骤。
 产物: docs/superpowers/plans/YYYY-MM-DD-{feature}.md（plan 通过后自动生成同名 .plan.html）
 orchestrator 自动检测 plan 文件写入 + 验证 writing-plans 签名。"""),
