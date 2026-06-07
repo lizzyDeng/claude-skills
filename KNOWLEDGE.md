@@ -4,6 +4,16 @@
 
 ---
 
+## 在 claude-skills 自身跑 fastship 建 plan.html 渲染器（CLI 模式坑 + 渲染器安全）
+
+- **CLI 模式 codex-review FAIL 不会自动回退到 1.4（hook-only）**：`orchestrator.py` 的「codex FAIL → `current_step="1.4"`」自动回退只在 **hook post_edit** 路径（~L1767）触发；CLI `cmd_done` 里 `validate_codex_review` 返回 False 只打印「自动回退」提示但**实际停在 1.5c**。CLI 驱动时若 grill/codex 要改 plan，须**手动**把 orch state `current_step` 设回 `"1.4"`（`load_orch_state`→改→`save_orch_state`，忠实复制 hook 的同一状态迁移），再 `done --plan` 重绑 artifact（新 hash），重走 1.5→1.5c。直接在 1.5/1.5c 编辑 plan.md 会让 1.4 已记录的 artifact hash 失配 → `_verify_step_artifact` FAIL。
+- **plan artifact hash 绑定决定改 plan 必须经 1.4**：1.4 把 plan.md 的 sha256 记进可信账本；1.5c `validate_codex_review` 复算 plan 文件 hash 比对账本 + 要求 `reviewed_plan_sha256==当前账本 hash`。所以任何 plan 文本修订都要经 1.4 重绑，不能旁路。**派生产物（plan.html）反过来绝不进可信账本**——只存 `artifacts["plan_html_path"]`，否则「重新生成→hash 变」会误伤校验。
+- **纯 Python 在服务端拼 HTML 的两个 XSS sink（对抗性 review 才抓到，单测初版漏）**：① fenced-code 的 info string 裸插进 `class="language-%s"` → 构造 ` ```python"></code></pre><script>…` 可逃逸，必须 `_html.escape(info, quote=True)`；② markdown 链接 `[t](url)` 的 href 在 `_html.escape(…, quote=False)` 之后插入 → URL 里的 `"` 能 breakout 出属性，必须再把 href 内 `"`→`&quot;`（或 quote=True）。教训：「`<script>` 被转义」≠「XSS-safe」，**属性上下文（class/href）要单独按 quote 转义**；AC 写「XSS-safe」就得覆盖所有 user-controlled→HTML 的 sink，不能只测 body 里的 `<script>`。
+- **并行 bg job 污染共享 fastship registry**：claude-skills `.git/fastship/registry.json` 的 `current_session` 会被并行 job（如 smoke 测试）重建并抢占 → `done` 操作错 session（表现为 branch mismatch）。**驱动自己的 flow 全程 `export FASTSHIP_SESSION=<sid>`**（`current_session_id()` 先读该 env），免疫 registry 指针竞争。跑项目 pytest 时反而要 `env -u FASTSHIP_SESSION`（否则隔离测试失败）。
+- **离线优先渲染策略**：正文/覆盖矩阵/模块架构图用纯 Python 服务端渲染（零依赖、可单测、完全离线）；只有 mermaid 流程图走 CDN（`MERMAID_SRC` 单点常量，离线降级为显示图源）。比「整页 marked.js+mermaid CDN」更稳，也契合本仓 stdlib-only/no-vendored-JS 风格。
+
+---
+
 ## Fastship Ship Gate 与项目本地 Hook 漂移
 
 ### 关键认知

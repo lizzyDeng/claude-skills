@@ -100,7 +100,19 @@ $FASTSHIP goal             # 生成 /goal 条件（Phase 2+ 可用）
 $FASTSHIP adopt-branch     # 将活跃 session 迁移到当前分支
 $FASTSHIP reset            # 重置当前 session
 $FASTSHIP reset --all      # 清空全部 sessions
+$FASTSHIP render-plan [plan.md]   # 把 plan 渲染成可视化 plan.html（缺省用当前 session 的 plan）
 ```
+
+## Plan 可视化（plan.html）
+
+Step 1.4 写计划通过校验后，orchestrator 自动在 plan.md 同目录生成同名 `*.plan.html`（hook + CLI 两种模式都会触发）：
+
+- **生成后自动在浏览器打开**（直接给你看，无需手动触发）。
+  - 自动打开开关 `FASTSHIP_PLAN_HTML_OPEN`：`auto`（缺省，非 CI/headless 才开）/ `always` / `never`。
+- 图示渲染：`## 图示` 里 ```mermaid 流程图走 **ELK 布局**（比默认 dagre 少交叉、更清晰）；```dot/```graphviz 架构/依赖图走 **Graphviz-WASM**（层级布局最清楚）。都离线优雅降级（加载失败显示图源）。
+- 离线自包含单文件，把 Goal/Architecture、**E2E↔AC 覆盖矩阵**、**模块架构图**（从 `## File Structure` 表派生）、正文渲染成直观视图，解决「纯 md 看不清」。正文/矩阵/模块图纯 Python 渲染完全离线；mermaid 走 CDN，离线降级显示图源。
+- 按需重渲染：`render-plan [plan.md]`（缺省取当前 session 的 plan_path；不想弹浏览器用 `plan_html.py <plan> --no-open`）。
+- 生成失败**不阻断**流程；plan.html **不进可信账本**（派生视图，非门禁交付物）；产物已 gitignore（`docs/superpowers/plans/*.plan.html`）。
 
 ## 项目级 E2E 配置
 
