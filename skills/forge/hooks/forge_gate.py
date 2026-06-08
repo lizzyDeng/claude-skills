@@ -721,6 +721,41 @@ def verify_trusted_artifact(orch_state, step_id):
     return (True, "", rec)
 
 
+def _trusted_plan_has_open_fork(orch_state):
+    """Re-derive the open-fork decision from the SHA-verified 1.4 plan artifact, NOT
+    from the mutable orch-state field. Returns (ok, has_open_fork, reason). The phase-1
+    gate honors a 1.5 grill skip only when the TRUSTED plan genuinely has no open
+    exclusive fork — binding the waiver to trusted evidence (a forged/stale orch field
+    or an edited plan can't move a fork-bearing feature to planned without arbitration).
+    Fails CLOSED: if the trusted plan can't be read/parsed, treat as having an open
+    fork so the grill is NOT waived."""
+    ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
+    if not ok:
+        return (False, True, reason)
+    try:
+        with open(plan_rec["path"], encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return (False, True, f"cannot read trusted plan artifact: {e}")
+    gate = None
+    for block in CODEX_GATE_JSON_RE.findall(content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "ac_mapping" in obj:
+            gate = obj
+    if not isinstance(gate, dict):
+        # A validly-planned feature always carries the ac_mapping block; its absence is
+        # anomalous → fail closed (don't waive the grill).
+        return (True, True, "")
+    forks = gate.get("exclusive_forks", [])
+    if not isinstance(forks, list):
+        return (True, True, "")
+    has_open = any(isinstance(fk, dict) and fk.get("status") == "open" for fk in forks)
+    return (True, has_open, "")
+
+
 def verify_codex_review_artifact(orch_state):
     ok, reason, codex_rec = verify_trusted_artifact(orch_state, "1.5c")
     if not ok:
@@ -772,12 +807,16 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     # let a forged skip of a MANDATORY step bypass the gate: a bugfix must still run
     # its 1.5 grill, and a feature must still run its 1.3r 1A tribunal.
     allowed_skips = {"1.3r"} if is_bugfix else {"1.3d"}
-    # F4: a feature may skip the 1.5 grill ONLY when its plan surfaced no open
-    # technical fork — this mirrors the orchestrator's own skip condition exactly. If
-    # open forks exist the engine routes to the grill (mandatory human arbitration),
-    # so a 1.5 skip there is illegitimate (forged/stale) and must NOT satisfy the gate.
-    if not is_bugfix and not orch_state.get("artifacts", {}).get("plan_open_fork_ids"):
-        allowed_skips = allowed_skips | {"1.5"}
+    # F4: a feature may skip the 1.5 grill ONLY when its plan surfaced no open technical
+    # fork — derived from the SHA-VERIFIED 1.4 plan artifact, not the mutable orch-state
+    # field. If the trusted plan carries an open fork the engine routes to the grill
+    # (mandatory human arbitration), so honoring a 1.5 skip there would bypass it.
+    if not is_bugfix and "1.5" in skipped:
+        ok, has_open_fork, reason = _trusted_plan_has_open_fork(orch_state)
+        if not ok:
+            return (False, "Gate 2: " + reason)
+        if not has_open_fork:
+            allowed_skips = allowed_skips | {"1.5"}
     honored_skips = skipped & allowed_skips
     satisfied = completed | honored_skips
     required = {"1.4", "1.5", "1.5c", "1.6"}

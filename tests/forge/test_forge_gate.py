@@ -71,7 +71,10 @@ def codex_review_content(plan_sha):
 def make_fastship_phase1_state(tmp_path, slug="f1"):
     plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
     plan.parent.mkdir(parents=True, exist_ok=True)
-    plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n")
+    # A real feature plan carries the 1B ac_mapping block; here with no exclusive fork.
+    plan.write_text(
+        "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+        '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}]}\n```\n')
     grill = tmp_path / ".claude" / ".fastship-grill-result.md"
     grill.parent.mkdir(parents=True, exist_ok=True)
     grill.write_text("## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- pass\n" + "x " * 150)
@@ -392,12 +395,17 @@ class TestStateTransition:
         assert ok is False and "1.5" in reason
 
     def test_draft_to_planned_rejects_grill_skip_when_open_fork(self, tmp_path):
-        # codex F4 [P1] round 2: a feature whose plan HAS open technical forks must run
-        # the 1.5 grill (the engine routes there). A skipped=["1.5"] with open forks
-        # present is illegitimate (forged/stale) and must NOT satisfy the gate — the
-        # gate mirrors the orchestrator's exact skip condition (no open fork).
+        # codex F4 [P1] round 2+3: a feature whose TRUSTED plan HAS an open technical
+        # fork must run the 1.5 grill. The decision is derived from the sha-verified
+        # plan content, NOT a mutable orch field — so writing the open fork into the
+        # plan (and re-trusting it) is what must make the skip illegitimate.
         fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
-        orch_state["artifacts"]["plan_open_fork_ids"] = ["tf-1"]
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}]}\n```\n')
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = trusted_artifact("1.4", plan)
         orch_state["completed_steps"].remove("1.5")
         orch_state["skipped_steps"] = ["1.5"]
         orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
