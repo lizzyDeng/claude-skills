@@ -368,6 +368,18 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is True, reason
 
+    def test_draft_to_planned_feature_skipped_grill_passes(self, tmp_path):
+        # F4: a feature whose 1B plan had no open technical fork auto-skips the 1.5
+        # grill. The phase-1 gate must treat that skip as satisfied (and not demand a
+        # 1.5 artifact) — otherwise Forge could never mark such a feature "planned".
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        orch_state["artifacts"].pop("grill_result_path", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is True, reason
+
     def test_draft_to_planned_rejects_plan_ready_without_artifacts(self, tmp_path):
         fastship_state = {"forge_feature": "f1", "plan_ready": True}
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, {})

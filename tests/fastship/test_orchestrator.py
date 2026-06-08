@@ -1025,7 +1025,8 @@ class TestIntegrationFullFlow:
             "# Plan\n> **For agentic workers:** REQUIRED\n"
             "**Goal:** dark mode\n- [ ] **Step 1:** test\n"
             "## AC→task+E2E\n```json\n"
-            '{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["实现暗色切换"], "e2e": ["E2E-dark-toggle"]}]}\n'
+            '{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["实现暗色切换"], "e2e": ["E2E-dark-toggle"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "主题存 localStorage 还是 profile", "status": "open"}]}\n'
             "```\n"
         )
         hook["plan_ready"] = True
@@ -1167,6 +1168,36 @@ class TestIntegrationFullFlow:
             orch_path=orch_file)
         st = reload()
         assert st["current_step"] == "done"
+
+    def test_codex_fail_rollback_clears_f4_grill_skip(self, tmp_path, monkeypatch):
+        # F4 + rollback: a feature whose plan had no open fork auto-skipped 1.5 and
+        # reached 1.5c. If codex FAILs, rolling back to 1.4 must also clear the prior
+        # 1.5 skip + stale fork signal, so the rewritten plan decides the grill afresh.
+        from orchestrator import save_orch_state, load_orch_state, hook_post_edit_logic
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        orch_file = str(tmp_path / "orch.json")
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-x.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"],          # 1.5 was auto-skipped (no fork)
+            "plan_path": str(plan),
+            "artifacts": {"plan_open_fork_ids": []},   # stale signal
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        review.write_text(codex_review_content(plan_sha, gate="FAIL"))
+        save_orch_state(orch, orch_file)
+        hook_post_edit_logic(data={"tool_input": {"file_path": str(review)}}, orch_path=orch_file)
+        st = load_orch_state(orch_file)
+        assert st["current_step"] == "1.4"                       # rolled back
+        assert "1.5" not in st["skipped_steps"]                  # prior auto-skip cleared
+        assert "plan_open_fork_ids" not in st["artifacts"]       # stale fork signal dropped
 
     def test_loop_fail_pauses_for_decision(self, tmp_path):
         from orchestrator import save_orch_state, load_orch_state, hook_post_bash_logic

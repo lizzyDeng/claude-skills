@@ -765,6 +765,11 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     if not orch_state:
         return (False, "Gate 2: fastship orchestrator state missing")
     completed = set(orch_state.get("completed_steps", []))
+    # A step the engine legitimately skipped (lands in skipped_steps) is satisfied,
+    # not missing — and has no artifact to verify. F4 lets a feature with no open
+    # technical fork skip the 1.5 grill; bugfix skips 1.3r; non-bugfix skips 1.3d.
+    skipped = set(orch_state.get("skipped_steps", []))
+    satisfied = completed | skipped
     required = {"1.4", "1.5", "1.5c", "1.6"}
     artifact_steps = ["1.4", "1.5"]
     # 1A requirements tribunal (1.3r) is mandatory for non-bugfix features — without it
@@ -774,12 +779,14 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     if orch_state.get("request_type") != "bugfix":
         required = required | {"1.3r"}
         artifact_steps = ["1.3r"] + artifact_steps
-    missing = sorted(required - completed)
+    missing = sorted(required - satisfied)
     if missing:
         return (False, "Gate 2: fastship Phase 1 incomplete. Missing: " + ", ".join(missing))
     if not orch_state.get("artifacts", {}).get("user_confirmed"):
         return (False, "Gate 2: user confirmation missing")
     for step_id in artifact_steps:
+        if step_id in skipped:
+            continue  # skipped step produced no artifact
         ok, reason, _ = verify_trusted_artifact(orch_state, step_id)
         if not ok:
             return (False, "Gate 2: " + reason)

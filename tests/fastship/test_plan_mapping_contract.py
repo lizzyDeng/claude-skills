@@ -224,3 +224,110 @@ def test_validate_plan_bugfix_skips_mapping(tmp_path, monkeypatch):
                         request_type="bugfix", seed_1a=False)
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
+
+
+# ── F4: 1B technical forks gate the 1.5 grill ──────────────────────────────
+
+def _forks(forks):
+    from orchestrator import _check_exclusive_forks
+    return _check_exclusive_forks(forks)
+
+
+def test_check_exclusive_forks_valid_returns_open_ids():
+    ok, msg, open_ids = _forks([
+        {"id": "tf-1", "decision": "PG vs Redis", "status": "open"},
+        {"id": "tf-2", "decision": "REST vs RPC", "status": "resolved", "resolution": "REST"},
+    ])
+    assert ok and open_ids == ["tf-1"]
+
+
+def test_check_exclusive_forks_empty_ok():
+    ok, _, open_ids = _forks([])
+    assert ok and open_ids == []
+
+
+def test_check_exclusive_forks_non_list_fails():
+    ok, msg, _ = _forks({"id": "x"})
+    assert ok is False and "数组" in msg
+
+
+def test_check_exclusive_forks_dup_id_fails():
+    ok, msg, _ = _forks([
+        {"id": "tf-1", "decision": "a", "status": "open"},
+        {"id": "tf-1", "decision": "b", "status": "open"},
+    ])
+    assert ok is False and "重复" in msg
+
+
+def test_check_exclusive_forks_bad_status_fails():
+    ok, msg, _ = _forks([{"id": "tf-1", "decision": "a", "status": "maybe"}])
+    assert ok is False and "status" in msg
+
+
+def test_check_exclusive_forks_resolved_without_resolution_fails():
+    ok, msg, _ = _forks([{"id": "tf-1", "decision": "a", "status": "resolved"}])
+    assert ok is False and "resolution" in msg
+
+
+def test_validate_plan_stashes_open_forks(tmp_path, monkeypatch):
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
+        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+        "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}],
+    }))
+    ok, msg = o.validate_plan(orch, {})
+    assert ok, msg
+    assert orch["artifacts"]["plan_open_fork_ids"] == ["tf-1"]
+
+
+def test_validate_plan_stashes_empty_when_no_fork(tmp_path, monkeypatch):
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
+        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+    }))
+    ok, msg = o.validate_plan(orch, {})
+    assert ok, msg
+    assert orch["artifacts"]["plan_open_fork_ids"] == []
+
+
+def test_validate_plan_rejects_malformed_fork(tmp_path, monkeypatch):
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
+        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+        "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "huh"}],
+    }))
+    ok, msg = o.validate_plan(orch, {})
+    assert ok is False and "exclusive_forks" in msg
+
+
+# ── F4: _advance_state 1.5 skip/run ─────────────────────────────────────────
+
+def _adv_from_1_4(request_type, open_fork_ids):
+    import orchestrator as o
+    orch = {"current_step": "1.4", "request_type": request_type,
+            "completed_steps": [], "skipped_steps": [], "phase": 1, "artifacts": {}}
+    if open_fork_ids is not None:
+        orch["artifacts"]["plan_open_fork_ids"] = open_fork_ids
+    return o._advance_state(orch)
+
+
+def test_feature_no_open_fork_skips_grill():
+    orch = _adv_from_1_4("feature", [])
+    assert orch["current_step"] == "1.5c"          # grill auto-skipped
+    assert "1.5" in orch["skipped_steps"]
+
+
+def test_feature_absent_signal_skips_grill():
+    # defensive: no stashed signal == no open fork → skip (validate_plan always stashes).
+    orch = _adv_from_1_4("feature", None)
+    assert orch["current_step"] == "1.5c"
+    assert "1.5" in orch["skipped_steps"]
+
+
+def test_feature_open_fork_runs_grill():
+    orch = _adv_from_1_4("feature", ["tf-1"])
+    assert orch["current_step"] == "1.5"           # human arbitrates the open fork
+    assert "1.5" not in orch["skipped_steps"]
+
+
+def test_bugfix_always_runs_grill():
+    orch = _adv_from_1_4("bugfix", None)
+    assert orch["current_step"] == "1.5"           # bugfix keeps its plan grill
+    assert "1.5" not in orch["skipped_steps"]
