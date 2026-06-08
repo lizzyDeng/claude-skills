@@ -695,7 +695,7 @@ class TestValidatorsFallbackDenied:
 class TestSteps:
     def test_step_count(self):
         from orchestrator import STEPS
-        assert len(STEPS) == 18
+        assert len(STEPS) == 19
 
     def test_phase_order(self):
         from orchestrator import STEPS
@@ -988,6 +988,23 @@ class TestIntegrationFullFlow:
         save_orch_state(st, orch_file)
         hook_post_edit_logic(
             data={"tool_input": {"file_path": str(brief)}},
+            orch_path=orch_file)
+        st = reload()
+        assert st["current_step"] == "1.3r"   # 1A requirements tribunal runs for features
+
+        # 1.3r: requirements-lock (auto via post_edit)
+        req_gate = {
+            "roles": [{"role": "产品", "abstain": False, "concerns": [
+                {"id": "c1", "kind": "ac", "point": "dark mode toggle", "evidence_ref": "用户原话"}]}],
+            "additive_union": [{"id": "c1", "kind": "ac", "point": "dark mode toggle", "sources": ["产品"]}],
+            "exclusive_forks": [],
+            "p0": [{"id": "p0-1", "source": "用户原话", "observable_ac": ["切换后主题变暗"]}],
+        }
+        req = brief_dir / ".fastship-requirements.md"
+        req.write_text("# 需求定稿\n## 契约\n```json\n" + json.dumps(req_gate, ensure_ascii=False)
+                       + "\n```\n" + "占位 " * 20)
+        hook_post_edit_logic(
+            data={"tool_input": {"file_path": str(req)}},
             orch_path=orch_file)
         st = reload()
         assert st["current_step"] == "1.4"

@@ -57,7 +57,7 @@ class SessionLinkageTest(unittest.TestCase):
         self.assertEqual(feat["fastship"]["current_step"], "2.0")
         self.assertEqual(feat["fastship"]["phase"], 2)
         self.assertEqual(feat["fastship"]["completed_count"], 8)
-        self.assertEqual(feat["fastship"]["applicable_steps"], 17)
+        self.assertEqual(feat["fastship"]["applicable_steps"], 18)
         self.assertTrue(feat["fastship"]["test_passed"])
         self.assertEqual(snap["counts"]["sessions"], 1)
 
@@ -87,7 +87,7 @@ class SessionLinkageTest(unittest.TestCase):
         snap = fd.build_snapshot(self.tmp)
         feat = snap["objectives"][0]["features"][0]
         self.assertEqual(feat["fastship"]["completed_count"], 0)
-        self.assertEqual(feat["fastship"]["applicable_steps"], 18)
+        self.assertEqual(feat["fastship"]["applicable_steps"], 19)
 
 
 class RollupTest(unittest.TestCase):

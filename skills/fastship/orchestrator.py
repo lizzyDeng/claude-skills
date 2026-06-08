@@ -275,6 +275,7 @@ def attach_plan_html(orch: dict, plan_path: str):
 
 STEP_ARTIFACT_OWNERS = {
     BRIEF_FILENAME: "1.3",
+    REQUIREMENTS_FILENAME: "1.3r",
     GRILL_RESULT_FILENAME: "1.5",
     CODEX_REVIEW_FILENAME: "1.5c",
     CODE_REVIEW_FILENAME: "2.5",
@@ -1256,6 +1257,22 @@ STEPS = [
 
 🔴 必须引用 file_path，不引用 = 凑数。orchestrator 自动检测文件写入并验证章节。"""),
 
+    Step("1.3r", "1A 需求拷打", 1, validator=validate_requirements, conditional="non-bugfix",
+         instruction="""1A 需求拷打（仅 non-bugfix，bugfix 自动跳过）：多角色法庭拷打需求 → 书记员合成 → grill 合岔路 → 需求定稿。
+
+派 Workflow 并行多角色（产品/运营/数据/财务，吃 1.3 Brief 作输入）：
+  - 各角色结构化输出 concern，每条带 evidence_ref（用户原话 / brief 的 file:line）；无实质关切→显式 abstain（合法，禁造假充数）
+  - 书记员机械合成（书记员不是法官）：additive 取并集谁都不许删（标 sources）；exclusive 摊成 fork
+  - grill 合 exclusive fork（无 open fork 自动跳过）
+
+用 Write 写需求定稿到 .claude/.fastship-requirements.md，含 ```json 契约块（字段）：
+  roles[]: role / abstain / concerns[]（每条 id,kind,point,evidence_ref）
+  additive_union[]: id / kind / point / sources[]
+  exclusive_forks[]: id / decision / status(open|resolved) / resolution
+  p0[]: id / source / observable_ac[]    （p1 / constraints / open_questions 同理）
+
+🔴 引擎硬验证(validate_requirements)：additive 并集不减 / fork 全 resolved / 每 P0 有 source+≥1 可观察 AC / concern 必带 evidence_ref。verdict 派生自结构，自报 PASS 无效。orchestrator 自动检测文件写入并验证。"""),
+
     Step("1.3d", "Bug 诊断", 1, validator=validate_diagnosis, conditional="bugfix",
          instruction="""Bugfix 诊断三步（缺一不可）：
 
@@ -1518,6 +1535,9 @@ def detect_completion_post_edit(current_step: str, data: dict) -> Optional[str]:
     if current_step == "1.3" and BRIEF_FILENAME in file_path:
         return "1.3"
 
+    if current_step == "1.3r" and REQUIREMENTS_FILENAME in file_path:
+        return "1.3r"
+
     if current_step == "1.4" and PLAN_DIR_MARKER in file_path and file_path.endswith(".md"):
         return "1.4"
 
@@ -1579,6 +1599,8 @@ def _is_orchestrator_allowed_file(path: str) -> bool:
         return True
     if CODE_REVIEW_FILENAME in p:
         return True
+    if REQUIREMENTS_FILENAME in p:
+        return True
     return False
 
 
@@ -1627,6 +1649,12 @@ def _advance_state(orch: dict) -> dict:
     for next_idx in range(idx + 1, len(STEPS)):
         candidate = STEPS[next_idx]
         if candidate.conditional == "bugfix" and orch.get("request_type") != "bugfix":
+            skipped = orch.get("skipped_steps", [])
+            if candidate.id not in skipped:
+                skipped.append(candidate.id)
+            orch["skipped_steps"] = skipped
+            continue
+        if candidate.conditional == "non-bugfix" and orch.get("request_type") == "bugfix":
             skipped = orch.get("skipped_steps", [])
             if candidate.id not in skipped:
                 skipped.append(candidate.id)
@@ -1958,6 +1986,20 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 save_orch_state(orch, orch_path)
                 return 0
 
+        if detected == "1.3r":
+            orch.setdefault("artifacts", {})["requirements_path"] = file_path
+            ok, msg = record_step_artifact(orch, "1.3r", file_path)
+            if not ok:
+                print(f"⚠️ 需求定稿 artifact 记录失败: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+            hook = load_hook_state()
+            ok, msg = validate_requirements(orch, hook)
+            if not ok:
+                print(f"⚠️ 需求定稿写入已检测，但验证未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+
         if detected == "1.5c":
             orch.setdefault("artifacts", {})["codex_review_path"] = file_path
             ok, msg = record_step_artifact(orch, "1.5c", file_path)
@@ -2086,6 +2128,7 @@ def hook_post_edit():
 VALUED_FLAGS = {
     "--agents",
     "--brief",
+    "--requirements",
     "--plan",
     "--grill",
     "--codex-review",
@@ -2301,6 +2344,12 @@ def cmd_done(argv: list) -> int:
         ok, msg = record_step_artifact(st, "1.3", args["--brief"], source="cli_done")
         if not ok:
             print(f"❌ Brief artifact 记录失败: {msg}")
+            return 1
+    if "--requirements" in args:
+        artifacts["requirements_path"] = args["--requirements"]
+        ok, msg = record_step_artifact(st, "1.3r", args["--requirements"], source="cli_done")
+        if not ok:
+            print(f"❌ 需求定稿 artifact 记录失败: {msg}")
             return 1
     if "--plan" in args:
         st["plan_path"] = args["--plan"]

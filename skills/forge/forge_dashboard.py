@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # that fails the moment this list diverges from orchestrator.STEPS. The embedded
 # JS copy below is injected from this list (see render_html), so this is the only
 # place the dashboard's step-id list is written.
-ALL_STEPS = ["1.0", "1.1", "1.2", "1.3", "1.3d", "1.4", "1.5", "1.5c", "1.6",
+ALL_STEPS = ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.3d", "1.4", "1.5", "1.5c", "1.6",
              "2.0", "2.5", "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"]
 DONE_STATUSES = ("shipped", "measuring", "concluded")
 TODO_STATUSES = ("draft", "planned", "in_progress")

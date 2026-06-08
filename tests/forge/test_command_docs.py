@@ -33,7 +33,7 @@ def test_forge_docs_cover_metrics_tracking_contract():
 def test_fastship_docs_cover_all_orchestrator_steps():
     # ids derived from the live source of truth, not a hardcoded list
     ids = [s.id for s in orchestrator.STEPS]
-    assert len(ids) == 18, f"expected 18 steps, got {len(ids)}"
+    assert len(ids) == 19, f"expected 19 steps, got {len(ids)}"
     # both the command doc and the skill doc must reflect every step
     for rel in (".claude/commands/fastship.md", "skills/fastship/SKILL.md"):
         md = _read(rel)

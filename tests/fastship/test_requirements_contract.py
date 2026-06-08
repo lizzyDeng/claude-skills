@@ -202,3 +202,53 @@ def test_validate_requirements_rejects_dropped_concern_end_to_end(tmp_path, monk
     orch["artifacts"]["requirements_path"] = str(p)
     ok, msg = o.validate_requirements(orch, {})
     assert ok is False and "da-1" in msg
+
+
+# ── Step 1.3r wiring: conditional skip (non-bugfix only) + detection ────────
+
+def _advance(step, request_type):
+    import orchestrator as o
+    orch = {"current_step": step, "request_type": request_type,
+            "completed_steps": [], "skipped_steps": [], "phase": 1}
+    return o._advance_state(orch)
+
+
+def test_step_1_3r_is_registered_after_1_3():
+    import orchestrator as o
+    ids = [s.id for s in o.STEPS]
+    assert "1.3r" in ids
+    assert ids.index("1.3r") == ids.index("1.3") + 1  # inserted right after Brief
+
+
+def test_non_bugfix_runs_1_3r_then_skips_1_3d():
+    import orchestrator as o
+    orch = _advance("1.3", "feature")
+    assert orch["current_step"] == "1.3r"          # 1A runs for features
+    orch = o._advance_state(orch)
+    assert orch["current_step"] == "1.4"           # then 1.3d (bugfix-only) is skipped
+    assert "1.3d" in orch["skipped_steps"]
+
+
+def test_bugfix_skips_1_3r_and_runs_1_3d():
+    orch = _advance("1.3", "bugfix")
+    assert orch["current_step"] == "1.3d"          # 1A skipped for bugfix
+    assert "1.3r" in orch["skipped_steps"]
+
+
+def test_detect_completion_1_3r():
+    import orchestrator as o
+    data = {"tool_input": {"file_path": "/repo/.claude/.fastship-requirements.md"}}
+    assert o.detect_completion_post_edit("1.3r", data) == "1.3r"
+    # wrong current_step → no detection
+    assert o.detect_completion_post_edit("1.3", data) != "1.3r"
+
+
+def test_requirements_file_allowed_in_phase1():
+    import orchestrator as o
+    # Phase-1 must let the 1A artifact be written, not BLOCK it as a code file.
+    assert o._is_orchestrator_allowed_file("/repo/.claude/.fastship-requirements.md") is True
+
+
+def test_requirements_filename_owned_by_1_3r():
+    import orchestrator as o
+    assert o._artifact_owner_step("/repo/.claude/.fastship-requirements.md") == "1.3r"

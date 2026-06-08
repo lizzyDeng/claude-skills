@@ -22,7 +22,7 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 - **pre_edit**: Phase 1 阻止编辑代码，打印当前步骤
 - **post_edit/post_bash**: 自动检测步骤完成，推进下一步
 
-18 步中多数自动推进，关键关卡需手动：
+19 步中多数自动推进，关键关卡需手动：
   python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" done [--flags]
 
 ### Codex / 其他 Agent（CLI 模式）
@@ -33,17 +33,18 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
   3. `python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" done [--flags]` → 验证 + 推进
   4. 重复
 
-全部 18 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
+全部 19 步需手动 done，但 done 仍做硬性 artifact 验证（文件存在、内容检查）。
 Validators 自动检测环境：有 hook state 用 hook state，没有则直接扫文件系统。
 
 ## 流程概览
 
 ```
-Phase 1: Brainstorm (9 步)
+Phase 1: Brainstorm (10 步)
   1.0  需求分类         [CC:auto | Codex:done] classify CLI
   1.1  上下文+recall    [CC:auto | Codex:done] knowledge_recall CLI
   1.2  并行 Explore     [CC:done  | Codex:done] done --agents N (≥3)
   1.3  Context Brief    [CC:auto | Codex:done] .fastship-brief.md 验证章节
+  1.3r 1A 需求拷打      [CC:auto | Codex:done] 多角色法庭→书记员合成→grill→需求定稿 .fastship-requirements.md (仅 feature；bugfix 跳)
   1.3d Bug 诊断         [CC:auto | Codex:done] fix_verified (仅 bugfix)
   1.4  写计划           [CC:auto | Codex:done] plan 文件 + writing-plans 签名
   1.5  Grill            [CC:auto | Codex:done] .fastship-grill-result.md 验证
