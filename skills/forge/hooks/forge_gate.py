@@ -770,10 +770,14 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     # Only steps the engine could LEGITIMATELY skip in THIS request context count as
     # satisfied (and waive their artifact). Honoring every skipped_steps entry would
     # let a forged skip of a MANDATORY step bypass the gate: a bugfix must still run
-    # its 1.5 grill, and a feature must still run its 1.3r 1A tribunal. A bugfix may
-    # skip 1.3r (non-bugfix-only); a feature may skip 1.3d (bugfix-only) and — via F4
-    # — the 1.5 grill when its plan surfaced no open technical fork.
-    allowed_skips = {"1.3r"} if is_bugfix else {"1.3d", "1.5"}
+    # its 1.5 grill, and a feature must still run its 1.3r 1A tribunal.
+    allowed_skips = {"1.3r"} if is_bugfix else {"1.3d"}
+    # F4: a feature may skip the 1.5 grill ONLY when its plan surfaced no open
+    # technical fork — this mirrors the orchestrator's own skip condition exactly. If
+    # open forks exist the engine routes to the grill (mandatory human arbitration),
+    # so a 1.5 skip there is illegitimate (forged/stale) and must NOT satisfy the gate.
+    if not is_bugfix and not orch_state.get("artifacts", {}).get("plan_open_fork_ids"):
+        allowed_skips = allowed_skips | {"1.5"}
     honored_skips = skipped & allowed_skips
     satisfied = completed | honored_skips
     required = {"1.4", "1.5", "1.5c", "1.6"}
