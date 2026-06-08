@@ -994,8 +994,13 @@ class TestIntegrationFullFlow:
 
         # 1.3r: requirements-lock (auto via post_edit)
         req_gate = {
-            "roles": [{"role": "产品", "abstain": False, "concerns": [
-                {"id": "c1", "kind": "ac", "point": "dark mode toggle", "evidence_ref": "用户原话"}]}],
+            "roles": [
+                {"role": "产品", "abstain": False, "concerns": [
+                    {"id": "c1", "kind": "ac", "point": "dark mode toggle", "evidence_ref": "用户原话"}]},
+                {"role": "运营", "abstain": True, "concerns": []},
+                {"role": "数据", "abstain": True, "concerns": []},
+                {"role": "财务", "abstain": True, "concerns": []},
+            ],
             "additive_union": [{"id": "c1", "kind": "ac", "point": "dark mode toggle", "sources": ["产品"]}],
             "exclusive_forks": [],
             "p0": [{"id": "p0-1", "source": "用户原话", "observable_ac": ["切换后主题变暗"]}],

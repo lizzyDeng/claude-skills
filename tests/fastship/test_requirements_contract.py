@@ -24,6 +24,7 @@ def valid_gate():
                 {"id": "da-1", "kind": "risk", "point": "改名频率需限流", "evidence_ref": "brief.md:42"},
             ]},
             {"role": "财务", "abstain": True, "concerns": []},
+            {"role": "运营", "abstain": True, "concerns": []},
         ],
         "additive_union": [
             {"id": "pr-1", "kind": "ac", "point": "用户能改名", "sources": ["产品"]},
@@ -302,3 +303,19 @@ def test_additive_union_invented_entry_fails():
     g["additive_union"].append({"id": "ghost", "kind": "risk", "point": "凭空", "sources": ["产品"]})
     ok, msg = check(g)
     assert ok is False and "凭空造" in msg
+
+
+def test_additive_union_extra_source_role_fails():
+    # [P2 round 3] crediting an extra role that never raised the concern (id is unique).
+    g = valid_gate()
+    g["additive_union"][0]["sources"] = ["产品", "运营"]
+    ok, msg = check(g)
+    assert ok is False and "运营" in msg
+
+
+def test_missing_tribunal_role_fails():
+    # [P2 round 3] a single-role self-review must not satisfy the multi-role gate.
+    g = valid_gate()
+    g["roles"] = [r for r in g["roles"] if r["role"] != "财务"]
+    ok, msg = check(g)
+    assert ok is False and "财务" in msg

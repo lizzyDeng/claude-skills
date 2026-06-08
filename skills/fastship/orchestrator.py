@@ -851,6 +851,10 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
 # The verdict is DERIVED from structure — a self-declared "gate":"PASS" is ignored.
 REQUIREMENTS_STEP_ID = "1.3r"
 REQUIREMENTS_REQUIRED_LIST_FIELDS = ("roles", "additive_union", "exclusive_forks", "p0")
+# The 1A tribunal roster. Every role must appear (participating OR explicitly
+# abstaining) so a single-role self-review can't satisfy the multi-role gate —
+# omitted ≠ abstained.
+REQUIREMENTS_TRIBUNAL_ROLES = ("产品", "运营", "数据", "财务")
 
 
 def _check_requirements_contract(gate: dict) -> tuple:
@@ -915,6 +919,11 @@ def _check_requirements_contract(gate: dict) -> tuple:
             role_concern_meta[cid] = (c["kind"], c["point"], name)
     if non_abstaining == 0:
         return False, "全部角色弃权 — 未产出任何需求,不能定稿"
+    present_roles = {x.get("role") for x in gate["roles"] if isinstance(x, dict)}
+    missing_roles = [r for r in REQUIREMENTS_TRIBUNAL_ROLES if r not in present_roles]
+    if missing_roles:
+        return False, ("未跑全多角色法庭(omitted ≠ abstain,缺席角色须显式 abstain 到场): 缺 "
+                       + ", ".join(missing_roles))
 
     union_ids = set()
     for u in gate["additive_union"]:
@@ -944,8 +953,10 @@ def _check_requirements_contract(gate: dict) -> tuple:
         o_kind, o_point, o_role = origin
         if u.get("kind") != o_kind or u.get("point") != o_point:
             return False, f"additive_union 项 {uid} 改写了原 concern 的 kind/point(书记员只搬运不改写)"
-        if o_role not in srcs:
-            return False, f"additive_union 项 {uid} 的 sources 未标注真实来源角色 {o_role}"
+        bad_src = [s for s in srcs if s != o_role]
+        if bad_src:
+            return False, (f"additive_union 项 {uid} 的 sources 含未提出该 concern 的角色: "
+                           + ", ".join(bad_src) + f"(id 唯一 → 真实来源只能是 {o_role})")
         union_ids.add(uid)
     dropped = sorted(role_concern_ids - union_ids)
     if dropped:
