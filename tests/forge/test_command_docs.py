@@ -30,6 +30,13 @@ def test_forge_docs_cover_metrics_tracking_contract():
         assert token in sk, f"SKILL.md missing metrics-tracking token: {token}"
 
 
+def test_skill_documents_requirements_cli_binding():
+    # CLI/Codex users have no auto-detect hook; the 1.3r artifact needs an explicit
+    # `done --requirements <path>` binding, and it must be documented or they get stuck.
+    sk = _read("skills/fastship/SKILL.md")
+    assert "done --requirements" in sk, "SKILL.md missing CLI binding for 1.3r requirements"
+
+
 def test_fastship_docs_cover_all_orchestrator_steps():
     # ids derived from the live source of truth, not a hardcoded list
     ids = [s.id for s in orchestrator.STEPS]

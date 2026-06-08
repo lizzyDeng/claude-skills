@@ -39,7 +39,7 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 
 全部 19 步需手动 done，但 protected validators 不允许 filesystem fallback。
 无 hook/gate state 的关键步骤（plan provenance、Codex review、E2E、report、gate、loop pass、knowledge）必须失败，不能靠文件存在自动通过。
-Codex/CLI 模式下，文件产物步骤必须显式绑定 artifact：`done --brief <path>`、`done --plan <path>`、`done --grill <path>`、`done --codex-review <path>`、`done --code-review <path>`、`done --report <path>`、`done --knowledge <path>`。没有绑定就不能通过。
+Codex/CLI 模式下，文件产物步骤必须显式绑定 artifact：`done --brief <path>`、`done --requirements <path>`、`done --plan <path>`、`done --grill <path>`、`done --codex-review <path>`、`done --code-review <path>`、`done --report <path>`、`done --knowledge <path>`。没有绑定就不能通过。
 
 ## 流程概览
 

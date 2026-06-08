@@ -1306,7 +1306,8 @@ STEPS = [
   exclusive_forks[]: id / decision / status(open|resolved) / resolution
   p0[]: id / source / observable_ac[]    （p1 / constraints / open_questions 同理）
 
-🔴 引擎硬验证(validate_requirements)：additive 并集不减 / fork 全 resolved / 每 P0 有 source+≥1 可观察 AC / concern 必带 evidence_ref。verdict 派生自结构，自报 PASS 无效。orchestrator 自动检测文件写入并验证。"""),
+🔴 引擎硬验证(validate_requirements)：additive 并集不减 / fork 全 resolved / 每 P0 有 source+≥1 可观察 AC / concern 必带 evidence_ref。verdict 派生自结构，自报 PASS 无效。
+hook 模式自动检测文件写入并验证；CLI/Codex 模式须显式绑定：`done --requirements <path>`。"""),
 
     Step("1.3d", "Bug 诊断", 1, validator=validate_diagnosis, conditional="bugfix",
          instruction="""Bugfix 诊断三步（缺一不可）：
