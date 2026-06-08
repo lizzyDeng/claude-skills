@@ -75,18 +75,22 @@ def make_fastship_phase1_state(tmp_path, slug="f1"):
     grill = tmp_path / ".claude" / ".fastship-grill-result.md"
     grill.parent.mkdir(parents=True, exist_ok=True)
     grill.write_text("## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- pass\n" + "x " * 150)
+    req = tmp_path / ".claude" / ".fastship-requirements.md"
+    req.write_text("# 需求定稿\n```json\n{}\n```\n" + "x " * 50)
     plan_rec = trusted_artifact("1.4", plan)
     codex = tmp_path / ".claude" / ".fastship-codex-review.md"
     codex.write_text(codex_review_content(plan_rec["sha256"]))
     orch = {
         "current_step": "2.0",
-        "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6"],
+        "request_type": "feature",
+        "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4", "1.5", "1.5c", "1.6"],
         "plan_path": str(plan),
         "artifacts": {
             "user_confirmed": True,
             "grill_result_path": str(grill),
             "codex_review_path": str(codex),
             "trusted_artifacts": {
+                "1.3r": trusted_artifact("1.3r", req),
                 "1.4": plan_rec,
                 "1.5": trusted_artifact("1.5", grill),
                 "1.5c": trusted_artifact("1.5c", codex),
@@ -345,6 +349,24 @@ class TestStateTransition:
         fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is True
+
+    def test_draft_to_planned_rejects_feature_missing_1a(self, tmp_path):
+        # codex [P1]: a feature must not reach "planned" without 1A requirements (1.3r).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.3r")
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+        assert "1.3r" in reason
+
+    def test_draft_to_planned_bugfix_does_not_require_1a(self, tmp_path):
+        # bugfix skips 1A; the gate must still pass without 1.3r.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["request_type"] = "bugfix"
+        orch_state["completed_steps"].remove("1.3r")
+        orch_state["skipped_steps"] = ["1.3r"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.3r", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is True, reason
 
     def test_draft_to_planned_rejects_plan_ready_without_artifacts(self, tmp_path):
         fastship_state = {"forge_feature": "f1", "plan_ready": True}

@@ -766,12 +766,20 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
         return (False, "Gate 2: fastship orchestrator state missing")
     completed = set(orch_state.get("completed_steps", []))
     required = {"1.4", "1.5", "1.5c", "1.6"}
+    artifact_steps = ["1.4", "1.5"]
+    # 1A requirements tribunal (1.3r) is mandatory for non-bugfix features — without it
+    # Forge could mark a feature "planned" with no 需求定稿. bugfix skips 1.3r (it lands
+    # in skipped_steps, not completed). Unset/stale request_type defaults to requiring 1A
+    # (safe: a feature missing its type must still have produced requirements).
+    if orch_state.get("request_type") != "bugfix":
+        required = required | {"1.3r"}
+        artifact_steps = ["1.3r"] + artifact_steps
     missing = sorted(required - completed)
     if missing:
         return (False, "Gate 2: fastship Phase 1 incomplete. Missing: " + ", ".join(missing))
     if not orch_state.get("artifacts", {}).get("user_confirmed"):
         return (False, "Gate 2: user confirmation missing")
-    for step_id in ("1.4", "1.5"):
+    for step_id in artifact_steps:
         ok, reason, _ = verify_trusted_artifact(orch_state, step_id)
         if not ok:
             return (False, "Gate 2: " + reason)

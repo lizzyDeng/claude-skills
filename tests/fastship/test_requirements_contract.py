@@ -252,3 +252,29 @@ def test_requirements_file_allowed_in_phase1():
 def test_requirements_filename_owned_by_1_3r():
     import orchestrator as o
     assert o._artifact_owner_step("/repo/.claude/.fastship-requirements.md") == "1.3r"
+
+
+# ── codex-review findings (GATE FAIL → fixed): close the bypasses ──────────
+
+def test_duplicate_concern_id_fails():
+    # [P1] two concerns sharing an id collapse in the set diff, masking a drop.
+    g = valid_gate()
+    g["roles"][1]["concerns"][0]["id"] = "pr-1"   # collide with 产品's pr-1
+    ok, msg = check(g)
+    assert ok is False and "重复" in msg
+
+
+def test_non_abstaining_role_with_empty_concerns_fails():
+    # [P2] abstain=false + concerns=[] should fail (no substantive concern → abstain).
+    g = valid_gate()
+    g["roles"][1]["concerns"] = []                # 数据 claims to participate, says nothing
+    ok, msg = check(g)
+    assert ok is False and "abstain" in msg
+
+
+def test_blank_source_entry_fails():
+    # [P2] sources=[""] / ["  "] is meaningless provenance.
+    g = valid_gate()
+    g["additive_union"][0]["sources"] = ["   "]
+    ok, msg = check(g)
+    assert ok is False and "sources" in msg

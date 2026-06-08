@@ -892,12 +892,16 @@ def _check_requirements_contract(gate: dict) -> tuple:
                 return False, f"role {name} 弃权(abstain=true)却带 concern — 弃权必须空集"
             continue
         non_abstaining += 1
+        if not concerns:
+            return False, f"role {name} 未弃权(abstain=false)却无 concern — 无实质关切应 abstain=true"
         for c in concerns:
             if not isinstance(c, dict):
                 return False, f"role {name} 的 concern 含非 object 项"
             cid = c.get("id")
             if not isinstance(cid, str) or not cid.strip():
                 return False, f"role {name} 的 concern 缺少非空 id"
+            if cid in role_concern_ids:
+                return False, f"concern id 重复: {cid} — 重复 id 会让「并集不减」的 set 比对漏掉被偷删的 concern"
             for fld in ("kind", "point"):
                 v = c.get(fld)
                 if not isinstance(v, str) or not v.strip():
@@ -920,8 +924,12 @@ def _check_requirements_contract(gate: dict) -> tuple:
             v = u.get(fld)
             if not isinstance(v, str) or not v.strip():
                 return False, f"additive_union 项 {uid} 缺少 {fld}"
-        if not isinstance(u.get("sources"), list) or not u["sources"]:
+        srcs = u.get("sources")
+        if not isinstance(srcs, list) or not srcs:
             return False, f"additive_union 项 {uid} 缺少 sources"
+        for s in srcs:
+            if not isinstance(s, str) or not s.strip():
+                return False, f"additive_union 项 {uid} 的 sources 含空/非字符串项,provenance 无效"
         union_ids.add(uid)
     dropped = sorted(role_concern_ids - union_ids)
     if dropped:
