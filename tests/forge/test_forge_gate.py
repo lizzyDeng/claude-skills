@@ -380,6 +380,27 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is True, reason
 
+    def test_draft_to_planned_rejects_bugfix_skipping_grill(self, tmp_path):
+        # codex F4 [P1]: 1.5 is MANDATORY for bugfix (no upstream tribunal). A forged
+        # skipped_steps=["1.5"] must NOT satisfy the gate or waive the grill artifact.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["request_type"] = "bugfix"
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.5" in reason
+
+    def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
+        # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
+        # must NOT satisfy the gate (only bugfix may legitimately skip 1A).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.3r")
+        orch_state["skipped_steps"] = ["1.3r"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.3r", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.3r" in reason
+
     def test_draft_to_planned_rejects_plan_ready_without_artifacts(self, tmp_path):
         fastship_state = {"forge_feature": "f1", "plan_ready": True}
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, {})
