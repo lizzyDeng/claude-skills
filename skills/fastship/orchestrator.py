@@ -1296,6 +1296,12 @@ orchestrator 检测后需手动路由:
 """),
 ]
 
+# Canonical ordered step-id list — the SINGLE SOURCE for any step-id consumer
+# (forge dashboard/gate, tooling). STEPS above is where step ids are defined;
+# consumers must derive from this constant (or be pinned to it by a guard test,
+# e.g. tests/forge/test_step_ids_sync.py) rather than hardcoding their own copy.
+ALL_STEP_IDS = [s.id for s in STEPS]
+
 
 # ━━━━━━━━━━━━ Auto-Detection ━━━━━━━━━━━━
 
