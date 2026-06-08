@@ -278,3 +278,27 @@ def test_blank_source_entry_fails():
     g["additive_union"][0]["sources"] = ["   "]
     ok, msg = check(g)
     assert ok is False and "sources" in msg
+
+
+def test_additive_union_rewriting_concern_content_fails():
+    # [P1 round 2] same id but rewritten point — clerk carries, doesn't edit.
+    g = valid_gate()
+    g["additive_union"][0]["point"] = "完全不同的内容"   # pr-1 rewritten under same id
+    ok, msg = check(g)
+    assert ok is False and "改写" in msg
+
+
+def test_additive_union_misattributed_source_fails():
+    # [P1 round 2] pr-1 was raised by 产品; crediting 运营 is misattribution.
+    g = valid_gate()
+    g["additive_union"][0]["sources"] = ["运营"]
+    ok, msg = check(g)
+    assert ok is False and "来源" in msg
+
+
+def test_additive_union_invented_entry_fails():
+    # [P1 round 2] a union entry with no originating role concern = clerk invention.
+    g = valid_gate()
+    g["additive_union"].append({"id": "ghost", "kind": "risk", "point": "凭空", "sources": ["产品"]})
+    ok, msg = check(g)
+    assert ok is False and "凭空造" in msg

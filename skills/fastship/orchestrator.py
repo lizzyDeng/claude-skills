@@ -875,6 +875,8 @@ def _check_requirements_contract(gate: dict) -> tuple:
             return False, f"requirements 契约缺少数组字段或类型错误: {f}"
 
     role_concern_ids = set()
+    role_concern_meta = {}  # cid → (kind, point, role): lets additive_union be checked
+                            # for content fidelity + provenance, not just id presence.
     non_abstaining = 0
     for r in gate["roles"]:
         if not isinstance(r, dict):
@@ -910,6 +912,7 @@ def _check_requirements_contract(gate: dict) -> tuple:
             if not isinstance(ev, str) or not ev.strip():
                 return False, f"role {name} concern {cid} 缺 evidence_ref — 疑似造假需求,禁止充数"
             role_concern_ids.add(cid)
+            role_concern_meta[cid] = (c["kind"], c["point"], name)
     if non_abstaining == 0:
         return False, "全部角色弃权 — 未产出任何需求,不能定稿"
 
@@ -930,6 +933,19 @@ def _check_requirements_contract(gate: dict) -> tuple:
         for s in srcs:
             if not isinstance(s, str) or not s.strip():
                 return False, f"additive_union 项 {uid} 的 sources 含空/非字符串项,provenance 无效"
+        # Faithful reproduction, not just id presence: same id → same (kind, point),
+        # attributed to the role that raised it. An id-set-only check would let the
+        # clerk rewrite a concern's content or misattribute its source under the same
+        # id while `dropped` stays empty — the deeper bypass of 「并集不减」
+        # (书记员只搬运不改写,不凭空造条目).
+        origin = role_concern_meta.get(uid)
+        if origin is None:
+            return False, f"additive_union 项 {uid} 不对应任何角色 concern — 书记员禁止凭空造条目"
+        o_kind, o_point, o_role = origin
+        if u.get("kind") != o_kind or u.get("point") != o_point:
+            return False, f"additive_union 项 {uid} 改写了原 concern 的 kind/point(书记员只搬运不改写)"
+        if o_role not in srcs:
+            return False, f"additive_union 项 {uid} 的 sources 未标注真实来源角色 {o_role}"
         union_ids.add(uid)
     dropped = sorted(role_concern_ids - union_ids)
     if dropped:
