@@ -721,14 +721,44 @@ def verify_trusted_artifact(orch_state, step_id):
     return (True, "", rec)
 
 
+def _forks_require_grill(forks):
+    """Pure: does this plan's exclusive_forks list REQUIRE the 1.5 grill? True if any
+    fork is OPEN **or** the list is MALFORMED (fails closed). This mirrors the
+    orchestrator's _check_exclusive_forks discipline exactly, so the forge gate can't
+    be fooled into waiving the grill by a fork shape the engine would have rejected
+    (e.g. status='resolved' with no resolution, a status typo, a dup/blank id). Kept
+    in lockstep with the orchestrator by tests/forge/test_step_ids_sync.py."""
+    if not isinstance(forks, list):
+        return True
+    seen = set()
+    has_open = False
+    for fk in forks:
+        if not isinstance(fk, dict):
+            return True
+        fid = fk.get("id")
+        if not isinstance(fid, str) or not fid.strip() or fid in seen:
+            return True
+        seen.add(fid)
+        if not isinstance(fk.get("decision"), str) or not fk["decision"].strip():
+            return True
+        status = fk.get("status")
+        if status not in ("open", "resolved"):
+            return True
+        if status == "open":
+            has_open = True
+        elif not isinstance(fk.get("resolution"), str) or not fk["resolution"].strip():
+            return True
+    return has_open
+
+
 def _trusted_plan_has_open_fork(orch_state):
     """Re-derive the open-fork decision from the SHA-verified 1.4 plan artifact, NOT
-    from the mutable orch-state field. Returns (ok, has_open_fork, reason). The phase-1
+    from the mutable orch-state field. Returns (ok, requires_grill, reason). The phase-1
     gate honors a 1.5 grill skip only when the TRUSTED plan genuinely has no open
     exclusive fork — binding the waiver to trusted evidence (a forged/stale orch field
     or an edited plan can't move a fork-bearing feature to planned without arbitration).
-    Fails CLOSED: if the trusted plan can't be read/parsed, treat as having an open
-    fork so the grill is NOT waived."""
+    Fails CLOSED: if the trusted plan can't be read/parsed, or its forks are malformed,
+    treat it as requiring the grill so the skip is NOT waived."""
     ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
     if not ok:
         return (False, True, reason)
@@ -749,11 +779,7 @@ def _trusted_plan_has_open_fork(orch_state):
         # A validly-planned feature always carries the ac_mapping block; its absence is
         # anomalous → fail closed (don't waive the grill).
         return (True, True, "")
-    forks = gate.get("exclusive_forks", [])
-    if not isinstance(forks, list):
-        return (True, True, "")
-    has_open = any(isinstance(fk, dict) and fk.get("status") == "open" for fk in forks)
-    return (True, has_open, "")
+    return (True, _forks_require_grill(gate.get("exclusive_forks", [])), "")
 
 
 def verify_codex_review_artifact(orch_state):
@@ -812,10 +838,10 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     # field. If the trusted plan carries an open fork the engine routes to the grill
     # (mandatory human arbitration), so honoring a 1.5 skip there would bypass it.
     if not is_bugfix and "1.5" in skipped:
-        ok, has_open_fork, reason = _trusted_plan_has_open_fork(orch_state)
+        ok, requires_grill, reason = _trusted_plan_has_open_fork(orch_state)
         if not ok:
             return (False, "Gate 2: " + reason)
-        if not has_open_fork:
+        if not requires_grill:
             allowed_skips = allowed_skips | {"1.5"}
     honored_skips = skipped & allowed_skips
     satisfied = completed | honored_skips

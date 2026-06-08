@@ -412,6 +412,23 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is False and "1.5" in reason
 
+    def test_draft_to_planned_rejects_grill_skip_when_malformed_fork(self, tmp_path):
+        # codex F4 [P1] round 4: a malformed fork (resolved without resolution) is NOT
+        # "open", but the orchestrator validator rejects it — so the forge gate must
+        # fail CLOSED and still require the grill, not waive it on a status!=open check.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "resolved"}]}\n```\n')
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = trusted_artifact("1.4", plan)
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.5" in reason
+
     def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
         # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
         # must NOT satisfy the gate (only bugfix may legitimately skip 1A).

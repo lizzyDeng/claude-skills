@@ -31,6 +31,7 @@ if FASTSHIP_DIR not in sys.path:
     sys.path.insert(0, FASTSHIP_DIR)
 orch = _load("orchestrator", os.path.join(FASTSHIP_DIR, "orchestrator.py"))
 fd = _load("forge_dashboard", os.path.join(FORGE_DIR, "forge_dashboard.py"))
+fg = _load("forge_gate", os.path.join(FORGE_DIR, "hooks", "forge_gate.py"))
 
 
 class StepIdsInSyncTest(unittest.TestCase):
@@ -56,6 +57,41 @@ class StepIdsInSyncTest(unittest.TestCase):
             json.loads(m.group(1)), fd.ALL_STEPS,
             "embedded JS step list out of sync with ALL_STEPS injection",
         )
+
+
+class ForkDisciplineParityTest(unittest.TestCase):
+    """Guard: the forge gate's fork interpretation (whether a plan's exclusive_forks
+    waive the 1.5 grill) must agree with the orchestrator's _check_exclusive_forks for
+    EVERY shape. Two implementations of fork-discipline silently drifted once (codex
+    found the forge gate waiving the grill on a malformed fork the engine rejects);
+    this pins them: 'requires grill' == 'open OR malformed' per the engine."""
+
+    CASES = [
+        [],                                                                  # none
+        [{"id": "a", "decision": "d", "status": "resolved", "resolution": "r"}],  # all resolved
+        [{"id": "a", "decision": "d", "status": "open"}],                    # open
+        [{"id": "a", "decision": "d", "status": "resolved"}],                # resolved, no resolution
+        [{"id": "a", "decision": "d", "status": "typo"}],                    # bad status
+        [{"decision": "d", "status": "open"}],                               # missing id
+        [{"id": "  ", "decision": "d", "status": "open"}],                   # blank id
+        [{"id": "a", "decision": "", "status": "open"}],                     # blank decision
+        [{"id": "a", "decision": "d", "status": "open"},
+         {"id": "a", "decision": "e", "status": "resolved", "resolution": "x"}],  # dup id
+        [42],                                                                # non-dict entry
+        "not-a-list",                                                        # wrong type
+        [{"id": "a", "decision": "d", "status": "resolved", "resolution": "r"},
+         {"id": "b", "decision": "e", "status": "open"}],                    # mixed → open
+    ]
+
+    def test_forge_gate_fork_discipline_matches_orchestrator(self):
+        for forks in self.CASES:
+            ok, _msg, open_ids = orch._check_exclusive_forks(forks)
+            engine_requires_grill = (not ok) or bool(open_ids)
+            self.assertEqual(
+                fg._forks_require_grill(forks), engine_requires_grill,
+                f"forge_gate._forks_require_grill drifted from orchestrator "
+                f"_check_exclusive_forks for forks={forks!r}",
+            )
 
 
 if __name__ == "__main__":
