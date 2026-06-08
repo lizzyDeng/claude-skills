@@ -320,7 +320,8 @@ class TestValidatorsPhase1:
             "- [ ] **Step 1:** write test\n"
         )
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        orch = {"plan_path": str(plan), "artifacts": {}}
+        # bugfix has no 1A → signature is sufficient (1B AC-mapping is feature-only).
+        orch = {"plan_path": str(plan), "artifacts": {}, "request_type": "bugfix"}
         trust_artifact(orch, "1.4", plan)
         ok, _ = validate_plan(orch, {"plan_ready": True, "plan_file": str(plan)})
         assert ok is True
@@ -1003,7 +1004,8 @@ class TestIntegrationFullFlow:
             ],
             "additive_union": [{"id": "c1", "kind": "ac", "point": "dark mode toggle", "sources": ["产品"]}],
             "exclusive_forks": [],
-            "p0": [{"id": "p0-1", "source": "用户原话", "observable_ac": ["切换后主题变暗"]}],
+            "p0": [{"id": "p0-1", "source": "用户原话",
+                    "observable_ac": [{"id": "ac-1", "assertion": "切换后主题变暗"}]}],
         }
         req = brief_dir / ".fastship-requirements.md"
         req.write_text("# 需求定稿\n## 契约\n```json\n" + json.dumps(req_gate, ensure_ascii=False)
@@ -1022,6 +1024,9 @@ class TestIntegrationFullFlow:
         plan_file.write_text(
             "# Plan\n> **For agentic workers:** REQUIRED\n"
             "**Goal:** dark mode\n- [ ] **Step 1:** test\n"
+            "## AC→task+E2E\n```json\n"
+            '{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["实现暗色切换"], "e2e": ["E2E-dark-toggle"]}]}\n'
+            "```\n"
         )
         hook["plan_ready"] = True
         hook["plan_file"] = str(plan_file)

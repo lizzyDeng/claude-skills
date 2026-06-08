@@ -46,7 +46,7 @@ Phase 1: Brainstorm (10 步)
   1.3  Context Brief    [CC:auto | Codex:done] .fastship-brief.md 验证章节
   1.3r 1A 需求拷打      [CC:auto | Codex:done] 多角色法庭→书记员合成→grill→需求定稿 .fastship-requirements.md (仅 feature；bugfix 跳)
   1.3d Bug 诊断         [CC:auto | Codex:done] fix_verified (仅 bugfix)
-  1.4  写计划           [CC:auto | Codex:done] plan 文件 + writing-plans 签名
+  1.4  1B 技术方案      [CC:auto | Codex:done] RD/QA/总结者法庭→writing-plans 签名 + 每条 1A P0 AC→task+E2E 映射 (bugfix 只验签名)
   1.5  Grill            [CC:auto | Codex:done] .fastship-grill-result.md 验证
   1.5c Codex Review     [CC:done  | Codex:done] .fastship-codex-review.md GATE:PASS
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed

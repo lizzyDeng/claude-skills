@@ -35,7 +35,8 @@ def valid_gate():
              "resolution": "需走敏感词过滤", "options": []},
         ],
         "p0": [
-            {"id": "p0-1", "source": "用户原始需求", "observable_ac": ["改名后昵称在 profile 更新"]},
+            {"id": "p0-1", "source": "用户原始需求",
+             "observable_ac": [{"id": "ac-1", "assertion": "改名后昵称在 profile 更新"}]},
         ],
         "p1": [],
         "constraints": [],
@@ -319,3 +320,36 @@ def test_missing_tribunal_role_fails():
     g["roles"] = [r for r in g["roles"] if r["role"] != "财务"]
     ok, msg = check(g)
     assert ok is False and "财务" in msg
+
+
+# ── AC first-class id (1B reference key) ────────────────────────────────────
+
+def test_ac_as_bare_string_fails():
+    # ACs must be {id, assertion} objects so 1B can reference each by handle.
+    g = valid_gate()
+    g["p0"][0]["observable_ac"] = ["改名后昵称在 profile 更新"]
+    ok, msg = check(g)
+    assert ok is False and "object" in msg
+
+
+def test_ac_missing_id_fails():
+    g = valid_gate()
+    g["p0"][0]["observable_ac"] = [{"assertion": "无 id 的 AC"}]
+    ok, msg = check(g)
+    assert ok is False and "id" in msg
+
+
+def test_ac_missing_assertion_fails():
+    g = valid_gate()
+    g["p0"][0]["observable_ac"] = [{"id": "ac-x", "assertion": "  "}]
+    ok, msg = check(g)
+    assert ok is False and "assertion" in msg
+
+
+def test_duplicate_ac_id_fails():
+    # A duplicate AC id would let 1B's coverage set-comparison hide a gap.
+    g = valid_gate()
+    g["p0"].append({"id": "p0-2", "source": "用户原话",
+                    "observable_ac": [{"id": "ac-1", "assertion": "另一条但 id 撞车"}]})
+    ok, msg = check(g)
+    assert ok is False and "重复" in msg
