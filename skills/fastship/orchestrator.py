@@ -230,6 +230,7 @@ E2E_MIN_TURNS = 10
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
 CODE_REVIEW_FILENAME = ".fastship-code-review.md"
+REQUIREMENTS_FILENAME = ".fastship-requirements.md"
 
 # ── plan.html visualization (derived, non-gating view of the 1.4 plan) ──
 _PLAN_HTML_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "plan_html.py")
@@ -840,6 +841,159 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
             return False, "Code review 未覆盖任何实际改动文件（reviewed_files 与 git diff 不相交）"
 
     return True, "code review PASS (structured gate verified)"
+
+
+# ── 1A Requirements tribunal (Step 1.3r) contract ──────────────────────────────
+# .fastship-requirements.md is the 需求定稿 produced by the Phase-1 1A multi-role
+# tribunal (产品/运营/数据/财务 → 书记员合成 → grill). Its synthesis discipline is
+# ENGINE-enforced here, not by skill prompts: the 书记员 is a clerk, never a judge.
+# The verdict is DERIVED from structure — a self-declared "gate":"PASS" is ignored.
+REQUIREMENTS_STEP_ID = "1.3r"
+REQUIREMENTS_REQUIRED_LIST_FIELDS = ("roles", "additive_union", "exclusive_forks", "p0")
+
+
+def _check_requirements_contract(gate: dict) -> tuple:
+    """Pure discipline check over the requirements-lock JSON contract — no I/O, no
+    ledger, no hashing — so the synthesis rules are unit-testable in isolation.
+
+    FAIL (with a specific reason) on any of:
+      - structure: a required list field is missing / wrong type;
+      - role integrity: abstain ⇒ no concerns; a non-abstaining concern ⇒ non-empty
+        evidence_ref (blocks fabricated requirements); ≥1 non-abstaining role;
+      - additive 并集不减: a non-abstaining role concern id missing from
+        additive_union (the synthesizer silently dropped it — the exact failure the
+        dogfood tribunal exhibited);
+      - exclusive forks: any fork still open (held until grill arbitrates), or a
+        resolved fork without a resolution;
+      - completeness: ≥1 P0, each P0 carries a source and ≥1 observable AC.
+    """
+    if not isinstance(gate, dict):
+        return False, "requirements 契约必须是 JSON object"
+    for f in REQUIREMENTS_REQUIRED_LIST_FIELDS:
+        if not isinstance(gate.get(f), list):
+            return False, f"requirements 契约缺少数组字段或类型错误: {f}"
+
+    role_concern_ids = set()
+    non_abstaining = 0
+    for r in gate["roles"]:
+        if not isinstance(r, dict):
+            return False, "roles 含非 object 项"
+        name = r.get("role")
+        if not isinstance(name, str) or not name.strip():
+            return False, "role 缺少非空 role 名"
+        if not isinstance(r.get("abstain"), bool):
+            return False, f"role {name} 缺少 abstain 布尔字段"
+        concerns = r.get("concerns")
+        if not isinstance(concerns, list):
+            return False, f"role {name} 的 concerns 必须是数组"
+        if r["abstain"]:
+            if concerns:
+                return False, f"role {name} 弃权(abstain=true)却带 concern — 弃权必须空集"
+            continue
+        non_abstaining += 1
+        for c in concerns:
+            if not isinstance(c, dict):
+                return False, f"role {name} 的 concern 含非 object 项"
+            cid = c.get("id")
+            if not isinstance(cid, str) or not cid.strip():
+                return False, f"role {name} 的 concern 缺少非空 id"
+            for fld in ("kind", "point"):
+                v = c.get(fld)
+                if not isinstance(v, str) or not v.strip():
+                    return False, f"role {name} concern {cid} 缺少 {fld}"
+            ev = c.get("evidence_ref")
+            if not isinstance(ev, str) or not ev.strip():
+                return False, f"role {name} concern {cid} 缺 evidence_ref — 疑似造假需求,禁止充数"
+            role_concern_ids.add(cid)
+    if non_abstaining == 0:
+        return False, "全部角色弃权 — 未产出任何需求,不能定稿"
+
+    union_ids = set()
+    for u in gate["additive_union"]:
+        if not isinstance(u, dict):
+            return False, "additive_union 含非 object 项"
+        uid = u.get("id")
+        if not isinstance(uid, str) or not uid.strip():
+            return False, "additive_union 项缺少非空 id"
+        for fld in ("kind", "point"):
+            v = u.get(fld)
+            if not isinstance(v, str) or not v.strip():
+                return False, f"additive_union 项 {uid} 缺少 {fld}"
+        if not isinstance(u.get("sources"), list) or not u["sources"]:
+            return False, f"additive_union 项 {uid} 缺少 sources"
+        union_ids.add(uid)
+    dropped = sorted(role_concern_ids - union_ids)
+    if dropped:
+        return False, "additive 并集漏掉角色关切(synthesizer 偷删,违反并集不减): " + ", ".join(dropped)
+
+    open_forks = []
+    for fk in gate["exclusive_forks"]:
+        if not isinstance(fk, dict):
+            return False, "exclusive_forks 含非 object 项"
+        fid = fk.get("id")
+        if not isinstance(fid, str) or not fid.strip():
+            return False, "exclusive_forks 项缺少非空 id"
+        if not isinstance(fk.get("decision"), str) or not fk["decision"].strip():
+            return False, f"fork {fid} 缺少 decision"
+        status = fk.get("status")
+        if status not in ("open", "resolved"):
+            return False, f"fork {fid} 的 status 必须是 open/resolved"
+        if status == "open":
+            open_forks.append(fid)
+        elif not isinstance(fk.get("resolution"), str) or not fk["resolution"].strip():
+            return False, f"fork {fid} 标 resolved 却无 resolution"
+    if open_forks:
+        return False, "存在未裁决 exclusive fork,需 grill 合岔路后定稿: " + ", ".join(open_forks)
+
+    if not gate["p0"]:
+        return False, "需求定稿缺少 P0 — feature 至少要有一个 P0 需求"
+    for item in gate["p0"]:
+        if not isinstance(item, dict):
+            return False, "p0 含非 object 项"
+        pid = item.get("id")
+        if not isinstance(pid, str) or not pid.strip():
+            return False, "p0 项缺少非空 id"
+        if not isinstance(item.get("source"), str) or not item["source"].strip():
+            return False, f"p0 {pid} 缺少 source(需求出处:用户原话/brief 证据/角色)"
+        acs = item.get("observable_ac")
+        if not isinstance(acs, list) or not acs:
+            return False, f"p0 {pid} 缺少 observable_ac — 每个 P0 至少一条可观察 AC"
+        for a in acs:
+            if not isinstance(a, str) or not a.strip():
+                return False, f"p0 {pid} 的 observable_ac 含空项"
+
+    return True, "requirements 契约 PASS (synthesis 纪律 + 完备性已验证)"
+
+
+def validate_requirements(orch: dict, hook: dict) -> tuple:
+    """Step 1.3r gate — the 1A 需求定稿 (.fastship-requirements.md). Plumbing only:
+    bind to the trusted artifact, extract the JSON contract, then delegate the
+    discipline to the pure _check_requirements_contract (engine-derived verdict).
+    """
+    path = orch.get("artifacts", {}).get("requirements_path")
+    if not path:
+        return False, "requirements_path 未由当前 step 写入记录,禁止 filesystem fallback"
+    ok, msg, _rec = _verify_step_artifact(orch, REQUIREMENTS_STEP_ID, path)
+    if not ok:
+        return False, msg
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    if REQUIREMENTS_FILENAME not in _normalize(path):
+        return False, f"requirements 路径非法: {path}"
+    try:
+        content = open(path, encoding="utf-8").read()
+    except Exception:
+        return False, f"无法读取: {path}"
+    if len(content) < 100:
+        return False, f"requirements 太短 ({len(content)}B < 100B)"
+    matches = CODEX_GATE_JSON_RE.findall(content)
+    if not matches:
+        return False, "requirements 缺少机器可验证 JSON 契约块"
+    try:
+        gate = json.loads(matches[-1])
+    except json.JSONDecodeError as e:
+        return False, f"requirements JSON 契约解析失败: {e}"
+    return _check_requirements_contract(gate)
 
 
 def validate_user_confirm(orch: dict, hook: dict) -> tuple:
