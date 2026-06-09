@@ -12,7 +12,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills',
 
 def _gate_block(**fields):
     import json
-    base = {"gate": "FAIL", "p0_requirements_missing": []}
+    # A full 1.5c contract gate (all coverage arrays present) — the strict
+    # _extract_codex_review_gate only recognizes a block carrying every array.
+    base = {"gate": "FAIL", "p0_requirements_missing": [], "uncovered_ac": [],
+            "unmapped_e2e_scenarios": [], "weak_scenarios": [],
+            "non_business_assertions": [], "missing_evidence": []}
     base.update(fields)
     return "## Review\n```json\n" + json.dumps(base, ensure_ascii=False) + "\n```\n### GATE: FAIL\n"
 
@@ -51,12 +55,15 @@ def test_requirements_layer_without_trusted_1a_falls_to_1_4():
 
 
 def test_trailing_json_block_does_not_misroute():
-    # The gate is the block with a `gate` key, not merely the last json block — a trailing
-    # unrelated block must not hide p0_requirements_missing and misroute 需求层 → 1.4.
+    # The gate is the full CONTRACT block (gate∈PASS/FAIL + coverage arrays), not merely
+    # the last json block — neither a trailing unrelated block NOR a trailing block with a
+    # bogus `gate` key ({"gate":"example-only"}) may hide p0_requirements_missing and
+    # misroute 需求层 → 1.4 (codex review round-2 residual).
     import json
     from orchestrator import _codex_fail_rollback_step
     content = (_gate_block(p0_requirements_missing=["missing audit"])
-               + "\n附录\n```json\n" + json.dumps({"unrelated": True}) + "\n```\n")
+               + "\n附录\n```json\n" + json.dumps({"unrelated": True}) + "\n```\n"
+               + "示例\n```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n")
     assert _codex_fail_rollback_step(_with_trusted_1a(), content) == "1.3r"
 
 

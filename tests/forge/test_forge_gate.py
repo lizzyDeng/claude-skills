@@ -467,6 +467,21 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok, reason
 
+    def test_draft_to_planned_rejects_grill_with_dangling_resolution(self, tmp_path):
+        # codex [P2]: forge must mirror the engine's STRICT _check_grill_fork_resolution —
+        # a grill that resolves tf-1 but also dangles a non-open tf-ghost is rejected by the
+        # engine, so G2 must reject it too (not lenient-skip the bad entry).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)
+        grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+        grill.write_text(
+            "## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile"},'
+            ' {"id": "tf-ghost", "resolution": "裁了不存在的"}]}\n```\n' + "x " * 150)
+        orch_state["artifacts"]["trusted_artifacts"]["1.5"] = trusted_artifact("1.5", grill)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "fork" in reason.lower()
+
     def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
         # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
         # must NOT satisfy the gate (only bugfix may legitimately skip 1A).

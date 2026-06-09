@@ -773,6 +773,38 @@ def _extract_plan_open_fork_ids(plan_content):
     return (open_ids, malformed, True)
 
 
+def _check_grill_fork_resolution(open_fork_ids, grill_gate):
+    """Pure: strictly mirror the orchestrator's _check_grill_fork_resolution VERDICT so
+    Forge G2 rejects exactly the grill shapes the engine rejects — a non-object entry, a
+    blank / dangling (not an open fork) / duplicate id, a blank resolution, or any open
+    fork left unresolved. (Codex review [P2]: an earlier lenient `continue` let a grill
+    the engine rejects pass G2.) Pinned in lockstep by tests/forge/test_step_ids_sync.py.
+    Returns (ok, reason)."""
+    if not isinstance(grill_gate, dict):
+        return (False, "grill fork_resolutions gate not an object")
+    res = grill_gate.get("fork_resolutions")
+    if not isinstance(res, list) or not res:
+        return (False, "grill fork_resolutions empty")
+    resolved = set()
+    for r in res:
+        if not isinstance(r, dict):
+            return (False, "fork_resolutions has a non-object entry")
+        fid = r.get("id")
+        if not isinstance(fid, str) or not fid.strip():
+            return (False, "fork_resolutions entry missing id")
+        if fid not in open_fork_ids:
+            return (False, f"fork_resolutions resolves a non-open fork: {fid}")
+        if fid in resolved:
+            return (False, f"fork_resolutions duplicate id: {fid}")
+        if not isinstance(r.get("resolution"), str) or not r["resolution"].strip():
+            return (False, f"fork {fid} resolution empty")
+        resolved.add(fid)
+    missing = sorted(fid for fid in open_fork_ids if fid not in resolved)
+    if missing:
+        return (False, "open technical fork(s) not resolved in grill: " + ", ".join(missing))
+    return (True, "")
+
+
 def _grill_resolution_satisfied(orch_state):
     """For a non-bugfix whose 1.5 grill RAN (not legitimately skipped), re-derive the
     open technical forks from the SHA-verified 1.4 plan and require the SHA-verified 1.5
@@ -814,23 +846,7 @@ def _grill_resolution_satisfied(orch_state):
             res_gate = obj
     if not isinstance(res_gate, dict):
         return (False, "trusted grill missing fork_resolutions for open technical fork(s)")
-    res = res_gate.get("fork_resolutions")
-    if not isinstance(res, list) or not res:
-        return (False, "grill fork_resolutions empty")
-    resolved = set()
-    for r in res:
-        if not isinstance(r, dict):
-            continue
-        fid = r.get("id")
-        if not isinstance(fid, str) or not fid.strip():
-            continue
-        if not isinstance(r.get("resolution"), str) or not r["resolution"].strip():
-            continue
-        resolved.add(fid)
-    missing = sorted(fid for fid in open_ids if fid not in resolved)
-    if missing:
-        return (False, "open technical fork(s) not resolved in grill: " + ", ".join(missing))
-    return (True, "")
+    return _check_grill_fork_resolution(set(open_ids), res_gate)
 
 
 def _trusted_plan_has_open_fork(orch_state):
@@ -864,6 +880,28 @@ def _trusted_plan_has_open_fork(orch_state):
     return (True, _forks_require_grill(gate.get("exclusive_forks", [])), "")
 
 
+def _extract_codex_review_gate(content):
+    """Mirror of the orchestrator's _extract_codex_review_gate: the LAST ```json block
+    that is a dict with gate ∈ PASS/FAIL AND carries every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS
+    as a list. Identifies the real 1.5c contract gate the same way the engine does, so a
+    trailing example block like {"gate":"example-only"} can't move the gate selection.
+    Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
+    found = None
+    for block in CODEX_GATE_JSON_RE.findall(content or ""):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("gate", "")).upper() not in ("PASS", "FAIL"):
+            continue
+        if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
+            continue
+        found = obj
+    return found
+
+
 def verify_codex_review_artifact(orch_state):
     ok, reason, codex_rec = verify_trusted_artifact(orch_state, "1.5c")
     if not ok:
@@ -876,13 +914,9 @@ def verify_codex_review_artifact(orch_state):
             content = f.read()
     except Exception as e:
         return (False, f"cannot read codex review artifact: {e}")
-    matches = CODEX_GATE_JSON_RE.findall(content)
-    if not matches:
-        return (False, "Codex review missing structured JSON gate")
-    try:
-        gate = json.loads(matches[-1])
-    except json.JSONDecodeError as e:
-        return (False, f"Codex review JSON gate invalid: {e}")
+    gate = _extract_codex_review_gate(content)
+    if gate is None:
+        return (False, "Codex review missing structured contract JSON gate")
     if str(gate.get("gate", "")).upper() != "PASS":
         return (False, "Codex review JSON gate is not PASS")
     if gate.get("reviewed_plan_sha256") != plan_rec.get("sha256"):

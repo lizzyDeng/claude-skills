@@ -94,5 +94,70 @@ class ForkDisciplineParityTest(unittest.TestCase):
             )
 
 
+def _full_gate(**over):
+    g = {"gate": "FAIL", "reviewed_plan_sha256": "x", "p0_contract_reviewed": True,
+         "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+         "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+         "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+         "missing_evidence": []}
+    g.update(over)
+    return g
+
+
+class CodexGateSelectorParityTest(unittest.TestCase):
+    """The forge gate and the orchestrator must identify the codex 1.5c CONTRACT gate
+    the SAME way — else a trailing example block could be read as the gate by one and not
+    the other (the F7-misroute seam). Pins forge._extract_codex_review_gate to the
+    orchestrator's for every shape."""
+
+    CONTENTS = [
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n",                       # one full gate
+        "## R\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n"
+        + "```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n",                # + bogus gate key
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n"
+        + "```json\n" + json.dumps({"unrelated": True}) + "\n```\n",                     # + unrelated
+        "## R\n```json\n" + json.dumps({"gate": "PASS"}) + "\n```\n",                    # gate but no arrays
+        "## R\nno json here\n",                                                          # none
+        "## R\n```json\n{bad json\n```\n",                                              # unparseable
+    ]
+
+    def test_gate_selector_matches(self):
+        for content in self.CONTENTS:
+            self.assertEqual(
+                fg._extract_codex_review_gate(content),
+                orch._extract_codex_review_gate(content),
+                f"codex gate selector drifted for content={content!r}",
+            )
+
+
+class GrillResolutionParityTest(unittest.TestCase):
+    """Forge G2's grill fork-resolution verdict must equal the orchestrator's
+    _check_grill_fork_resolution for every shape (codex review [P2]: forge was laxer).
+    Pins the two so a grill the engine rejects can't pass G2."""
+
+    OPEN = {"tf-1", "tf-2"}
+    GATES = [
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-2", "resolution": "b"}]},  # ok
+        {"fork_resolutions": []},                                                       # empty
+        {"other": 1},                                                                   # missing field
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}]},                       # tf-2 unresolved
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-2", "resolution": "b"},
+                              {"id": "tf-ghost", "resolution": "c"}]},                   # dangling
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-1", "resolution": "b"},
+                              {"id": "tf-2", "resolution": "c"}]},                       # duplicate
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "  "}, {"id": "tf-2", "resolution": "b"}]},  # blank res
+        {"fork_resolutions": [{"id": "  ", "resolution": "a"}]},                         # blank id
+        {"fork_resolutions": ["tf-1"]},                                                 # non-object entry
+    ]
+
+    def test_grill_resolution_verdict_matches(self):
+        for gate in self.GATES:
+            self.assertEqual(
+                fg._check_grill_fork_resolution(set(self.OPEN), gate)[0],
+                orch._check_grill_fork_resolution(set(self.OPEN), gate)[0],
+                f"grill fork-resolution verdict drifted for gate={gate!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -689,6 +689,32 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
     return True, "grill validated"
 
 
+def _extract_codex_review_gate(content: str):
+    """Return the codex 1.5c CONTRACT gate dict from a review's markdown, or None.
+
+    The contract gate is the LAST ```json block that is a dict with gate ∈ PASS/FAIL
+    AND carries every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS as a list. Those two conditions
+    are what tell the real gate apart from incidental/example json blocks — a doc
+    snippet like {"gate":"example-only"} (gate not PASS/FAIL) or a trailing illustration
+    missing the coverage arrays. Used by BOTH validate_codex_review and
+    _codex_fail_rollback_step so the gate is identified identically — a selector drift
+    here is exactly what let a trailing block misroute the F7 rollback."""
+    found = None
+    for block in CODEX_GATE_JSON_RE.findall(content or ""):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("gate", "")).upper() not in {"PASS", "FAIL"}:
+            continue
+        if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
+            continue
+        found = obj
+    return found
+
+
 def validate_codex_review(orch: dict, hook: dict) -> tuple:
     path = orch.get("artifacts", {}).get("codex_review_path")
     if not path:
@@ -721,19 +747,11 @@ def validate_codex_review(orch: dict, hook: dict) -> tuple:
     if verdict == "FAIL":
         return False, "codex review FAIL — 需更新 plan 后重新 review（orchestrator 自动回退到 1.4）"
 
-    matches = CODEX_GATE_JSON_RE.findall(content)
-    if not matches:
-        return False, "Codex review 缺少机器可验证 JSON gate，禁止纯文本 PASS"
-    try:
-        gate = json.loads(matches[-1])
-    except json.JSONDecodeError as e:
-        return False, f"Codex review JSON gate 解析失败: {e}"
-    if not isinstance(gate, dict):
-        return False, "Codex review JSON gate 必须是 object"
-
+    gate = _extract_codex_review_gate(content)
+    if gate is None:
+        return False, ("Codex review 缺少机器可验证 JSON gate（contract gate 须含 gate=PASS/FAIL "
+                       "+ 全部覆盖数组），禁止纯文本 PASS")
     json_verdict = str(gate.get("gate", "")).upper()
-    if json_verdict not in {"PASS", "FAIL"}:
-        return False, "Codex review JSON gate 缺少 gate=PASS/FAIL"
     if json_verdict != verdict:
         return False, f"Codex review 文本 GATE={verdict} 与 JSON gate={json_verdict} 不一致"
     if json_verdict == "FAIL":
@@ -2097,21 +2115,16 @@ def _codex_fail_rollback_step(orch: dict, review_content: str) -> str:
     …) → rewind to 1.4 (the plan).
 
     Two hardening rules (codex review of this very feature):
-    - the defect-layer signal is read from the codex GATE block (the json block that
-      carries a `gate` key), NOT merely the last json block — a trailing unrelated
-      block must not misroute a 需求层 defect to 1.4;
+    - the defect-layer signal is read from the codex CONTRACT gate via the SHARED
+      _extract_codex_review_gate (gate ∈ PASS/FAIL + full coverage arrays), NOT merely a
+      block with a `gate` key — else a trailing example block like {"gate":"example-only"}
+      misroutes a 需求层 defect to 1.4. Sharing the selector with validate_codex_review
+      keeps the gate identified identically (no drift);
     - 需求层 routing is gated on a TRUSTED 1.3r artifact existing (1A actually ran),
       derived from trusted evidence rather than the mutable request_type field. A bugfix
       (or any flow without a trusted 1A lock) has nothing to rewind to → 1.4.
     Fail-closed to 1.4 on any parse failure (least re-work; the loop cap backstops it)."""
-    gate = None
-    for block in CODEX_GATE_JSON_RE.findall(review_content or ""):
-        try:
-            obj = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and "gate" in obj:
-            gate = obj
+    gate = _extract_codex_review_gate(review_content)
     if not (isinstance(gate, dict) and gate.get("p0_requirements_missing")):
         return PLAN_STEP_ID
     trusted = orch.get("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {})
