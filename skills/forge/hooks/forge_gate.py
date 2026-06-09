@@ -913,6 +913,35 @@ def _trusted_plan_has_open_fork(orch_state):
     return (True, _forks_require_grill(gate.get("exclusive_forks", [])), "")
 
 
+def _codex_gate_jsons(content):
+    """Mirror of the orchestrator's _codex_gate_jsons: JSON strings from TOP-LEVEL, column-0
+    ```json fenced blocks (an indented or inside-another-fence gate block is not top-level).
+    Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return []
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = []
+    fence_char = None
+    fence_len = 0
+    is_json = False
+    buf = []
+    for line in text.split("\n"):
+        fm = _FENCE_LINE_RE.match(line)
+        if fence_char is None:
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
+                is_json = fm.group(2).strip().lower() == "json"
+                buf = []
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len \
+                and fm.group(2).strip() == "":
+            if is_json:
+                blocks.append("\n".join(buf))
+            fence_char, fence_len, is_json, buf = None, 0, False, []
+        else:
+            buf.append(line)
+    return blocks
+
+
 def _extract_codex_review_gate(content):
     """Mirror of the orchestrator's _extract_codex_review_gate: requires EXACTLY ONE
     `### GATE:` verdict line and EXACTLY ONE contract-shaped json block (dict with gate ∈
@@ -928,7 +957,7 @@ def _extract_codex_review_gate(content):
         return None
     verdict = markers[0]
     gates = []
-    for block in CODEX_GATE_JSON_RE.findall(content):
+    for block in _codex_gate_jsons(content):
         try:
             obj = json.loads(block)
         except json.JSONDecodeError:

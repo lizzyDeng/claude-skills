@@ -185,6 +185,29 @@ class CodexVerdictMarkerParityTest(unittest.TestCase):
             )
 
 
+class CodexGateJsonsParityTest(unittest.TestCase):
+    """The forge gate and orchestrator must extract the codex contract JSON gate the SAME
+    way — top-level, column-0 ```json fences only (round-10). Pins forge._codex_gate_jsons."""
+
+    CASES = [
+        "```json\n{\"a\": 1}\n```\n",                                  # top-level → one block
+        "  ```json\n{\"a\": 1}\n  ```\n",                              # indented → none
+        "```text\n```json\n{\"a\": 1}\n```\n### GATE: PASS\n",          # nested in outer fence → none
+        "```json\n{\"a\": 1}\n```\n```json\n{\"b\": 2}\n```\n",          # two top-level → two
+        "```\n{\"a\": 1}\n```\n",                                      # not a json fence → none
+        "- ```json\n  {\"a\": 1}\n  ```\n",                            # list-item gate → none
+        "no fence here\n",
+        "",
+    ]
+
+    def test_gate_jsons_match(self):
+        for content in self.CASES:
+            self.assertEqual(
+                fg._codex_gate_jsons(content), orch._codex_gate_jsons(content),
+                f"codex gate-json extraction drifted for content={content!r}",
+            )
+
+
 class GrillResolutionParityTest(unittest.TestCase):
     """Forge G2's grill fork-resolution verdict must equal the orchestrator's
     _check_grill_fork_resolution for every shape (codex review [P2]: forge was laxer).
