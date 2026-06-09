@@ -636,10 +636,10 @@ VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
-# Mirror of the orchestrator: the verdict must be a WHOLE-LINE `### GATE: PASS|FAIL` outside
-# code fences, so the placeholder `### GATE: PASS / FAIL` and fenced markers aren't counted.
-CODEX_VERDICT_LINE_RE = re.compile(r"^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-_FENCE_RE = re.compile(r"^[ \t]*([`~]{3,})")
+# Mirror of the orchestrator: the verdict must be a WHOLE-LINE `### GATE: PASS|FAIL` (≤3 space
+# indent) outside code fences; placeholder/fenced/indented markers aren't counted.
+CODEX_VERDICT_LINE_RE = re.compile(r"^ {0,3}#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _codex_verdict_markers(content):
@@ -654,22 +654,18 @@ def _codex_verdict_markers(content):
     fence_char = None
     fence_len = 0
     for line in text.split("\n"):
+        fm = _FENCE_LINE_RE.match(line)
         if fence_char is None:
-            fm = _FENCE_RE.match(line)
-            if fm:
-                run = fm.group(1)
-                fence_char, fence_len = run[0], len(run)
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
                 continue
             vm = CODEX_VERDICT_LINE_RE.match(line)
             if vm:
                 markers.append(vm.group(1).upper())
-        else:
-            # CommonMark closing fence: same char, length >= opener, ONLY whitespace after.
-            # A run with trailing text (```x) is NOT a close (codex round-7).
-            stripped = line.strip()
-            if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
-                fence_char = None
-                fence_len = 0
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len \
+                and fm.group(2).strip() == "":
+            fence_char = None
+            fence_len = 0
     return markers
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",

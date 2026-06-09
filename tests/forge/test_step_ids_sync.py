@@ -164,6 +164,9 @@ class CodexVerdictMarkerParityTest(unittest.TestCase):
         "````\n### GATE: PASS\n````\n",                  # 4-backtick fence → none
         "```outer\n```x\n### GATE: PASS\n",              # fake closer ```x (trailing text) → none (round-7)
         "```\n### GATE: PASS\n```x\n### GATE: FAIL\n",  # ```x not a close; both verdicts fenced → none
+        "    ```\n### GATE: PASS\n",                      # 4-space indent ``` not a fence → one (round-8)
+        "```outer\n    ```\n### GATE: PASS\n",           # indented ``` not a closer → verdict fenced → none
+        "```bad`info\n### GATE: FAIL\n",                 # backtick-in-info not a fence → one (round-8)
         "### GATE: PASS\r\n",                             # CRLF whole line → one
         "### GATE: PASS\n### GATE: FAIL\n",              # two
         "   ##  GATE:  FAIL   \n",                       # heading lvl 2 + extra ws → one

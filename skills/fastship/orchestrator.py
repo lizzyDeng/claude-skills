@@ -304,11 +304,12 @@ PLAN_SIGNATURE_MARKERS = [
 GRILL_REQUIRED_SECTIONS = ["拷问", "修订", "结论"]
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
 # The codex 1.5c verdict line must be a WHOLE line `### GATE: PASS|FAIL` (nothing after the
-# verdict), so the instruction's own placeholder `### GATE: PASS / FAIL` (trailing text) does
-# NOT count as a verdict — that boundary-match was a real PASS bypass (codex review round-5).
-CODEX_VERDICT_LINE_RE = re.compile(r"^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-# A CommonMark code-fence open/close line: ≥3 backticks or tildes (after optional indent).
-_FENCE_RE = re.compile(r"^[ \t]*([`~]{3,})")
+# verdict, ≤3 spaces indent per CommonMark ATX headings), so the instruction's own placeholder
+# `### GATE: PASS / FAIL` (trailing text) does NOT count as a verdict (codex review round-5).
+CODEX_VERDICT_LINE_RE = re.compile(r"^ {0,3}#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+# A CommonMark code-fence line: ≤3 spaces indent (4+ = indented code, not a fence) then a run
+# of ≥3 backticks OR ≥3 tildes (group 1, same char), then an info string (group 2).
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
 CODEX_REVIEW_PLAN_HASH_FIELD = "reviewed_plan_sha256"
@@ -711,24 +712,24 @@ def _codex_verdict_markers(content: str):
     fence_char = None
     fence_len = 0
     for line in text.split("\n"):
+        fm = _FENCE_LINE_RE.match(line)
         if fence_char is None:
-            fm = _FENCE_RE.match(line)
-            if fm:
-                run = fm.group(1)
-                fence_char, fence_len = run[0], len(run)
+            # A valid OPENING fence: same-char run (≤3 indent). A backtick fence's info
+            # string must not contain a backtick (CommonMark) — `` ```a`b `` is not a fence.
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
                 continue
             vm = CODEX_VERDICT_LINE_RE.match(line)
             if vm:
                 markers.append(vm.group(1).upper())
-        else:
-            # CommonMark closing fence: a run of the SAME char, length >= the opener, with
-            # ONLY whitespace after (no info string). A run with trailing text (e.g. ```x)
-            # is NOT a close — treating it as one let the scanner close a fence CommonMark
-            # keeps open, exposing a verdict that should stay hidden (codex round-7).
-            stripped = line.strip()
-            if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
-                fence_char = None
-                fence_len = 0
+        # A CommonMark CLOSING fence: same char as the opener, length >= the opener, and
+        # ONLY whitespace after the run (no info string). A run with trailing text (```x) or
+        # a 4-space-indented run is NOT a close — accepting those let the scanner close a
+        # fence CommonMark keeps open, exposing a hidden verdict (codex rounds 7-8).
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len \
+                and fm.group(2).strip() == "":
+            fence_char = None
+            fence_len = 0
     return markers
 
 
