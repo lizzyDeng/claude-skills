@@ -158,7 +158,11 @@ class CodexVerdictMarkerParityTest(unittest.TestCase):
         "### GATE: FAIL\n",
         "### GATE: PASS / FAIL\n",                       # placeholder (trailing text) → none
         "prose ### GATE: PASS more\n",                   # not a whole line → none
-        "```\n### GATE: PASS\n```\n",                    # fenced → none
+        "```\n### GATE: PASS\n```\n",                    # closed fence → none
+        "```\n### GATE: PASS\n",                         # UNCLOSED fence → none (round-6)
+        "~~~\n### GATE: PASS\n~~~\n",                     # tilde fence → none (round-6)
+        "````\n### GATE: PASS\n````\n",                  # 4-backtick fence → none
+        "### GATE: PASS\r\n",                             # CRLF whole line → one
         "### GATE: PASS\n### GATE: FAIL\n",              # two
         "   ##  GATE:  FAIL   \n",                       # heading lvl 2 + extra ws → one
         "## Contract\n```json\n{\"gate\": \"PASS\"}\n```\n### GATE: PASS\n",  # one (fence stripped)

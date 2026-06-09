@@ -637,16 +637,36 @@ VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
 # Mirror of the orchestrator: the verdict must be a WHOLE-LINE `### GATE: PASS|FAIL` outside
-# code fences, so the placeholder `### GATE: PASS / FAIL` isn't counted (codex round-5).
-CODEX_VERDICT_LINE_RE = re.compile(r"(?m)^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# code fences, so the placeholder `### GATE: PASS / FAIL` and fenced markers aren't counted.
+CODEX_VERDICT_LINE_RE = re.compile(r"^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^[ \t]*([`~]{3,})")
 
 
 def _codex_verdict_markers(content):
-    """Mirror of the orchestrator's _codex_verdict_markers: full-line, de-fenced verdict
-    tokens. Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
-    defenced = _CODE_FENCE_RE.sub("", content or "")
-    return [v.upper() for v in CODEX_VERDICT_LINE_RE.findall(defenced)]
+    """Mirror of the orchestrator's _codex_verdict_markers: a line-by-line CommonMark fence
+    scanner (normalizes line endings, tracks ``` and ~~~ fences incl. UNCLOSED) yielding
+    full-line `### GATE:` verdicts outside any fence. Pinned in lockstep by
+    tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return []
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    markers = []
+    fence_char = None
+    fence_len = 0
+    for line in text.split("\n"):
+        fm = _FENCE_RE.match(line)
+        if fence_char is None:
+            if fm:
+                run = fm.group(1)
+                fence_char, fence_len = run[0], len(run)
+                continue
+            vm = CODEX_VERDICT_LINE_RE.match(line)
+            if vm:
+                markers.append(vm.group(1).upper())
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len:
+            fence_char = None
+            fence_len = 0
+    return markers
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",
     "ac_e2e_coverage_reviewed",

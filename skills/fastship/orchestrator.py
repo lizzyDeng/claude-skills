@@ -306,8 +306,9 @@ CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
 # The codex 1.5c verdict line must be a WHOLE line `### GATE: PASS|FAIL` (nothing after the
 # verdict), so the instruction's own placeholder `### GATE: PASS / FAIL` (trailing text) does
 # NOT count as a verdict — that boundary-match was a real PASS bypass (codex review round-5).
-CODEX_VERDICT_LINE_RE = re.compile(r"(?m)^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+CODEX_VERDICT_LINE_RE = re.compile(r"^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+# A CommonMark code-fence open/close line: ≥3 backticks or tildes (after optional indent).
+_FENCE_RE = re.compile(r"^[ \t]*([`~]{3,})")
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
 CODEX_REVIEW_PLAN_HASH_FIELD = "reviewed_plan_sha256"
@@ -695,13 +696,34 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
 
 
 def _codex_verdict_markers(content: str):
-    """Verdict tokens from the `### GATE: PASS/FAIL` lines that are full-line AND outside
-    code fences. Line-anchored so a placeholder like `### GATE: PASS / FAIL` (trailing text)
-    doesn't count; de-fenced so a marker embedded in a ```code``` block doesn't count
-    (codex review round-5). Shared by validate_codex_review and _extract_codex_review_gate
-    so the verdict line is counted identically."""
-    defenced = _CODE_FENCE_RE.sub("", content or "")
-    return [v.upper() for v in CODEX_VERDICT_LINE_RE.findall(defenced)]
+    """Verdict tokens from the `### GATE: PASS/FAIL` lines that are full lines OUTSIDE any
+    code fence. A line-by-line CommonMark fence scanner (not a regex sub): normalizes line
+    endings, tracks ``` and ~~~ fences, and an UNCLOSED fence swallows everything after it —
+    so a verdict hidden inside a fence (closed, unclosed, or tilde) does NOT count, and the
+    instruction placeholder `### GATE: PASS / FAIL` (trailing text) is not a full-line match.
+    Shared by validate_codex_review and _extract_codex_review_gate (and mirrored in forge)
+    so the verdict line is counted identically — these are the gate-hiding bypasses codex
+    review rounds 5-6 demonstrated."""
+    if not content:
+        return []
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    markers = []
+    fence_char = None
+    fence_len = 0
+    for line in text.split("\n"):
+        fm = _FENCE_RE.match(line)
+        if fence_char is None:
+            if fm:
+                run = fm.group(1)
+                fence_char, fence_len = run[0], len(run)
+                continue
+            vm = CODEX_VERDICT_LINE_RE.match(line)
+            if vm:
+                markers.append(vm.group(1).upper())
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len:
+            fence_char = None
+            fence_len = 0
+    return markers
 
 
 def _extract_codex_review_gate(content: str):

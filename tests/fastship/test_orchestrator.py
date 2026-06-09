@@ -465,6 +465,33 @@ class TestValidatorsPhase1:
         ok, msg = validate_codex_review(orch, {})
         assert ok is False and "GATE 判定行" in msg
 
+    def test_codex_review_rejects_unclosed_fence_marker(self, tmp_path, monkeypatch):
+        # codex round-6: a verdict hidden inside an UNCLOSED ``` fence must not count — the
+        # fence scanner swallows everything after an unclosed fence.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "```\n### GATE: PASS")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_tilde_fence_marker(self, tmp_path, monkeypatch):
+        # ~~~ fences count too — a verdict inside a tilde fence is not a real verdict.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "~~~\n### GATE: PASS\n~~~")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
     def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
         from orchestrator import validate_codex_review
         orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
