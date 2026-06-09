@@ -348,6 +348,9 @@ class TestValidatorsPhase1:
     def test_grill_pass(self, tmp_path, monkeypatch):
         from orchestrator import validate_grill
         orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        # bugfix grill is structural-only (no 1A/1B fork contract on a signature plan);
+        # the feature fork-resolution path is covered in TestGrillForkResolution.
+        orch["request_type"] = "bugfix"
         grill = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill.parent.mkdir(parents=True)
         grill.write_text(
@@ -1038,13 +1041,16 @@ class TestIntegrationFullFlow:
         st = reload()
         assert st["current_step"] == "1.5"
 
-        # 1.5: grill (auto via post_edit when grill result file written)
+        # 1.5: grill (auto via post_edit when grill result file written) — the plan's
+        # open fork tf-1 must be resolved in the grill summary's fork_resolutions block.
         grill_result = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill_result.parent.mkdir(parents=True, exist_ok=True)
         grill_result.write_text(
-            "## 拷问记录\n1. Q: AC? → A: ok → resolved\n"
+            "## 拷问记录\n1. Q: 主题存哪 → A: 定了 → resolved\n"
             "## 修订记录\n- none\n"
-            "## 结论\n- resolved\n" + "x " * 150
+            "## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile，跨设备同步"}]}\n```\n'
+            + "x " * 150
         )
         hook_post_edit_logic(
             data={"tool_input": {"file_path": str(grill_result)}},
@@ -1198,6 +1204,81 @@ class TestIntegrationFullFlow:
         assert st["current_step"] == "1.4"                       # rolled back
         assert "1.5" not in st["skipped_steps"]                  # prior auto-skip cleared
         assert "plan_open_fork_ids" not in st["artifacts"]       # stale fork signal dropped
+
+    def _rollback_orch(self, tmp_path, monkeypatch, p0_missing, extra_overrides=None):
+        """Drive a feature to 1.5c with a trusted 1A requirements + plan, then write a
+        FAIL codex review, run the hook, and return the post-rollback state."""
+        from orchestrator import save_orch_state, load_orch_state, hook_post_edit_logic
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        orch_file = str(tmp_path / "orch.json")
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-x.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        req = claude / ".fastship-requirements.md"
+        req.write_text("# 需求定稿\n" + "占位 " * 30)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"],
+            "plan_path": str(plan),
+            "artifacts": {"requirements_path": str(req), "plan_open_fork_ids": []},
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        trust_artifact(orch, "1.3r", req)
+        overrides = {"gate": "FAIL", "p0_requirements_missing": p0_missing}
+        overrides.update(extra_overrides or {})
+        review.write_text(codex_review_content(plan_sha, **overrides))
+        save_orch_state(orch, orch_file)
+        hook_post_edit_logic(data={"tool_input": {"file_path": str(review)}}, orch_path=orch_file)
+        return load_orch_state(orch_file), str(req)
+
+    def test_codex_fail_requirements_layer_rolls_to_1_3r(self, tmp_path, monkeypatch):
+        # 需求层: codex flags p0_requirements_missing → rewind to 1.3r, the 1A lock reset.
+        st, _req = self._rollback_orch(tmp_path, monkeypatch, p0_missing=["改名审核需求漏了"])
+        assert st["current_step"] == "1.3r"
+        assert "requirements_path" not in st["artifacts"]              # 1A lock reset
+        assert "1.3r" not in st.get("completed_steps", [])
+        assert "1.3r" not in st["artifacts"].get("trusted_artifacts", {})
+        assert "1.4" not in st.get("completed_steps", [])
+
+    def test_codex_fail_plan_layer_preserves_requirements(self, tmp_path, monkeypatch):
+        # 方案层: only coverage gaps (p0_requirements_missing empty) → rewind to 1.4,
+        # the trusted 1A requirements stay intact (don't re-run the tribunal needlessly).
+        st, req = self._rollback_orch(tmp_path, monkeypatch, p0_missing=[],
+                                      extra_overrides={"uncovered_ac": ["ac-2"]})
+        assert st["current_step"] == "1.4"
+        assert st["artifacts"].get("requirements_path") == req         # 1A lock preserved
+        assert "1.3r" in st["artifacts"].get("trusted_artifacts", {})
+
+    def test_cmd_done_codex_fail_rolls_back_cli_parity(self, tmp_path, monkeypatch):
+        # CLI parity: cmd_done at 1.5c with a FAIL review rewinds (instead of dead-ending).
+        import orchestrator as o
+        monkeypatch.setattr(o, "_repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr(o, "_branch_mismatch", lambda st: False)
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-cli.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"], "plan_path": str(plan), "artifacts": {},
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        review.write_text(codex_review_content(plan_sha, gate="FAIL"))
+        o.save_orch_state(orch)
+        rc = o.cmd_done(["--codex-review", str(review)])
+        assert rc == 0                                # routed rewind, not an error exit
+        st = o.load_orch_state()
+        assert st["current_step"] == "1.4"            # CLI rolled back, same as hook mode
+        assert not os.path.exists(str(review))        # stale review removed
 
     def test_loop_fail_pauses_for_decision(self, tmp_path):
         from orchestrator import save_orch_state, load_orch_state, hook_post_bash_logic
@@ -2133,3 +2214,84 @@ class TestStep20Contract:
         i = self._instr()
         assert "implement-verdicts" in i
         assert "2.5" in i
+
+
+def make_trusted_plan_with_forks(tmp_path, monkeypatch, forks):
+    """A trusted 1B feature plan carrying an ac_mapping block + the given
+    exclusive_forks — so validate_grill can re-derive the open-fork set from it."""
+    plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan = plan_dir / "2026-06-08-feat.md"
+    mapping = {"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+               "exclusive_forks": forks}
+    plan.write_text(
+        "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n"
+        "## AC→task+E2E\n```json\n" + json.dumps(mapping, ensure_ascii=False) + "\n```\n"
+    )
+    monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+    orch = {"plan_path": str(plan), "artifacts": {}, "request_type": "feature"}
+    trust_artifact(orch, "1.4", plan)
+    return orch, plan
+
+
+def _write_grill(tmp_path, orch, resolutions=None):
+    grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+    grill.parent.mkdir(parents=True, exist_ok=True)
+    body = ("## 拷问记录\n1. Q: 选哪个 fork → A: 定了 → resolved\n"
+            "## 修订记录\n- ok\n## 结论\n- 全部 resolved\n" + "x " * 160)
+    if resolutions is not None:
+        body += ("\n```json\n"
+                 + json.dumps({"fork_resolutions": resolutions}, ensure_ascii=False)
+                 + "\n```\n")
+    grill.write_text(body)
+    orch["artifacts"]["grill_result_path"] = str(grill)
+    trust_artifact(orch, "1.5", grill)
+    return grill
+
+
+class TestGrillForkResolution:
+    """validate_grill (feature): when the plan declares an open technical fork, the
+    grill summary must resolve it (derived from the TRUSTED plan, F4 round-3/4 lesson)."""
+
+    def test_open_fork_resolved_passes(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "PG vs Redis", "status": "open"}])
+        _write_grill(tmp_path, orch, [{"id": "tf-1", "resolution": "选 PG"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok, msg
+
+    def test_open_fork_no_resolution_block_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "PG vs Redis", "status": "open"}])
+        _write_grill(tmp_path, orch, resolutions=None)  # prose only, no fork_resolutions
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "fork_resolutions" in msg
+
+    def test_open_fork_unresolved_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(tmp_path, monkeypatch, [
+            {"id": "tf-1", "decision": "a", "status": "open"},
+            {"id": "tf-2", "decision": "b", "status": "open"},
+        ])
+        _write_grill(tmp_path, orch, [{"id": "tf-1", "resolution": "只裁了一个"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "tf-2" in msg
+
+    def test_dangling_resolution_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "a", "status": "open"}])
+        _write_grill(tmp_path, orch, [{"id": "tf-ghost", "resolution": "裁了不存在的"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "tf-ghost" in msg
+
+    def test_no_open_fork_passes_structural_only(self, tmp_path, monkeypatch):
+        # If the grill runs with no open fork (normally auto-skipped), there's nothing
+        # to arbitrate → the structural summary is sufficient, no fork_resolutions needed.
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(tmp_path, monkeypatch, [])
+        _write_grill(tmp_path, orch, resolutions=None)
+        ok, msg = validate_grill(orch, {})
+        assert ok, msg

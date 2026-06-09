@@ -108,16 +108,27 @@ def test_uncovered_ac_fails():
     assert ok is False and "ac-2" in msg and "未在技术方案中映射" in msg
 
 
-# ── _collect_p0_ac_ids / _extract_plan_mapping_gate ─────────────────────────
+# ── _collect_required_ac_ids / _extract_plan_mapping_gate ───────────────────
 
-def test_collect_p0_ac_ids():
-    from orchestrator import _collect_p0_ac_ids
+def test_collect_required_ac_ids_p0_only():
+    from orchestrator import _collect_required_ac_ids
     gate = {"p0": [
         {"id": "p0-1", "observable_ac": [{"id": "ac-1", "assertion": "a"},
                                          {"id": "ac-2", "assertion": "b"}]},
         {"id": "p0-2", "observable_ac": [{"id": "ac-3", "assertion": "c"}]},
     ]}
-    assert _collect_p0_ac_ids(gate) == {"ac-1", "ac-2", "ac-3"}
+    assert _collect_required_ac_ids(gate) == {"ac-1", "ac-2", "ac-3"}
+
+
+def test_collect_required_ac_ids_includes_p1():
+    # P1 ACs join the universe 1B must cover (P1 is a hard mapping gate too).
+    from orchestrator import _collect_required_ac_ids
+    gate = {
+        "p0": [{"id": "p0-1", "observable_ac": [{"id": "ac-1", "assertion": "a"}]}],
+        "p1": [{"id": "p1-1", "observable_ac": [{"id": "ac-2", "assertion": "b"},
+                                                {"id": "ac-3", "assertion": "c"}]}],
+    }
+    assert _collect_required_ac_ids(gate) == {"ac-1", "ac-2", "ac-3"}
 
 
 def test_extract_plan_mapping_gate_picks_the_ac_mapping_block():
@@ -164,7 +175,26 @@ def _requirements_md():
     return "# 需求定稿\n## 契约\n```json\n" + json.dumps(gate, ensure_ascii=False) + "\n```\n" + "占位 " * 30
 
 
-def _setup(tmp_path, monkeypatch, plan_body, request_type="feature", seed_1a=True):
+def _requirements_md_with_p1():
+    gate = {
+        "roles": [
+            {"role": "产品", "abstain": False, "concerns": [
+                {"id": "c1", "kind": "ac", "point": "改名", "evidence_ref": "用户原话"}]},
+            {"role": "运营", "abstain": True, "concerns": []},
+            {"role": "数据", "abstain": True, "concerns": []},
+            {"role": "财务", "abstain": True, "concerns": []},
+        ],
+        "additive_union": [{"id": "c1", "kind": "ac", "point": "改名", "sources": ["产品"]}],
+        "exclusive_forks": [],
+        "p0": [{"id": "p0-1", "source": "用户原话",
+                "observable_ac": [{"id": "ac-1", "assertion": "改名后昵称更新"}]}],
+        "p1": [{"id": "p1-1", "source": "brief.md:9",
+                "observable_ac": [{"id": "ac-2", "assertion": "改名记入操作日志"}]}],
+    }
+    return "# 需求定稿\n## 契约\n```json\n" + json.dumps(gate, ensure_ascii=False) + "\n```\n" + "占位 " * 30
+
+
+def _setup(tmp_path, monkeypatch, plan_body, request_type="feature", seed_1a=True, req_md=None):
     import orchestrator as o
     monkeypatch.setattr(o, "_repo_root", lambda: str(tmp_path))
     claude = tmp_path / ".claude"
@@ -178,7 +208,7 @@ def _setup(tmp_path, monkeypatch, plan_body, request_type="feature", seed_1a=Tru
     assert ok
     if seed_1a:
         req = claude / ".fastship-requirements.md"
-        req.write_text(_requirements_md())
+        req.write_text(req_md if req_md is not None else _requirements_md())
         ok, _ = o.record_step_artifact(orch, o.REQUIREMENTS_STEP_ID, str(req), source="test")
         assert ok
         orch["artifacts"]["requirements_path"] = str(req)
@@ -222,6 +252,29 @@ def test_validate_plan_bugfix_skips_mapping(tmp_path, monkeypatch):
     # bugfix: no 1A, signed plan with no mapping block still passes (signature-only).
     o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan(None),
                         request_type="bugfix", seed_1a=False)
+    ok, msg = o.validate_plan(orch, {})
+    assert ok, msg
+
+
+def test_validate_plan_feature_fails_uncovered_p1_ac(tmp_path, monkeypatch):
+    # P1 is a hard mapping gate too: plan covers p0 (ac-1) but leaves p1 (ac-2) unmapped → FAIL.
+    o, orch, _ = _setup(
+        tmp_path, monkeypatch,
+        _signed_plan({"ac_mapping": [{"ac_id": "ac-1", "tasks": ["改名 API"], "e2e": ["E2E-rename"]}]}),
+        req_md=_requirements_md_with_p1())
+    ok, msg = o.validate_plan(orch, {})
+    assert ok is False and "ac-2" in msg
+
+
+def test_validate_plan_feature_passes_with_p0_and_p1_mapping(tmp_path, monkeypatch):
+    # Mapping both the p0 AC and the p1 AC passes — P1 is covered, not waived.
+    o, orch, _ = _setup(
+        tmp_path, monkeypatch,
+        _signed_plan({"ac_mapping": [
+            {"ac_id": "ac-1", "tasks": ["改名 API"], "e2e": ["E2E-rename"]},
+            {"ac_id": "ac-2", "tasks": ["写操作日志"], "e2e": ["E2E-rename-audit"]},
+        ]}),
+        req_md=_requirements_md_with_p1())
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
 

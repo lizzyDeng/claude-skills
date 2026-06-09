@@ -353,3 +353,53 @@ def test_duplicate_ac_id_fails():
                     "observable_ac": [{"id": "ac-1", "assertion": "另一条但 id 撞车"}]})
     ok, msg = check(g)
     assert ok is False and "重复" in msg
+
+
+# ── P1 enters the same AC discipline + global id namespace ──────────────────
+
+def _with_p1(gate, p1):
+    g = gate
+    g["p1"] = p1
+    return g
+
+
+def test_valid_gate_with_p1_passes():
+    g = _with_p1(valid_gate(), [
+        {"id": "p1-1", "source": "brief.md:9",
+         "observable_ac": [{"id": "ac-2", "assertion": "改名记入操作日志"}]},
+    ])
+    ok, msg = check(g)
+    assert ok, msg
+
+
+def test_p1_not_a_list_fails():
+    g = valid_gate()
+    g["p1"] = {"id": "p1-1"}
+    ok, msg = check(g)
+    assert ok is False and "p1" in msg
+
+
+def test_p1_ac_missing_assertion_fails():
+    g = _with_p1(valid_gate(), [
+        {"id": "p1-1", "source": "brief", "observable_ac": [{"id": "ac-9", "assertion": "  "}]},
+    ])
+    ok, msg = check(g)
+    assert ok is False and "assertion" in msg
+
+
+def test_p1_ac_id_colliding_with_p0_fails():
+    # AC ids are one global namespace across P0/P1 — a P1 AC reusing a P0 AC id
+    # would let 1B's coverage diff hide a gap, same dup-id bypass P0 closes.
+    g = _with_p1(valid_gate(), [
+        {"id": "p1-1", "source": "brief", "observable_ac": [{"id": "ac-1", "assertion": "撞 P0 的 ac-1"}]},
+    ])
+    ok, msg = check(g)
+    assert ok is False and "重复" in msg
+
+
+def test_p1_without_source_fails():
+    g = _with_p1(valid_gate(), [
+        {"id": "p1-1", "observable_ac": [{"id": "ac-2", "assertion": "x"}]},
+    ])
+    ok, msg = check(g)
+    assert ok is False and "source" in msg
