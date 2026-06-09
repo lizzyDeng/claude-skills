@@ -71,22 +71,29 @@ def codex_review_content(plan_sha):
 def make_fastship_phase1_state(tmp_path, slug="f1"):
     plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
     plan.parent.mkdir(parents=True, exist_ok=True)
-    plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n")
+    # A real feature plan carries the 1B ac_mapping block; here with no exclusive fork.
+    plan.write_text(
+        "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+        '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}]}\n```\n')
     grill = tmp_path / ".claude" / ".fastship-grill-result.md"
     grill.parent.mkdir(parents=True, exist_ok=True)
     grill.write_text("## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- pass\n" + "x " * 150)
+    req = tmp_path / ".claude" / ".fastship-requirements.md"
+    req.write_text("# 需求定稿\n```json\n{}\n```\n" + "x " * 50)
     plan_rec = trusted_artifact("1.4", plan)
     codex = tmp_path / ".claude" / ".fastship-codex-review.md"
     codex.write_text(codex_review_content(plan_rec["sha256"]))
     orch = {
         "current_step": "2.0",
-        "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.5c", "1.6"],
+        "request_type": "feature",
+        "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4", "1.5", "1.5c", "1.6"],
         "plan_path": str(plan),
         "artifacts": {
             "user_confirmed": True,
             "grill_result_path": str(grill),
             "codex_review_path": str(codex),
             "trusted_artifacts": {
+                "1.3r": trusted_artifact("1.3r", req),
                 "1.4": plan_rec,
                 "1.5": trusted_artifact("1.5", grill),
                 "1.5c": trusted_artifact("1.5c", codex),
@@ -345,6 +352,177 @@ class TestStateTransition:
         fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is True
+
+    def test_draft_to_planned_rejects_feature_missing_1a(self, tmp_path):
+        # codex [P1]: a feature must not reach "planned" without 1A requirements (1.3r).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.3r")
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+        assert "1.3r" in reason
+
+    def test_draft_to_planned_bugfix_does_not_require_1a(self, tmp_path):
+        # bugfix skips 1A; the gate must still pass without 1.3r.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["request_type"] = "bugfix"
+        orch_state["completed_steps"].remove("1.3r")
+        orch_state["skipped_steps"] = ["1.3r"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.3r", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is True, reason
+
+    def test_draft_to_planned_feature_skipped_grill_passes(self, tmp_path):
+        # F4: a feature whose 1B plan had no open technical fork auto-skips the 1.5
+        # grill. The phase-1 gate must treat that skip as satisfied (and not demand a
+        # 1.5 artifact) — otherwise Forge could never mark such a feature "planned".
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        orch_state["artifacts"].pop("grill_result_path", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is True, reason
+
+    def test_draft_to_planned_rejects_bugfix_skipping_grill(self, tmp_path):
+        # codex F4 [P1]: 1.5 is MANDATORY for bugfix (no upstream tribunal). A forged
+        # skipped_steps=["1.5"] must NOT satisfy the gate or waive the grill artifact.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["request_type"] = "bugfix"
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.5" in reason
+
+    def test_draft_to_planned_rejects_grill_skip_when_open_fork(self, tmp_path):
+        # codex F4 [P1] round 2+3: a feature whose TRUSTED plan HAS an open technical
+        # fork must run the 1.5 grill. The decision is derived from the sha-verified
+        # plan content, NOT a mutable orch field — so writing the open fork into the
+        # plan (and re-trusting it) is what must make the skip illegitimate.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}]}\n```\n')
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = trusted_artifact("1.4", plan)
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.5" in reason
+
+    def test_draft_to_planned_rejects_grill_skip_when_malformed_fork(self, tmp_path):
+        # codex F4 [P1] round 4: a malformed fork (resolved without resolution) is NOT
+        # "open", but the orchestrator validator rejects it — so the forge gate must
+        # fail CLOSED and still require the grill, not waive it on a status!=open check.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "resolved"}]}\n```\n')
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = trusted_artifact("1.4", plan)
+        orch_state["completed_steps"].remove("1.5")
+        orch_state["skipped_steps"] = ["1.5"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.5", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.5" in reason
+
+    def _plan_with_open_fork(self, tmp_path, orch_state):
+        """Rewrite the trusted 1.4 plan to carry an open fork tf-1 and re-bind the codex
+        review (which is pinned to the plan hash). Returns the open-fork plan path."""
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}]}\n```\n')
+        plan_rec = trusted_artifact("1.4", plan)
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = plan_rec
+        codex = tmp_path / ".claude" / ".fastship-codex-review.md"
+        codex.write_text(codex_review_content(plan_rec["sha256"]))
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        return plan
+
+    def test_draft_to_planned_rejects_completed_grill_open_fork_unresolved(self, tmp_path):
+        # item-2 seam: 1.5 RAN (completed) for a feature whose TRUSTED plan has an open
+        # technical fork, but the TRUSTED grill is prose-only (no fork_resolutions) — the
+        # open fork was never arbitrated. Forge G2 must mirror the engine and FAIL, not
+        # pass on the grill-artifact hash alone.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)   # default grill has no fork_resolutions
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "fork" in reason.lower()
+
+    def test_draft_to_planned_completed_grill_resolves_open_fork_passes(self, tmp_path):
+        # Same open fork, but the trusted grill resolves it via fork_resolutions → passes.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)
+        grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+        grill.write_text(
+            "## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile，跨设备同步"}]}\n```\n'
+            + "x " * 150)
+        orch_state["artifacts"]["trusted_artifacts"]["1.5"] = trusted_artifact("1.5", grill)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok, reason
+
+    def test_draft_to_planned_rejects_grill_with_dangling_resolution(self, tmp_path):
+        # codex [P2]: forge must mirror the engine's STRICT _check_grill_fork_resolution —
+        # a grill that resolves tf-1 but also dangles a non-open tf-ghost is rejected by the
+        # engine, so G2 must reject it too (not lenient-skip the bad entry).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)
+        grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+        grill.write_text(
+            "## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile"},'
+            ' {"id": "tf-ghost", "resolution": "裁了不存在的"}]}\n```\n' + "x " * 150)
+        orch_state["artifacts"]["trusted_artifacts"]["1.5"] = trusted_artifact("1.5", grill)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "fork" in reason.lower()
+
+    def test_draft_to_planned_rejects_fail_review_with_trailing_pass_template(self, tmp_path):
+        # codex round-3: a FAIL codex review with a trailing FULL PASS contract template
+        # must NOT pass G2 — forge binds the gate to the text `### GATE:` verdict (FAIL),
+        # so it selects the real FAIL gate and rejects, not the trailing PASS template.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        plan_sha = orch_state["artifacts"]["trusted_artifacts"]["1.4"]["sha256"]
+
+        def _gate(verdict, **over):
+            g = {"gate": verdict, "reviewed_plan_sha256": plan_sha, "p0_contract_reviewed": True,
+                 "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+                 "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+                 "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+                 "missing_evidence": []}
+            g.update(over)
+            return "### Contract Gate\n```json\n" + json.dumps(g) + f"\n```\n### GATE: {verdict}\n"
+
+        codex = tmp_path / ".claude" / ".fastship-codex-review.md"
+        codex.write_text("## Codex Plan Review\n"
+                         + _gate("FAIL", p0_requirements_missing=["missing P0"])
+                         + _gate("PASS"))   # trailing full PASS template after the real FAIL verdict
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+
+        # codex round-4 mirror: EARLY PASS template hiding the LATE real FAIL must also fail.
+        codex.write_text("## Codex Plan Review\n"
+                         + _gate("PASS")
+                         + _gate("FAIL", p0_requirements_missing=["missing P0"]))
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+
+    def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
+        # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
+        # must NOT satisfy the gate (only bugfix may legitimately skip 1A).
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        orch_state["completed_steps"].remove("1.3r")
+        orch_state["skipped_steps"] = ["1.3r"]
+        orch_state["artifacts"]["trusted_artifacts"].pop("1.3r", None)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "1.3r" in reason
 
     def test_draft_to_planned_rejects_plan_ready_without_artifacts(self, tmp_path):
         fastship_state = {"forge_feature": "f1", "plan_ready": True}

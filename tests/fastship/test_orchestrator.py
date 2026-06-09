@@ -320,7 +320,8 @@ class TestValidatorsPhase1:
             "- [ ] **Step 1:** write test\n"
         )
         monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        orch = {"plan_path": str(plan), "artifacts": {}}
+        # bugfix has no 1A → signature is sufficient (1B AC-mapping is feature-only).
+        orch = {"plan_path": str(plan), "artifacts": {}, "request_type": "bugfix"}
         trust_artifact(orch, "1.4", plan)
         ok, _ = validate_plan(orch, {"plan_ready": True, "plan_file": str(plan)})
         assert ok is True
@@ -347,6 +348,9 @@ class TestValidatorsPhase1:
     def test_grill_pass(self, tmp_path, monkeypatch):
         from orchestrator import validate_grill
         orch, _plan, _plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        # bugfix grill is structural-only (no 1A/1B fork contract on a signature plan);
+        # the feature fork-resolution path is covered in TestGrillForkResolution.
+        orch["request_type"] = "bugfix"
         grill = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill.parent.mkdir(parents=True)
         grill.write_text(
@@ -417,6 +421,203 @@ class TestValidatorsPhase1:
         ok, msg = validate_codex_review(orch, {})
         assert ok is False
         assert "JSON gate" in msg
+
+    def test_codex_review_rejects_multiple_gate_markers(self, tmp_path, monkeypatch):
+        # codex round-4: a spliced review with two ### GATE: verdict lines (an early PASS
+        # template + a later real FAIL) must be rejected, not read as PASS.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(
+            codex_review_content(plan_sha)                                 # full PASS + ### GATE: PASS
+            + codex_review_content("other", gate="FAIL", p0_requirements_missing=["missing P0"]))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "多个 GATE" in msg
+
+    def test_codex_review_rejects_gate_placeholder_line(self, tmp_path, monkeypatch):
+        # codex round-5: the instruction placeholder `### GATE: PASS / FAIL` is NOT a verdict
+        # (trailing text after PASS) — a review left with only the placeholder must be
+        # rejected, not read as PASS via a non-anchored boundary match.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "### GATE: PASS / FAIL")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_fenced_gate_marker(self, tmp_path, monkeypatch):
+        # A `### GATE: PASS` embedded inside a ``` code fence is not a verdict line.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "```\n### GATE: PASS\n```")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_unclosed_fence_marker(self, tmp_path, monkeypatch):
+        # codex round-6: a verdict hidden inside an UNCLOSED ``` fence must not count — the
+        # fence scanner swallows everything after an unclosed fence.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "```\n### GATE: PASS")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_tilde_fence_marker(self, tmp_path, monkeypatch):
+        # ~~~ fences count too — a verdict inside a tilde fence is not a real verdict.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "~~~\n### GATE: PASS\n~~~")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_verdict_hidden_by_fake_closer(self, tmp_path, monkeypatch):
+        # codex round-7: a fence "closed" only by a trailing-text line (```x — NOT a real
+        # CommonMark close) keeps the verdict inside the fence; it must stay hidden, so the
+        # crafted PASS (a full contract gate bound to the plan hash) must NOT pass.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        gate = {"gate": "PASS", "reviewed_plan_sha256": plan_sha, "p0_contract_reviewed": True,
+                "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+                "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+                "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+                "missing_evidence": []}
+        review.write_text("## Codex Plan Review\n```outer\n```x\n### GATE: PASS\n"
+                          "### Contract Gate\n```json\n" + json.dumps(gate) + "\n```\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def _pass_gate(self, plan_sha):
+        return {"gate": "PASS", "reviewed_plan_sha256": plan_sha, "p0_contract_reviewed": True,
+                "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+                "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+                "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+                "missing_evidence": []}
+
+    def test_codex_review_rejects_indented_fake_closer(self, tmp_path, monkeypatch):
+        # codex round-8: a 4-space-indented ``` is indented code, NOT a closing fence — it must
+        # not close the outer fence and expose the verdict hidden inside it.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n```outer\n    ```\n### GATE: PASS\n"
+                          "### Contract Gate\n```json\n" + json.dumps(self._pass_gate(plan_sha)) + "\n```\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_passes_with_indented_backticks_as_content(self, tmp_path, monkeypatch):
+        # round-8 regression: a 4-space-indented ``` must NOT open a fence that swallows the
+        # real verdict — a legit PASS review with such an indented-code line still passes.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n### Contract Gate\n```json\n"
+                          + json.dumps(self._pass_gate(plan_sha)) + "\n```\n    ```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok, msg
+
+    def test_codex_review_rejects_backtick_info_opener_hiding_fail(self, tmp_path, monkeypatch):
+        # codex round-8: a backtick opener whose info string contains a backtick (```a`b) is
+        # NOT a fence — the visible FAIL it tries to hide must be seen, making it two verdicts.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n```bad`info\n### GATE: FAIL\n```\n"
+                          "### Contract Gate\n```json\n" + json.dumps(self._pass_gate(plan_sha)) + "\n```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "多个 GATE" in msg
+
+    def test_codex_review_passes_with_list_item_fenced_snippet(self, tmp_path, monkeypatch):
+        # codex round-9 regression: a fenced snippet inside a list item (indented) must not be
+        # tracked as a top-level fence swallowing the final column-0 verdict — a legit PASS passes.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n### Contract Gate\n```json\n"
+                          + json.dumps(self._pass_gate(plan_sha))
+                          + "\n```\n### Notes\n- ```\n  assert total == 0\n  ```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok, msg
+
+    def test_codex_review_rejects_indented_verdict(self, tmp_path, monkeypatch):
+        # An indented (non-column-0) `### GATE:` line is not a top-level verdict → not counted.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n### Contract Gate\n```json\n"
+                          + json.dumps(self._pass_gate(plan_sha)) + "\n```\n- ### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_indented_gate_block(self, tmp_path, monkeypatch):
+        # codex round-10: an INDENTED ```json gate block (not column 0) is not a top-level
+        # contract gate — the gate fence must be column 0, same as the verdict.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        gate_json = json.dumps(self._pass_gate(plan_sha))
+        review.write_text("## Codex Plan Review\n### Contract Gate\n  ```json\n  "
+                          + gate_json + "\n  ```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "JSON gate" in msg
+
+    def test_codex_review_rejects_gate_block_inside_outer_fence(self, tmp_path, monkeypatch):
+        # A ```json gate nested inside an outer ``` code fence is fence content, not a
+        # top-level contract gate — must not be read as the gate.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        gate_json = json.dumps(self._pass_gate(plan_sha))
+        review.write_text("## Codex Plan Review\n```text\n### Contract Gate\n```json\n"
+                          + gate_json + "\n```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "JSON gate" in msg
 
     def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
         from orchestrator import validate_codex_review
@@ -695,7 +896,7 @@ class TestValidatorsFallbackDenied:
 class TestSteps:
     def test_step_count(self):
         from orchestrator import STEPS
-        assert len(STEPS) == 18
+        assert len(STEPS) == 19
 
     def test_phase_order(self):
         from orchestrator import STEPS
@@ -990,6 +1191,29 @@ class TestIntegrationFullFlow:
             data={"tool_input": {"file_path": str(brief)}},
             orch_path=orch_file)
         st = reload()
+        assert st["current_step"] == "1.3r"   # 1A requirements tribunal runs for features
+
+        # 1.3r: requirements-lock (auto via post_edit)
+        req_gate = {
+            "roles": [
+                {"role": "产品", "abstain": False, "concerns": [
+                    {"id": "c1", "kind": "ac", "point": "dark mode toggle", "evidence_ref": "用户原话"}]},
+                {"role": "运营", "abstain": True, "concerns": []},
+                {"role": "数据", "abstain": True, "concerns": []},
+                {"role": "财务", "abstain": True, "concerns": []},
+            ],
+            "additive_union": [{"id": "c1", "kind": "ac", "point": "dark mode toggle", "sources": ["产品"]}],
+            "exclusive_forks": [],
+            "p0": [{"id": "p0-1", "source": "用户原话",
+                    "observable_ac": [{"id": "ac-1", "assertion": "切换后主题变暗"}]}],
+        }
+        req = brief_dir / ".fastship-requirements.md"
+        req.write_text("# 需求定稿\n## 契约\n```json\n" + json.dumps(req_gate, ensure_ascii=False)
+                       + "\n```\n" + "占位 " * 20)
+        hook_post_edit_logic(
+            data={"tool_input": {"file_path": str(req)}},
+            orch_path=orch_file)
+        st = reload()
         assert st["current_step"] == "1.4"
         assert "1.3d" in st["skipped_steps"]
 
@@ -1000,6 +1224,10 @@ class TestIntegrationFullFlow:
         plan_file.write_text(
             "# Plan\n> **For agentic workers:** REQUIRED\n"
             "**Goal:** dark mode\n- [ ] **Step 1:** test\n"
+            "## AC→task+E2E\n```json\n"
+            '{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["实现暗色切换"], "e2e": ["E2E-dark-toggle"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "主题存 localStorage 还是 profile", "status": "open"}]}\n'
+            "```\n"
         )
         hook["plan_ready"] = True
         hook["plan_file"] = str(plan_file)
@@ -1010,13 +1238,16 @@ class TestIntegrationFullFlow:
         st = reload()
         assert st["current_step"] == "1.5"
 
-        # 1.5: grill (auto via post_edit when grill result file written)
+        # 1.5: grill (auto via post_edit when grill result file written) — the plan's
+        # open fork tf-1 must be resolved in the grill summary's fork_resolutions block.
         grill_result = tmp_path / ".claude" / ".fastship-grill-result.md"
         grill_result.parent.mkdir(parents=True, exist_ok=True)
         grill_result.write_text(
-            "## 拷问记录\n1. Q: AC? → A: ok → resolved\n"
+            "## 拷问记录\n1. Q: 主题存哪 → A: 定了 → resolved\n"
             "## 修订记录\n- none\n"
-            "## 结论\n- resolved\n" + "x " * 150
+            "## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile，跨设备同步"}]}\n```\n'
+            + "x " * 150
         )
         hook_post_edit_logic(
             data={"tool_input": {"file_path": str(grill_result)}},
@@ -1140,6 +1371,111 @@ class TestIntegrationFullFlow:
             orch_path=orch_file)
         st = reload()
         assert st["current_step"] == "done"
+
+    def test_codex_fail_rollback_clears_f4_grill_skip(self, tmp_path, monkeypatch):
+        # F4 + rollback: a feature whose plan had no open fork auto-skipped 1.5 and
+        # reached 1.5c. If codex FAILs, rolling back to 1.4 must also clear the prior
+        # 1.5 skip + stale fork signal, so the rewritten plan decides the grill afresh.
+        from orchestrator import save_orch_state, load_orch_state, hook_post_edit_logic
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        orch_file = str(tmp_path / "orch.json")
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-x.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"],          # 1.5 was auto-skipped (no fork)
+            "plan_path": str(plan),
+            "artifacts": {"plan_open_fork_ids": []},   # stale signal
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        review.write_text(codex_review_content(plan_sha, gate="FAIL"))
+        save_orch_state(orch, orch_file)
+        hook_post_edit_logic(data={"tool_input": {"file_path": str(review)}}, orch_path=orch_file)
+        st = load_orch_state(orch_file)
+        assert st["current_step"] == "1.4"                       # rolled back
+        assert "1.5" not in st["skipped_steps"]                  # prior auto-skip cleared
+        assert "plan_open_fork_ids" not in st["artifacts"]       # stale fork signal dropped
+
+    def _rollback_orch(self, tmp_path, monkeypatch, p0_missing, extra_overrides=None):
+        """Drive a feature to 1.5c with a trusted 1A requirements + plan, then write a
+        FAIL codex review, run the hook, and return the post-rollback state."""
+        from orchestrator import save_orch_state, load_orch_state, hook_post_edit_logic
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        orch_file = str(tmp_path / "orch.json")
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-x.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        req = claude / ".fastship-requirements.md"
+        req.write_text("# 需求定稿\n" + "占位 " * 30)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"],
+            "plan_path": str(plan),
+            "artifacts": {"requirements_path": str(req), "plan_open_fork_ids": []},
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        trust_artifact(orch, "1.3r", req)
+        overrides = {"gate": "FAIL", "p0_requirements_missing": p0_missing}
+        overrides.update(extra_overrides or {})
+        review.write_text(codex_review_content(plan_sha, **overrides))
+        save_orch_state(orch, orch_file)
+        hook_post_edit_logic(data={"tool_input": {"file_path": str(review)}}, orch_path=orch_file)
+        return load_orch_state(orch_file), str(req)
+
+    def test_codex_fail_requirements_layer_rolls_to_1_3r(self, tmp_path, monkeypatch):
+        # 需求层: codex flags p0_requirements_missing → rewind to 1.3r, the 1A lock reset.
+        st, _req = self._rollback_orch(tmp_path, monkeypatch, p0_missing=["改名审核需求漏了"])
+        assert st["current_step"] == "1.3r"
+        assert "requirements_path" not in st["artifacts"]              # 1A lock reset
+        assert "1.3r" not in st.get("completed_steps", [])
+        assert "1.3r" not in st["artifacts"].get("trusted_artifacts", {})
+        assert "1.4" not in st.get("completed_steps", [])
+
+    def test_codex_fail_plan_layer_preserves_requirements(self, tmp_path, monkeypatch):
+        # 方案层: only coverage gaps (p0_requirements_missing empty) → rewind to 1.4,
+        # the trusted 1A requirements stay intact (don't re-run the tribunal needlessly).
+        st, req = self._rollback_orch(tmp_path, monkeypatch, p0_missing=[],
+                                      extra_overrides={"uncovered_ac": ["ac-2"]})
+        assert st["current_step"] == "1.4"
+        assert st["artifacts"].get("requirements_path") == req         # 1A lock preserved
+        assert "1.3r" in st["artifacts"].get("trusted_artifacts", {})
+
+    def test_cmd_done_codex_fail_rolls_back_cli_parity(self, tmp_path, monkeypatch):
+        # CLI parity: cmd_done at 1.5c with a FAIL review rewinds (instead of dead-ending).
+        import orchestrator as o
+        monkeypatch.setattr(o, "_repo_root", lambda: str(tmp_path))
+        monkeypatch.setattr(o, "_branch_mismatch", lambda st: False)
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan = plan_dir / "2026-06-08-cli.md"
+        plan.write_text("# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n")
+        claude = tmp_path / ".claude"
+        claude.mkdir(parents=True, exist_ok=True)
+        review = claude / ".fastship-codex-review.md"
+        orch = {
+            "current_step": "1.5c", "phase": 1, "request_type": "feature", "branch": None,
+            "completed_steps": ["1.0", "1.1", "1.2", "1.3", "1.3r", "1.4"],
+            "skipped_steps": ["1.3d", "1.5"], "plan_path": str(plan), "artifacts": {},
+        }
+        plan_sha = trust_artifact(orch, "1.4", plan)
+        review.write_text(codex_review_content(plan_sha, gate="FAIL"))
+        o.save_orch_state(orch)
+        rc = o.cmd_done(["--codex-review", str(review)])
+        assert rc == 0                                # routed rewind, not an error exit
+        st = o.load_orch_state()
+        assert st["current_step"] == "1.4"            # CLI rolled back, same as hook mode
+        assert not os.path.exists(str(review))        # stale review removed
 
     def test_loop_fail_pauses_for_decision(self, tmp_path):
         from orchestrator import save_orch_state, load_orch_state, hook_post_bash_logic
@@ -2075,3 +2411,84 @@ class TestStep20Contract:
         i = self._instr()
         assert "implement-verdicts" in i
         assert "2.5" in i
+
+
+def make_trusted_plan_with_forks(tmp_path, monkeypatch, forks):
+    """A trusted 1B feature plan carrying an ac_mapping block + the given
+    exclusive_forks — so validate_grill can re-derive the open-fork set from it."""
+    plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan = plan_dir / "2026-06-08-feat.md"
+    mapping = {"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+               "exclusive_forks": forks}
+    plan.write_text(
+        "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n"
+        "## AC→task+E2E\n```json\n" + json.dumps(mapping, ensure_ascii=False) + "\n```\n"
+    )
+    monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+    orch = {"plan_path": str(plan), "artifacts": {}, "request_type": "feature"}
+    trust_artifact(orch, "1.4", plan)
+    return orch, plan
+
+
+def _write_grill(tmp_path, orch, resolutions=None):
+    grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+    grill.parent.mkdir(parents=True, exist_ok=True)
+    body = ("## 拷问记录\n1. Q: 选哪个 fork → A: 定了 → resolved\n"
+            "## 修订记录\n- ok\n## 结论\n- 全部 resolved\n" + "x " * 160)
+    if resolutions is not None:
+        body += ("\n```json\n"
+                 + json.dumps({"fork_resolutions": resolutions}, ensure_ascii=False)
+                 + "\n```\n")
+    grill.write_text(body)
+    orch["artifacts"]["grill_result_path"] = str(grill)
+    trust_artifact(orch, "1.5", grill)
+    return grill
+
+
+class TestGrillForkResolution:
+    """validate_grill (feature): when the plan declares an open technical fork, the
+    grill summary must resolve it (derived from the TRUSTED plan, F4 round-3/4 lesson)."""
+
+    def test_open_fork_resolved_passes(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "PG vs Redis", "status": "open"}])
+        _write_grill(tmp_path, orch, [{"id": "tf-1", "resolution": "选 PG"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok, msg
+
+    def test_open_fork_no_resolution_block_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "PG vs Redis", "status": "open"}])
+        _write_grill(tmp_path, orch, resolutions=None)  # prose only, no fork_resolutions
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "fork_resolutions" in msg
+
+    def test_open_fork_unresolved_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(tmp_path, monkeypatch, [
+            {"id": "tf-1", "decision": "a", "status": "open"},
+            {"id": "tf-2", "decision": "b", "status": "open"},
+        ])
+        _write_grill(tmp_path, orch, [{"id": "tf-1", "resolution": "只裁了一个"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "tf-2" in msg
+
+    def test_dangling_resolution_fails(self, tmp_path, monkeypatch):
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(
+            tmp_path, monkeypatch, [{"id": "tf-1", "decision": "a", "status": "open"}])
+        _write_grill(tmp_path, orch, [{"id": "tf-ghost", "resolution": "裁了不存在的"}])
+        ok, msg = validate_grill(orch, {})
+        assert ok is False and "tf-ghost" in msg
+
+    def test_no_open_fork_passes_structural_only(self, tmp_path, monkeypatch):
+        # If the grill runs with no open fork (normally auto-skipped), there's nothing
+        # to arbitrate → the structural summary is sufficient, no fork_resolutions needed.
+        from orchestrator import validate_grill
+        orch, _ = make_trusted_plan_with_forks(tmp_path, monkeypatch, [])
+        _write_grill(tmp_path, orch, resolutions=None)
+        ok, msg = validate_grill(orch, {})
+        assert ok, msg

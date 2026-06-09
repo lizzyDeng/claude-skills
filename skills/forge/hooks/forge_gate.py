@@ -635,6 +635,39 @@ HARVEST_EVIDENCE_REQUIRED_FIELDS = ["source", "collected_at", "raw_path", "raw_s
 VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
+# Mirror of the orchestrator: the verdict and the gate fence must be at COLUMN 0 (narrower
+# than full CommonMark on purpose — see the orchestrator note). Indented/placeholder/fenced
+# markers aren't counted.
+CODEX_VERDICT_LINE_RE = re.compile(r"^#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
+def _codex_verdict_markers(content):
+    """Mirror of the orchestrator's _codex_verdict_markers: a line-by-line CommonMark fence
+    scanner (normalizes line endings, tracks ``` and ~~~ fences incl. UNCLOSED) yielding
+    full-line `### GATE:` verdicts outside any fence. Pinned in lockstep by
+    tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return []
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    markers = []
+    fence_char = None
+    fence_len = 0
+    for line in text.split("\n"):
+        fm = _FENCE_LINE_RE.match(line)
+        if fence_char is None:
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
+                continue
+            vm = CODEX_VERDICT_LINE_RE.match(line)
+            if vm:
+                markers.append(vm.group(1).upper())
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len \
+                and fm.group(2).strip() == "":
+            fence_char = None
+            fence_len = 0
+    return markers
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",
     "ac_e2e_coverage_reviewed",
@@ -721,6 +754,229 @@ def verify_trusted_artifact(orch_state, step_id):
     return (True, "", rec)
 
 
+def _plan_open_fork_ids(forks):
+    """Pure: parse a plan's exclusive_forks → (open_ids, malformed). Mirrors the
+    orchestrator's _check_exclusive_forks discipline: any bad shape (non-list/non-dict
+    entry, blank/dup id, blank decision, bad status, resolved-without-resolution) sets
+    malformed=True so callers fail CLOSED — the forge gate can't be fooled by a fork
+    shape the engine would have rejected. Kept in lockstep by test_step_ids_sync.py."""
+    if not isinstance(forks, list):
+        return ([], True)
+    seen = set()
+    open_ids = []
+    for fk in forks:
+        if not isinstance(fk, dict):
+            return ([], True)
+        fid = fk.get("id")
+        if not isinstance(fid, str) or not fid.strip() or fid in seen:
+            return ([], True)
+        seen.add(fid)
+        if not isinstance(fk.get("decision"), str) or not fk["decision"].strip():
+            return ([], True)
+        status = fk.get("status")
+        if status not in ("open", "resolved"):
+            return ([], True)
+        if status == "open":
+            open_ids.append(fid)
+        elif not isinstance(fk.get("resolution"), str) or not fk["resolution"].strip():
+            return ([], True)
+    return (open_ids, False)
+
+
+def _forks_require_grill(forks):
+    """Pure: does this plan's exclusive_forks list REQUIRE the 1.5 grill? True if any
+    fork is OPEN **or** the list is MALFORMED (fails closed)."""
+    open_ids, malformed = _plan_open_fork_ids(forks)
+    return malformed or bool(open_ids)
+
+
+def _extract_plan_open_fork_ids(plan_content):
+    """(open_ids, malformed, has_block) from a trusted plan's ac_mapping json block."""
+    gate = None
+    for block in CODEX_GATE_JSON_RE.findall(plan_content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "ac_mapping" in obj:
+            gate = obj
+    if not isinstance(gate, dict):
+        return ([], True, False)
+    open_ids, malformed = _plan_open_fork_ids(gate.get("exclusive_forks", []))
+    return (open_ids, malformed, True)
+
+
+def _check_grill_fork_resolution(open_fork_ids, grill_gate):
+    """Pure: strictly mirror the orchestrator's _check_grill_fork_resolution VERDICT so
+    Forge G2 rejects exactly the grill shapes the engine rejects — a non-object entry, a
+    blank / dangling (not an open fork) / duplicate id, a blank resolution, or any open
+    fork left unresolved. (Codex review [P2]: an earlier lenient `continue` let a grill
+    the engine rejects pass G2.) Pinned in lockstep by tests/forge/test_step_ids_sync.py.
+    Returns (ok, reason)."""
+    if not isinstance(grill_gate, dict):
+        return (False, "grill fork_resolutions gate not an object")
+    res = grill_gate.get("fork_resolutions")
+    if not isinstance(res, list) or not res:
+        return (False, "grill fork_resolutions empty")
+    resolved = set()
+    for r in res:
+        if not isinstance(r, dict):
+            return (False, "fork_resolutions has a non-object entry")
+        fid = r.get("id")
+        if not isinstance(fid, str) or not fid.strip():
+            return (False, "fork_resolutions entry missing id")
+        if fid not in open_fork_ids:
+            return (False, f"fork_resolutions resolves a non-open fork: {fid}")
+        if fid in resolved:
+            return (False, f"fork_resolutions duplicate id: {fid}")
+        if not isinstance(r.get("resolution"), str) or not r["resolution"].strip():
+            return (False, f"fork {fid} resolution empty")
+        resolved.add(fid)
+    missing = sorted(fid for fid in open_fork_ids if fid not in resolved)
+    if missing:
+        return (False, "open technical fork(s) not resolved in grill: " + ", ".join(missing))
+    return (True, "")
+
+
+def _grill_resolution_satisfied(orch_state):
+    """For a non-bugfix whose 1.5 grill RAN (not legitimately skipped), re-derive the
+    open technical forks from the SHA-verified 1.4 plan and require the SHA-verified 1.5
+    grill summary to resolve EVERY one (a fork_resolutions entry with a non-empty
+    resolution per open fork). Mirrors the orchestrator's validate_grill fork-resolution
+    check so Forge G2 can't pass a feature whose open fork was never arbitrated — e.g. a
+    grill recorded before this rule, or a forged state with prose-only grill. Returns
+    (ok, reason). Fails CLOSED on any unreadable/malformed/missing evidence."""
+    ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
+    if not ok:
+        return (False, reason)
+    ok, reason, grill_rec = verify_trusted_artifact(orch_state, "1.5")
+    if not ok:
+        return (False, reason)
+    try:
+        with open(plan_rec["path"], encoding="utf-8") as f:
+            plan_content = f.read()
+    except Exception as e:
+        return (False, f"cannot read trusted plan artifact: {e}")
+    open_ids, malformed, has_block = _extract_plan_open_fork_ids(plan_content)
+    if not has_block:
+        return (False, "trusted plan missing ac_mapping block (cannot verify fork resolution)")
+    if malformed:
+        return (False, "trusted plan exclusive_forks malformed")
+    if not open_ids:
+        return (True, "")  # no open fork → the grill had nothing to arbitrate
+    try:
+        with open(grill_rec["path"], encoding="utf-8") as f:
+            grill_content = f.read()
+    except Exception as e:
+        return (False, f"cannot read trusted grill artifact: {e}")
+    res_gate = None
+    for block in CODEX_GATE_JSON_RE.findall(grill_content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "fork_resolutions" in obj:
+            res_gate = obj
+    if not isinstance(res_gate, dict):
+        return (False, "trusted grill missing fork_resolutions for open technical fork(s)")
+    return _check_grill_fork_resolution(set(open_ids), res_gate)
+
+
+def _trusted_plan_has_open_fork(orch_state):
+    """Re-derive the open-fork decision from the SHA-verified 1.4 plan artifact, NOT
+    from the mutable orch-state field. Returns (ok, requires_grill, reason). The phase-1
+    gate honors a 1.5 grill skip only when the TRUSTED plan genuinely has no open
+    exclusive fork — binding the waiver to trusted evidence (a forged/stale orch field
+    or an edited plan can't move a fork-bearing feature to planned without arbitration).
+    Fails CLOSED: if the trusted plan can't be read/parsed, or its forks are malformed,
+    treat it as requiring the grill so the skip is NOT waived."""
+    ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
+    if not ok:
+        return (False, True, reason)
+    try:
+        with open(plan_rec["path"], encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return (False, True, f"cannot read trusted plan artifact: {e}")
+    gate = None
+    for block in CODEX_GATE_JSON_RE.findall(content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "ac_mapping" in obj:
+            gate = obj
+    if not isinstance(gate, dict):
+        # A validly-planned feature always carries the ac_mapping block; its absence is
+        # anomalous → fail closed (don't waive the grill).
+        return (True, True, "")
+    return (True, _forks_require_grill(gate.get("exclusive_forks", [])), "")
+
+
+def _codex_gate_jsons(content):
+    """Mirror of the orchestrator's _codex_gate_jsons: JSON strings from TOP-LEVEL, column-0
+    ```json fenced blocks (an indented or inside-another-fence gate block is not top-level).
+    Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return []
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = []
+    fence_char = None
+    fence_len = 0
+    is_json = False
+    buf = []
+    for line in text.split("\n"):
+        fm = _FENCE_LINE_RE.match(line)
+        if fence_char is None:
+            if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
+                is_json = fm.group(2).strip().lower() == "json"
+                buf = []
+        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len \
+                and fm.group(2).strip() == "":
+            if is_json:
+                blocks.append("\n".join(buf))
+            fence_char, fence_len, is_json, buf = None, 0, False, []
+        else:
+            buf.append(line)
+    return blocks
+
+
+def _extract_codex_review_gate(content):
+    """Mirror of the orchestrator's _extract_codex_review_gate: requires EXACTLY ONE
+    `### GATE:` verdict line and EXACTLY ONE contract-shaped json block (dict with gate ∈
+    PASS/FAIL + every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a list) before it whose `gate`
+    equals the verdict; otherwise None. Rejecting spliced reviews (an early PASS template
+    hiding a later real FAIL, or a trailing PASS after a real FAIL) is what stops Forge
+    from accepting a FAIL review as PASS. Pinned in lockstep with the engine by
+    tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return None
+    markers = _codex_verdict_markers(content)
+    if len(markers) != 1:
+        return None
+    verdict = markers[0]
+    gates = []
+    for block in _codex_gate_jsons(content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("gate", "")).upper() not in ("PASS", "FAIL"):
+            continue
+        if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
+            continue
+        gates.append(obj)
+    if len(gates) != 1:
+        return None
+    gate = gates[0]
+    if str(gate.get("gate", "")).upper() != verdict:
+        return None
+    return gate
+
+
 def verify_codex_review_artifact(orch_state):
     ok, reason, codex_rec = verify_trusted_artifact(orch_state, "1.5c")
     if not ok:
@@ -733,13 +989,9 @@ def verify_codex_review_artifact(orch_state):
             content = f.read()
     except Exception as e:
         return (False, f"cannot read codex review artifact: {e}")
-    matches = CODEX_GATE_JSON_RE.findall(content)
-    if not matches:
-        return (False, "Codex review missing structured JSON gate")
-    try:
-        gate = json.loads(matches[-1])
-    except json.JSONDecodeError as e:
-        return (False, f"Codex review JSON gate invalid: {e}")
+    gate = _extract_codex_review_gate(content)
+    if gate is None:
+        return (False, "Codex review missing structured contract JSON gate")
     if str(gate.get("gate", "")).upper() != "PASS":
         return (False, "Codex review JSON gate is not PASS")
     if gate.get("reviewed_plan_sha256") != plan_rec.get("sha256"):
@@ -765,14 +1017,52 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
     if not orch_state:
         return (False, "Gate 2: fastship orchestrator state missing")
     completed = set(orch_state.get("completed_steps", []))
+    skipped = set(orch_state.get("skipped_steps", []))
+    is_bugfix = orch_state.get("request_type") == "bugfix"
+    # Only steps the engine could LEGITIMATELY skip in THIS request context count as
+    # satisfied (and waive their artifact). Honoring every skipped_steps entry would
+    # let a forged skip of a MANDATORY step bypass the gate: a bugfix must still run
+    # its 1.5 grill, and a feature must still run its 1.3r 1A tribunal.
+    allowed_skips = {"1.3r"} if is_bugfix else {"1.3d"}
+    # F4: a feature may skip the 1.5 grill ONLY when its plan surfaced no open technical
+    # fork — derived from the SHA-VERIFIED 1.4 plan artifact, not the mutable orch-state
+    # field. If the trusted plan carries an open fork the engine routes to the grill
+    # (mandatory human arbitration), so honoring a 1.5 skip there would bypass it.
+    if not is_bugfix and "1.5" in skipped:
+        ok, requires_grill, reason = _trusted_plan_has_open_fork(orch_state)
+        if not ok:
+            return (False, "Gate 2: " + reason)
+        if not requires_grill:
+            allowed_skips = allowed_skips | {"1.5"}
+    honored_skips = skipped & allowed_skips
+    satisfied = completed | honored_skips
     required = {"1.4", "1.5", "1.5c", "1.6"}
-    missing = sorted(required - completed)
+    artifact_steps = ["1.4", "1.5"]
+    # 1A requirements tribunal (1.3r) is mandatory for non-bugfix features — without it
+    # Forge could mark a feature "planned" with no 需求定稿. Unset/stale request_type
+    # defaults to requiring 1A (safe: a feature missing its type must still have
+    # produced requirements).
+    if not is_bugfix:
+        required = required | {"1.3r"}
+        artifact_steps = ["1.3r"] + artifact_steps
+    missing = sorted(required - satisfied)
     if missing:
         return (False, "Gate 2: fastship Phase 1 incomplete. Missing: " + ", ".join(missing))
     if not orch_state.get("artifacts", {}).get("user_confirmed"):
         return (False, "Gate 2: user confirmation missing")
-    for step_id in ("1.4", "1.5"):
+    for step_id in artifact_steps:
+        if step_id in honored_skips:
+            continue  # legitimately-skipped step produced no artifact
         ok, reason, _ = verify_trusted_artifact(orch_state, step_id)
+        if not ok:
+            return (False, "Gate 2: " + reason)
+    # When the 1.5 grill RAN (not legitimately skipped), the engine required it to have
+    # resolved every open technical fork (item 2). Mirror that here so a trusted-but-
+    # unresolving grill — recorded before this rule, or a forged state with a prose-only
+    # grill — can't pass G2 with an open fork that was never arbitrated. (Same seam as
+    # the F4 grill-skip waiver: the external gate must enforce the engine's discipline.)
+    if not is_bugfix and "1.5" not in honored_skips:
+        ok, reason = _grill_resolution_satisfied(orch_state)
         if not ok:
             return (False, "Gate 2: " + reason)
     ok, reason = verify_codex_review_artifact(orch_state)

@@ -1,0 +1,243 @@
+"""Guard: the forge dashboard's step-id list must stay in sync with the single
+source of truth (orchestrator.STEPS / orchestrator.ALL_STEP_IDS).
+
+Adding or reordering a Step in the orchestrator without updating the dashboard
+(or vice versa) fails here loudly, instead of silently drifting the dashboard's
+progress-bar denominator and "stuck in planning" detection. This is the
+machine-enforced contract that lets new steps (e.g. the Phase-1 1A requirement
+tribunal) be inserted into STEPS without quietly breaking forge observability.
+"""
+import importlib.util
+import json
+import os
+import re
+import sys
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+FASTSHIP_DIR = os.path.join(ROOT, "skills", "fastship")
+FORGE_DIR = os.path.join(ROOT, "skills", "forge")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# orchestrator does a bare `import fastship_state`, so its dir must be importable.
+if FASTSHIP_DIR not in sys.path:
+    sys.path.insert(0, FASTSHIP_DIR)
+orch = _load("orchestrator", os.path.join(FASTSHIP_DIR, "orchestrator.py"))
+fd = _load("forge_dashboard", os.path.join(FORGE_DIR, "forge_dashboard.py"))
+fg = _load("forge_gate", os.path.join(FORGE_DIR, "hooks", "forge_gate.py"))
+
+
+class StepIdsInSyncTest(unittest.TestCase):
+    def test_canonical_matches_steps(self):
+        # ALL_STEP_IDS is exactly the ordered ids of STEPS — no second copy.
+        self.assertEqual(orch.ALL_STEP_IDS, [s.id for s in orch.STEPS])
+
+    def test_dashboard_python_list_in_sync(self):
+        self.assertEqual(
+            fd.ALL_STEPS, orch.ALL_STEP_IDS,
+            "forge_dashboard.ALL_STEPS drifted from orchestrator.STEPS — "
+            "update skills/forge/forge_dashboard.py ALL_STEPS to match.",
+        )
+
+    def test_dashboard_embedded_js_in_sync(self):
+        # render_html injects ALL_STEPS into `const ALL=...`; prove the injection
+        # happened and the JS list equals the Python list.
+        html = fd.render_html()
+        self.assertNotIn("__ALL_STEPS__", html, "step-id placeholder was not injected")
+        m = re.search(r"const ALL=(\[[^\]]*\]);", html)
+        self.assertIsNotNone(m, "could not find `const ALL=[...]` in dashboard HTML")
+        self.assertEqual(
+            json.loads(m.group(1)), fd.ALL_STEPS,
+            "embedded JS step list out of sync with ALL_STEPS injection",
+        )
+
+
+class ForkDisciplineParityTest(unittest.TestCase):
+    """Guard: the forge gate's fork interpretation (whether a plan's exclusive_forks
+    waive the 1.5 grill) must agree with the orchestrator's _check_exclusive_forks for
+    EVERY shape. Two implementations of fork-discipline silently drifted once (codex
+    found the forge gate waiving the grill on a malformed fork the engine rejects);
+    this pins them: 'requires grill' == 'open OR malformed' per the engine."""
+
+    CASES = [
+        [],                                                                  # none
+        [{"id": "a", "decision": "d", "status": "resolved", "resolution": "r"}],  # all resolved
+        [{"id": "a", "decision": "d", "status": "open"}],                    # open
+        [{"id": "a", "decision": "d", "status": "resolved"}],                # resolved, no resolution
+        [{"id": "a", "decision": "d", "status": "typo"}],                    # bad status
+        [{"decision": "d", "status": "open"}],                               # missing id
+        [{"id": "  ", "decision": "d", "status": "open"}],                   # blank id
+        [{"id": "a", "decision": "", "status": "open"}],                     # blank decision
+        [{"id": "a", "decision": "d", "status": "open"},
+         {"id": "a", "decision": "e", "status": "resolved", "resolution": "x"}],  # dup id
+        [42],                                                                # non-dict entry
+        "not-a-list",                                                        # wrong type
+        [{"id": "a", "decision": "d", "status": "resolved", "resolution": "r"},
+         {"id": "b", "decision": "e", "status": "open"}],                    # mixed → open
+    ]
+
+    def test_forge_gate_fork_discipline_matches_orchestrator(self):
+        for forks in self.CASES:
+            ok, _msg, open_ids = orch._check_exclusive_forks(forks)
+            engine_requires_grill = (not ok) or bool(open_ids)
+            self.assertEqual(
+                fg._forks_require_grill(forks), engine_requires_grill,
+                f"forge_gate._forks_require_grill drifted from orchestrator "
+                f"_check_exclusive_forks for forks={forks!r}",
+            )
+
+
+def _full_gate(**over):
+    g = {"gate": "FAIL", "reviewed_plan_sha256": "x", "p0_contract_reviewed": True,
+         "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+         "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+         "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+         "missing_evidence": []}
+    g.update(over)
+    return g
+
+
+class CodexGateSelectorParityTest(unittest.TestCase):
+    """The forge gate and the orchestrator must identify the codex 1.5c CONTRACT gate
+    the SAME way — else a trailing example block could be read as the gate by one and not
+    the other (the F7-misroute seam). Pins forge._extract_codex_review_gate to the
+    orchestrator's for every shape."""
+
+    CONTENTS = [
+        # exactly one full FAIL gate + one verdict line → both select it
+        "## R\n### Contract Gate\n```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # real FAIL gate + trailing FULL PASS template (own verdict) → 2 markers → None
+        "## R\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n### GATE: FAIL\n"
+        + "### Contract Gate\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
+        # early PASS template hiding a later real FAIL → 2 markers → None
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n"
+        + "### Contract Gate\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n### GATE: FAIL\n",
+        # bogus gate-key block before the verdict + one real gate → real selected
+        "## R\n```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n"
+        + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # two full contract gates before a single verdict → ambiguous → None
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n"
+        + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # placeholder verdict line `### GATE: PASS / FAIL` (trailing text) → no verdict → None
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS / FAIL\n",
+        # verdict marker buried in a code fence → not counted → None
+        "## R\n```\n### GATE: PASS\n```\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n",
+        # PASS gate + verdict PASS
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
+        # gate-shaped but missing the coverage arrays + verdict → None
+        "## R\n```json\n" + json.dumps({"gate": "PASS"}) + "\n```\n### GATE: PASS\n",
+        # gate present but NO verdict marker → None (no authoritative verdict)
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n",
+        "## R\nno json here\n### GATE: FAIL\n",                                          # none
+        "## R\n```json\n{bad json\n```\n### GATE: FAIL\n",                              # unparseable
+    ]
+
+    def test_gate_selector_matches(self):
+        for content in self.CONTENTS:
+            self.assertEqual(
+                fg._extract_codex_review_gate(content),
+                orch._extract_codex_review_gate(content),
+                f"codex gate selector drifted for content={content!r}",
+            )
+
+
+class CodexVerdictMarkerParityTest(unittest.TestCase):
+    """The forge gate and the orchestrator must count `### GATE:` verdict lines the SAME
+    way — full-line, de-fenced — else a placeholder/fenced marker could be a verdict to one
+    and not the other. Pins forge._codex_verdict_markers to the orchestrator's."""
+
+    CASES = [
+        "### GATE: PASS\n",
+        "### GATE: FAIL\n",
+        "### GATE: PASS / FAIL\n",                       # placeholder (trailing text) → none
+        "prose ### GATE: PASS more\n",                   # not a whole line → none
+        "```\n### GATE: PASS\n```\n",                    # closed fence → none
+        "```\n### GATE: PASS\n",                         # UNCLOSED fence → none (round-6)
+        "~~~\n### GATE: PASS\n~~~\n",                     # tilde fence → none (round-6)
+        "````\n### GATE: PASS\n````\n",                  # 4-backtick fence → none
+        "```outer\n```x\n### GATE: PASS\n",              # fake closer ```x (trailing text) → none (round-7)
+        "```\n### GATE: PASS\n```x\n### GATE: FAIL\n",  # ```x not a close; both verdicts fenced → none
+        "    ```\n### GATE: PASS\n",                      # 4-space indent ``` not a fence → one (round-8)
+        "```outer\n    ```\n### GATE: PASS\n",           # indented ``` not a closer → verdict fenced → none
+        "```bad`info\n### GATE: FAIL\n",                 # backtick-in-info not a fence → one (round-8)
+        "### Notes\n- ```\n  x\n  ```\n### GATE: PASS\n",  # list-item fence ignored; col0 verdict → one (round-9)
+        "  ### GATE: PASS\n",                            # indented verdict (not column 0) → none
+        "- ### GATE: PASS\n",                            # list-item verdict (not column 0) → none
+        "### GATE: PASS\r\n",                             # CRLF whole line → one
+        "### GATE: PASS\n### GATE: FAIL\n",              # two
+        "   ##  GATE:  FAIL   \n",                       # heading lvl 2 + extra ws → one
+        "## Contract\n```json\n{\"gate\": \"PASS\"}\n```\n### GATE: PASS\n",  # one (fence stripped)
+        "",
+    ]
+
+    def test_marker_count_matches(self):
+        for content in self.CASES:
+            self.assertEqual(
+                fg._codex_verdict_markers(content), orch._codex_verdict_markers(content),
+                f"codex verdict-marker parsing drifted for content={content!r}",
+            )
+
+
+class CodexGateJsonsParityTest(unittest.TestCase):
+    """The forge gate and orchestrator must extract the codex contract JSON gate the SAME
+    way — top-level, column-0 ```json fences only (round-10). Pins forge._codex_gate_jsons."""
+
+    CASES = [
+        "```json\n{\"a\": 1}\n```\n",                                  # top-level → one block
+        "  ```json\n{\"a\": 1}\n  ```\n",                              # indented → none
+        "```text\n```json\n{\"a\": 1}\n```\n### GATE: PASS\n",          # nested in outer fence → none
+        "```json\n{\"a\": 1}\n```\n```json\n{\"b\": 2}\n```\n",          # two top-level → two
+        "```\n{\"a\": 1}\n```\n",                                      # not a json fence → none
+        "- ```json\n  {\"a\": 1}\n  ```\n",                            # list-item gate → none
+        "no fence here\n",
+        "",
+    ]
+
+    def test_gate_jsons_match(self):
+        for content in self.CASES:
+            self.assertEqual(
+                fg._codex_gate_jsons(content), orch._codex_gate_jsons(content),
+                f"codex gate-json extraction drifted for content={content!r}",
+            )
+
+
+class GrillResolutionParityTest(unittest.TestCase):
+    """Forge G2's grill fork-resolution verdict must equal the orchestrator's
+    _check_grill_fork_resolution for every shape (codex review [P2]: forge was laxer).
+    Pins the two so a grill the engine rejects can't pass G2."""
+
+    OPEN = {"tf-1", "tf-2"}
+    GATES = [
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-2", "resolution": "b"}]},  # ok
+        {"fork_resolutions": []},                                                       # empty
+        {"other": 1},                                                                   # missing field
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}]},                       # tf-2 unresolved
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-2", "resolution": "b"},
+                              {"id": "tf-ghost", "resolution": "c"}]},                   # dangling
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "a"}, {"id": "tf-1", "resolution": "b"},
+                              {"id": "tf-2", "resolution": "c"}]},                       # duplicate
+        {"fork_resolutions": [{"id": "tf-1", "resolution": "  "}, {"id": "tf-2", "resolution": "b"}]},  # blank res
+        {"fork_resolutions": [{"id": "  ", "resolution": "a"}]},                         # blank id
+        {"fork_resolutions": ["tf-1"]},                                                 # non-object entry
+        None,                                                                            # top-level non-dict
+        ["nope"],                                                                        # top-level list
+    ]
+
+    def test_grill_resolution_verdict_matches(self):
+        for gate in self.GATES:
+            self.assertEqual(
+                fg._check_grill_fork_resolution(set(self.OPEN), gate)[0],
+                orch._check_grill_fork_resolution(set(self.OPEN), gate)[0],
+                f"grill fork-resolution verdict drifted for gate={gate!r}",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
