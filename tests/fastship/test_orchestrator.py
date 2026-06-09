@@ -437,6 +437,34 @@ class TestValidatorsPhase1:
         ok, msg = validate_codex_review(orch, {})
         assert ok is False and "多个 GATE" in msg
 
+    def test_codex_review_rejects_gate_placeholder_line(self, tmp_path, monkeypatch):
+        # codex round-5: the instruction placeholder `### GATE: PASS / FAIL` is NOT a verdict
+        # (trailing text after PASS) — a review left with only the placeholder must be
+        # rejected, not read as PASS via a non-anchored boundary match.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "### GATE: PASS / FAIL")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
+    def test_codex_review_rejects_fenced_gate_marker(self, tmp_path, monkeypatch):
+        # A `### GATE: PASS` embedded inside a ``` code fence is not a verdict line.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        body = codex_review_content(plan_sha).replace("### GATE: PASS", "```\n### GATE: PASS\n```")
+        review.write_text(body)
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
     def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
         from orchestrator import validate_codex_review
         orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)

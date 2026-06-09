@@ -636,6 +636,17 @@ VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
+# Mirror of the orchestrator: the verdict must be a WHOLE-LINE `### GATE: PASS|FAIL` outside
+# code fences, so the placeholder `### GATE: PASS / FAIL` isn't counted (codex round-5).
+CODEX_VERDICT_LINE_RE = re.compile(r"(?m)^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _codex_verdict_markers(content):
+    """Mirror of the orchestrator's _codex_verdict_markers: full-line, de-fenced verdict
+    tokens. Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
+    defenced = _CODE_FENCE_RE.sub("", content or "")
+    return [v.upper() for v in CODEX_VERDICT_LINE_RE.findall(defenced)]
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",
     "ac_e2e_coverage_reviewed",
@@ -891,13 +902,12 @@ def _extract_codex_review_gate(content):
     tests/forge/test_step_ids_sync.py."""
     if not content:
         return None
-    markers = list(CODEX_GATE_RE.finditer(content))
+    markers = _codex_verdict_markers(content)
     if len(markers) != 1:
         return None
-    m = markers[0]
-    verdict = m.group(1).upper()
+    verdict = markers[0]
     gates = []
-    for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
+    for block in CODEX_GATE_JSON_RE.findall(content):
         try:
             obj = json.loads(block)
         except json.JSONDecodeError:

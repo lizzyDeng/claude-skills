@@ -303,6 +303,11 @@ PLAN_SIGNATURE_MARKERS = [
 
 GRILL_REQUIRED_SECTIONS = ["拷问", "修订", "结论"]
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
+# The codex 1.5c verdict line must be a WHOLE line `### GATE: PASS|FAIL` (nothing after the
+# verdict), so the instruction's own placeholder `### GATE: PASS / FAIL` (trailing text) does
+# NOT count as a verdict — that boundary-match was a real PASS bypass (codex review round-5).
+CODEX_VERDICT_LINE_RE = re.compile(r"(?m)^[ \t]*#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
 CODEX_REVIEW_PLAN_HASH_FIELD = "reviewed_plan_sha256"
@@ -689,31 +694,41 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
     return True, "grill validated"
 
 
+def _codex_verdict_markers(content: str):
+    """Verdict tokens from the `### GATE: PASS/FAIL` lines that are full-line AND outside
+    code fences. Line-anchored so a placeholder like `### GATE: PASS / FAIL` (trailing text)
+    doesn't count; de-fenced so a marker embedded in a ```code``` block doesn't count
+    (codex review round-5). Shared by validate_codex_review and _extract_codex_review_gate
+    so the verdict line is counted identically."""
+    defenced = _CODE_FENCE_RE.sub("", content or "")
+    return [v.upper() for v in CODEX_VERDICT_LINE_RE.findall(defenced)]
+
+
 def _extract_codex_review_gate(content: str):
     """Return the codex 1.5c CONTRACT gate dict from a review's markdown, or None.
 
-    A well-formed review has EXACTLY ONE `### GATE: PASS/FAIL` text line and EXACTLY ONE
-    contract-shaped json block (dict with gate ∈ PASS/FAIL AND every
-    CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a list) appearing BEFORE it, whose `gate` equals the
-    text verdict. Anything else — zero/multiple verdict lines, zero/multiple contract gates
-    before the line, or gate≠verdict — returns None (reject the ambiguous/spliced review).
+    A well-formed review has EXACTLY ONE full-line `### GATE: PASS/FAIL` verdict (outside
+    code fences) and EXACTLY ONE contract-shaped json block (dict with gate ∈ PASS/FAIL AND
+    every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a list), whose `gate` equals the verdict.
+    Anything else — zero/multiple verdict lines, zero/multiple contract gates, gate≠verdict,
+    or a non-line-anchored placeholder like `### GATE: PASS / FAIL` — returns None (reject
+    the ambiguous/spliced/placeholder review).
 
     Why this strict shape: a spliced review (an early PASS template + a later real FAIL, or
-    a real FAIL + a trailing PASS template) must not let one block hide the other. An early
+    a real FAIL + a trailing PASS template) must not let one block hide the other; an early
     PASS hiding a later FAIL would skip the F7 rollback AND let validate/Forge accept a FAIL
-    review as PASS (codex review rounds 2-4). Shared by validate_codex_review and
+    review as PASS (codex review rounds 2-5). Shared by validate_codex_review and
     _codex_fail_rollback_step so the gate is identified identically (no drift). Incidental
     non-contract blocks (a doc snippet {"gate":"example-only"}, an unrelated json) are
     ignored — only contract-shaped blocks count toward the "exactly one" rule."""
     if not content:
         return None
-    markers = list(CODEX_GATE_RE.finditer(content))
+    markers = _codex_verdict_markers(content)
     if len(markers) != 1:
         return None
-    m = markers[0]
-    verdict = m.group(1).upper()
+    verdict = markers[0]
     gates = []
-    for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
+    for block in CODEX_GATE_JSON_RE.findall(content):
         try:
             obj = json.loads(block)
         except json.JSONDecodeError:
@@ -758,15 +773,16 @@ def validate_codex_review(orch: dict, hook: dict) -> tuple:
         return False, f"无法读取: {path}"
     if len(content) < 100:
         return False, f"Codex review 太短 ({len(content)}B < 100B)"
-    markers = CODEX_GATE_RE.findall(content)
+    markers = _codex_verdict_markers(content)
     if not markers:
-        return False, "Codex review 缺少显式 GATE 判定行（须恰好一行 ### GATE: 判定）"
+        return False, ("Codex review 缺少显式 GATE 判定行（须恰好一行独占整行的 ### GATE: 判定，"
+                       "占位行 ### GATE: PASS / FAIL 不算）")
     if len(markers) != 1:
         # A spliced review (multiple verdict lines) could hide a real FAIL behind an
         # early PASS — reject outright. NOTE: keep "FAIL" out of this message so it does
         # not trip the rollback trigger (which keys on "FAIL" in the message).
         return False, "Codex review 出现多个 GATE 判定行（须恰好一个），疑似拼接/复制模板，请只保留一个"
-    verdict = markers[0].upper()
+    verdict = markers[0]
     if verdict == "FAIL":
         return False, "codex review FAIL — 需更新 plan 后重新 review（orchestrator 自动按缺陷层回退）"
 

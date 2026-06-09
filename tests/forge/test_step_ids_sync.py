@@ -125,6 +125,10 @@ class CodexGateSelectorParityTest(unittest.TestCase):
         # two full contract gates before a single verdict → ambiguous → None
         "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n"
         + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # placeholder verdict line `### GATE: PASS / FAIL` (trailing text) → no verdict → None
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS / FAIL\n",
+        # verdict marker buried in a code fence → not counted → None
+        "## R\n```\n### GATE: PASS\n```\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n",
         # PASS gate + verdict PASS
         "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
         # gate-shaped but missing the coverage arrays + verdict → None
@@ -141,6 +145,31 @@ class CodexGateSelectorParityTest(unittest.TestCase):
                 fg._extract_codex_review_gate(content),
                 orch._extract_codex_review_gate(content),
                 f"codex gate selector drifted for content={content!r}",
+            )
+
+
+class CodexVerdictMarkerParityTest(unittest.TestCase):
+    """The forge gate and the orchestrator must count `### GATE:` verdict lines the SAME
+    way — full-line, de-fenced — else a placeholder/fenced marker could be a verdict to one
+    and not the other. Pins forge._codex_verdict_markers to the orchestrator's."""
+
+    CASES = [
+        "### GATE: PASS\n",
+        "### GATE: FAIL\n",
+        "### GATE: PASS / FAIL\n",                       # placeholder (trailing text) → none
+        "prose ### GATE: PASS more\n",                   # not a whole line → none
+        "```\n### GATE: PASS\n```\n",                    # fenced → none
+        "### GATE: PASS\n### GATE: FAIL\n",              # two
+        "   ##  GATE:  FAIL   \n",                       # heading lvl 2 + extra ws → one
+        "## Contract\n```json\n{\"gate\": \"PASS\"}\n```\n### GATE: PASS\n",  # one (fence stripped)
+        "",
+    ]
+
+    def test_marker_count_matches(self):
+        for content in self.CASES:
+            self.assertEqual(
+                fg._codex_verdict_markers(content), orch._codex_verdict_markers(content),
+                f"codex verdict-marker parsing drifted for content={content!r}",
             )
 
 
