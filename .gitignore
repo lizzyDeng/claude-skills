@@ -19,6 +19,15 @@ __pycache__/
 
 # fastship runtime artifacts
 .claude/fastship-e2e-result.json
+.claude/.ship-verify-state.json
+.claude/.fastship-orchestrator-state.json
+.claude/state/
+.claude/worktrees/
+.claude/.fastship-brief.md
+.claude/.fastship-requirements.md
+.claude/.fastship-grill-result.md
+.claude/.fastship-codex-review.md
+.claude/.fastship-code-review.md
 
 # fastship-generated plan visualization (derived from plan.md)
 docs/superpowers/plans/*.plan.html

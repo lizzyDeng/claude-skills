@@ -37,6 +37,21 @@ FORGE_LINKS = {
     ".claude/tools/forge_dashboard.py": SKILLS_DIR / "forge" / "forge_dashboard.py",
 }
 
+FASTSHIP_GITIGNORE_LINES = [
+    "# fastship runtime artifacts",
+    ".claude/.ship-verify-state.json",
+    ".claude/.fastship-orchestrator-state.json",
+    ".claude/state/",
+    ".claude/worktrees/",
+    ".claude/fastship-e2e-result.json",
+    ".claude/.fastship-brief.md",
+    ".claude/.fastship-requirements.md",
+    ".claude/.fastship-grill-result.md",
+    ".claude/.fastship-codex-review.md",
+    ".claude/.fastship-code-review.md",
+    "docs/superpowers/plans/*.plan.html",
+]
+
 
 def _git_root(path: Path) -> Path:
     proc = subprocess.run(
@@ -161,6 +176,26 @@ def _merge_settings(project: Path, with_forge: bool, dry_run: bool) -> str:
     return "updated"
 
 
+def _merge_gitignore(project: Path, dry_run: bool) -> str:
+    path = project / ".gitignore"
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    present = set(line.strip() for line in existing)
+    missing = [line for line in FASTSHIP_GITIGNORE_LINES if line.strip() and line.strip() not in present]
+    if not missing:
+        return "exists"
+    if dry_run:
+        return "update"
+    out = list(existing)
+    if out and out[-1].strip():
+        out.append("")
+    for line in FASTSHIP_GITIGNORE_LINES:
+        if line.strip() and line.strip() not in present:
+            out.append(line)
+            present.add(line.strip())
+    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    return "updated"
+
+
 def install(project: Path, replace: bool, with_forge: bool, no_hooks: bool, dry_run: bool) -> list[str]:
     project = _git_root(project)
     links = dict(FASTSHIP_LINKS)
@@ -175,6 +210,8 @@ def install(project: Path, replace: bool, with_forge: bool, no_hooks: bool, dry_
     if not no_hooks:
         status = _merge_settings(project, with_forge=with_forge, dry_run=dry_run)
         results.append(f"{status:8} .claude/settings.local.json hooks")
+    status = _merge_gitignore(project, dry_run=dry_run)
+    results.append(f"{status:8} .gitignore fastship artifacts")
     return results
 
 

@@ -14,6 +14,11 @@ E2E 验证通过为唯一交付标准。Python 状态机驱动每一步，artifa
 收到需求后立即运行：
   python3 "${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py" start "<需求>"
 
+默认 `start` 会尽力从 `origin/staging` 创建隔离 worktree：
+先同步 `staging`（checked out 时 `git pull --ff-only origin staging`，否则 `git fetch origin staging`），
+再 `git worktree add -b fastship/<session> .claude/worktrees/<session> origin/staging`。
+创建成功后必须 `cd` 到输出的 worktree 路径继续执行；创建失败且未加 `--require-worktree` 时降级为当前工作区启动并打印警告。
+
 ## 双模工作方式
 
 ### Claude Code（hook 模式 — 最强）
@@ -70,10 +75,14 @@ Phase 3: Verification (7 步)
 ```bash
 FASTSHIP="python3 ${CLAUDE_PLUGIN_ROOT}/skills/fastship/orchestrator.py"
 $FASTSHIP start "<需求>"   # 启动
+$FASTSHIP start --base staging "<需求>"  # 指定 worktree base（默认 staging）
+$FASTSHIP start --require-worktree "<需求>"  # base/worktree 不可用时硬失败
+$FASTSHIP start --no-worktree "<需求>"  # 显式在当前工作区启动
 $FASTSHIP next             # 当前步骤
 $FASTSHIP done [--flags]   # 完成 + 验证
 $FASTSHIP status           # 全部状态
 $FASTSHIP adopt-branch     # 将活跃 session 迁移到当前分支
+$FASTSHIP sweep-worktrees [--dry-run]  # 清理 fastship 创建且已完成+干净+合入 base 的 worktree
 $FASTSHIP reset            # 重置
 ```
 
@@ -86,6 +95,7 @@ $FASTSHIP reset            # 重置
 - Codex Review FAIL 按缺陷层回退（F7）：p0_requirements_missing→1.3r（需求层）/ 其余→1.4（方案层）；hook 与 CLI 一致
 - 执行必须走 executing-plans / subagent-driven-development
 - 主线程禁止亲自 grep/find（改为 1.2 并行 Explore）
+- 一 session 一 worktree：`start` 默认从 `origin/staging` 创建 `.claude/worktrees/<session>` 隔离 worktree；`--shared` 只复用当前 worktree。cleanup 只清 fastship 自己创建、done/stopped、干净且已并入 base 的 worktree；当前/main/dirty/unmerged/外部 worktree 一律保留。
 - Phase 1 编辑代码文件 → hook 自动 BLOCK + 打印当前步骤（Claude Code only）
 - E2E 阶段禁止 DB 写入（gate 拦截）
 - Loop 上限 3 次（gate 锁死）
