@@ -429,6 +429,44 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is False and "1.5" in reason
 
+    def _plan_with_open_fork(self, tmp_path, orch_state):
+        """Rewrite the trusted 1.4 plan to carry an open fork tf-1 and re-bind the codex
+        review (which is pinned to the plan hash). Returns the open-fork plan path."""
+        plan = tmp_path / "docs" / "superpowers" / "plans" / "2026-05-28-f1.md"
+        plan.write_text(
+            "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** f1\n- [ ] **Step 1:** x\n"
+            '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],'
+            ' "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}]}\n```\n')
+        plan_rec = trusted_artifact("1.4", plan)
+        orch_state["artifacts"]["trusted_artifacts"]["1.4"] = plan_rec
+        codex = tmp_path / ".claude" / ".fastship-codex-review.md"
+        codex.write_text(codex_review_content(plan_rec["sha256"]))
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        return plan
+
+    def test_draft_to_planned_rejects_completed_grill_open_fork_unresolved(self, tmp_path):
+        # item-2 seam: 1.5 RAN (completed) for a feature whose TRUSTED plan has an open
+        # technical fork, but the TRUSTED grill is prose-only (no fork_resolutions) — the
+        # open fork was never arbitrated. Forge G2 must mirror the engine and FAIL, not
+        # pass on the grill-artifact hash alone.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)   # default grill has no fork_resolutions
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False and "fork" in reason.lower()
+
+    def test_draft_to_planned_completed_grill_resolves_open_fork_passes(self, tmp_path):
+        # Same open fork, but the trusted grill resolves it via fork_resolutions → passes.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        self._plan_with_open_fork(tmp_path, orch_state)
+        grill = tmp_path / ".claude" / ".fastship-grill-result.md"
+        grill.write_text(
+            "## 拷问记录\nQ/A\n## 修订记录\n- none\n## 结论\n- resolved\n"
+            '```json\n{"fork_resolutions": [{"id": "tf-1", "resolution": "存 profile，跨设备同步"}]}\n```\n'
+            + "x " * 150)
+        orch_state["artifacts"]["trusted_artifacts"]["1.5"] = trusted_artifact("1.5", grill)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok, reason
+
     def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
         # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
         # must NOT satisfy the gate (only bugfix may legitimately skip 1A).

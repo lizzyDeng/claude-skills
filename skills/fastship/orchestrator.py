@@ -2095,18 +2095,28 @@ def _codex_fail_rollback_step(orch: dict, review_content: str) -> str:
     tribunal re-derive the requirement.
     方案层 — sound requirements but coverage/quality gaps (uncovered_ac, weak_scenarios,
     …) → rewind to 1.4 (the plan).
-    bugfix has no 1A (1.3r skipped) → always 1.4. Fail-closed to 1.4 on any parse
-    failure: least re-work, and the loop cap backstops a mis-route."""
-    if orch.get("request_type") == "bugfix":
-        return PLAN_STEP_ID
-    blocks = CODEX_GATE_JSON_RE.findall(review_content or "")
-    if blocks:
+
+    Two hardening rules (codex review of this very feature):
+    - the defect-layer signal is read from the codex GATE block (the json block that
+      carries a `gate` key), NOT merely the last json block — a trailing unrelated
+      block must not misroute a 需求层 defect to 1.4;
+    - 需求层 routing is gated on a TRUSTED 1.3r artifact existing (1A actually ran),
+      derived from trusted evidence rather than the mutable request_type field. A bugfix
+      (or any flow without a trusted 1A lock) has nothing to rewind to → 1.4.
+    Fail-closed to 1.4 on any parse failure (least re-work; the loop cap backstops it)."""
+    gate = None
+    for block in CODEX_GATE_JSON_RE.findall(review_content or ""):
         try:
-            gate = json.loads(blocks[-1])
+            obj = json.loads(block)
         except json.JSONDecodeError:
-            gate = None
-        if isinstance(gate, dict) and gate.get("p0_requirements_missing"):
-            return REQUIREMENTS_STEP_ID
+            continue
+        if isinstance(obj, dict) and "gate" in obj:
+            gate = obj
+    if not (isinstance(gate, dict) and gate.get("p0_requirements_missing")):
+        return PLAN_STEP_ID
+    trusted = orch.get("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {})
+    if isinstance(trusted, dict) and REQUIREMENTS_STEP_ID in trusted:
+        return REQUIREMENTS_STEP_ID
     return PLAN_STEP_ID
 
 

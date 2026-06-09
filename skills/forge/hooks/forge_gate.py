@@ -721,34 +721,116 @@ def verify_trusted_artifact(orch_state, step_id):
     return (True, "", rec)
 
 
-def _forks_require_grill(forks):
-    """Pure: does this plan's exclusive_forks list REQUIRE the 1.5 grill? True if any
-    fork is OPEN **or** the list is MALFORMED (fails closed). This mirrors the
-    orchestrator's _check_exclusive_forks discipline exactly, so the forge gate can't
-    be fooled into waiving the grill by a fork shape the engine would have rejected
-    (e.g. status='resolved' with no resolution, a status typo, a dup/blank id). Kept
-    in lockstep with the orchestrator by tests/forge/test_step_ids_sync.py."""
+def _plan_open_fork_ids(forks):
+    """Pure: parse a plan's exclusive_forks → (open_ids, malformed). Mirrors the
+    orchestrator's _check_exclusive_forks discipline: any bad shape (non-list/non-dict
+    entry, blank/dup id, blank decision, bad status, resolved-without-resolution) sets
+    malformed=True so callers fail CLOSED — the forge gate can't be fooled by a fork
+    shape the engine would have rejected. Kept in lockstep by test_step_ids_sync.py."""
     if not isinstance(forks, list):
-        return True
+        return ([], True)
     seen = set()
-    has_open = False
+    open_ids = []
     for fk in forks:
         if not isinstance(fk, dict):
-            return True
+            return ([], True)
         fid = fk.get("id")
         if not isinstance(fid, str) or not fid.strip() or fid in seen:
-            return True
+            return ([], True)
         seen.add(fid)
         if not isinstance(fk.get("decision"), str) or not fk["decision"].strip():
-            return True
+            return ([], True)
         status = fk.get("status")
         if status not in ("open", "resolved"):
-            return True
+            return ([], True)
         if status == "open":
-            has_open = True
+            open_ids.append(fid)
         elif not isinstance(fk.get("resolution"), str) or not fk["resolution"].strip():
-            return True
-    return has_open
+            return ([], True)
+    return (open_ids, False)
+
+
+def _forks_require_grill(forks):
+    """Pure: does this plan's exclusive_forks list REQUIRE the 1.5 grill? True if any
+    fork is OPEN **or** the list is MALFORMED (fails closed)."""
+    open_ids, malformed = _plan_open_fork_ids(forks)
+    return malformed or bool(open_ids)
+
+
+def _extract_plan_open_fork_ids(plan_content):
+    """(open_ids, malformed, has_block) from a trusted plan's ac_mapping json block."""
+    gate = None
+    for block in CODEX_GATE_JSON_RE.findall(plan_content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "ac_mapping" in obj:
+            gate = obj
+    if not isinstance(gate, dict):
+        return ([], True, False)
+    open_ids, malformed = _plan_open_fork_ids(gate.get("exclusive_forks", []))
+    return (open_ids, malformed, True)
+
+
+def _grill_resolution_satisfied(orch_state):
+    """For a non-bugfix whose 1.5 grill RAN (not legitimately skipped), re-derive the
+    open technical forks from the SHA-verified 1.4 plan and require the SHA-verified 1.5
+    grill summary to resolve EVERY one (a fork_resolutions entry with a non-empty
+    resolution per open fork). Mirrors the orchestrator's validate_grill fork-resolution
+    check so Forge G2 can't pass a feature whose open fork was never arbitrated — e.g. a
+    grill recorded before this rule, or a forged state with prose-only grill. Returns
+    (ok, reason). Fails CLOSED on any unreadable/malformed/missing evidence."""
+    ok, reason, plan_rec = verify_trusted_artifact(orch_state, "1.4")
+    if not ok:
+        return (False, reason)
+    ok, reason, grill_rec = verify_trusted_artifact(orch_state, "1.5")
+    if not ok:
+        return (False, reason)
+    try:
+        with open(plan_rec["path"], encoding="utf-8") as f:
+            plan_content = f.read()
+    except Exception as e:
+        return (False, f"cannot read trusted plan artifact: {e}")
+    open_ids, malformed, has_block = _extract_plan_open_fork_ids(plan_content)
+    if not has_block:
+        return (False, "trusted plan missing ac_mapping block (cannot verify fork resolution)")
+    if malformed:
+        return (False, "trusted plan exclusive_forks malformed")
+    if not open_ids:
+        return (True, "")  # no open fork → the grill had nothing to arbitrate
+    try:
+        with open(grill_rec["path"], encoding="utf-8") as f:
+            grill_content = f.read()
+    except Exception as e:
+        return (False, f"cannot read trusted grill artifact: {e}")
+    res_gate = None
+    for block in CODEX_GATE_JSON_RE.findall(grill_content):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "fork_resolutions" in obj:
+            res_gate = obj
+    if not isinstance(res_gate, dict):
+        return (False, "trusted grill missing fork_resolutions for open technical fork(s)")
+    res = res_gate.get("fork_resolutions")
+    if not isinstance(res, list) or not res:
+        return (False, "grill fork_resolutions empty")
+    resolved = set()
+    for r in res:
+        if not isinstance(r, dict):
+            continue
+        fid = r.get("id")
+        if not isinstance(fid, str) or not fid.strip():
+            continue
+        if not isinstance(r.get("resolution"), str) or not r["resolution"].strip():
+            continue
+        resolved.add(fid)
+    missing = sorted(fid for fid in open_ids if fid not in resolved)
+    if missing:
+        return (False, "open technical fork(s) not resolved in grill: " + ", ".join(missing))
+    return (True, "")
 
 
 def _trusted_plan_has_open_fork(orch_state):
@@ -863,6 +945,15 @@ def fastship_phase1_complete(slug, fastship_state, orch_state):
         if step_id in honored_skips:
             continue  # legitimately-skipped step produced no artifact
         ok, reason, _ = verify_trusted_artifact(orch_state, step_id)
+        if not ok:
+            return (False, "Gate 2: " + reason)
+    # When the 1.5 grill RAN (not legitimately skipped), the engine required it to have
+    # resolved every open technical fork (item 2). Mirror that here so a trusted-but-
+    # unresolving grill — recorded before this rule, or a forged state with a prose-only
+    # grill — can't pass G2 with an open fork that was never arbitrated. (Same seam as
+    # the F4 grill-skip waiver: the external gate must enforce the engine's discipline.)
+    if not is_bugfix and "1.5" not in honored_skips:
+        ok, reason = _grill_resolution_satisfied(orch_state)
         if not ok:
             return (False, "Gate 2: " + reason)
     ok, reason = verify_codex_review_artifact(orch_state)

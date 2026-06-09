@@ -18,31 +18,54 @@ def _gate_block(**fields):
 
 
 # ── routing: _codex_fail_rollback_step ──────────────────────────────────────
+# 需求层 routing is gated on a TRUSTED 1.3r artifact existing (1A actually ran), derived
+# from trusted evidence rather than the mutable request_type field.
+
+def _with_trusted_1a():
+    return {"artifacts": {"trusted_artifacts": {"1.3r": {"sha256": "x"}}}}
+
 
 def test_requirements_layer_routes_to_1_3r():
     from orchestrator import _codex_fail_rollback_step
     content = _gate_block(p0_requirements_missing=["改名审核需求漏了"])
-    assert _codex_fail_rollback_step({"request_type": "feature"}, content) == "1.3r"
+    assert _codex_fail_rollback_step(_with_trusted_1a(), content) == "1.3r"
 
 
 def test_plan_layer_routes_to_1_4():
     from orchestrator import _codex_fail_rollback_step
     content = _gate_block(p0_requirements_missing=[], uncovered_ac=["ac-2"])
-    assert _codex_fail_rollback_step({"request_type": "feature"}, content) == "1.4"
+    assert _codex_fail_rollback_step(_with_trusted_1a(), content) == "1.4"
 
 
-def test_bugfix_always_routes_to_1_4():
-    # bugfix has no 1A; even a requirements-layer flag can't rewind to a skipped 1.3r.
+def test_requirements_layer_without_trusted_1a_falls_to_1_4():
+    # Derive from trusted evidence, NOT request_type: no trusted 1.3r → nothing to rewind
+    # to → 1.4. A bugfix (1.3r skipped) lands here; so would a tampered/absent 1A lock.
     from orchestrator import _codex_fail_rollback_step
     content = _gate_block(p0_requirements_missing=["x"])
-    assert _codex_fail_rollback_step({"request_type": "bugfix"}, content) == "1.4"
+    assert _codex_fail_rollback_step({"artifacts": {}}, content) == "1.4"
+    # flipping request_type alone must not buy a rewind to 1.3r…
+    assert _codex_fail_rollback_step({"request_type": "feature", "artifacts": {}}, content) == "1.4"
+    # …nor avoid it: a trusted 1A present routes to 1.3r even labeled bugfix.
+    orch = {"request_type": "bugfix", "artifacts": {"trusted_artifacts": {"1.3r": {"sha256": "x"}}}}
+    assert _codex_fail_rollback_step(orch, content) == "1.3r"
+
+
+def test_trailing_json_block_does_not_misroute():
+    # The gate is the block with a `gate` key, not merely the last json block — a trailing
+    # unrelated block must not hide p0_requirements_missing and misroute 需求层 → 1.4.
+    import json
+    from orchestrator import _codex_fail_rollback_step
+    content = (_gate_block(p0_requirements_missing=["missing audit"])
+               + "\n附录\n```json\n" + json.dumps({"unrelated": True}) + "\n```\n")
+    assert _codex_fail_rollback_step(_with_trusted_1a(), content) == "1.3r"
 
 
 def test_unparseable_defaults_to_1_4():
     from orchestrator import _codex_fail_rollback_step
-    assert _codex_fail_rollback_step({"request_type": "feature"}, "no json at all") == "1.4"
-    assert _codex_fail_rollback_step({"request_type": "feature"}, "```json\n{bad json\n```") == "1.4"
-    assert _codex_fail_rollback_step({"request_type": "feature"}, "") == "1.4"
+    a = _with_trusted_1a()
+    assert _codex_fail_rollback_step(a, "no json at all") == "1.4"
+    assert _codex_fail_rollback_step(a, "```json\n{bad json\n```") == "1.4"
+    assert _codex_fail_rollback_step(a, "") == "1.4"
 
 
 # ── state mutation: _apply_codex_fail_rollback ──────────────────────────────
