@@ -33,6 +33,13 @@ def isolate_fastship_state_home(tmp_path_factory, monkeypatch):
     home = tmp_path_factory.mktemp("fastship_state_home")
     monkeypatch.setenv("FASTSHIP_STATE_HOME", str(home))
     monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+    # Global safety net: never pop a real browser during tests. Integration tests
+    # (e.g. test_feature_flow_via_hooks) drive the hook flow through step 1.4, which
+    # calls attach_plan_html -> open_in_browser; in 'auto' mode that opens the
+    # rendered plan.html on a dev machine (no CI/FASTSHIP_HEADLESS set). Making
+    # 'never' the test default is the single source of truth so no test can forget.
+    # Tests that exercise the 'always'/'auto' branches override this and mock Popen.
+    monkeypatch.setenv("FASTSHIP_PLAN_HTML_OPEN", "never")
     # Strip ambient harness env so project-root resolution tests aren't polluted, then
     # pin repo_root() to a fresh EMPTY dir (no .claude/fastship.project.json) so no test
     # accidentally reads the real checkout's project config. Resolution tests delenv
