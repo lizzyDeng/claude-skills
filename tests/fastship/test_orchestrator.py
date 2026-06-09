@@ -1094,6 +1094,72 @@ class TestCLI:
         assert args["--agents"] == "4"
         assert args["--grill-complete"] is True
 
+    def test_parse_start_args_accepts_options_before_requirement(self):
+        from orchestrator import parse_start_args
+        req, opts = parse_start_args([
+            "--base", "staging",
+            "--require-worktree",
+            "fix branch lifecycle",
+            "--worktree-root=.claude/worktrees",
+        ])
+        assert req == "fix branch lifecycle"
+        assert opts == [
+            "--base", "staging",
+            "--require-worktree",
+            "--worktree-root=.claude/worktrees",
+        ]
+
+    def test_base_sync_pulls_checked_out_staging_worktree_only(self, tmp_path, monkeypatch):
+        import orchestrator
+        calls = []
+        stage_wt = tmp_path / "stage-wt"
+        stage_wt.mkdir()
+
+        def fake_run_git(args, cwd=None, timeout=20):
+            calls.append((args, cwd, timeout))
+            if args == ["remote"]:
+                return subprocess.CompletedProcess(args, 0, stdout="origin\n", stderr="")
+            if args == ["worktree", "list", "--porcelain"]:
+                return subprocess.CompletedProcess(args, 0, stdout=(
+                    f"worktree {tmp_path / 'repo'}\n"
+                    "HEAD 111\n"
+                    "branch refs/heads/main\n\n"
+                    f"worktree {stage_wt}\n"
+                    "HEAD 222\n"
+                    "branch refs/heads/staging\n"
+                ), stderr="")
+            if args[:3] == ["rev-parse", "--verify", "--quiet"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(orchestrator, "_run_git", fake_run_git)
+        orchestrator._git_fetch_base(str(tmp_path / "repo"), "staging")
+
+        assert (["pull", "--ff-only", "origin", "staging"], str(stage_wt.resolve()), 60) in calls
+        assert (["fetch", "origin", "staging"], str(tmp_path / "repo"), 30) in calls
+
+    def test_resolve_base_syncs_before_using_existing_origin_staging(self, monkeypatch):
+        import orchestrator
+        calls = []
+
+        monkeypatch.setattr(orchestrator, "_git_fetch_base", lambda root, base: calls.append((root, base)))
+        monkeypatch.setattr(orchestrator, "_git_ref_exists", lambda root, ref: ref == "origin/staging")
+
+        assert orchestrator._resolve_base_ref("/repo", "staging", fetch=True) == "origin/staging"
+        assert calls == [("/repo", "staging")]
+
+    def test_shared_start_disables_auto_worktree(self):
+        from orchestrator import _worktree_mode
+
+        assert _worktree_mode(["--shared"]) == "off"
+
+    def test_remote_base_fetch_uses_branch_name(self):
+        from orchestrator import _remote_branch_for_fetch
+
+        assert _remote_branch_for_fetch("origin/staging") == "staging"
+        assert _remote_branch_for_fetch("refs/remotes/origin/staging") == "staging"
+        assert _remote_branch_for_fetch("refs/heads/staging") is None
+
     def test_format_status(self):
         from orchestrator import format_status
         orch = {"requirement": "dark mode", "current_step": "1.2", "phase": 1,
@@ -2147,6 +2213,136 @@ class TestWorktreeStateIsolation:
 
         assert home_wt != home_main
         assert "worktrees" in home_wt
+
+
+class TestFastshipWorktreeLifecycle:
+    def _git(self, *args, cwd):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       check=True, capture_output=True, text=True)
+
+    def _make_repo_with_origin_staging(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git("init", "-q", "-b", "main", cwd=repo)
+        self._git("config", "user.email", "t@t.io", cwd=repo)
+        self._git("config", "user.name", "t", cwd=repo)
+        self._git("remote", "add", "origin", str(tmp_path / "origin.git"), cwd=repo)
+        (repo / "README.md").write_text("base\n")
+        self._git("add", "-A", cwd=repo)
+        self._git("commit", "-q", "-m", "base", cwd=repo)
+        self._git("switch", "-q", "-c", "staging", cwd=repo)
+        (repo / "staging-only.txt").write_text("from staging\n")
+        self._git("add", "-A", cwd=repo)
+        self._git("commit", "-q", "-m", "staging", cwd=repo)
+        self._git("update-ref", "refs/remotes/origin/staging", "HEAD", cwd=repo)
+        staging_sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        self._git("switch", "-q", "main", cwd=repo)
+        return repo, staging_sha
+
+    def test_start_creates_isolated_worktree_from_origin_staging(self, tmp_path, monkeypatch, capsys):
+        import orchestrator
+        import fastship_state
+
+        repo, staging_sha = self._make_repo_with_origin_staging(tmp_path)
+        sid = "feature-branch-lifecycle"
+        monkeypatch.delenv("FASTSHIP_STATE_HOME", raising=False)
+        monkeypatch.setenv("FASTSHIP_REPO_ROOT", str(repo))
+        monkeypatch.setenv("FASTSHIP_SESSION", sid)
+        monkeypatch.setattr(orchestrator, "_compact_is_recent", lambda: True)
+        monkeypatch.chdir(repo)
+
+        rc = orchestrator.cmd_start("test staging worktree", ["--no-fetch"])
+        out = capsys.readouterr().out
+
+        wt = repo / ".claude" / "worktrees" / sid
+        assert rc == 0
+        assert "origin/staging" in out
+        assert wt.exists()
+        assert (wt / "staging-only.txt").read_text() == "from staging\n"
+        branch = subprocess.run(
+            ["git", "-C", str(wt), "branch", "--show-current"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        assert branch == f"fastship/{sid}"
+
+        gd = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--git-dir"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        if not os.path.isabs(gd):
+            gd = os.path.join(wt, gd)
+        st_path = os.path.join(gd, "fastship", "sessions", sid, "orchestrator.json")
+        st = fastship_state.load_json(st_path)
+        assert st["branch"] == f"fastship/{sid}"
+        assert st["repo_root"] == str(wt.resolve())
+        assert st["base_sha"] == staging_sha
+        assert st["worktree"]["base_ref"] == "origin/staging"
+
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--short"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        assert status == ""
+
+    def test_sweep_removes_done_clean_merged_fastship_worktree(self, tmp_path, monkeypatch):
+        import orchestrator
+        import fastship_state
+
+        repo, _ = self._make_repo_with_origin_staging(tmp_path)
+        sid = "done-clean"
+        monkeypatch.delenv("FASTSHIP_STATE_HOME", raising=False)
+        monkeypatch.setenv("FASTSHIP_REPO_ROOT", str(repo))
+        monkeypatch.setenv("FASTSHIP_SESSION", sid)
+        monkeypatch.setattr(orchestrator, "_compact_is_recent", lambda: True)
+        monkeypatch.chdir(repo)
+        assert orchestrator.cmd_start("done feature", ["--no-fetch"]) == 0
+        wt = repo / ".claude" / "worktrees" / sid
+        gd = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--git-dir"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        if not os.path.isabs(gd):
+            gd = os.path.join(wt, gd)
+        st_path = os.path.join(gd, "fastship", "sessions", sid, "orchestrator.json")
+        st = fastship_state.load_json(st_path)
+        st["current_step"] = "done"
+        fastship_state.save_json(st_path, st)
+
+        res = orchestrator.sweep_fastship_worktrees(str(repo))
+
+        assert any(item[1] == f"fastship/{sid}" for item in res["removed"])
+        assert not wt.exists()
+        branches = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--format=%(refname:short)"],
+            check=True, capture_output=True, text=True).stdout.split()
+        assert f"fastship/{sid}" not in branches
+
+    def test_sweep_keeps_dirty_fastship_worktree(self, tmp_path, monkeypatch):
+        import orchestrator
+        import fastship_state
+
+        repo, _ = self._make_repo_with_origin_staging(tmp_path)
+        sid = "dirty-feature"
+        monkeypatch.delenv("FASTSHIP_STATE_HOME", raising=False)
+        monkeypatch.setenv("FASTSHIP_REPO_ROOT", str(repo))
+        monkeypatch.setenv("FASTSHIP_SESSION", sid)
+        monkeypatch.setattr(orchestrator, "_compact_is_recent", lambda: True)
+        monkeypatch.chdir(repo)
+        assert orchestrator.cmd_start("dirty feature", ["--no-fetch"]) == 0
+        wt = repo / ".claude" / "worktrees" / sid
+        (wt / "scratch.txt").write_text("keep me\n")
+        gd = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--git-dir"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        if not os.path.isabs(gd):
+            gd = os.path.join(wt, gd)
+        st_path = os.path.join(gd, "fastship", "sessions", sid, "orchestrator.json")
+        st = fastship_state.load_json(st_path)
+        st["current_step"] = "done"
+        fastship_state.save_json(st_path, st)
+
+        res = orchestrator.sweep_fastship_worktrees(str(repo))
+
+        assert any(item[1] == f"fastship/{sid}" and item[2] == "kept-dirty" for item in res["kept"])
+        assert (wt / "scratch.txt").read_text() == "keep me\n"
 
 
 class TestStep20StateNoop:

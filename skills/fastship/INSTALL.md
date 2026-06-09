@@ -315,6 +315,12 @@ E2E 命令识别（通用）：`curl localhost`, `playwright`, `cypress`, `puppe
 .claude/.ship-verify-state.json
 .claude/.fastship-orchestrator-state.json
 .claude/state/
+.claude/worktrees/
+.claude/fastship-e2e-result.json
 .claude/.fastship-brief.md
+.claude/.fastship-requirements.md
 .claude/.fastship-grill-result.md
+.claude/.fastship-codex-review.md
+.claude/.fastship-code-review.md
+docs/superpowers/plans/*.plan.html
 ```

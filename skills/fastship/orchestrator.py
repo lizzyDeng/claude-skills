@@ -15,10 +15,12 @@ import sys
 import os
 import json
 import re
+import shlex
 import subprocess
 import hashlib
 import shutil
 import time as _time
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Callable, Any, Union
@@ -544,6 +546,446 @@ def _git_head_sha() -> Optional[str]:
         return sha or None
     except Exception:
         return None
+
+
+# ━━━━━━━━━━━━ Git Worktree Management ━━━━━━━━━━━━
+
+DEFAULT_WORKTREE_BASE_BRANCH = "staging"
+DEFAULT_WORKTREE_ROOT = os.path.join(".claude", "worktrees")
+DEFAULT_WORKTREE_BRANCH_PREFIX = "fastship/"
+FASTSHIP_LOCAL_EXCLUDES = [
+    ".claude/worktrees/",
+    ".claude/state/",
+    ".claude/fastship-e2e-result.json",
+    ".claude/.ship-verify-state.json",
+    ".claude/.fastship-orchestrator-state.json",
+    ".claude/.fastship-brief.md",
+    ".claude/.fastship-requirements.md",
+    ".claude/.fastship-grill-result.md",
+    ".claude/.fastship-codex-review.md",
+    ".claude/.fastship-code-review.md",
+]
+
+
+def _run_git(args: list[str], cwd: str = None, timeout: int = 20) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return subprocess.run(
+        ["git", "-C", cwd or _repo_root(), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _git_ref_exists(root: str, ref: str) -> bool:
+    try:
+        return _run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=root).returncode == 0
+    except Exception:
+        return False
+
+
+def _git_repo_root_from(path: str) -> Optional[str]:
+    try:
+        r = _run_git(["rev-parse", "--show-toplevel"], cwd=path)
+        return os.path.realpath(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def _main_worktree_root(root: str) -> str:
+    try:
+        r = _run_git(["worktree", "list", "--porcelain"], cwd=root)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if line.startswith("worktree "):
+                    return os.path.realpath(line[len("worktree "):])
+    except Exception:
+        pass
+    return os.path.realpath(root)
+
+
+def _worktree_path_for_branch(root: str, branch: str) -> Optional[str]:
+    try:
+        r = _run_git(["worktree", "list", "--porcelain"], cwd=root)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    current_path = None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):]
+            continue
+        if line.startswith("branch ") and current_path:
+            ref = line[len("branch "):]
+            name = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+            if name == branch:
+                return os.path.realpath(current_path)
+    return None
+
+
+def _remote_branch_for_fetch(base_branch: str) -> Optional[str]:
+    if not base_branch:
+        return None
+    if base_branch.startswith("origin/"):
+        return base_branch.split("/", 1)[1]
+    prefix = "refs/remotes/origin/"
+    if base_branch.startswith(prefix):
+        return base_branch[len(prefix):]
+    if base_branch.startswith("refs/"):
+        return None
+    return base_branch
+
+
+def _git_fetch_base(root: str, base_branch: str) -> None:
+    # Best-effort parity with teamwork's prepare flow. If the base branch exists
+    # in a worktree, update it there via ff-only pull; otherwise only fetch the
+    # remote-tracking ref. Never run `git pull origin staging` from an unrelated
+    # current branch, because that would merge staging into the wrong branch.
+    try:
+        remote = _run_git(["remote"], cwd=root, timeout=5)
+        if "origin" not in set(remote.stdout.split()):
+            return
+        if (
+            base_branch
+            and not base_branch.startswith("origin/")
+            and not base_branch.startswith("refs/")
+            and _git_ref_exists(root, base_branch)
+        ):
+            wt = _worktree_path_for_branch(root, base_branch)
+            if wt:
+                _run_git(["pull", "--ff-only", "origin", base_branch], cwd=wt, timeout=60)
+        fetch_branch = _remote_branch_for_fetch(base_branch)
+        if fetch_branch:
+            _run_git(["fetch", "origin", fetch_branch], cwd=root, timeout=30)
+    except Exception:
+        return
+
+
+def _ensure_fastship_local_excludes(root: str) -> None:
+    try:
+        r = _run_git(["rev-parse", "--git-path", "info/exclude"], cwd=root)
+        if r.returncode != 0 or not r.stdout.strip():
+            return
+        path = r.stdout.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            existing_text = open(path, encoding="utf-8").read()
+        except FileNotFoundError:
+            existing_text = ""
+        existing = {line.strip() for line in existing_text.splitlines()}
+        missing = [line for line in FASTSHIP_LOCAL_EXCLUDES if line not in existing]
+        if not missing:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            if existing_text and not existing_text.endswith("\n"):
+                f.write("\n")
+            f.write("\n# fastship runtime artifacts\n")
+            for line in missing:
+                f.write(line + "\n")
+    except Exception:
+        return
+
+
+def _resolve_base_ref(root: str, base_branch: str, fetch: bool = True) -> Optional[str]:
+    base = (base_branch or DEFAULT_WORKTREE_BASE_BRANCH).strip()
+    if not base:
+        return None
+
+    def candidates() -> list[str]:
+        if base.startswith("refs/") or base.startswith("origin/"):
+            return [base]
+        return [f"origin/{base}", base]
+
+    if fetch:
+        _git_fetch_base(root, base)
+    for ref in candidates():
+        if _git_ref_exists(root, ref):
+            return ref
+    return None
+
+
+def _project_git_config() -> dict:
+    cfg = fastship_state.load_project_config()
+    git_cfg = cfg.get("git") or cfg.get("worktree") or {}
+    return git_cfg if isinstance(git_cfg, dict) else {}
+
+
+def _start_option(argv: list[str], names: tuple[str, ...], default=None):
+    for i, arg in enumerate(argv or []):
+        for name in names:
+            if arg == name and i + 1 < len(argv):
+                return argv[i + 1]
+            if arg.startswith(name + "="):
+                return arg.split("=", 1)[1]
+    return default
+
+
+def _start_flag(argv: list[str], *names: str) -> bool:
+    return any(arg in names for arg in (argv or []))
+
+
+def _worktree_mode(argv: list[str]) -> str:
+    if _start_flag(argv, "--shared", "--no-worktree"):
+        return "off"
+    if _start_flag(argv, "--require-worktree"):
+        return "require"
+    if _start_flag(argv, "--worktree"):
+        return "auto"
+    git_cfg = _project_git_config()
+    return str(git_cfg.get("worktree_mode") or git_cfg.get("mode") or "auto").strip().lower()
+
+
+def _worktree_root_for_start(argv: list[str], main_root: str) -> str:
+    git_cfg = _project_git_config()
+    rel = (
+        _start_option(argv, ("--worktree-root",))
+        or git_cfg.get("worktree_root")
+        or DEFAULT_WORKTREE_ROOT
+    )
+    rel = os.path.expanduser(str(rel))
+    return os.path.realpath(rel if os.path.isabs(rel) else os.path.join(main_root, rel))
+
+
+def _branch_for_start(argv: list[str], session_id: str) -> str:
+    git_cfg = _project_git_config()
+    explicit = _start_option(argv, ("--branch",))
+    if explicit:
+        return explicit
+    prefix = str(git_cfg.get("branch_prefix") or DEFAULT_WORKTREE_BRANCH_PREFIX)
+    return prefix + session_id
+
+
+def _base_branch_for_start(argv: list[str]) -> str:
+    git_cfg = _project_git_config()
+    return str(
+        _start_option(argv, ("--base", "--base-branch"))
+        or os.environ.get("FASTSHIP_BASE_BRANCH")
+        or git_cfg.get("base_branch")
+        or DEFAULT_WORKTREE_BASE_BRANCH
+    )
+
+
+@contextlib.contextmanager
+def _temporary_repo_root(root: str):
+    old = os.environ.get("FASTSHIP_REPO_ROOT")
+    os.environ["FASTSHIP_REPO_ROOT"] = root
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("FASTSHIP_REPO_ROOT", None)
+        else:
+            os.environ["FASTSHIP_REPO_ROOT"] = old
+
+
+def _create_session_worktree(session_id: str, argv: list[str]) -> tuple[Optional[dict], list[str], Optional[str]]:
+    """Create a fastship-owned worktree when possible.
+
+    Returns (metadata, warnings, error). In auto mode an unavailable base branch
+    is a warning + in-place fallback; in require mode it is a hard error.
+    """
+    mode = _worktree_mode(argv)
+    warnings: list[str] = []
+    if mode in ("off", "false", "0", "no"):
+        return None, warnings, None
+
+    root = _git_repo_root_from(_repo_root())
+    if not root:
+        if mode == "require":
+            return None, warnings, "当前目录不是 git repo，不能创建 fastship worktree"
+        warnings.append("未识别 git repo，跳过 worktree 创建")
+        return None, warnings, None
+
+    main_root = _main_worktree_root(root)
+    base_branch = _base_branch_for_start(argv)
+    fetch = not _start_flag(argv, "--no-fetch")
+    base_ref = _resolve_base_ref(main_root, base_branch, fetch=fetch)
+    if not base_ref:
+        msg = f"找不到 base branch {base_branch!r}（尝试 origin/{base_branch} / {base_branch}）"
+        if mode == "require":
+            return None, warnings, msg
+        warnings.append(msg + "，跳过 worktree 创建")
+        return None, warnings, None
+
+    worktree_path = os.path.realpath(
+        _start_option(argv, ("--worktree-path",))
+        or os.path.join(_worktree_root_for_start(argv, main_root), session_id)
+    )
+    branch = _branch_for_start(argv, session_id)
+
+    if os.path.exists(worktree_path):
+        return None, warnings, (
+            f"worktree path 已存在: {worktree_path}；换 --worktree-path，"
+            "或确认无用后手动清理"
+        )
+    if _git_ref_exists(main_root, branch):
+        return None, warnings, (
+            f"branch 已存在: {branch}；换 --branch，或确认已合入后手动删除"
+        )
+
+    _ensure_fastship_local_excludes(main_root)
+    os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+    try:
+        r = _run_git(["worktree", "add", "-b", branch, worktree_path, base_ref], cwd=main_root, timeout=60)
+    except Exception as e:
+        return None, warnings, f"git worktree add 失败: {e}"
+    if r.returncode != 0:
+        return None, warnings, f"git worktree add 失败: {(r.stderr or r.stdout).strip()[:240]}"
+    _run_git(["branch", "--set-upstream-to", base_ref, branch], cwd=main_root)
+
+    return {
+        "mode": "auto",
+        "created_by_fastship": True,
+        "path": worktree_path,
+        "branch": branch,
+        "base_branch": base_branch,
+        "base_ref": base_ref,
+        "main_repo_root": main_root,
+    }, warnings, None
+
+
+def _list_worktrees(root: str) -> list[dict]:
+    try:
+        r = _run_git(["worktree", "list", "--porcelain"], cwd=root)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    out, cur = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                out.append(cur)
+            cur = {"path": line[len("worktree "):], "head": None, "branch": None, "is_main": False}
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    if cur:
+        out.append(cur)
+    if out:
+        out[0]["is_main"] = True
+    return out
+
+
+def _git_dir_for_worktree(path: str) -> Optional[str]:
+    try:
+        r = _run_git(["rev-parse", "--git-dir"], cwd=path)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        gd = r.stdout.strip()
+        return os.path.realpath(gd if os.path.isabs(gd) else os.path.join(path, gd))
+    except Exception:
+        return None
+
+
+def _load_done_fastship_worktree_state(path: str) -> Optional[dict]:
+    gd = _git_dir_for_worktree(path)
+    if not gd:
+        return None
+    sessions = os.path.join(gd, "fastship", "sessions")
+    if not os.path.isdir(sessions):
+        return None
+    for sid in sorted(os.listdir(sessions)):
+        orch = fastship_state.load_json(os.path.join(sessions, sid, "orchestrator.json")) or {}
+        wt = orch.get("worktree") or {}
+        if (
+            orch.get("current_step") in ("done", "stopped")
+            and wt.get("created_by_fastship")
+            and os.path.realpath(wt.get("path", "")) == os.path.realpath(path)
+        ):
+            return orch
+    return None
+
+
+def _worktree_clean(path: str) -> bool:
+    try:
+        r = _run_git(["status", "--porcelain"], cwd=path)
+        return r.returncode == 0 and not r.stdout.strip()
+    except Exception:
+        return False
+
+
+def _head_merged(root: str, head: str, base_ref: str) -> bool:
+    if not head or not base_ref or not _git_ref_exists(root, base_ref):
+        return False
+    try:
+        return _run_git(["merge-base", "--is-ancestor", head, base_ref], cwd=root).returncode == 0
+    except Exception:
+        return False
+
+
+def sweep_fastship_worktrees(root: str = None, dry_run: bool = False, prune: bool = False) -> dict:
+    """Remove only fastship-created worktrees that are done/stopped, clean, and merged.
+
+    This is intentionally narrower than forge's global reaper: it never touches a
+    worktree unless the owning fastship session state says fastship created it.
+    """
+    root = _git_repo_root_from(root or _repo_root())
+    res = {"removed": [], "kept": []}
+    if not root:
+        res["error"] = "不在 git repo 中"
+        return res
+    wts = _list_worktrees(root)
+    if not wts:
+        return res
+    main_root = os.path.realpath(wts[0]["path"])
+    current = os.path.realpath(root)
+    for wt in wts:
+        path = os.path.realpath(wt["path"])
+        orch = _load_done_fastship_worktree_state(path)
+        if not orch:
+            continue
+        meta = orch.get("worktree") or {}
+        branch = wt.get("branch") or meta.get("branch")
+        base_ref = meta.get("base_ref") or _resolve_base_ref(main_root, meta.get("base_branch") or DEFAULT_WORKTREE_BASE_BRANCH, fetch=False)
+        if wt.get("is_main"):
+            res["kept"].append((path, branch, "kept-main", "主工作区"))
+            continue
+        if path == current:
+            res["kept"].append((path, branch, "kept-current", "当前 worktree，git 不能删除自身"))
+            continue
+        if not _worktree_clean(path):
+            res["kept"].append((path, branch, "kept-dirty", "有未提交/未跟踪改动"))
+            continue
+        if not _head_merged(main_root, wt.get("head"), base_ref):
+            res["kept"].append((path, branch, "kept-unmerged", f"HEAD 未并入 {base_ref or 'base'}"))
+            continue
+        if dry_run:
+            res["removed"].append((path, branch, "DRY-RUN"))
+            continue
+        r = _run_git(["worktree", "remove", path], cwd=main_root, timeout=60)
+        if r.returncode != 0:
+            res["kept"].append((path, branch, "kept-remove-failed", (r.stderr or r.stdout).strip()[:160]))
+            continue
+        if branch:
+            if base_ref:
+                _run_git(["branch", "--set-upstream-to", base_ref, branch], cwd=main_root)
+            _run_git(["branch", "-d", branch], cwd=main_root)
+        res["removed"].append((path, branch, f"clean + merged into {base_ref}"))
+    if prune and not dry_run:
+        _run_git(["worktree", "prune"], cwd=main_root)
+    return res
+
+
+def _print_sweep_result(res: dict) -> None:
+    if res.get("error"):
+        print(f"🧹 fastship worktree cleanup skipped: {res['error']}")
+        return
+    for path, branch, reason in res.get("removed", []):
+        print(f"🧹 removed fastship worktree: {path} [{branch}] — {reason}")
+    for path, branch, status, reason in res.get("kept", []):
+        print(f"   kept {path} [{branch}] — {status}: {reason}")
+    if res.get("removed") or res.get("kept"):
+        print(f"🧹 fastship worktree cleanup: removed {len(res.get('removed', []))}, kept {len(res.get('kept', []))}")
 
 
 def _changed_files(base_sha: Optional[str] = None) -> set:
@@ -2841,17 +3283,37 @@ def cmd_start(requirement: str, argv: list = None) -> int:
         # proceed; the user decides whether to /compact first.
         print("🧠 SUGGESTION: 建议新 feature 前先 /compact，确保 context 干净。")
         print("   未检测到最近 2 分钟内 /compact；继续 start（不阻断）。")
-    st = empty_orchestrator_state(requirement)
-    st["session_id"] = session_id
-    st["base_sha"] = _git_head_sha()
-    fastship_state.set_current_session_id(session_id, requirement, st)
-    save_orch_state(st)
-    gp = gate_script_path()
-    if os.path.exists(gp):
-        delegate_to_gate(gp, "reset", {})
+
+    worktree_meta, warnings, error = _create_session_worktree(session_id, argv)
+    for warning in warnings:
+        print(f"⚠️  {warning}")
+    if error:
+        print(f"❌ {error}")
+        return 1
+
+    state_repo = (worktree_meta or {}).get("path") or _repo_root()
+    with _temporary_repo_root(state_repo):
+        st = empty_orchestrator_state(requirement)
+        st["session_id"] = session_id
+        st["base_sha"] = _git_head_sha()
+        if worktree_meta:
+            st["worktree"] = worktree_meta
+        fastship_state.set_current_session_id(session_id, requirement, st)
+        save_orch_state(st)
+        gp = gate_script_path()
+        if os.path.exists(gp):
+            delegate_to_gate(gp, "reset", {})
+        next_text = format_next(st)
+
     print(f"🚀 Fastship started: \"{requirement}\"")
     print(f"   Session: {session_id}\n")
-    print(format_next(st))
+    if worktree_meta:
+        print(f"🌿 Worktree: {worktree_meta['path']}")
+        print(f"   Branch: {worktree_meta['branch']}  (base: {worktree_meta['base_ref']})")
+        print("   Continue from that worktree so hooks/state stay isolated:\n")
+        print(f"     cd {shlex.quote(worktree_meta['path'])}")
+        print(f"     FASTSHIP_SESSION={shlex.quote(session_id)} python3 {shlex.quote(os.path.abspath(__file__))} next\n")
+    print(next_text)
     return 0
 
 
@@ -3027,6 +3489,9 @@ def cmd_done(argv: list) -> int:
             _print_goal_hint(st)
     elif st.get("current_step") == "done":
         print("\n🎉 全部完成！")
+        if st.get("worktree", {}).get("created_by_fastship"):
+            print("   Worktree 保留用于 /goal/Forge 读取最终状态。")
+            print('   合入 base 后从主工作区运行: fastship sweep-worktrees')
     return 0
 
 
@@ -3106,18 +3571,19 @@ def cmd_reset(argv: list = None) -> int:
         print("❌ 没有选中的 session。使用 list 查看，或 reset --all。")
         return 1
 
-    for path in (
-        fastship_state.orchestrator_state_path(session_id),
-        fastship_state.gate_state_path(session_id),
-    ):
-        if os.path.exists(path):
-            os.remove(path)
     session_dir = fastship_state.session_state_dir(session_id)
-    if os.path.isdir(session_dir) and not os.listdir(session_dir):
-        os.rmdir(session_dir)
+    if os.path.isdir(session_dir):
+        shutil.rmtree(session_dir)
     fastship_state.unregister_session(session_id)
     print(f"✅ Fastship session cleared: {session_id}")
     return 0
+
+
+def cmd_sweep_worktrees(argv: list = None) -> int:
+    argv = argv or []
+    res = sweep_fastship_worktrees(_repo_root(), dry_run="--dry-run" in argv, prune=True)
+    _print_sweep_result(res)
+    return 1 if res.get("error") else 0
 
 
 def cmd_render_plan(argv: list) -> int:
@@ -3220,6 +3686,53 @@ def strip_global_session_arg(argv: list[str]) -> tuple[Optional[str], list[str]]
     return session_id, stripped
 
 
+_START_VALUE_OPTIONS = {
+    "--base",
+    "--base-branch",
+    "--worktree-root",
+    "--worktree-path",
+    "--branch",
+}
+_START_FLAG_OPTIONS = {
+    "--shared",
+    "--worktree",
+    "--no-worktree",
+    "--require-worktree",
+    "--no-fetch",
+}
+
+
+def parse_start_args(argv: list[str]) -> tuple[str, list[str]]:
+    requirement_parts: list[str] = []
+    options: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        matched_equals = next(
+            (name for name in _START_VALUE_OPTIONS if arg.startswith(name + "=")),
+            None,
+        )
+        if matched_equals:
+            options.append(arg)
+            i += 1
+            continue
+        if arg in _START_VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                options.append(arg)
+                i += 1
+                continue
+            options.extend([arg, argv[i + 1]])
+            i += 2
+            continue
+        if arg in _START_FLAG_OPTIONS:
+            options.append(arg)
+            i += 1
+            continue
+        requirement_parts.append(arg)
+        i += 1
+    return " ".join(requirement_parts).strip(), options
+
+
 def main():
     session_arg, argv = strip_global_session_arg(sys.argv[1:])
     if session_arg:
@@ -3240,6 +3753,7 @@ def main():
         print("  use <session>      切换 hook/CLI 默认 session")
         print("  goal               生成 /goal 条件（Phase 2+ 可用）")
         print("  adopt-branch       将活跃 session 迁移到当前分支")
+        print("  sweep-worktrees [--dry-run]  清理 fastship 创建且已完成/合入的 worktree")
         print("  reset [--all]      重置当前 session 或全部 sessions")
         sys.exit(1)
 
@@ -3257,10 +3771,11 @@ def main():
     }
 
     if cmd == "start":
-        if len(argv) < 2:
+        requirement, start_argv = parse_start_args(argv[1:])
+        if not requirement:
             print("Usage: start [--session ID] \"<需求>\"")
             sys.exit(1)
-        sys.exit(cmd_start(argv[1], argv[2:]))
+        sys.exit(cmd_start(requirement, start_argv))
     elif cmd == "done":
         sys.exit(cmd_done(argv[1:]))
     elif cmd == "use":
@@ -3270,6 +3785,8 @@ def main():
         sys.exit(cmd_use(argv[1]))
     elif cmd == "reset":
         sys.exit(cmd_reset(argv[1:]))
+    elif cmd == "sweep-worktrees":
+        sys.exit(cmd_sweep_worktrees(argv[1:]))
     elif cmd == "render-plan":
         sys.exit(cmd_render_plan(argv[1:]))
     elif cmd in handlers:

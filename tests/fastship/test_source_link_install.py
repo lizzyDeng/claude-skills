@@ -46,6 +46,9 @@ def test_source_link_install_replaces_copied_engine_files(tmp_path):
     settings = (project / ".claude" / "settings.local.json").read_text(encoding="utf-8")
     assert "fastship_orchestrator.py" in settings
     assert "forge_gate.py" in settings
+    gitignore = (project / ".gitignore").read_text(encoding="utf-8")
+    assert ".claude/worktrees/" in gitignore
+    assert ".claude/.fastship-codex-review.md" in gitignore
 
     proc = subprocess.run(
         [str(project / ".claude" / "tools" / "fastship"), "status"],
