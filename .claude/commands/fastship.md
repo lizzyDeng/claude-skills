@@ -46,8 +46,8 @@ Phase 1: Brainstorm (10 步)
   1.3  Context Brief    [CC:auto | Codex:done] .fastship-brief.md 验证章节
   1.3r 1A 需求拷打      [CC:auto | Codex:done] 多角色法庭→书记员合成→grill→需求定稿 .fastship-requirements.md (仅 feature；bugfix 跳)
   1.3d Bug 诊断         [CC:auto | Codex:done] fix_verified (仅 bugfix)
-  1.4  1B 技术方案      [CC:auto | Codex:done] RD/QA/总结者法庭→writing-plans 签名 + 每条 1A P0 AC→task+E2E 映射 (bugfix 只验签名)
-  1.5  Grill            [CC:auto | Codex:done] 裁决 1B open 技术 fork；feature 无 open fork 自动跳过(F4)，bugfix 照跑
+  1.4  1B 技术方案      [CC:auto | Codex:done] RD/QA/总结者法庭→writing-plans 签名 + 每条 1A P0/P1 AC→task+E2E 映射 (bugfix 只验签名)
+  1.5  Grill            [CC:auto | Codex:done] 裁决 1B open 技术 fork（须 fork_resolutions 回写 resolution）；feature 无 open fork 自动跳过(F4)，bugfix 照跑
   1.5c Codex Review     [CC:done  | Codex:done] .fastship-codex-review.md GATE:PASS
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
 
@@ -80,7 +80,10 @@ $FASTSHIP reset            # 重置
 ## 核心红线
 
 - Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）
-- Grill 必须走 grill-me skill（orchestrator 验证 grill 摘要文件 ≥300B + 结构）
+- 1A 需求拷打 (1.3r，仅 feature)：多角色法庭→书记员合成→grill；硬验合成纪律（并集不减/不改写/不冒名）、fork 全 resolved、每 P0 有 source+≥1 AC（{id,assertion}，id 全局唯一含 P1）
+- 1B 技术方案 (1.4)：每条 1A P0/P1 AC 须映射 ≥1 task+≥1 E2E（ac_mapping JSON）；dangling/重复/空/未全覆盖 = 当场 FAIL
+- Grill 必须走 grill-me skill（≥300B + 结构）；1B 有 open 技术 fork 时须含 fork_resolutions 逐条回写（从可信 plan 复核，漏裁/空裁 FAIL）
+- Codex Review FAIL 按缺陷层回退（F7）：p0_requirements_missing→1.3r（需求层）/ 其余→1.4（方案层）；hook 与 CLI 一致
 - 执行必须走 executing-plans / subagent-driven-development
 - 主线程禁止亲自 grep/find（改为 1.2 并行 Explore）
 - Phase 1 编辑代码文件 → hook 自动 BLOCK + 打印当前步骤（Claude Code only）
