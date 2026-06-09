@@ -111,13 +111,19 @@ class CodexGateSelectorParityTest(unittest.TestCase):
     orchestrator's for every shape."""
 
     CONTENTS = [
-        # full FAIL gate then its verdict line → both select it
+        # exactly one full FAIL gate + one verdict line → both select it
         "## R\n### Contract Gate\n```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
-        # real FAIL gate + trailing FULL PASS template (own verdict) → real FAIL selected
+        # real FAIL gate + trailing FULL PASS template (own verdict) → 2 markers → None
         "## R\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n### GATE: FAIL\n"
         + "### Contract Gate\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
-        # bogus gate-key block before the verdict + real gate → real selected
+        # early PASS template hiding a later real FAIL → 2 markers → None
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n"
+        + "### Contract Gate\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n### GATE: FAIL\n",
+        # bogus gate-key block before the verdict + one real gate → real selected
         "## R\n```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n"
+        + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # two full contract gates before a single verdict → ambiguous → None
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n"
         + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
         # PASS gate + verdict PASS
         "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",

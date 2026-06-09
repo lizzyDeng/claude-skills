@@ -422,6 +422,21 @@ class TestValidatorsPhase1:
         assert ok is False
         assert "JSON gate" in msg
 
+    def test_codex_review_rejects_multiple_gate_markers(self, tmp_path, monkeypatch):
+        # codex round-4: a spliced review with two ### GATE: verdict lines (an early PASS
+        # template + a later real FAIL) must be rejected, not read as PASS.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(
+            codex_review_content(plan_sha)                                 # full PASS + ### GATE: PASS
+            + codex_review_content("other", gate="FAIL", p0_requirements_missing=["missing P0"]))
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "多个 GATE" in msg
+
     def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
         from orchestrator import validate_codex_review
         orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)

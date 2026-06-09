@@ -692,23 +692,27 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
 def _extract_codex_review_gate(content: str):
     """Return the codex 1.5c CONTRACT gate dict from a review's markdown, or None.
 
-    The authoritative verdict is the `### GATE: PASS/FAIL` text line. The gate is the
-    LAST contract-shaped json block — a dict with gate ∈ PASS/FAIL AND every
-    CODEX_REVIEW_REQUIRED_EMPTY_FIELDS as a list — that appears BEFORE that line AND whose
-    `gate` field EQUALS the text verdict. Binding the structured gate to the text verdict
-    and ignoring any json block AFTER the verdict line stops a trailing fake contract
-    template (a full PASS template appended after `### GATE: FAIL`, or a doc snippet like
-    {"gate":"example-only"}) from flipping the verdict or being read as the gate (codex
-    review rounds 2-3). Shared by validate_codex_review and _codex_fail_rollback_step so
-    the gate is identified identically — selector drift here is what let a trailing block
-    misroute the F7 rollback and let Forge accept a FAIL review as PASS."""
+    A well-formed review has EXACTLY ONE `### GATE: PASS/FAIL` text line and EXACTLY ONE
+    contract-shaped json block (dict with gate ∈ PASS/FAIL AND every
+    CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a list) appearing BEFORE it, whose `gate` equals the
+    text verdict. Anything else — zero/multiple verdict lines, zero/multiple contract gates
+    before the line, or gate≠verdict — returns None (reject the ambiguous/spliced review).
+
+    Why this strict shape: a spliced review (an early PASS template + a later real FAIL, or
+    a real FAIL + a trailing PASS template) must not let one block hide the other. An early
+    PASS hiding a later FAIL would skip the F7 rollback AND let validate/Forge accept a FAIL
+    review as PASS (codex review rounds 2-4). Shared by validate_codex_review and
+    _codex_fail_rollback_step so the gate is identified identically (no drift). Incidental
+    non-contract blocks (a doc snippet {"gate":"example-only"}, an unrelated json) are
+    ignored — only contract-shaped blocks count toward the "exactly one" rule."""
     if not content:
         return None
-    m = CODEX_GATE_RE.search(content)
-    if not m:
+    markers = list(CODEX_GATE_RE.finditer(content))
+    if len(markers) != 1:
         return None
+    m = markers[0]
     verdict = m.group(1).upper()
-    found = None
+    gates = []
     for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
         try:
             obj = json.loads(block)
@@ -716,12 +720,17 @@ def _extract_codex_review_gate(content: str):
             continue
         if not isinstance(obj, dict):
             continue
-        if str(obj.get("gate", "")).upper() != verdict:
+        if str(obj.get("gate", "")).upper() not in {"PASS", "FAIL"}:
             continue
         if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
             continue
-        found = obj
-    return found
+        gates.append(obj)
+    if len(gates) != 1:
+        return None
+    gate = gates[0]
+    if str(gate.get("gate", "")).upper() != verdict:
+        return None
+    return gate
 
 
 def validate_codex_review(orch: dict, hook: dict) -> tuple:
@@ -749,17 +758,24 @@ def validate_codex_review(orch: dict, hook: dict) -> tuple:
         return False, f"无法读取: {path}"
     if len(content) < 100:
         return False, f"Codex review 太短 ({len(content)}B < 100B)"
-    m = CODEX_GATE_RE.search(content)
-    if not m:
-        return False, "Codex review 缺少显式 GATE 判定行（格式: ### GATE: PASS 或 ### GATE: FAIL）"
-    verdict = m.group(1).upper()
+    markers = CODEX_GATE_RE.findall(content)
+    if not markers:
+        return False, "Codex review 缺少显式 GATE 判定行（须恰好一行 ### GATE: 判定）"
+    if len(markers) != 1:
+        # A spliced review (multiple verdict lines) could hide a real FAIL behind an
+        # early PASS — reject outright. NOTE: keep "FAIL" out of this message so it does
+        # not trip the rollback trigger (which keys on "FAIL" in the message).
+        return False, "Codex review 出现多个 GATE 判定行（须恰好一个），疑似拼接/复制模板，请只保留一个"
+    verdict = markers[0].upper()
     if verdict == "FAIL":
-        return False, "codex review FAIL — 需更新 plan 后重新 review（orchestrator 自动回退到 1.4）"
+        return False, "codex review FAIL — 需更新 plan 后重新 review（orchestrator 自动按缺陷层回退）"
 
     gate = _extract_codex_review_gate(content)
     if gate is None:
-        return False, ("Codex review 缺少机器可验证 JSON gate（contract gate 须含 gate=PASS/FAIL "
-                       "+ 全部覆盖数组），禁止纯文本 PASS")
+        return False, ("Codex review 缺少唯一机器可验证 JSON gate（须恰好一个含 gate=PASS/FAIL "
+                       "+ 全部覆盖数组、且与文本判定一致的 contract block），禁止纯文本 PASS")
+    # selector already guarantees gate's verdict == the single text marker; both kept
+    # defensive in case the selector relaxes later.
     json_verdict = str(gate.get("gate", "")).upper()
     if json_verdict != verdict:
         return False, f"Codex review 文本 GATE={verdict} 与 JSON gate={json_verdict} 不一致"

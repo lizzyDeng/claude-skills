@@ -506,6 +506,14 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is False
 
+        # codex round-4 mirror: EARLY PASS template hiding the LATE real FAIL must also fail.
+        codex.write_text("## Codex Plan Review\n"
+                         + _gate("PASS")
+                         + _gate("FAIL", p0_requirements_missing=["missing P0"]))
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+
     def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
         # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
         # must NOT satisfy the gate (only bugfix may legitimately skip 1A).

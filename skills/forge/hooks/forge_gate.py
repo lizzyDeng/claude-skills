@@ -882,20 +882,21 @@ def _trusted_plan_has_open_fork(orch_state):
 
 
 def _extract_codex_review_gate(content):
-    """Mirror of the orchestrator's _extract_codex_review_gate: the LAST contract-shaped
-    json block (dict with gate ∈ PASS/FAIL + every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a
-    list) appearing BEFORE the `### GATE:` text line AND whose `gate` equals the text
-    verdict. Binding to the text verdict means a FAIL review with a trailing fake-PASS
-    contract template selects the real FAIL gate (which verify then rejects), instead of
-    the trailing PASS — closing the seam where Forge accepted a FAIL review as PASS.
-    Pinned in lockstep with the engine by tests/forge/test_step_ids_sync.py."""
+    """Mirror of the orchestrator's _extract_codex_review_gate: requires EXACTLY ONE
+    `### GATE:` verdict line and EXACTLY ONE contract-shaped json block (dict with gate ∈
+    PASS/FAIL + every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a list) before it whose `gate`
+    equals the verdict; otherwise None. Rejecting spliced reviews (an early PASS template
+    hiding a later real FAIL, or a trailing PASS after a real FAIL) is what stops Forge
+    from accepting a FAIL review as PASS. Pinned in lockstep with the engine by
+    tests/forge/test_step_ids_sync.py."""
     if not content:
         return None
-    m = CODEX_GATE_RE.search(content)
-    if not m:
+    markers = list(CODEX_GATE_RE.finditer(content))
+    if len(markers) != 1:
         return None
+    m = markers[0]
     verdict = m.group(1).upper()
-    found = None
+    gates = []
     for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
         try:
             obj = json.loads(block)
@@ -903,12 +904,17 @@ def _extract_codex_review_gate(content):
             continue
         if not isinstance(obj, dict):
             continue
-        if str(obj.get("gate", "")).upper() != verdict:
+        if str(obj.get("gate", "")).upper() not in ("PASS", "FAIL"):
             continue
         if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
             continue
-        found = obj
-    return found
+        gates.append(obj)
+    if len(gates) != 1:
+        return None
+    gate = gates[0]
+    if str(gate.get("gate", "")).upper() != verdict:
+        return None
+    return gate
 
 
 def verify_codex_review_artifact(orch_state):
