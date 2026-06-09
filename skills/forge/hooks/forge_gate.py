@@ -654,8 +654,8 @@ def _codex_verdict_markers(content):
     fence_char = None
     fence_len = 0
     for line in text.split("\n"):
-        fm = _FENCE_RE.match(line)
         if fence_char is None:
+            fm = _FENCE_RE.match(line)
             if fm:
                 run = fm.group(1)
                 fence_char, fence_len = run[0], len(run)
@@ -663,9 +663,13 @@ def _codex_verdict_markers(content):
             vm = CODEX_VERDICT_LINE_RE.match(line)
             if vm:
                 markers.append(vm.group(1).upper())
-        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len:
-            fence_char = None
-            fence_len = 0
+        else:
+            # CommonMark closing fence: same char, length >= opener, ONLY whitespace after.
+            # A run with trailing text (```x) is NOT a close (codex round-7).
+            stripped = line.strip()
+            if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
+                fence_char = None
+                fence_len = 0
     return markers
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",

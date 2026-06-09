@@ -703,7 +703,7 @@ def _codex_verdict_markers(content: str):
     instruction placeholder `### GATE: PASS / FAIL` (trailing text) is not a full-line match.
     Shared by validate_codex_review and _extract_codex_review_gate (and mirrored in forge)
     so the verdict line is counted identically — these are the gate-hiding bypasses codex
-    review rounds 5-6 demonstrated."""
+    review rounds 5-7 demonstrated."""
     if not content:
         return []
     text = content.replace("\r\n", "\n").replace("\r", "\n")
@@ -711,8 +711,8 @@ def _codex_verdict_markers(content: str):
     fence_char = None
     fence_len = 0
     for line in text.split("\n"):
-        fm = _FENCE_RE.match(line)
         if fence_char is None:
+            fm = _FENCE_RE.match(line)
             if fm:
                 run = fm.group(1)
                 fence_char, fence_len = run[0], len(run)
@@ -720,9 +720,15 @@ def _codex_verdict_markers(content: str):
             vm = CODEX_VERDICT_LINE_RE.match(line)
             if vm:
                 markers.append(vm.group(1).upper())
-        elif fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len:
-            fence_char = None
-            fence_len = 0
+        else:
+            # CommonMark closing fence: a run of the SAME char, length >= the opener, with
+            # ONLY whitespace after (no info string). A run with trailing text (e.g. ```x)
+            # is NOT a close — treating it as one let the scanner close a fence CommonMark
+            # keeps open, exposing a verdict that should stay hidden (codex round-7).
+            stripped = line.strip()
+            if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
+                fence_char = None
+                fence_len = 0
     return markers
 
 
