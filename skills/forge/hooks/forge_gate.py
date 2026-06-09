@@ -636,10 +636,11 @@ VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
-# Mirror of the orchestrator: the verdict must be a WHOLE-LINE `### GATE: PASS|FAIL` (≤3 space
-# indent) outside code fences; placeholder/fenced/indented markers aren't counted.
-CODEX_VERDICT_LINE_RE = re.compile(r"^ {0,3}#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# Mirror of the orchestrator: the verdict and the gate fence must be at COLUMN 0 (narrower
+# than full CommonMark on purpose — see the orchestrator note). Indented/placeholder/fenced
+# markers aren't counted.
+CODEX_VERDICT_LINE_RE = re.compile(r"^#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+_FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 
 
 def _codex_verdict_markers(content):

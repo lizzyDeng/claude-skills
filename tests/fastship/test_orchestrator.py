@@ -561,6 +561,34 @@ class TestValidatorsPhase1:
         ok, msg = validate_codex_review(orch, {})
         assert ok is False and "多个 GATE" in msg
 
+    def test_codex_review_passes_with_list_item_fenced_snippet(self, tmp_path, monkeypatch):
+        # codex round-9 regression: a fenced snippet inside a list item (indented) must not be
+        # tracked as a top-level fence swallowing the final column-0 verdict — a legit PASS passes.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n### Contract Gate\n```json\n"
+                          + json.dumps(self._pass_gate(plan_sha))
+                          + "\n```\n### Notes\n- ```\n  assert total == 0\n  ```\n### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok, msg
+
+    def test_codex_review_rejects_indented_verdict(self, tmp_path, monkeypatch):
+        # An indented (non-column-0) `### GATE:` line is not a top-level verdict → not counted.
+        from orchestrator import validate_codex_review
+        orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)
+        review = tmp_path / ".claude" / ".fastship-codex-review.md"
+        review.parent.mkdir(parents=True)
+        review.write_text("## Codex Plan Review\n### Contract Gate\n```json\n"
+                          + json.dumps(self._pass_gate(plan_sha)) + "\n```\n- ### GATE: PASS\n")
+        orch["artifacts"]["codex_review_path"] = str(review)
+        trust_artifact(orch, "1.5c", review)
+        ok, msg = validate_codex_review(orch, {})
+        assert ok is False and "GATE 判定行" in msg
+
     def test_codex_review_rejects_weak_scenarios(self, tmp_path, monkeypatch):
         from orchestrator import validate_codex_review
         orch, _plan, plan_sha = make_trusted_plan(tmp_path, monkeypatch)

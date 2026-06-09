@@ -303,13 +303,16 @@ PLAN_SIGNATURE_MARKERS = [
 
 GRILL_REQUIRED_SECTIONS = ["拷问", "修订", "结论"]
 CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
-# The codex 1.5c verdict line must be a WHOLE line `### GATE: PASS|FAIL` (nothing after the
-# verdict, ≤3 spaces indent per CommonMark ATX headings), so the instruction's own placeholder
-# `### GATE: PASS / FAIL` (trailing text) does NOT count as a verdict (codex review round-5).
-CODEX_VERDICT_LINE_RE = re.compile(r"^ {0,3}#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
-# A CommonMark code-fence line: ≤3 spaces indent (4+ = indented code, not a fence) then a run
-# of ≥3 backticks OR ≥3 tildes (group 1, same char), then an info string (group 2).
-_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# The codex 1.5c verdict line must be a COLUMN-0 whole line `### GATE: PASS|FAIL` (nothing
+# before the heading, nothing after the verdict). Deliberately narrower than full CommonMark:
+# approximating container indentation (list items etc.) with line-start regexes is unreliable
+# (codex review round-9), so the contract requires the verdict AND the gate fence at column 0.
+# A column-0 verdict is unambiguously top-level; an indented (list-item / nested) verdict is
+# not counted. The placeholder `### GATE: PASS / FAIL` (trailing text) is still excluded.
+CODEX_VERDICT_LINE_RE = re.compile(r"^#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
+# A column-0 code-fence line: a run of ≥3 backticks OR ≥3 tildes (group 1, same char), then an
+# info string (group 2). Indented fences (incl. list-item content) are NOT tracked.
+_FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
 CODEX_REVIEW_PLAN_HASH_FIELD = "reviewed_plan_sha256"
@@ -1800,7 +1803,11 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
     "missing_evidence": []
   }}
   ```
-  ### GATE: PASS / FAIL
+### GATE: PASS
+
+🔴 判定行写「### GATE: PASS」或「### GATE: FAIL」二选一，必须【顶格 column 0、独占整行】；
+   勿照抄占位「### GATE: PASS / FAIL」、勿缩进、勿放进列表项或代码块——否则不算判定行，整步被拒。
+   contract gate 的 ```json 块同样要顶格（column 0），且全篇恰好一个判定行 + 一个 contract gate。
 
 	Codex 必须按同一套 P0 contract / AC / E2E 证据规则审查：
 	  - reviewed_plan_sha256 必须等于当前 1.4 plan artifact hash，禁止复用旧 review

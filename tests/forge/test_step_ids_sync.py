@@ -167,6 +167,9 @@ class CodexVerdictMarkerParityTest(unittest.TestCase):
         "    ```\n### GATE: PASS\n",                      # 4-space indent ``` not a fence → one (round-8)
         "```outer\n    ```\n### GATE: PASS\n",           # indented ``` not a closer → verdict fenced → none
         "```bad`info\n### GATE: FAIL\n",                 # backtick-in-info not a fence → one (round-8)
+        "### Notes\n- ```\n  x\n  ```\n### GATE: PASS\n",  # list-item fence ignored; col0 verdict → one (round-9)
+        "  ### GATE: PASS\n",                            # indented verdict (not column 0) → none
+        "- ### GATE: PASS\n",                            # list-item verdict (not column 0) → none
         "### GATE: PASS\r\n",                             # CRLF whole line → one
         "### GATE: PASS\n### GATE: FAIL\n",              # two
         "   ##  GATE:  FAIL   \n",                       # heading lvl 2 + extra ws → one
