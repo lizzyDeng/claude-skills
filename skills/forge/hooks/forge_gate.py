@@ -635,6 +635,7 @@ HARVEST_EVIDENCE_REQUIRED_FIELDS = ["source", "collected_at", "raw_path", "raw_s
 VALID_VERDICTS = {"achieved", "partial", "missed"}
 VALID_NEXT_ACTIONS = {"done", "iterate", "pivot"}
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
 CODEX_REVIEW_REQUIRED_TRUE_FIELDS = (
     "p0_contract_reviewed",
     "ac_e2e_coverage_reviewed",
@@ -881,20 +882,28 @@ def _trusted_plan_has_open_fork(orch_state):
 
 
 def _extract_codex_review_gate(content):
-    """Mirror of the orchestrator's _extract_codex_review_gate: the LAST ```json block
-    that is a dict with gate ∈ PASS/FAIL AND carries every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS
-    as a list. Identifies the real 1.5c contract gate the same way the engine does, so a
-    trailing example block like {"gate":"example-only"} can't move the gate selection.
-    Pinned in lockstep by tests/forge/test_step_ids_sync.py."""
+    """Mirror of the orchestrator's _extract_codex_review_gate: the LAST contract-shaped
+    json block (dict with gate ∈ PASS/FAIL + every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS a
+    list) appearing BEFORE the `### GATE:` text line AND whose `gate` equals the text
+    verdict. Binding to the text verdict means a FAIL review with a trailing fake-PASS
+    contract template selects the real FAIL gate (which verify then rejects), instead of
+    the trailing PASS — closing the seam where Forge accepted a FAIL review as PASS.
+    Pinned in lockstep with the engine by tests/forge/test_step_ids_sync.py."""
+    if not content:
+        return None
+    m = CODEX_GATE_RE.search(content)
+    if not m:
+        return None
+    verdict = m.group(1).upper()
     found = None
-    for block in CODEX_GATE_JSON_RE.findall(content or ""):
+    for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
         try:
             obj = json.loads(block)
         except json.JSONDecodeError:
             continue
         if not isinstance(obj, dict):
             continue
-        if str(obj.get("gate", "")).upper() not in ("PASS", "FAIL"):
+        if str(obj.get("gate", "")).upper() != verdict:
             continue
         if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
             continue

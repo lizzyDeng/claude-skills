@@ -482,6 +482,30 @@ class TestStateTransition:
         ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
         assert ok is False and "fork" in reason.lower()
 
+    def test_draft_to_planned_rejects_fail_review_with_trailing_pass_template(self, tmp_path):
+        # codex round-3: a FAIL codex review with a trailing FULL PASS contract template
+        # must NOT pass G2 — forge binds the gate to the text `### GATE:` verdict (FAIL),
+        # so it selects the real FAIL gate and rejects, not the trailing PASS template.
+        fastship_state, orch_state = make_fastship_phase1_state(tmp_path, "f1")
+        plan_sha = orch_state["artifacts"]["trusted_artifacts"]["1.4"]["sha256"]
+
+        def _gate(verdict, **over):
+            g = {"gate": verdict, "reviewed_plan_sha256": plan_sha, "p0_contract_reviewed": True,
+                 "ac_e2e_coverage_reviewed": True, "weak_case_reviewed": True,
+                 "evidence_plan_reviewed": True, "p0_requirements_missing": [], "uncovered_ac": [],
+                 "unmapped_e2e_scenarios": [], "weak_scenarios": [], "non_business_assertions": [],
+                 "missing_evidence": []}
+            g.update(over)
+            return "### Contract Gate\n```json\n" + json.dumps(g) + f"\n```\n### GATE: {verdict}\n"
+
+        codex = tmp_path / ".claude" / ".fastship-codex-review.md"
+        codex.write_text("## Codex Plan Review\n"
+                         + _gate("FAIL", p0_requirements_missing=["missing P0"])
+                         + _gate("PASS"))   # trailing full PASS template after the real FAIL verdict
+        orch_state["artifacts"]["trusted_artifacts"]["1.5c"] = trusted_artifact("1.5c", codex)
+        ok, reason = forge_gate.can_transition("f1", "draft", "planned", str(tmp_path), fastship_state, orch_state)
+        assert ok is False
+
     def test_draft_to_planned_rejects_feature_skipping_1a(self, tmp_path):
         # codex F4 [P1]: 1.3r is MANDATORY for features. A forged skipped_steps=["1.3r"]
         # must NOT satisfy the gate (only bugfix may legitimately skip 1A).

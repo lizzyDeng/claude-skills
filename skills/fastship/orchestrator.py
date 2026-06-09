@@ -692,22 +692,31 @@ def validate_grill(orch: dict, hook: dict) -> tuple:
 def _extract_codex_review_gate(content: str):
     """Return the codex 1.5c CONTRACT gate dict from a review's markdown, or None.
 
-    The contract gate is the LAST ```json block that is a dict with gate ∈ PASS/FAIL
-    AND carries every CODEX_REVIEW_REQUIRED_EMPTY_FIELDS as a list. Those two conditions
-    are what tell the real gate apart from incidental/example json blocks — a doc
-    snippet like {"gate":"example-only"} (gate not PASS/FAIL) or a trailing illustration
-    missing the coverage arrays. Used by BOTH validate_codex_review and
-    _codex_fail_rollback_step so the gate is identified identically — a selector drift
-    here is exactly what let a trailing block misroute the F7 rollback."""
+    The authoritative verdict is the `### GATE: PASS/FAIL` text line. The gate is the
+    LAST contract-shaped json block — a dict with gate ∈ PASS/FAIL AND every
+    CODEX_REVIEW_REQUIRED_EMPTY_FIELDS as a list — that appears BEFORE that line AND whose
+    `gate` field EQUALS the text verdict. Binding the structured gate to the text verdict
+    and ignoring any json block AFTER the verdict line stops a trailing fake contract
+    template (a full PASS template appended after `### GATE: FAIL`, or a doc snippet like
+    {"gate":"example-only"}) from flipping the verdict or being read as the gate (codex
+    review rounds 2-3). Shared by validate_codex_review and _codex_fail_rollback_step so
+    the gate is identified identically — selector drift here is what let a trailing block
+    misroute the F7 rollback and let Forge accept a FAIL review as PASS."""
+    if not content:
+        return None
+    m = CODEX_GATE_RE.search(content)
+    if not m:
+        return None
+    verdict = m.group(1).upper()
     found = None
-    for block in CODEX_GATE_JSON_RE.findall(content or ""):
+    for block in CODEX_GATE_JSON_RE.findall(content[:m.start()]):
         try:
             obj = json.loads(block)
         except json.JSONDecodeError:
             continue
         if not isinstance(obj, dict):
             continue
-        if str(obj.get("gate", "")).upper() not in {"PASS", "FAIL"}:
+        if str(obj.get("gate", "")).upper() != verdict:
             continue
         if not all(isinstance(obj.get(f), list) for f in CODEX_REVIEW_REQUIRED_EMPTY_FIELDS):
             continue

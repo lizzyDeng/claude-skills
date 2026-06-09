@@ -111,14 +111,22 @@ class CodexGateSelectorParityTest(unittest.TestCase):
     orchestrator's for every shape."""
 
     CONTENTS = [
-        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n",                       # one full gate
-        "## R\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n"
-        + "```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n",                # + bogus gate key
-        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n"
-        + "```json\n" + json.dumps({"unrelated": True}) + "\n```\n",                     # + unrelated
-        "## R\n```json\n" + json.dumps({"gate": "PASS"}) + "\n```\n",                    # gate but no arrays
-        "## R\nno json here\n",                                                          # none
-        "## R\n```json\n{bad json\n```\n",                                              # unparseable
+        # full FAIL gate then its verdict line → both select it
+        "## R\n### Contract Gate\n```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # real FAIL gate + trailing FULL PASS template (own verdict) → real FAIL selected
+        "## R\n```json\n" + json.dumps(_full_gate(p0_requirements_missing=["x"])) + "\n```\n### GATE: FAIL\n"
+        + "### Contract Gate\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
+        # bogus gate-key block before the verdict + real gate → real selected
+        "## R\n```json\n" + json.dumps({"gate": "example-only"}) + "\n```\n"
+        + "```json\n" + json.dumps(_full_gate()) + "\n```\n### GATE: FAIL\n",
+        # PASS gate + verdict PASS
+        "## R\n```json\n" + json.dumps(_full_gate(gate="PASS")) + "\n```\n### GATE: PASS\n",
+        # gate-shaped but missing the coverage arrays + verdict → None
+        "## R\n```json\n" + json.dumps({"gate": "PASS"}) + "\n```\n### GATE: PASS\n",
+        # gate present but NO verdict marker → None (no authoritative verdict)
+        "## R\n```json\n" + json.dumps(_full_gate()) + "\n```\n",
+        "## R\nno json here\n### GATE: FAIL\n",                                          # none
+        "## R\n```json\n{bad json\n```\n### GATE: FAIL\n",                              # unparseable
     ]
 
     def test_gate_selector_matches(self):
@@ -148,6 +156,8 @@ class GrillResolutionParityTest(unittest.TestCase):
         {"fork_resolutions": [{"id": "tf-1", "resolution": "  "}, {"id": "tf-2", "resolution": "b"}]},  # blank res
         {"fork_resolutions": [{"id": "  ", "resolution": "a"}]},                         # blank id
         {"fork_resolutions": ["tf-1"]},                                                 # non-object entry
+        None,                                                                            # top-level non-dict
+        ["nope"],                                                                        # top-level list
     ]
 
     def test_grill_resolution_verdict_matches(self):
