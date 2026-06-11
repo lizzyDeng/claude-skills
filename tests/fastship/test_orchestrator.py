@@ -1,10 +1,11 @@
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship'))
@@ -2767,3 +2768,188 @@ class TestSniffLivenessParity:
                       "done", "completed", "finished", "stopped", None, "", "wibble"]:
             assert _classify_bg_state(state) == sd.liveness(0, is_bg=True, bg_state=state), \
                 f"divergence on {state!r} — 单源被破坏(ops-6)"
+
+
+def _mk_session(tmp_path, monkeypatch, sid="sniff-t", step="2.0", entered_offset_s=0):
+    """真实形状的 session fixture：经 empty_orchestrator_state 构造再落盘。"""
+    import fastship_state
+    from orchestrator import empty_orchestrator_state
+    monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("FASTSHIP_SESSION", sid)
+    st = empty_orchestrator_state("sniff fixture")
+    st["session_id"] = sid
+    st["current_step"] = step
+    st["phase"] = 2
+    entered = datetime.now() - timedelta(seconds=entered_offset_s)
+    st["step_entered_at"][step] = entered.isoformat()
+    fastship_state.save_json(fastship_state.orchestrator_state_path(sid), st)
+    fastship_state.save_json(fastship_state.gate_state_path(sid), {"test_passed": False})
+    return st
+
+
+def _sniff_once(tmp_path, capsys):
+    from orchestrator import cmd_sniff, _parse_sniff_line
+    cmd_sniff(["--jobs-dir", str(tmp_path / "jobs")])
+    lines = [l for l in capsys.readouterr().out.splitlines()
+             if l.startswith("[FASTSHIP_SNIFF]")]
+    assert len(lines) == 1
+    return _parse_sniff_line(lines[0])
+
+
+class TestSniff:
+    def test_parse_sniff_line(self):
+        from orchestrator import _parse_sniff_line
+        d = _parse_sniff_line("[FASTSHIP_SNIFF] session=a step=2.0 verdict=ok action=none jobs_checked=0")
+        assert d == {"session": "a", "step": "2.0", "verdict": "ok",
+                     "action": "none", "jobs_checked": "0"}
+        assert _parse_sniff_line("not a sniff line") == {}
+
+    def test_healthy_ok_single_line(self, tmp_path, monkeypatch, capsys):
+        _mk_session(tmp_path, monkeypatch)
+        d = _sniff_once(tmp_path, capsys)
+        assert d["session"] == "sniff-t" and d["step"] == "2.0"
+        assert d["verdict"] == "ok" and d["action"] == "none"
+
+    def test_escalation_resume_notify_silent(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch, entered_offset_s=99999)  # >3600s 阈值
+        actions = [_sniff_once(tmp_path, capsys) for _ in range(5)]
+        assert [a["action"] for a in actions] == ["resume", "notify_user", "none", "none", "none"]
+        assert actions[0]["verdict"] == "stalled" and actions[2]["verdict"] == "stalled_notified"
+        n = actions[1]  # 证据链（AC-RESUME-2）
+        assert n["signal"] == "step_stale" and "stalled_since" in n
+        assert int(n["stalled_s"]) > 3600 and "resume_at" in n
+        # 事件键计数持久化恒 1（AC-RESUME-1 防风暴）
+        sniff = fastship_state.load_json(fastship_state.sniff_state_path())
+        key = f"2.0|step_stale|{st['step_entered_at']['2.0']}"
+        assert sniff["events"][key]["resume_attempts"] == 1
+        assert sniff["events"][key]["notified"] is True
+
+    def test_entered_at_refresh_opens_new_event_chain(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch, entered_offset_s=99999)
+        for _ in range(2):
+            _sniff_once(tmp_path, capsys)            # resume → notify（事件 1 关链）
+        # 模拟 rewind 重入：引擎刷新 entered_at（fixture builder 身份），又一次假死
+        st["step_entered_at"]["2.0"] = (datetime.now() - timedelta(seconds=88888)).isoformat()
+        fastship_state.save_json(fastship_state.orchestrator_state_path(), st)
+        d = _sniff_once(tmp_path, capsys)
+        assert d["action"] == "resume"               # 新事件键 → 新链（AC-NOTIFY-1 反向）
+
+    def test_new_blocked_job_after_notified_opens_new_chain(self, tmp_path, monkeypatch, capsys):
+        st = _mk_session(tmp_path, monkeypatch)
+        jobs = tmp_path / "jobs"
+        (jobs / "j1").mkdir(parents=True)
+        (jobs / "j1" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"],
+             "updatedAt": "2026-06-11T00:00:00"}))
+        a1 = _sniff_once(tmp_path, capsys)
+        a2 = _sniff_once(tmp_path, capsys)
+        assert (a1["action"], a2["action"]) == ("resume", "notify_user")
+        assert a2["signal"] == "bg_state" and a2["stalled_since"] == "2026-06-11T00:00:00"
+        assert a2["job"] == "j1" and "resume_at" in a2
+        a25 = _sniff_once(tmp_path, capsys)          # j1 链已走完 → 静默
+        assert a25["verdict"] == "stalled_notified"
+        # 🔴 j1 保持 blocked 在场（codex round-2 starvation case）：
+        # 新 job 必须仍能开新链，不被已 notified 的旧事件遮蔽
+        (jobs / "j2").mkdir()
+        (jobs / "j2" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "psql migrate", "cwd": st["repo_root"]}))
+        a3 = _sniff_once(tmp_path, capsys)
+        assert a3["action"] == "resume" and a3["job"] == "j2"
+        a4 = _sniff_once(tmp_path, capsys)
+        assert a4["action"] == "notify_user" and a4["job"] == "j2"
+        a5 = _sniff_once(tmp_path, capsys)           # 全部链走完 → 整体静默
+        assert a5["verdict"] == "stalled_notified"
+        # 🔴 防回归（codex round-4）：同一 blocked job 的 updatedAt 心跳变化
+        # 绝不重开链（updatedAt 不在事件键里 —— 否则 resume 风暴）
+        (jobs / "j2" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "psql migrate", "cwd": st["repo_root"],
+             "updatedAt": datetime.now().isoformat()}))
+        a6 = _sniff_once(tmp_path, capsys)
+        assert a6["verdict"] == "stalled_notified" and a6["action"] == "none"
+
+    def test_done_session_same_root_does_not_block_bg(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        from orchestrator import empty_orchestrator_state
+        st = _mk_session(tmp_path, monkeypatch)
+        done_s = empty_orchestrator_state("done one")
+        done_s["session_id"] = "done-s"
+        done_s["current_step"] = "done"              # 已终结的同根 session 不算共享
+        done_s["repo_root"] = st["repo_root"]
+        fastship_state.save_json(fastship_state.orchestrator_state_path("done-s"), done_s)
+        jobs = tmp_path / "jobs"
+        (jobs / "jb").mkdir(parents=True)
+        (jobs / "jb" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
+        d = _sniff_once(tmp_path, capsys)
+        assert d["action"] == "resume" and d["job"] == "jb"  # 对照组：正常告警
+
+    def test_readonly_hash_sandwich(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        _mk_session(tmp_path, monkeypatch, entered_offset_s=99999)
+        op = fastship_state.orchestrator_state_path()
+        gp = fastship_state.gate_state_path()
+        h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+        before = (h(op), h(gp))
+        for _ in range(3):  # 覆盖 resume/notify/silent 三条有写诱惑的路径
+            _sniff_once(tmp_path, capsys)
+        assert (h(op), h(gp)) == before  # AC-SNIFF-4
+        assert os.path.exists(fastship_state.sniff_state_path())
+
+    def test_heartbeat_advances(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        _mk_session(tmp_path, monkeypatch)
+        _sniff_once(tmp_path, capsys)
+        t1 = fastship_state.load_json(fastship_state.sniff_state_path())["last_check_at"]
+        time.sleep(1.1)
+        _sniff_once(tmp_path, capsys)
+        t2 = fastship_state.load_json(fastship_state.sniff_state_path())["last_check_at"]
+        assert t2 > t1  # AC-HB-1：严格递增，不是首写后不动
+
+    def test_session_done_stops_loop(self, tmp_path, monkeypatch, capsys):
+        _mk_session(tmp_path, monkeypatch, step="done")
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "session_done" and d["action"] == "stop_loop"
+
+    def test_exempt_step_never_stalled(self, tmp_path, monkeypatch, capsys):
+        _mk_session(tmp_path, monkeypatch, step="1.6", entered_offset_s=999999)
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "ok"  # 等用户确认的步骤永不假死
+
+    def test_missing_step_ts_degrades_ok(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch)
+        st.pop("step_entered_at")  # 存量旧 session 无此字段
+        fastship_state.save_json(fastship_state.orchestrator_state_path(), st)
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "ok" and d.get("note") == "no_step_ts"  # 绝不误报
+
+    def test_self_and_foreign_jobs_excluded(self, tmp_path, monkeypatch, capsys):
+        st = _mk_session(tmp_path, monkeypatch)
+        jobs = tmp_path / "jobs"
+        (jobs / "jself").mkdir(parents=True)
+        (jobs / "jself" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "FASTSHIP_SNIFF watch loop", "cwd": st["repo_root"]}))
+        (jobs / "jother").mkdir()
+        (jobs / "jother" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "x", "cwd": "/elsewhere/repo"}))
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "ok" and d["jobs_checked"] == "0"  # 两个都不进判定
+
+    def test_shared_root_skips_bg_attribution(self, tmp_path, monkeypatch, capsys):
+        import fastship_state
+        from orchestrator import empty_orchestrator_state
+        st = _mk_session(tmp_path, monkeypatch)
+        # 第二个活跃 session 同根（--shared 场景）
+        other = empty_orchestrator_state("other")
+        other["session_id"] = "other-s"
+        other["current_step"] = "2.0"
+        other["repo_root"] = st["repo_root"]
+        fastship_state.save_json(fastship_state.orchestrator_state_path("other-s"), other)
+        jobs = tmp_path / "jobs"
+        (jobs / "jamb").mkdir(parents=True)
+        (jobs / "jamb" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "ok" and "bg_shared_root" in d.get("note", "")

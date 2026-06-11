@@ -3295,6 +3295,197 @@ def _scan_bg_jobs(jobs_dir: str) -> dict:
     return out
 
 
+SNIFF_LINE_PREFIX = "[FASTSHIP_SNIFF]"
+SNIFF_DEFAULT_INTERVAL_S = 240            # ≤270s：贴 prompt-cache 5min 窗口（1A constraints）
+SNIFF_PHASE_THRESHOLDS_S = {1: 1800, 2: 3600, 3: 3600}
+SNIFF_THRESHOLD_DEFAULT_S = 3600
+SNIFF_EXEMPT_STEPS = ("1.5", "1.6", "3.5")  # 设计上等人的步骤：永不判 stalled
+SNIFF_SELF_MARKER = "FASTSHIP_SNIFF"        # intent 带此签名的 bg job = 嗅探自身（防反馈环）
+
+
+def _parse_sniff_line(line: str) -> dict:
+    """[FASTSHIP_SNIFF] k=v 单行 → dict。loop agent 与测试共用的解析口径
+    （[FASTSHIP_GOAL] 无解析测试的债不复制到这条线上）。"""
+    if not line.startswith(SNIFF_LINE_PREFIX):
+        return {}
+    out = {}
+    for tok in line[len(SNIFF_LINE_PREFIX):].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def _iso_age_s(now_dt, iso_str) -> int:
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return max(0, int((now_dt - dt).total_seconds()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _sniff_interval_s() -> int:
+    cfg = fastship_state.load_project_config().get("sniff") or {}
+    try:
+        return int(cfg.get("interval_s", SNIFF_DEFAULT_INTERVAL_S))
+    except (TypeError, ValueError):
+        return SNIFF_DEFAULT_INTERVAL_S
+
+
+def _sniff_step_threshold_s(step_id: str, phase) -> int:
+    cfg = fastship_state.load_project_config().get("sniff") or {}
+    per_step = cfg.get("thresholds") or {}
+    if step_id in per_step:
+        return int(per_step[step_id])
+    if "threshold_default_s" in cfg:
+        return int(cfg["threshold_default_s"])
+    try:
+        return SNIFF_PHASE_THRESHOLDS_S.get(int(phase), SNIFF_THRESHOLD_DEFAULT_S)
+    except (TypeError, ValueError):
+        return SNIFF_THRESHOLD_DEFAULT_S
+
+
+def _other_active_session_shares_root(sid: str, roots: list) -> bool:
+    """同 state home 下是否有其他活跃 session 与本 session 同根（--shared 场景）。
+    同根时 bg job 的 cwd 归属不可分辨 —— 保守跳过 bg 告警，绝不替别的 session 行动
+    （step_stale 信号不受影响）。纯只读扫描。"""
+    try:
+        sids = os.listdir(fastship_state.sessions_dir())
+    except OSError:
+        return False
+    for other in sids:
+        if other == sid:
+            continue
+        o = fastship_state.load_json(fastship_state.orchestrator_state_path(other))
+        if not o or o.get("current_step") in ("done", "stopped", None):
+            continue
+        oroots = {o.get("repo_root"), (o.get("worktree") or {}).get("path")}
+        if any(r in oroots for r in roots):
+            return True
+    return False
+
+
+def cmd_sniff(argv: list = None) -> int:
+    """嗅探：纯 stdlib 假死判定，单行 [FASTSHIP_SNIFF] verdict 输出。
+    🔴 对 orchestrator.json/gate.json 严格只读（不走 load_orch_state —— 它触发
+    migrate_legacy_state 写盘）；唯一写入 sniff-state.json。exit 恒 0（判定结果
+    在 verdict 字段，loop agent 不该因 exit code 误判）。
+    升级链事件键 = {step}|{signal}|{事件标识}：step_stale 的事件标识=本次 entered_at
+    （刷新即自动开新链）；bg_state 的事件标识=job id（不同 job 独立链；updatedAt 被
+    daemon 心跳刷新故不进 key，否则 resume 风暴）。"""
+    args = list(argv or [])
+    jobs_dir = os.path.expanduser("~/.claude/jobs")
+    i = 0
+    while i < len(args):
+        if args[i] == "--jobs-dir" and i + 1 < len(args):
+            jobs_dir = args[i + 1]
+            i += 2
+            continue
+        i += 1
+
+    sid = fastship_state.resolve_session_id()
+    orch = fastship_state.load_json(fastship_state.orchestrator_state_path(sid)) if sid else None
+    if not orch:
+        print(f"{SNIFF_LINE_PREFIX} session={sid or '-'} verdict=no_session action=stop_loop")
+        return 0
+
+    now = datetime.now()
+    spath = fastship_state.sniff_state_path(sid)
+    sniff = fastship_state.load_json(spath) or {}
+    sniff["last_check_at"] = now.isoformat()           # AC-HB-1：每轮心跳
+    events = sniff.setdefault("events", {})
+    step = orch.get("current_step")
+
+    if step in ("done", "stopped"):
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=session_done action=stop_loop")
+        return 0
+
+    # 信号 1：step 停留时长（豁免等人步骤；存量 session 无戳→降级 ok 绝不误报）
+    notes = []
+    step_stale_hit = None   # (event_key, signal, since_iso, stalled_s, extra)
+    entered = (orch.get("step_entered_at") or {}).get(step)
+    threshold_s = _sniff_step_threshold_s(step, orch.get("phase"))
+    if step in SNIFF_EXEMPT_STEPS:
+        notes.append("exempt_step")
+    elif not entered:
+        notes.append("no_step_ts")
+    else:
+        stalled_s = _iso_age_s(now, entered)
+        if stalled_s > threshold_s:
+            step_stale_hit = (f"{step}|step_stale|{entered}", "step_stale", entered, stalled_s,
+                              f" entered_at={entered} threshold_s={threshold_s}")
+
+    # 信号 2：归属本 session（cwd 在 repo/worktree 下）的 bg job 卡在 blocked
+    roots = [r for r in (orch.get("repo_root"),
+                         (orch.get("worktree") or {}).get("path")) if r]
+    jobs_checked = 0
+    jobs_unknown = 0
+    blocked_jobs = []
+    for jid, info in sorted(_scan_bg_jobs(jobs_dir).items()):
+        if SNIFF_SELF_MARKER in str(info.get("intent") or ""):
+            continue   # 自我排除（AC-SCOPE-1：嗅探不互相 resume）
+        cwd = info.get("cwd") or ""
+        if not any(cwd == r or cwd.startswith(r.rstrip("/") + "/") for r in roots):
+            continue   # 只盯本 session 的任务
+        jobs_checked += 1
+        cls = _classify_bg_state(info.get("state"))
+        if cls == "unknown":
+            jobs_unknown += 1   # 可观察的 unknown 计数（AC-SNIFF-2）
+        elif cls == "blocked":
+            blocked_jobs.append((jid, info))
+    if blocked_jobs and _other_active_session_shares_root(sid, roots):
+        blocked_jobs = []
+        notes.append("bg_shared_root")   # 同根多活跃 session：归属不可分辨，保守跳过
+
+    # 候选 stalled 事件按优先级排队：step_stale 在前，其后每个 blocked job 各一条。
+    # 行动选第一个「升级链未走完」的事件 —— 已 notified 的旧事件绝不遮蔽/饿死新事件
+    # （codex round-2 starvation 修复，AC-NOTIFY-1 反向 case 的实现保证）。
+    candidates = []   # (event_key, signal, since_iso, stalled_s, extra)
+    if step_stale_hit is not None:
+        candidates.append(step_stale_hit)
+    for jid, info in blocked_jobs:
+        since = str(info.get("updated_at") or now.isoformat())
+        candidates.append((f"{step}|bg_state|{jid}", "bg_state", since,
+                           _iso_age_s(now, since), f" job={jid}"))
+
+    counters = f" jobs_checked={jobs_checked} jobs_unknown={jobs_unknown}"
+    if not candidates:
+        fastship_state.save_json(spath, sniff)
+        suffix = f" note={','.join(notes)}" if notes else ""
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=ok action=none"
+              f"{counters}{suffix}")
+        return 0
+
+    # 升级链（事件键去重，计数持久化 —— 防 resume 风暴/告警疲劳）
+    chosen = next((c for c in candidates
+                   if not (events.get(c[0]) or {}).get("notified")), candidates[0])
+    key, signal, since, stalled_s, extra = chosen
+    rec = events.get(key) or {}
+    evidence = f" signal={signal} stalled_since={since} stalled_s={stalled_s}{extra}"
+    if not rec.get("resume_attempts"):
+        rec.update({"resume_attempts": 1, "resume_at": now.isoformat(),
+                    "stalled_since": since, "signal": signal})
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled"
+              f" action=resume{evidence}{counters}")
+    elif not rec.get("notified"):
+        rec.update({"notified": True, "notified_at": now.isoformat()})
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled"
+              f" action=notify_user{evidence} resume_at={rec.get('resume_at')}{counters}")
+    else:
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled_notified"
+              f" action=none{evidence}{counters}")
+    return 0
+
+
 # ━━━━━━━━━━━━ CLI Commands ━━━━━━━━━━━━
 
 def _session_id_for_start(requirement: str) -> str:
