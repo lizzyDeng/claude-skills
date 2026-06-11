@@ -2698,3 +2698,34 @@ class TestSniffStatePath:
         p = fastship_state.sniff_state_path()
         assert p == os.path.join(str(tmp_path), "sessions", "sess-a", "sniff-state.json")
         assert os.path.dirname(p) == os.path.dirname(fastship_state.gate_state_path())
+
+
+class TestStepEnteredAt:
+    def test_empty_state_stamps_first_step(self):
+        from orchestrator import empty_orchestrator_state
+        st = empty_orchestrator_state("x")
+        assert "1.0" in st["step_entered_at"]
+        datetime.fromisoformat(st["step_entered_at"]["1.0"])  # 合法 ISO
+
+    def test_advance_stamps_each_new_step_monotonic(self):
+        from orchestrator import empty_orchestrator_state, _advance_state
+        st = empty_orchestrator_state("x")
+        st["request_type"] = "feature"
+        prev_ts = st["step_entered_at"]["1.0"]
+        for _ in range(3):
+            st = _advance_state(st)
+            cur = st["current_step"]
+            assert cur in st["step_entered_at"]
+            assert st["step_entered_at"][cur] >= prev_ts  # ISO 字典序=时间序
+            prev_ts = st["step_entered_at"][cur]
+
+    def test_loop_continue_restamps_2_5(self):
+        from orchestrator import empty_orchestrator_state, _handle_loop_decision
+        st = empty_orchestrator_state("x")
+        st["current_step"] = "3.5"
+        st["loop_count"] = 1
+        st["artifacts"] = {"loop_decision": "continue"}
+        st["step_entered_at"]["2.5"] = "2000-01-01T00:00:00"
+        _handle_loop_decision(st)
+        assert st["current_step"] == "2.5"
+        assert st["step_entered_at"]["2.5"] > "2020-01-01"  # rewind 重置计时，防回退步秒级误报

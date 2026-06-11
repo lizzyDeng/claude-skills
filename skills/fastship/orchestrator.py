@@ -139,6 +139,7 @@ def empty_orchestrator_state(requirement: str) -> dict:
         "report_path": None,
         "started_at": datetime.now().isoformat(),
         "loop_count": 0,
+        "step_entered_at": {"1.0": datetime.now().isoformat()},
         "artifacts": {},
     }
 
@@ -2568,6 +2569,14 @@ def _get_step_map():
     return {s.id: s for s in STEPS}
 
 
+def _stamp_step_entry(orch: dict):
+    """记录进入当前 step 的时刻（sniff 的 step-staleness 信号源）。重入同一 step
+    覆盖该 key —— 计时复位正是 loop rewind 后想要的语义；entered_at 同时是
+    step_stale 升级链的事件标识，刷新即自动开新链。引擎写自己的 state，
+    与「sniff 对引擎 state 只读」不冲突。"""
+    orch.setdefault("step_entered_at", {})[orch["current_step"]] = datetime.now().isoformat()
+
+
 def _advance_state(orch: dict) -> dict:
     """Mark current step complete and advance to next (or skip conditional)."""
     step_ids = [s.id for s in STEPS]
@@ -2610,9 +2619,11 @@ def _advance_state(orch: dict) -> dict:
             continue
         orch["current_step"] = candidate.id
         orch["phase"] = candidate.phase
+        _stamp_step_entry(orch)
         return orch
 
     orch["current_step"] = "done"
+    _stamp_step_entry(orch)
     return orch
 
 
@@ -2623,6 +2634,7 @@ def _handle_loop_decision(orch: dict):
 
     if loop_count >= 3:
         orch["current_step"] = "stopped"
+        _stamp_step_entry(orch)
         print(f"\n🔴 Loop 上限 ({loop_count}/3) — 流程停止。输出聚合分析给用户。")
         return
 
@@ -2638,18 +2650,21 @@ def _handle_loop_decision(orch: dict):
         _clear_trusted_artifacts(orch, ("2.5",))
         orch["current_step"] = "2.5"
         orch["phase"] = 2
+        _stamp_step_entry(orch)
         for k in ("loop_outcome", "loop_decision"):
             orch.get("artifacts", {}).pop(k, None)
         print(f"\n📝 Loop {loop_count} FAIL → continue → 回到 2.5 重新 code review + 重试验证")
     elif decision == "escalate":
         orch["current_step"] = "1.0"
         orch["phase"] = 1
+        _stamp_step_entry(orch)
         orch["completed_steps"] = []
         orch["skipped_steps"] = []
         orch["artifacts"] = {}
         print(f"\n🔴 Loop {loop_count} FAIL → escalate → 回到 1.0 全流程重来")
     elif decision == "stop":
         orch["current_step"] = "stopped"
+        _stamp_step_entry(orch)
         print(f"\n🛑 Loop {loop_count} FAIL → stop → 输出聚合分析给用户")
     else:
         print(f"\n❌ 未知 decision: {decision}。必须是 continue|escalate|stop")
