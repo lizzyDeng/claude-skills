@@ -2729,3 +2729,41 @@ class TestStepEnteredAt:
         _handle_loop_decision(st)
         assert st["current_step"] == "2.5"
         assert st["step_entered_at"]["2.5"] > "2020-01-01"  # rewind 重置计时，防回退步秒级误报
+
+
+class TestSniffClassify:
+    @pytest.mark.parametrize("state,expected", [
+        ("active", "working"), ("running", "working"), ("in_progress", "working"),
+        ("blocked", "blocked"), ("waiting", "blocked"), ("paused", "blocked"),
+        ("done", "done"), ("completed", "done"), ("finished", "done"), ("stopped", "done"),
+        (None, "unknown"), ("", "unknown"), ("wibble", "unknown"),
+    ])
+    def test_classify(self, state, expected):
+        from orchestrator import _classify_bg_state
+        assert _classify_bg_state(state) == expected
+
+    def test_scan_jobs_missing_state_json_is_unknown_not_crash(self, tmp_path):
+        from orchestrator import _scan_bg_jobs
+        (tmp_path / "j1").mkdir()
+        (tmp_path / "j1" / "state.json").write_text('{"state": "blocked", "intent": "x", "cwd": "/r"}')
+        (tmp_path / "j2").mkdir()  # 无 state.json
+        (tmp_path / "j3").mkdir()
+        (tmp_path / "j3" / "state.json").write_text("{corrupt")
+        jobs = _scan_bg_jobs(str(tmp_path))
+        assert jobs["j1"]["state"] == "blocked" and jobs["j1"]["cwd"] == "/r"
+        assert jobs["j2"]["state"] is None and jobs["j3"]["state"] is None
+
+
+class TestSniffLivenessParity:
+    def test_parity_with_session_radar(self):
+        from orchestrator import _classify_bg_state
+        import importlib.util
+        sd_path = os.path.join(os.path.dirname(__file__), "..", "..",
+                               "skills", "session-radar", "session_dashboard.py")
+        spec = importlib.util.spec_from_file_location("session_dashboard", sd_path)
+        sd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sd)
+        for state in ["active", "running", "in_progress", "blocked", "waiting", "paused",
+                      "done", "completed", "finished", "stopped", None, "", "wibble"]:
+            assert _classify_bg_state(state) == sd.liveness(0, is_bg=True, bg_state=state), \
+                f"divergence on {state!r} — 单源被破坏(ops-6)"

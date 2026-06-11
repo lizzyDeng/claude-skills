@@ -3247,6 +3247,54 @@ def format_next(orch: dict) -> str:
     )
 
 
+# ── Sniff（后台存活监控）────────────────────────────────────────────────────
+# session-radar bg 分类的源内镜像（session_dashboard.py:191-193 + liveness() bg 分支）。
+# 写成字面量是因为引擎单文件分发到消费仓库（无 session-radar 可 import）；语义单源由
+# TestSniffLivenessParity 对活体 session_dashboard 逐项钉死，漂移当场红。
+# 🔴 绝不读 mtime —— bg job 两轮间静默是常态（KNOWLEDGE 教训），实现里不存在 dead 分类。
+SNIFF_BG_ALIVE = ("active", "running", "in_progress")
+SNIFF_BG_WAIT = ("blocked", "waiting", "paused")
+SNIFF_BG_DONE = ("done", "completed", "finished", "stopped")
+
+
+def _classify_bg_state(bg_state) -> str:
+    s = str(bg_state).lower() if bg_state else ""
+    if s in SNIFF_BG_ALIVE:
+        return "working"
+    if s in SNIFF_BG_WAIT:
+        return "blocked"
+    if s in SNIFF_BG_DONE:
+        return "done"
+    return "unknown"
+
+
+def _scan_bg_jobs(jobs_dir: str) -> dict:
+    """仿 session_dashboard.bg_jobs()：state.json 缺失/损坏不崩（state=None→unknown）。"""
+    out = {}
+    try:
+        entries = os.listdir(jobs_dir)
+    except OSError:
+        return out
+    for d in entries:
+        p = os.path.join(jobs_dir, d)
+        if not os.path.isdir(p):
+            continue
+        info = {"state": None, "intent": None, "cwd": None, "updated_at": None}
+        sp = os.path.join(p, "state.json")
+        if os.path.exists(sp):
+            try:
+                with open(sp, encoding="utf-8") as f:
+                    s = json.load(f)
+                info["state"] = s.get("state")
+                info["intent"] = s.get("intent")
+                info["cwd"] = s.get("cwd") or s.get("originCwd")
+                info["updated_at"] = s.get("updatedAt")
+            except Exception:
+                pass
+        out[d] = info
+    return out
+
+
 # ━━━━━━━━━━━━ CLI Commands ━━━━━━━━━━━━
 
 def _session_id_for_start(requirement: str) -> str:
