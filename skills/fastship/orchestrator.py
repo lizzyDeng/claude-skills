@@ -3419,15 +3419,16 @@ def cmd_sniff(argv: list = None) -> int:
                               f" entered_at={entered} threshold_s={threshold_s}")
 
     # 信号 2：归属本 session（cwd 在 repo/worktree 下）的 bg job 卡在 blocked
-    roots = [r for r in (orch.get("repo_root"),
-                         (orch.get("worktree") or {}).get("path")) if r]
+    # cwd 来自外部 job state，realpath 归一两侧（macOS /var↔/private/var 等 symlink 形态）
+    roots = [os.path.realpath(r) for r in (orch.get("repo_root"),
+                                           (orch.get("worktree") or {}).get("path")) if r]
     jobs_checked = 0
     jobs_unknown = 0
     blocked_jobs = []
     for jid, info in sorted(_scan_bg_jobs(jobs_dir).items()):
         if SNIFF_SELF_MARKER in str(info.get("intent") or ""):
             continue   # 自我排除（AC-SCOPE-1：嗅探不互相 resume）
-        cwd = info.get("cwd") or ""
+        cwd = os.path.realpath(info["cwd"]) if info.get("cwd") else ""
         if not any(cwd == r or cwd.startswith(r.rstrip("/") + "/") for r in roots):
             continue   # 只盯本 session 的任务
         jobs_checked += 1
