@@ -316,6 +316,13 @@ def gate_state_path(session_id: str = None) -> str:
     return os.path.join(session_state_dir(session_id), "gate.json")
 
 
+def sniff_state_path(session_id: str = None) -> str:
+    """嗅探（sniff 子命令）的自有状态：心跳 + 事件键 resume/notify 升级链。
+    与 orchestrator.json/gate.json 同 session 目录 —— sniff 对那两个文件严格只读，
+    这是它唯一可写的文件；reset 删 session 目录时自然回收。"""
+    return os.path.join(session_state_dir(session_id), "sniff-state.json")
+
+
 def implement_verdicts_path(session_id: str = None) -> str:
     return os.path.join(session_state_dir(session_id), "implement-verdicts.md")
 

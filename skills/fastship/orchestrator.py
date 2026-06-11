@@ -139,6 +139,7 @@ def empty_orchestrator_state(requirement: str) -> dict:
         "report_path": None,
         "started_at": datetime.now().isoformat(),
         "loop_count": 0,
+        "step_entered_at": {"1.0": datetime.now().isoformat()},
         "artifacts": {},
     }
 
@@ -2568,6 +2569,14 @@ def _get_step_map():
     return {s.id: s for s in STEPS}
 
 
+def _stamp_step_entry(orch: dict):
+    """记录进入当前 step 的时刻（sniff 的 step-staleness 信号源）。重入同一 step
+    覆盖该 key —— 计时复位正是 loop rewind 后想要的语义；entered_at 同时是
+    step_stale 升级链的事件标识，刷新即自动开新链。引擎写自己的 state，
+    与「sniff 对引擎 state 只读」不冲突。"""
+    orch.setdefault("step_entered_at", {})[orch["current_step"]] = datetime.now().isoformat()
+
+
 def _advance_state(orch: dict) -> dict:
     """Mark current step complete and advance to next (or skip conditional)."""
     step_ids = [s.id for s in STEPS]
@@ -2610,9 +2619,11 @@ def _advance_state(orch: dict) -> dict:
             continue
         orch["current_step"] = candidate.id
         orch["phase"] = candidate.phase
+        _stamp_step_entry(orch)
         return orch
 
     orch["current_step"] = "done"
+    _stamp_step_entry(orch)
     return orch
 
 
@@ -2623,6 +2634,7 @@ def _handle_loop_decision(orch: dict):
 
     if loop_count >= 3:
         orch["current_step"] = "stopped"
+        _stamp_step_entry(orch)
         print(f"\n🔴 Loop 上限 ({loop_count}/3) — 流程停止。输出聚合分析给用户。")
         return
 
@@ -2638,18 +2650,21 @@ def _handle_loop_decision(orch: dict):
         _clear_trusted_artifacts(orch, ("2.5",))
         orch["current_step"] = "2.5"
         orch["phase"] = 2
+        _stamp_step_entry(orch)
         for k in ("loop_outcome", "loop_decision"):
             orch.get("artifacts", {}).pop(k, None)
         print(f"\n📝 Loop {loop_count} FAIL → continue → 回到 2.5 重新 code review + 重试验证")
     elif decision == "escalate":
         orch["current_step"] = "1.0"
         orch["phase"] = 1
+        _stamp_step_entry(orch)
         orch["completed_steps"] = []
         orch["skipped_steps"] = []
         orch["artifacts"] = {}
         print(f"\n🔴 Loop {loop_count} FAIL → escalate → 回到 1.0 全流程重来")
     elif decision == "stop":
         orch["current_step"] = "stopped"
+        _stamp_step_entry(orch)
         print(f"\n🛑 Loop {loop_count} FAIL → stop → 输出聚合分析给用户")
     else:
         print(f"\n❌ 未知 decision: {decision}。必须是 continue|escalate|stop")
@@ -2704,6 +2719,9 @@ def _apply_codex_fail_rollback(orch: dict, target_step: str):
     orch["completed_steps"] = [s for s in orch.get("completed_steps", []) if s not in clear_steps]
     orch["current_step"] = target_step
     orch["phase"] = 1
+    # 与其余 6 处 current_step 变更对齐：rewind 必须重打 entered_at，否则 sniff 拿
+    # 旧戳在 rollback 后立刻误报 stalled，且 step_stale 事件键（=entered_at）不开新链。
+    _stamp_step_entry(orch)
 
 
 def _codex_fail_rollback_label(target_step: str) -> str:
@@ -3232,6 +3250,289 @@ def format_next(orch: dict) -> str:
     )
 
 
+# ── Sniff（后台存活监控）────────────────────────────────────────────────────
+# session-radar bg 分类的源内镜像（session_dashboard.py:191-193 + liveness() bg 分支）。
+# 写成字面量是因为引擎单文件分发到消费仓库（无 session-radar 可 import）；语义单源由
+# TestSniffLivenessParity 对活体 session_dashboard 逐项钉死，漂移当场红。
+# 🔴 绝不读 mtime —— bg job 两轮间静默是常态（KNOWLEDGE 教训），实现里不存在 dead 分类。
+SNIFF_BG_ALIVE = ("active", "running", "in_progress")
+SNIFF_BG_WAIT = ("blocked", "waiting", "paused")
+SNIFF_BG_DONE = ("done", "completed", "finished", "stopped")
+
+
+def _classify_bg_state(bg_state) -> str:
+    s = str(bg_state).lower() if bg_state else ""
+    if s in SNIFF_BG_ALIVE:
+        return "working"
+    if s in SNIFF_BG_WAIT:
+        return "blocked"
+    if s in SNIFF_BG_DONE:
+        return "done"
+    return "unknown"
+
+
+def _scan_bg_jobs(jobs_dir: str) -> dict:
+    """仿 session_dashboard.bg_jobs()：state.json 缺失/损坏不崩（state=None→unknown）。"""
+    out = {}
+    try:
+        entries = os.listdir(jobs_dir)
+    except OSError:
+        return out
+    for d in entries:
+        p = os.path.join(jobs_dir, d)
+        if not os.path.isdir(p):
+            continue
+        info = {"state": None, "intent": None, "cwd": None, "updated_at": None}
+        sp = os.path.join(p, "state.json")
+        if os.path.exists(sp):
+            try:
+                with open(sp, encoding="utf-8") as f:
+                    s = json.load(f)
+                info["state"] = s.get("state")
+                info["intent"] = s.get("intent")
+                info["cwd"] = s.get("cwd") or s.get("originCwd")
+                info["updated_at"] = s.get("updatedAt")
+            except Exception:
+                pass
+        out[d] = info
+    return out
+
+
+SNIFF_LINE_PREFIX = "[FASTSHIP_SNIFF]"
+SNIFF_DEFAULT_INTERVAL_S = 240            # ≤270s：贴 prompt-cache 5min 窗口（1A constraints）
+SNIFF_PHASE_THRESHOLDS_S = {1: 1800, 2: 3600, 3: 3600}
+SNIFF_THRESHOLD_DEFAULT_S = 3600
+SNIFF_EXEMPT_STEPS = ("1.5", "1.6", "3.5")  # 设计上等人的步骤：永不判 stalled
+SNIFF_SELF_MARKER = "FASTSHIP_SNIFF"        # intent 带此签名的 bg job = 嗅探自身（防反馈环）
+
+
+def _parse_sniff_line(line: str) -> dict:
+    """[FASTSHIP_SNIFF] k=v 单行 → dict。loop agent 与测试共用的解析口径
+    （[FASTSHIP_GOAL] 无解析测试的债不复制到这条线上）。"""
+    if not line.startswith(SNIFF_LINE_PREFIX):
+        return {}
+    out = {}
+    for tok in line[len(SNIFF_LINE_PREFIX):].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def _sniff_event_rec(events: dict, key: str) -> dict:
+    """事件记录读取的形状防御：手改 sniff-state.json 里 truthy 非 dict 的事件值
+    （如 "events": {"k": "x"}）当空记录处理，绝不让 .get 崩掉 exit-0 契约。"""
+    rec = events.get(key)
+    return rec if isinstance(rec, dict) else {}
+
+
+def _iso_age_s(now_dt, iso_str) -> int:
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return max(0, int((now_dt - dt).total_seconds()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _safe_realpath(p):
+    """realpath 的形状防御：根/cwd 值来自可被手改的 state json —— 非 str
+    （TypeError 向量）、空串（realpath("")=进程 cwd，伪造归属/误压真告警）
+    或内嵌 NUL 的 str（ValueError 向量）→ None，调用方过滤。"""
+    if not (isinstance(p, str) and p):
+        return None
+    try:
+        return os.path.realpath(p)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sniff_interval_s() -> int:
+    cfg = fastship_state.load_project_config().get("sniff") or {}
+    cfg = cfg if isinstance(cfg, dict) else {}      # {"sniff": "fast"} 容器形状防御
+    try:
+        return int(cfg.get("interval_s", SNIFF_DEFAULT_INTERVAL_S))
+    except (TypeError, ValueError):
+        return SNIFF_DEFAULT_INTERVAL_S
+
+
+def _sniff_step_threshold_s(step_id: str, phase) -> int:
+    # 坏配置值逐级回退（per-step → threshold_default_s → 内建默认），与
+    # _sniff_interval_s 同款容错 —— 配置错绝不让 cmd_sniff 崩掉 exit-0 契约。
+    # 容器本身也可能是 truthy 非 dict（{"sniff": "fast"} / {"thresholds": 5}）。
+    cfg = fastship_state.load_project_config().get("sniff") or {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    per_step = cfg.get("thresholds") or {}
+    per_step = per_step if isinstance(per_step, dict) else {}
+    if step_id in per_step:
+        try:
+            return int(per_step[step_id])
+        except (TypeError, ValueError):
+            pass
+    if "threshold_default_s" in cfg:
+        try:
+            return int(cfg["threshold_default_s"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        return SNIFF_PHASE_THRESHOLDS_S.get(int(phase), SNIFF_THRESHOLD_DEFAULT_S)
+    except (TypeError, ValueError):
+        return SNIFF_THRESHOLD_DEFAULT_S
+
+
+def _other_active_session_shares_root(sid: str, roots: list) -> bool:
+    """同 state home 下是否有其他活跃 session 与本 session 同根（--shared 场景）。
+    同根时 bg job 的 cwd 归属不可分辨 —— 保守跳过 bg 告警，绝不替别的 session 行动
+    （step_stale 信号不受影响）。纯只读扫描。"""
+    try:
+        sids = os.listdir(fastship_state.sessions_dir())
+    except OSError:
+        return False
+    for other in sids:
+        if other == sid:
+            continue
+        o = fastship_state.load_json(fastship_state.orchestrator_state_path(other))
+        if not o or o.get("current_step") in ("done", "stopped", None):
+            continue
+        # 落盘的根可能是 symlink 形态（macOS /var↔/private/var）：与调用方一致
+        # realpath 归一，否则保守跳过被静默击穿，sniff 替别的 session 行动。
+        # _safe_realpath：手改坏的非 str/含 NUL 根 → 滤掉，绝不崩 exit-0 契约。
+        oroots = {rp for rp in (_safe_realpath(p) for p in
+                  (o.get("repo_root"), (o.get("worktree") or {}).get("path"))) if rp}
+        if any(r in oroots for r in roots):
+            return True
+    return False
+
+
+def cmd_sniff(argv: list = None) -> int:
+    """嗅探：纯 stdlib 假死判定，单行 [FASTSHIP_SNIFF] verdict 输出。
+    🔴 对 orchestrator.json/gate.json 严格只读（不走 load_orch_state —— 它触发
+    migrate_legacy_state 写盘）；唯一写入 sniff-state.json。exit 恒 0（判定结果
+    在 verdict 字段，loop agent 不该因 exit code 误判）。
+    升级链事件键 = {step}|{signal}|{事件标识}：step_stale 的事件标识=本次 entered_at
+    （刷新即自动开新链）；bg_state 的事件标识=job id（不同 job 独立链；updatedAt 被
+    daemon 心跳刷新故不进 key，否则 resume 风暴）。"""
+    args = list(argv or [])
+    jobs_dir = os.path.expanduser("~/.claude/jobs")
+    session_arg = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--jobs-dir" and i + 1 < len(args):
+            jobs_dir = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--session" and i + 1 < len(args):
+            session_arg = args[i + 1]   # env 前缀被剥掉时的显式绑定兜底
+            i += 2
+            continue
+        i += 1
+
+    sid = fastship_state.resolve_session_id(explicit=session_arg)
+    orch = fastship_state.load_json(fastship_state.orchestrator_state_path(sid)) if sid else None
+    if not orch:
+        print(f"{SNIFF_LINE_PREFIX} session={sid or '-'} verdict=no_session action=stop_loop")
+        return 0
+
+    now = datetime.now()
+    spath = fastship_state.sniff_state_path(sid)
+    sniff = fastship_state.load_json(spath) or {}
+    sniff["last_check_at"] = now.isoformat()           # AC-HB-1：每轮心跳
+    events = sniff.setdefault("events", {})
+    if not isinstance(events, dict):                   # 手改成 [] 等形状 → 矫正
+        events = {}
+        sniff["events"] = events
+    step = orch.get("current_step")
+
+    if step in ("done", "stopped"):
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=session_done action=stop_loop")
+        return 0
+
+    # 信号 1：step 停留时长（豁免等人步骤；存量 session 无戳→降级 ok 绝不误报）
+    notes = []
+    step_stale_hit = None   # (event_key, signal, since_iso, stalled_s, extra)
+    entered = (orch.get("step_entered_at") or {}).get(step)
+    threshold_s = _sniff_step_threshold_s(step, orch.get("phase"))
+    if step in SNIFF_EXEMPT_STEPS:
+        notes.append("exempt_step")
+    elif not entered:
+        notes.append("no_step_ts")
+    else:
+        stalled_s = _iso_age_s(now, entered)
+        if stalled_s > threshold_s:
+            step_stale_hit = (f"{step}|step_stale|{entered}", "step_stale", entered, stalled_s,
+                              f" entered_at={entered} threshold_s={threshold_s}")
+
+    # 信号 2：归属本 session（cwd 在 repo/worktree 下）的 bg job 卡在 blocked
+    # cwd 来自外部 job state，realpath 归一两侧（macOS /var↔/private/var 等 symlink 形态）
+    roots = [rp for rp in (_safe_realpath(r) for r in (orch.get("repo_root"),
+             (orch.get("worktree") or {}).get("path"))) if rp]
+    jobs_checked = 0
+    jobs_unknown = 0
+    blocked_jobs = []
+    for jid, info in sorted(_scan_bg_jobs(jobs_dir).items()):
+        if SNIFF_SELF_MARKER in str(info.get("intent") or ""):
+            continue   # 自我排除（AC-SCOPE-1：嗅探不互相 resume）
+        cwd = _safe_realpath(info.get("cwd")) or ""    # 非 str/空 → ""（无归属语义）
+        if not any(cwd == r or cwd.startswith(r.rstrip("/") + "/") for r in roots):
+            continue   # 只盯本 session 的任务
+        jobs_checked += 1
+        cls = _classify_bg_state(info.get("state"))
+        if cls == "unknown":
+            jobs_unknown += 1   # 可观察的 unknown 计数（AC-SNIFF-2）
+        elif cls == "blocked":
+            blocked_jobs.append((jid, info))
+    if blocked_jobs and _other_active_session_shares_root(sid, roots):
+        blocked_jobs = []
+        notes.append("bg_shared_root")   # 同根多活跃 session：归属不可分辨，保守跳过
+
+    # 候选 stalled 事件按优先级排队：step_stale 在前，其后每个 blocked job 各一条。
+    # 行动选第一个「升级链未走完」的事件 —— 已 notified 的旧事件绝不遮蔽/饿死新事件
+    # （codex round-2 starvation 修复，AC-NOTIFY-1 反向 case 的实现保证）。
+    candidates = []   # (event_key, signal, since_iso, stalled_s, extra)
+    if step_stale_hit is not None:
+        candidates.append(step_stale_hit)
+    for jid, info in blocked_jobs:
+        since = str(info.get("updated_at") or now.isoformat())
+        candidates.append((f"{step}|bg_state|{jid}", "bg_state", since,
+                           _iso_age_s(now, since), f" job={jid}"))
+
+    counters = f" jobs_checked={jobs_checked} jobs_unknown={jobs_unknown}"
+    if not candidates:
+        fastship_state.save_json(spath, sniff)
+        suffix = f" note={','.join(notes)}" if notes else ""
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=ok action=none"
+              f"{counters}{suffix}")
+        return 0
+
+    # 升级链（事件键去重，计数持久化 —— 防 resume 风暴/告警疲劳）
+    chosen = next((c for c in candidates
+                   if not _sniff_event_rec(events, c[0]).get("notified")), candidates[0])
+    key, signal, since, stalled_s, extra = chosen
+    rec = _sniff_event_rec(events, key)
+    evidence = f" signal={signal} stalled_since={since} stalled_s={stalled_s}{extra}"
+    if not rec.get("resume_attempts"):
+        rec.update({"resume_attempts": 1, "resume_at": now.isoformat(),
+                    "stalled_since": since, "signal": signal})
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled"
+              f" action=resume{evidence}{counters}")
+    elif not rec.get("notified"):
+        rec.update({"notified": True, "notified_at": now.isoformat()})
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled"
+              f" action=notify_user{evidence} resume_at={rec.get('resume_at')}{counters}")
+    else:
+        events[key] = rec
+        fastship_state.save_json(spath, sniff)
+        print(f"{SNIFF_LINE_PREFIX} session={sid} step={step} verdict=stalled_notified"
+              f" action=none{evidence}{counters}")
+    return 0
+
+
 # ━━━━━━━━━━━━ CLI Commands ━━━━━━━━━━━━
 
 def _session_id_for_start(requirement: str) -> str:
@@ -3250,6 +3551,27 @@ def _session_id_for_start(requirement: str) -> str:
             return current
 
     return fastship_state.session_id_from_requirement(requirement)
+
+
+def _print_sniff_hint(session_id: str, state_repo: str):
+    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。Claude Code 主路径：驱动
+    agent 见到本段应立即按 SKILL.md 指示后台自动启动；CLI/Codex：用户手动粘贴。
+    命令必须可原样执行：FASTSHIP_STATE_HOME 被显式设置时一并嵌入（state 解析一致）。"""
+    interval = _sniff_interval_s()
+    env_bits = []
+    if os.environ.get("FASTSHIP_STATE_HOME"):
+        env_bits.append(f"FASTSHIP_STATE_HOME={shlex.quote(os.environ['FASTSHIP_STATE_HOME'])}")
+    env_bits.append(f"FASTSHIP_SESSION={shlex.quote(session_id)}")
+    # --session 与 env 前缀双保险：loop agent 转述命令时若剥掉 env 前缀，
+    # 显式参数仍把 sniff 钉在本 session 上（绝不静默落到 registry current_session）。
+    sniff_cmd = (f"cd {shlex.quote(state_repo)} && " + " ".join(env_bits)
+                 + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff"
+                 + f" --session {shlex.quote(session_id)}")
+    print("🕵️  嗅探 loop（后台存活监控）— Claude Code 下驱动 agent 应立即后台自动启动；CLI 手动粘贴：")
+    print(f"   /loop {interval}s 跑 `{sniff_cmd}` 并解析 [FASTSHIP_SNIFF] 行：")
+    print("      action=resume → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒（绝不 kill 进程）；")
+    print("      action=notify_user → 立即用最醒目可用通道通知用户，原样附上整行证据；")
+    print("      verdict=session_done / no_session → 停止本 loop。判定纯本地零 LLM。\n")
 
 
 def cmd_start(requirement: str, argv: list = None) -> int:
@@ -3314,6 +3636,7 @@ def cmd_start(requirement: str, argv: list = None) -> int:
         print(f"     cd {shlex.quote(worktree_meta['path'])}")
         print(f"     FASTSHIP_SESSION={shlex.quote(session_id)} python3 {shlex.quote(os.path.abspath(__file__))} next\n")
     print(next_text)
+    _print_sniff_hint(session_id, state_repo)
     return 0
 
 
@@ -3495,6 +3818,21 @@ def cmd_done(argv: list) -> int:
     return 0
 
 
+def _sniff_status_lines(orch: dict) -> list:
+    """fastship status 的嗅探心跳露出（AC-HB-2）：监控者失效必须可见（ops-5）。"""
+    data = fastship_state.load_json(fastship_state.sniff_state_path())
+    interval = _sniff_interval_s()
+    if not data or not data.get("last_check_at"):
+        if orch.get("current_step") not in ("done", "stopped"):
+            return ["🕵️  嗅探未启动 — 建议运行 start 输出的 /loop 嗅探命令（后台存活监控）"]
+        return []
+    age = _iso_age_s(datetime.now(), data["last_check_at"])
+    if age > 2 * interval:
+        return [f"⚠️  watchdog stale: 嗅探最后心跳 {data['last_check_at']}（{age}s 前 > "
+                f"2×{interval}s）— 嗅探 loop 可能已死，需重新启动"]
+    return [f"🕵️  嗅探心跳: {data['last_check_at']}（{age}s 前）"]
+
+
 def cmd_status() -> int:
     st = load_orch_state()
     if not st:
@@ -3506,6 +3844,8 @@ def cmd_status() -> int:
             print("❌ 没有活跃 session。")
         return 1
     print(format_status(st))
+    for line in _sniff_status_lines(st):
+        print(line)
     return 0
 
 
@@ -3755,6 +4095,7 @@ def main():
         print("  adopt-branch       将活跃 session 迁移到当前分支")
         print("  sweep-worktrees [--dry-run]  清理 fastship 创建且已完成/合入的 worktree")
         print("  reset [--all]      重置当前 session 或全部 sessions")
+        print("  sniff [--jobs-dir D]  嗅探一轮：后台任务存活判定（/loop agent 每轮调用）")
         sys.exit(1)
 
     cmd = argv[0]
@@ -3789,6 +4130,8 @@ def main():
         sys.exit(cmd_sweep_worktrees(argv[1:]))
     elif cmd == "render-plan":
         sys.exit(cmd_render_plan(argv[1:]))
+    elif cmd == "sniff":
+        sys.exit(cmd_sniff(argv[1:]))
     elif cmd in handlers:
         sys.exit(handlers[cmd]())
     else:

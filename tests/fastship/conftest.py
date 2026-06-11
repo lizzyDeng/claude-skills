@@ -47,3 +47,24 @@ def isolate_fastship_state_home(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     empty_repo_root = tmp_path_factory.mktemp("fastship_empty_repo_root")
     monkeypatch.setenv("FASTSHIP_REPO_ROOT", str(empty_repo_root))
+
+
+@pytest.fixture(autouse=True)
+def restore_fastship_session_env():
+    """Snapshot/restore FASTSHIP_SESSION around every test.
+
+    Root cause this guards against: ``cmd_start`` (and ``use``) deliberately
+    write ``os.environ[SESSION_ENV]`` so subsequent in-process calls bind the
+    new session. The ``monkeypatch.delenv(..., raising=False)`` above registers
+    NO undo when the key is already absent, so a test that drives ``cmd_start``
+    leaks the session id into every later test in the same pytest process —
+    including other test packages (tests/forge reads it via
+    ``current_fastship_session_id``). An explicit snapshot/restore is the only
+    shape that undoes writes made *during* the test by code under test.
+    """
+    prev = os.environ.get("FASTSHIP_SESSION")
+    yield
+    if prev is None:
+        os.environ.pop("FASTSHIP_SESSION", None)
+    else:
+        os.environ["FASTSHIP_SESSION"] = prev

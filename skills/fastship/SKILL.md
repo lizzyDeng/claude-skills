@@ -19,6 +19,29 @@ fastship 支持并行多个活跃需求。每个需求有独立 session/state：
 默认 session 由需求文本生成；需要和 Forge feature 对齐时使用 `--session <feature-slug>`。
 默认 `start` 会尽力创建隔离 worktree：先同步 `staging`（若该分支已在某个 worktree checkout，则在那里 `git pull --ff-only origin staging`；否则 `git fetch origin staging`），再 `git worktree add -b fastship/<session> .claude/worktrees/<session> origin/staging`，并在该 worktree 的 `{git-dir}/fastship` 下写 session state。创建成功后必须 `cd` 到输出的 worktree 路径继续执行；创建失败且未加 `--require-worktree` 时降级为当前工作区启动并打印警告。项目可在 `.claude/fastship.project.json` 的 `git.base_branch` / `git.worktree_root` / `git.branch_prefix` / `git.worktree_mode` 覆盖默认值；一次性覆盖用 `start --base <branch> --worktree-root <path> --branch <name>`。
 
+## 嗅探 loop（后台存活监控）
+
+🔴 **start 成功后，驱动 agent 必须立即以后台方式自动启动嗅探 loop**（Claude Code 主路径，
+用户零动作）：取 start 输出的 🕵️ hint 段里的 /loop 嗅探命令原样执行。CLI/Codex 等无后台
+能力的环境降级为提示用户手动粘贴该命令。
+
+嗅探每轮只跑一条纯 stdlib 命令（`orchestrator.py sniff`，零 LLM 判定），按其单行
+`[FASTSHIP_SNIFF]` 输出行动：
+
+- `action=resume` → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒。**绝不 kill
+  任何进程**——硬卡死交给升级通知，由用户决策。
+- `action=notify_user` → 立即用最醒目可用通道通知用户，原样附上整行证据链
+  （signal / stalled_since / stalled_s / resume_at）。
+- `verdict=session_done` / `no_session` → 流程已终结，停止本 loop。
+
+判定信号只有两个权威源：bg job 的 state.json `state` 字段（绝不看 mtime）+ 当前 step
+停留时长（等人步骤 1.5/1.6/3.5 豁免）。resume/通知按事件键 (step, 信号, 事件标识) 去重
+持久化在 sniff-state.json——不同 bg job、或 step 重入刷新 entered_at 都是新事件、重新走
+完整升级链；同一事件链终身 resume 一次、notify 一次，不会风暴。嗅探心跳在
+`fastship status` 可见，超龄显示 ⚠️ watchdog stale。阈值与轮询间隔均可在
+`.claude/fastship.project.json` 的 `sniff` 段覆盖
+（`{"sniff": {"threshold_default_s": 3600, "thresholds": {"3.1": 7200}, "interval_s": 240}}`）。
+
 ## 双模工作方式
 
 ### Claude Code（hook 模式 — 最强）
