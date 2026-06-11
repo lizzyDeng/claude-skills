@@ -2953,3 +2953,42 @@ class TestSniff:
             {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
         d = _sniff_once(tmp_path, capsys)
         assert d["verdict"] == "ok" and "bg_shared_root" in d.get("note", "")
+
+
+class TestSniffHint:
+    def test_start_prints_executable_sniff_hint(self, tmp_path, monkeypatch, capsys):
+        import re
+        from orchestrator import cmd_start, _sniff_interval_s
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("FASTSHIP_REPO_ROOT", str(tmp_path / "repo"))
+        (tmp_path / "repo").mkdir()
+        rc = cmd_start("hint fixture", ["--no-worktree"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "/loop" in out and "sniff" in out and str(_sniff_interval_s()) in out
+        m = re.search(r"FASTSHIP_SESSION=(\S+) python3 (\S+) sniff", out)
+        assert m, "hint 必须含可原样执行的 sniff 命令"
+        sid, script = m.group(1), m.group(2)
+        assert sid.strip("'\"") and os.path.exists(script.strip("'\""))
+        assert "FASTSHIP_STATE_HOME=" in out  # env 设定时 hint 带前缀，保证可原样执行
+        assert "session_done" in out          # AC-STOP-1 第二半：停止指示
+
+
+class TestSniffStatusLines:
+    def test_status_three_states(self, tmp_path, monkeypatch):
+        import fastship_state
+        from orchestrator import _sniff_status_lines, _sniff_interval_s
+        st = _mk_session(tmp_path, monkeypatch)
+        # (a) 未启动
+        lines = _sniff_status_lines(st)
+        assert any("嗅探未启动" in l for l in lines)
+        # (b) 健康心跳
+        fastship_state.save_json(fastship_state.sniff_state_path(),
+                                 {"last_check_at": datetime.now().isoformat()})
+        lines = _sniff_status_lines(st)
+        assert any("嗅探心跳" in l for l in lines) and not any("stale" in l for l in lines)
+        # (c) 心跳超龄（2×interval+60s）→ ⚠️ stale
+        old = (datetime.now() - timedelta(seconds=2 * _sniff_interval_s() + 60)).isoformat()
+        fastship_state.save_json(fastship_state.sniff_state_path(), {"last_check_at": old})
+        lines = _sniff_status_lines(st)
+        assert any("watchdog stale" in l for l in lines)

@@ -3506,6 +3506,24 @@ def _session_id_for_start(requirement: str) -> str:
     return fastship_state.session_id_from_requirement(requirement)
 
 
+def _print_sniff_hint(session_id: str, state_repo: str):
+    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。Claude Code 主路径：驱动
+    agent 见到本段应立即按 SKILL.md 指示后台自动启动；CLI/Codex：用户手动粘贴。
+    命令必须可原样执行：FASTSHIP_STATE_HOME 被显式设置时一并嵌入（state 解析一致）。"""
+    interval = _sniff_interval_s()
+    env_bits = []
+    if os.environ.get("FASTSHIP_STATE_HOME"):
+        env_bits.append(f"FASTSHIP_STATE_HOME={shlex.quote(os.environ['FASTSHIP_STATE_HOME'])}")
+    env_bits.append(f"FASTSHIP_SESSION={shlex.quote(session_id)}")
+    sniff_cmd = (f"cd {shlex.quote(state_repo)} && " + " ".join(env_bits)
+                 + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff")
+    print("🕵️  嗅探 loop（后台存活监控）— Claude Code 下驱动 agent 应立即后台自动启动；CLI 手动粘贴：")
+    print(f"   /loop {interval}s 跑 `{sniff_cmd}` 并解析 [FASTSHIP_SNIFF] 行：")
+    print("      action=resume → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒（绝不 kill 进程）；")
+    print("      action=notify_user → 立即用最醒目可用通道通知用户，原样附上整行证据；")
+    print("      verdict=session_done / no_session → 停止本 loop。判定纯本地零 LLM。\n")
+
+
 def cmd_start(requirement: str, argv: list = None) -> int:
     if argv is None:
         argv = []
@@ -3568,6 +3586,7 @@ def cmd_start(requirement: str, argv: list = None) -> int:
         print(f"     cd {shlex.quote(worktree_meta['path'])}")
         print(f"     FASTSHIP_SESSION={shlex.quote(session_id)} python3 {shlex.quote(os.path.abspath(__file__))} next\n")
     print(next_text)
+    _print_sniff_hint(session_id, state_repo)
     return 0
 
 
@@ -3749,6 +3768,21 @@ def cmd_done(argv: list) -> int:
     return 0
 
 
+def _sniff_status_lines(orch: dict) -> list:
+    """fastship status 的嗅探心跳露出（AC-HB-2）：监控者失效必须可见（ops-5）。"""
+    data = fastship_state.load_json(fastship_state.sniff_state_path())
+    interval = _sniff_interval_s()
+    if not data or not data.get("last_check_at"):
+        if orch.get("current_step") not in ("done", "stopped"):
+            return ["🕵️  嗅探未启动 — 建议运行 start 输出的 /loop 嗅探命令（后台存活监控）"]
+        return []
+    age = _iso_age_s(datetime.now(), data["last_check_at"])
+    if age > 2 * interval:
+        return [f"⚠️  watchdog stale: 嗅探最后心跳 {data['last_check_at']}（{age}s 前 > "
+                f"2×{interval}s）— 嗅探 loop 可能已死，需重新启动"]
+    return [f"🕵️  嗅探心跳: {data['last_check_at']}（{age}s 前）"]
+
+
 def cmd_status() -> int:
     st = load_orch_state()
     if not st:
@@ -3760,6 +3794,8 @@ def cmd_status() -> int:
             print("❌ 没有活跃 session。")
         return 1
     print(format_status(st))
+    for line in _sniff_status_lines(st):
+        print(line)
     return 0
 
 
@@ -4009,6 +4045,7 @@ def main():
         print("  adopt-branch       将活跃 session 迁移到当前分支")
         print("  sweep-worktrees [--dry-run]  清理 fastship 创建且已完成/合入的 worktree")
         print("  reset [--all]      重置当前 session 或全部 sessions")
+        print("  sniff [--jobs-dir D]  嗅探一轮：后台任务存活判定（/loop agent 每轮调用）")
         sys.exit(1)
 
     cmd = argv[0]
@@ -4043,6 +4080,8 @@ def main():
         sys.exit(cmd_sweep_worktrees(argv[1:]))
     elif cmd == "render-plan":
         sys.exit(cmd_render_plan(argv[1:]))
+    elif cmd == "sniff":
+        sys.exit(cmd_sniff(argv[1:]))
     elif cmd in handlers:
         sys.exit(handlers[cmd]())
     else:
