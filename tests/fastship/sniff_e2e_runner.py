@@ -55,7 +55,7 @@ def main():
     sid = (re.search(r"Session: (\S+)", r.stdout) or [None, ""])[1]
     turn("hint has /loop + interval + stop rule", "/loop" in r.stdout and "240" in r.stdout
          and "session_done" in r.stdout and "sniff" in r.stdout)
-    hint = re.search(r"`(cd .+? sniff)`", r.stdout)
+    hint = re.search(r"`(cd .+? sniff --session \S+)`", r.stdout)  # FIX5: 显式 --session 兜底
     turn("hint embeds full command with real session id",
          bool(hint) and sid in hint.group(1) and home in hint.group(1))
     if hint:

@@ -2719,6 +2719,9 @@ def _apply_codex_fail_rollback(orch: dict, target_step: str):
     orch["completed_steps"] = [s for s in orch.get("completed_steps", []) if s not in clear_steps]
     orch["current_step"] = target_step
     orch["phase"] = 1
+    # 与其余 6 处 current_step 变更对齐：rewind 必须重打 entered_at，否则 sniff 拿
+    # 旧戳在 rollback 后立刻误报 stalled，且 step_stale 事件键（=entered_at）不开新链。
+    _stamp_step_entry(orch)
 
 
 def _codex_fail_rollback_label(target_step: str) -> str:
@@ -3316,6 +3319,13 @@ def _parse_sniff_line(line: str) -> dict:
     return out
 
 
+def _sniff_event_rec(events: dict, key: str) -> dict:
+    """事件记录读取的形状防御：手改 sniff-state.json 里 truthy 非 dict 的事件值
+    （如 "events": {"k": "x"}）当空记录处理，绝不让 .get 崩掉 exit-0 契约。"""
+    rec = events.get(key)
+    return rec if isinstance(rec, dict) else {}
+
+
 def _iso_age_s(now_dt, iso_str) -> int:
     try:
         dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
@@ -3335,12 +3345,20 @@ def _sniff_interval_s() -> int:
 
 
 def _sniff_step_threshold_s(step_id: str, phase) -> int:
+    # 坏配置值逐级回退（per-step → threshold_default_s → 内建默认），与
+    # _sniff_interval_s 同款容错 —— 配置错绝不让 cmd_sniff 崩掉 exit-0 契约。
     cfg = fastship_state.load_project_config().get("sniff") or {}
     per_step = cfg.get("thresholds") or {}
     if step_id in per_step:
-        return int(per_step[step_id])
+        try:
+            return int(per_step[step_id])
+        except (TypeError, ValueError):
+            pass
     if "threshold_default_s" in cfg:
-        return int(cfg["threshold_default_s"])
+        try:
+            return int(cfg["threshold_default_s"])
+        except (TypeError, ValueError):
+            pass
     try:
         return SNIFF_PHASE_THRESHOLDS_S.get(int(phase), SNIFF_THRESHOLD_DEFAULT_S)
     except (TypeError, ValueError):
@@ -3361,7 +3379,10 @@ def _other_active_session_shares_root(sid: str, roots: list) -> bool:
         o = fastship_state.load_json(fastship_state.orchestrator_state_path(other))
         if not o or o.get("current_step") in ("done", "stopped", None):
             continue
-        oroots = {o.get("repo_root"), (o.get("worktree") or {}).get("path")}
+        # 落盘的根可能是 symlink 形态（macOS /var↔/private/var）：与调用方一致
+        # realpath 归一，否则保守跳过被静默击穿，sniff 替别的 session 行动。
+        oroots = {os.path.realpath(p) for p in
+                  (o.get("repo_root"), (o.get("worktree") or {}).get("path")) if p}
         if any(r in oroots for r in roots):
             return True
     return False
@@ -3377,15 +3398,20 @@ def cmd_sniff(argv: list = None) -> int:
     daemon 心跳刷新故不进 key，否则 resume 风暴）。"""
     args = list(argv or [])
     jobs_dir = os.path.expanduser("~/.claude/jobs")
+    session_arg = None
     i = 0
     while i < len(args):
         if args[i] == "--jobs-dir" and i + 1 < len(args):
             jobs_dir = args[i + 1]
             i += 2
             continue
+        if args[i] == "--session" and i + 1 < len(args):
+            session_arg = args[i + 1]   # env 前缀被剥掉时的显式绑定兜底
+            i += 2
+            continue
         i += 1
 
-    sid = fastship_state.resolve_session_id()
+    sid = fastship_state.resolve_session_id(explicit=session_arg)
     orch = fastship_state.load_json(fastship_state.orchestrator_state_path(sid)) if sid else None
     if not orch:
         print(f"{SNIFF_LINE_PREFIX} session={sid or '-'} verdict=no_session action=stop_loop")
@@ -3396,6 +3422,9 @@ def cmd_sniff(argv: list = None) -> int:
     sniff = fastship_state.load_json(spath) or {}
     sniff["last_check_at"] = now.isoformat()           # AC-HB-1：每轮心跳
     events = sniff.setdefault("events", {})
+    if not isinstance(events, dict):                   # 手改成 [] 等形状 → 矫正
+        events = {}
+        sniff["events"] = events
     step = orch.get("current_step")
 
     if step in ("done", "stopped"):
@@ -3462,9 +3491,9 @@ def cmd_sniff(argv: list = None) -> int:
 
     # 升级链（事件键去重，计数持久化 —— 防 resume 风暴/告警疲劳）
     chosen = next((c for c in candidates
-                   if not (events.get(c[0]) or {}).get("notified")), candidates[0])
+                   if not _sniff_event_rec(events, c[0]).get("notified")), candidates[0])
     key, signal, since, stalled_s, extra = chosen
-    rec = events.get(key) or {}
+    rec = _sniff_event_rec(events, key)
     evidence = f" signal={signal} stalled_since={since} stalled_s={stalled_s}{extra}"
     if not rec.get("resume_attempts"):
         rec.update({"resume_attempts": 1, "resume_at": now.isoformat(),
@@ -3516,8 +3545,11 @@ def _print_sniff_hint(session_id: str, state_repo: str):
     if os.environ.get("FASTSHIP_STATE_HOME"):
         env_bits.append(f"FASTSHIP_STATE_HOME={shlex.quote(os.environ['FASTSHIP_STATE_HOME'])}")
     env_bits.append(f"FASTSHIP_SESSION={shlex.quote(session_id)}")
+    # --session 与 env 前缀双保险：loop agent 转述命令时若剥掉 env 前缀，
+    # 显式参数仍把 sniff 钉在本 session 上（绝不静默落到 registry current_session）。
     sniff_cmd = (f"cd {shlex.quote(state_repo)} && " + " ".join(env_bits)
-                 + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff")
+                 + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff"
+                 + f" --session {shlex.quote(session_id)}")
     print("🕵️  嗅探 loop（后台存活监控）— Claude Code 下驱动 agent 应立即后台自动启动；CLI 手动粘贴：")
     print(f"   /loop {interval}s 跑 `{sniff_cmd}` 并解析 [FASTSHIP_SNIFF] 行：")
     print("      action=resume → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒（绝不 kill 进程）；")

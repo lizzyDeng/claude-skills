@@ -2731,6 +2731,20 @@ class TestStepEnteredAt:
         assert st["current_step"] == "2.5"
         assert st["step_entered_at"]["2.5"] > "2020-01-01"  # rewind 重置计时，防回退步秒级误报
 
+    @pytest.mark.parametrize("target", ["1.4", "1.3r"])
+    def test_codex_fail_rollback_restamps_target_step(self, target):
+        # codex FAIL rewind 必须刷新 entered_at：否则 sniff 拿旧戳立刻误报
+        # stalled→resume→notify，且 step_stale 事件键（=entered_at）不开新链。
+        from orchestrator import empty_orchestrator_state, _apply_codex_fail_rollback
+        st = empty_orchestrator_state("x")
+        st["current_step"] = "1.5c"
+        st["phase"] = 1
+        old = "2000-01-01T00:00:00"
+        st["step_entered_at"][target] = old
+        _apply_codex_fail_rollback(st, target)
+        assert st["current_step"] == target
+        assert st["step_entered_at"][target] > "2020-01-01"  # 戳已刷新，非 stale 旧值
+
 
 class TestSniffClassify:
     @pytest.mark.parametrize("state,expected", [
@@ -2954,6 +2968,94 @@ class TestSniff:
         d = _sniff_once(tmp_path, capsys)
         assert d["verdict"] == "ok" and "bg_shared_root" in d.get("note", "")
 
+    def test_shared_root_detected_when_other_session_stores_symlink_form(
+            self, tmp_path, monkeypatch, capsys):
+        # macOS /var↔/private/var：另一 session 落盘的是 symlink 形态根，
+        # 守卫两侧都必须 realpath，否则保守跳过被静默击穿。
+        import fastship_state
+        from orchestrator import empty_orchestrator_state, _other_active_session_shares_root
+        st = _mk_session(tmp_path, monkeypatch)
+        real_root = os.path.realpath(st["repo_root"])
+        link = str(tmp_path / "root-alias")
+        os.symlink(real_root, link)
+        other = empty_orchestrator_state("other")
+        other["session_id"] = "other-sym"
+        other["current_step"] = "2.0"
+        other["repo_root"] = link                    # 存的是 symlink 形态
+        fastship_state.save_json(fastship_state.orchestrator_state_path("other-sym"), other)
+        assert _other_active_session_shares_root("sniff-t", [real_root]) is True
+        # cmd_sniff 端到端：归属不可分辨的 blocked job → 保守跳过并打 note
+        jobs = tmp_path / "jobs"
+        (jobs / "jamb").mkdir(parents=True)
+        (jobs / "jamb" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "ok" and "bg_shared_root" in d.get("note", "")
+
+    def test_threshold_config_malformed_falls_back_by_precedence(self, monkeypatch):
+        import fastship_state
+        from orchestrator import _sniff_step_threshold_s, SNIFF_PHASE_THRESHOLDS_S
+        # per-step 坏值 + 合法 threshold_default_s → 落到 default_s 层
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": {"thresholds": {"2.0": "30min"},
+                                               "threshold_default_s": 123}})
+        assert _sniff_step_threshold_s("2.0", 2) == 123
+        # per-step 坏值 + null 的 threshold_default_s → 落到内建 phase 默认
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": {"thresholds": {"2.0": "30min"},
+                                               "threshold_default_s": None}})
+        assert _sniff_step_threshold_s("2.0", 2) == SNIFF_PHASE_THRESHOLDS_S[2]
+        # 只有 null 的 threshold_default_s → 内建 phase 默认
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": {"threshold_default_s": None}})
+        assert _sniff_step_threshold_s("2.0", 2) == SNIFF_PHASE_THRESHOLDS_S[2]
+
+    def test_cmd_sniff_malformed_config_keeps_exit0_contract(
+            self, tmp_path, monkeypatch, capsys):
+        # 文档化形态的坏配置绝不让 cmd_sniff 崩（rc=1 零 verdict 行 = 违约）
+        import fastship_state
+        from orchestrator import cmd_sniff
+        _mk_session(tmp_path, monkeypatch)
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": {"thresholds": {"2.0": "30min"},
+                                               "threshold_default_s": None}})
+        rc = cmd_sniff(["--jobs-dir", str(tmp_path / "jobs")])
+        lines = [l for l in capsys.readouterr().out.splitlines()
+                 if l.startswith("[FASTSHIP_SNIFF]")]
+        assert rc == 0 and len(lines) == 1
+
+    def test_sniff_state_events_list_shape_does_not_crash(self, tmp_path, monkeypatch, capsys):
+        # 手改 sniff-state.json 成 "events": [] → 必须矫正为 {}，不许 AttributeError
+        import fastship_state
+        _mk_session(tmp_path, monkeypatch, entered_offset_s=99999)
+        fastship_state.save_json(fastship_state.sniff_state_path(), {"events": []})
+        d = _sniff_once(tmp_path, capsys)
+        assert d["verdict"] == "stalled" and d["action"] == "resume"
+        sniff = fastship_state.load_json(fastship_state.sniff_state_path())
+        assert isinstance(sniff["events"], dict)       # 形状已矫正并落盘
+
+    def test_sniff_state_nondict_event_value_does_not_crash(self, tmp_path, monkeypatch, capsys):
+        # truthy 非 dict 事件值：既测命中真实事件键的形态，也测杂键形态
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch, entered_offset_s=99999)
+        key = f"2.0|step_stale|{st['step_entered_at']['2.0']}"
+        fastship_state.save_json(fastship_state.sniff_state_path(),
+                                 {"events": {key: "x", "k": "x"}})
+        d = _sniff_once(tmp_path, capsys)              # 候选检查 + rec 读取两处都不许崩
+        assert d["verdict"] == "stalled" and d["action"] == "resume"
+
+    def test_cmd_sniff_session_flag_binds_without_env(self, tmp_path, monkeypatch, capsys):
+        # env 前缀被剥掉时 --session 仍显式绑定，不许静默落到 registry current_session
+        from orchestrator import cmd_sniff, _parse_sniff_line
+        _mk_session(tmp_path, monkeypatch, sid="flag-bound")
+        monkeypatch.delenv("FASTSHIP_SESSION", raising=False)
+        rc = cmd_sniff(["--jobs-dir", str(tmp_path / "jobs"), "--session", "flag-bound"])
+        lines = [l for l in capsys.readouterr().out.splitlines()
+                 if l.startswith("[FASTSHIP_SNIFF]")]
+        assert rc == 0 and len(lines) == 1
+        d = _parse_sniff_line(lines[0])
+        assert d["session"] == "flag-bound" and d["verdict"] == "ok"
+
 
 class TestSniffHint:
     def test_start_prints_executable_sniff_hint(self, tmp_path, monkeypatch, capsys):
@@ -2970,6 +3072,9 @@ class TestSniffHint:
         assert m, "hint 必须含可原样执行的 sniff 命令"
         sid, script = m.group(1), m.group(2)
         assert sid.strip("'\"") and os.path.exists(script.strip("'\""))
+        # env 前缀被剥掉时显式绑定兜底：hint 同时携带 --session（FIX 5 双保险）
+        m2 = re.search(r" sniff --session (\S+)", out)
+        assert m2 and m2.group(1).strip("'\"`") == sid.strip("'\"")
         assert "FASTSHIP_STATE_HOME=" in out  # env 设定时 hint 带前缀，保证可原样执行
         assert "session_done" in out          # AC-STOP-1 第二半：停止指示
 
