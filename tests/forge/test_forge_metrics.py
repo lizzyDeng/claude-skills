@@ -170,7 +170,11 @@ def test_analyze_workflow_script_lint():
         assert "`" not in m[1:-1], "bare backtick inside template literal"
     node=shutil.which("node")
     if node:  # 有 node 才做语法门，无则跳过（lint 仍验形状）
-        r=subprocess.run([node,"--check",p],capture_output=True,text=True)
+        # workflow 脚本不是独立 ESM 文件：运行时 body 跑在 async 函数上下文（顶层
+        # return/await 合法），meta 由 harness 提取。lint 须模拟该形态——否则
+        # node --check 把 .js 当 CommonJS 在 'export' 挂掉，或当 ESM 在顶层 return 挂掉
+        lint_src="(async () => {\n"+src.replace("export const meta","const meta",1)+"\n})()"
+        r=subprocess.run([node,"--check","--input-type=module"],input=lint_src,capture_output=True,text=True)
         assert r.returncode==0, f"node --check failed: {r.stderr}"
 
 
