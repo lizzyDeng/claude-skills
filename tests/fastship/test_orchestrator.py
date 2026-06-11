@@ -3024,6 +3024,75 @@ class TestSniff:
                  if l.startswith("[FASTSHIP_SNIFF]")]
         assert rc == 0 and len(lines) == 1
 
+    def test_config_container_nondict_shapes_fall_back_to_defaults(self, monkeypatch):
+        # truthy 非 dict 容器（{"sniff": "fast"} / {"sniff": {"thresholds": 5}}）：
+        # 两个 helper 都必须回内建默认，绝不 AttributeError / TypeError
+        import fastship_state
+        from orchestrator import (_sniff_interval_s, _sniff_step_threshold_s,
+                                  SNIFF_DEFAULT_INTERVAL_S, SNIFF_PHASE_THRESHOLDS_S)
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": "fast"})
+        assert _sniff_interval_s() == SNIFF_DEFAULT_INTERVAL_S
+        assert _sniff_step_threshold_s("2.0", 2) == SNIFF_PHASE_THRESHOLDS_S[2]
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": {"thresholds": 5}})
+        assert _sniff_interval_s() == SNIFF_DEFAULT_INTERVAL_S
+        assert _sniff_step_threshold_s("2.0", 2) == SNIFF_PHASE_THRESHOLDS_S[2]
+
+    def test_cmd_sniff_nondict_sniff_config_keeps_exit0_contract(
+            self, tmp_path, monkeypatch, capsys):
+        # {"sniff": "fast"} 端到端：exit 0 + 恰好一行 verdict（exit-0 契约）
+        import fastship_state
+        from orchestrator import cmd_sniff
+        _mk_session(tmp_path, monkeypatch)
+        monkeypatch.setattr(fastship_state, "load_project_config",
+                            lambda: {"sniff": "fast"})
+        rc = cmd_sniff(["--jobs-dir", str(tmp_path / "jobs")])
+        lines = [l for l in capsys.readouterr().out.splitlines()
+                 if l.startswith("[FASTSHIP_SNIFF]")]
+        assert rc == 0 and len(lines) == 1
+
+    def test_safe_realpath_guards_nonstr_and_nul(self):
+        from orchestrator import _safe_realpath
+        assert _safe_realpath(123) is None             # 非 str → TypeError 向量
+        assert _safe_realpath(None) is None
+        assert _safe_realpath("a\x00b") is None        # 内嵌 NUL → ValueError 向量
+        assert _safe_realpath("/tmp") == os.path.realpath("/tmp")
+
+    def test_other_session_nonstr_root_no_crash_no_false_skip(
+            self, tmp_path, monkeypatch, capsys):
+        # 损坏的他 session 记录 repo_root=123：不许 TypeError 崩掉 exit-0 契约；
+        # int 根也不等于本 session 根 → 不许误触发保守跳过（blocked 照常告警）
+        import fastship_state
+        from orchestrator import empty_orchestrator_state
+        st = _mk_session(tmp_path, monkeypatch)
+        corrupt = empty_orchestrator_state("corrupt")
+        corrupt["session_id"] = "corrupt-s"
+        corrupt["current_step"] = "2.0"
+        corrupt["repo_root"] = 123                     # 手改坏的非 str 根
+        fastship_state.save_json(
+            fastship_state.orchestrator_state_path("corrupt-s"), corrupt)
+        jobs = tmp_path / "jobs"
+        (jobs / "jx").mkdir(parents=True)
+        (jobs / "jx" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
+        d = _sniff_once(tmp_path, capsys)
+        assert d["action"] == "resume" and d["job"] == "jx"
+
+    def test_own_session_nonstr_repo_root_keeps_exit0_contract(
+            self, tmp_path, monkeypatch, capsys):
+        # 本 session orchestrator.json 被手改 repo_root=123：仍 exit 0 + 一行 verdict
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch)
+        st["repo_root"] = 123
+        fastship_state.save_json(fastship_state.orchestrator_state_path(), st)
+        jobs = tmp_path / "jobs"
+        (jobs / "jy").mkdir(parents=True)
+        (jobs / "jy" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": os.getcwd()}))
+        d = _sniff_once(tmp_path, capsys)              # int 根被滤掉 → 无归属 → ok
+        assert d["verdict"] == "ok" and d["jobs_checked"] == "0"
+
     def test_sniff_state_events_list_shape_does_not_crash(self, tmp_path, monkeypatch, capsys):
         # 手改 sniff-state.json 成 "events": [] → 必须矫正为 {}，不许 AttributeError
         import fastship_state

@@ -3336,8 +3336,20 @@ def _iso_age_s(now_dt, iso_str) -> int:
         return 0
 
 
+def _safe_realpath(p):
+    """realpath 的形状防御：根/cwd 值来自可被手改的 state json —— 非 str
+    （TypeError 向量）或内嵌 NUL 的 str（ValueError 向量）→ None，调用方过滤。"""
+    if not isinstance(p, str):
+        return None
+    try:
+        return os.path.realpath(p)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sniff_interval_s() -> int:
     cfg = fastship_state.load_project_config().get("sniff") or {}
+    cfg = cfg if isinstance(cfg, dict) else {}      # {"sniff": "fast"} 容器形状防御
     try:
         return int(cfg.get("interval_s", SNIFF_DEFAULT_INTERVAL_S))
     except (TypeError, ValueError):
@@ -3347,8 +3359,11 @@ def _sniff_interval_s() -> int:
 def _sniff_step_threshold_s(step_id: str, phase) -> int:
     # 坏配置值逐级回退（per-step → threshold_default_s → 内建默认），与
     # _sniff_interval_s 同款容错 —— 配置错绝不让 cmd_sniff 崩掉 exit-0 契约。
+    # 容器本身也可能是 truthy 非 dict（{"sniff": "fast"} / {"thresholds": 5}）。
     cfg = fastship_state.load_project_config().get("sniff") or {}
+    cfg = cfg if isinstance(cfg, dict) else {}
     per_step = cfg.get("thresholds") or {}
+    per_step = per_step if isinstance(per_step, dict) else {}
     if step_id in per_step:
         try:
             return int(per_step[step_id])
@@ -3381,8 +3396,9 @@ def _other_active_session_shares_root(sid: str, roots: list) -> bool:
             continue
         # 落盘的根可能是 symlink 形态（macOS /var↔/private/var）：与调用方一致
         # realpath 归一，否则保守跳过被静默击穿，sniff 替别的 session 行动。
-        oroots = {os.path.realpath(p) for p in
-                  (o.get("repo_root"), (o.get("worktree") or {}).get("path")) if p}
+        # _safe_realpath：手改坏的非 str/含 NUL 根 → 滤掉，绝不崩 exit-0 契约。
+        oroots = {rp for rp in (_safe_realpath(p) for p in
+                  (o.get("repo_root"), (o.get("worktree") or {}).get("path"))) if rp}
         if any(r in oroots for r in roots):
             return True
     return False
@@ -3449,8 +3465,8 @@ def cmd_sniff(argv: list = None) -> int:
 
     # 信号 2：归属本 session（cwd 在 repo/worktree 下）的 bg job 卡在 blocked
     # cwd 来自外部 job state，realpath 归一两侧（macOS /var↔/private/var 等 symlink 形态）
-    roots = [os.path.realpath(r) for r in (orch.get("repo_root"),
-                                           (orch.get("worktree") or {}).get("path")) if r]
+    roots = [rp for rp in (_safe_realpath(r) for r in (orch.get("repo_root"),
+             (orch.get("worktree") or {}).get("path"))) if rp]
     jobs_checked = 0
     jobs_unknown = 0
     blocked_jobs = []
