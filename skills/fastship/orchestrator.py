@@ -3338,8 +3338,9 @@ def _iso_age_s(now_dt, iso_str) -> int:
 
 def _safe_realpath(p):
     """realpath 的形状防御：根/cwd 值来自可被手改的 state json —— 非 str
-    （TypeError 向量）或内嵌 NUL 的 str（ValueError 向量）→ None，调用方过滤。"""
-    if not isinstance(p, str):
+    （TypeError 向量）、空串（realpath("")=进程 cwd，伪造归属/误压真告警）
+    或内嵌 NUL 的 str（ValueError 向量）→ None，调用方过滤。"""
+    if not (isinstance(p, str) and p):
         return None
     try:
         return os.path.realpath(p)
@@ -3473,7 +3474,7 @@ def cmd_sniff(argv: list = None) -> int:
     for jid, info in sorted(_scan_bg_jobs(jobs_dir).items()):
         if SNIFF_SELF_MARKER in str(info.get("intent") or ""):
             continue   # 自我排除（AC-SCOPE-1：嗅探不互相 resume）
-        cwd = os.path.realpath(info["cwd"]) if info.get("cwd") else ""
+        cwd = _safe_realpath(info.get("cwd")) or ""    # 非 str/空 → ""（无归属语义）
         if not any(cwd == r or cwd.startswith(r.rstrip("/") + "/") for r in roots):
             continue   # 只盯本 session 的任务
         jobs_checked += 1

@@ -3056,6 +3056,7 @@ class TestSniff:
         from orchestrator import _safe_realpath
         assert _safe_realpath(123) is None             # 非 str → TypeError 向量
         assert _safe_realpath(None) is None
+        assert _safe_realpath("") is None              # realpath("")=进程 cwd，伪造归属向量
         assert _safe_realpath("a\x00b") is None        # 内嵌 NUL → ValueError 向量
         assert _safe_realpath("/tmp") == os.path.realpath("/tmp")
 
@@ -3091,6 +3092,59 @@ class TestSniff:
         (jobs / "jy" / "state.json").write_text(json.dumps(
             {"state": "blocked", "intent": "cargo build", "cwd": os.getcwd()}))
         d = _sniff_once(tmp_path, capsys)              # int 根被滤掉 → 无归属 → ok
+        assert d["verdict"] == "ok" and d["jobs_checked"] == "0"
+
+    def test_other_session_empty_repo_root_no_false_shared_root_skip(
+            self, tmp_path, monkeypatch, capsys):
+        # 9c7a3d5 回归：他 session 记录 repo_root=""，realpath("")=进程 cwd ——
+        # sniff 按 hint 形态 `cd <repo> && ...` 跑（cwd=本 session 根）时，
+        # 空串根会伪造成同根 → 误触发 bg_shared_root 压掉真告警。空串必须滤掉。
+        import fastship_state
+        from orchestrator import empty_orchestrator_state
+        st = _mk_session(tmp_path, monkeypatch)
+        monkeypatch.chdir(os.path.realpath(st["repo_root"]))   # hint 的正常 cwd 形态
+        other = empty_orchestrator_state("empty root")
+        other["session_id"] = "empty-s"
+        other["current_step"] = "2.0"
+        other["repo_root"] = ""                        # 手改坏的空串根
+        fastship_state.save_json(
+            fastship_state.orchestrator_state_path("empty-s"), other)
+        jobs = tmp_path / "jobs"
+        (jobs / "jz").mkdir(parents=True)
+        (jobs / "jz" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": st["repo_root"]}))
+        d = _sniff_once(tmp_path, capsys)              # 真告警必须照常发出
+        assert d["action"] == "resume" and d["job"] == "jz"
+        assert "bg_shared_root" not in d.get("note", "")
+
+    def test_own_session_empty_repo_root_no_cwd_self_attribution(
+            self, tmp_path, monkeypatch, capsys):
+        # 本 session repo_root=""：roots 不许坍缩成 [cwd] 抢占进程 cwd 下的 job
+        import fastship_state
+        st = _mk_session(tmp_path, monkeypatch)
+        st["repo_root"] = ""
+        fastship_state.save_json(fastship_state.orchestrator_state_path(), st)
+        jobs = tmp_path / "jobs"
+        (jobs / "jw").mkdir(parents=True)
+        (jobs / "jw" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": os.getcwd()}))
+        d = _sniff_once(tmp_path, capsys)              # 空串根被滤掉 → 无归属 → ok
+        assert d["verdict"] == "ok" and d["jobs_checked"] == "0"
+
+    def test_bg_job_nonstr_cwd_keeps_exit0_contract(self, tmp_path, monkeypatch, capsys):
+        # bg job state.json 手改成 "cwd": 123：不许 TypeError 崩掉 exit-0 契约；
+        # job 照常分类但不归属本 session（与缺失 cwd 的 "" 无匹配语义一致）
+        from orchestrator import cmd_sniff, _parse_sniff_line
+        _mk_session(tmp_path, monkeypatch)
+        jobs = tmp_path / "jobs"
+        (jobs / "jn").mkdir(parents=True)
+        (jobs / "jn" / "state.json").write_text(json.dumps(
+            {"state": "blocked", "intent": "cargo build", "cwd": 123}))
+        rc = cmd_sniff(["--jobs-dir", str(jobs)])
+        lines = [l for l in capsys.readouterr().out.splitlines()
+                 if l.startswith("[FASTSHIP_SNIFF]")]
+        assert rc == 0 and len(lines) == 1
+        d = _parse_sniff_line(lines[0])
         assert d["verdict"] == "ok" and d["jobs_checked"] == "0"
 
     def test_sniff_state_events_list_shape_does_not_crash(self, tmp_path, monkeypatch, capsys):
