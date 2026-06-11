@@ -2992,3 +2992,16 @@ class TestSniffStatusLines:
         fastship_state.save_json(fastship_state.sniff_state_path(), {"last_check_at": old})
         lines = _sniff_status_lines(st)
         assert any("watchdog stale" in l for l in lines)
+
+
+class TestSniffDocs:
+    @pytest.mark.parametrize("rel", ["skills/fastship/SKILL.md", ".claude/commands/fastship.md"])
+    def test_docs_mandate_auto_sniffer(self, rel):
+        root = os.path.join(os.path.dirname(__file__), "..", "..")
+        text = open(os.path.join(root, rel), encoding="utf-8").read()
+        # 锚点：同一文档中指令性自动启动语义 + 嗅探 + loop 共现（AC-START-2）
+        assert "start 成功后" in text and "自动" in text and "启动嗅探 loop" in text
+        assert "手动粘贴" in text          # CLI 降级说明
+        assert "绝不 kill" in text         # 软 resume 语义
+        assert "session_done" in text      # 停止条件
+        assert "interval_s" in text        # 间隔可配（P2 修正：文档与实现一致）
