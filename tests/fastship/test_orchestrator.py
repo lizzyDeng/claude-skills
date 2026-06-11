@@ -2688,3 +2688,13 @@ class TestGrillForkResolution:
         _write_grill(tmp_path, orch, resolutions=None)
         ok, msg = validate_grill(orch, {})
         assert ok, msg
+
+
+class TestSniffStatePath:
+    def test_sniff_state_path_in_session_dir(self, monkeypatch, tmp_path):
+        import fastship_state
+        monkeypatch.setenv("FASTSHIP_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv("FASTSHIP_SESSION", "sess-a")
+        p = fastship_state.sniff_state_path()
+        assert p == os.path.join(str(tmp_path), "sessions", "sess-a", "sniff-state.json")
+        assert os.path.dirname(p) == os.path.dirname(fastship_state.gate_state_path())
