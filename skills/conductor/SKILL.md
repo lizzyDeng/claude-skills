@@ -41,11 +41,14 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 🔴 **方案合成本身就是 `判断`**——主循环是便宜档时禁止闭门自产方案。动代码的任务
 （`需求` / `bugfix`）必须由两个 Opus 叶子完成拆解，主循环只调度与转述（指挥不主奏）：
 
-1. **plan 叶**（`model:'opus'`）：产出 方案 + 步骤清单 + **验收标准**（可执行命令 /
-   可观察行为，执行前锁定——这就是本次交付的 E2E 定义）。`bugfix` 的 plan 必须以
-   「复现 + 根因定位」开头，验收标准 = 复现用例由红转绿；禁止跳根因修症状。
+1. **plan 叶**（`model:'opus'`）：产出 方案 + 步骤清单 + **鲁棒性清单**（见下，逐项
+   覆盖或写 N/A + 理由）+ **验收标准**（可执行命令 / 可观察行为，执行前锁定——这就是
+   本次交付的 E2E 定义；🔴 必须含至少一条**非 happy path 验收**：失败注入 / 弱网或
+   超时模拟 / 非法输入）。`bugfix` 的 plan 必须以「复现 + 根因定位」开头，验收标准 =
+   复现用例由红转绿；禁止跳根因修症状。
 2. **grill 叶**（`model:'opus'`）：对 plan 对抗拷问——漏洞、边界、被忽略的更优解、
-   验收标准是否真能证明交付。按结论修订 plan 后拆解才算完成。
+   **鲁棒性清单逐项核验（重点打 N/A 项：真不适用还是偷懒）**、验收标准是否真能
+   证明交付。按结论修订 plan 后拆解才算完成。
 
 `审计/研究` 类可由主循环直接拆解（产出是报告，错了重跑代价低），验收标准 =
 覆盖完整 + 无静默截断。
@@ -60,6 +63,7 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
   + **验收标准**——用户确认的是「方案 + 验收」的整体，验收标准确认后即锁定。
 - **涉及前端 UI 的需求加一档**：必须给出具体 UI 方案——改哪些页面/组件、交互流程、
   布局与视觉处理（文字描述或 ASCII 草图）；有多个合理做法时列 2-3 个选项让用户挑。
+  UI 方案必须含 **loading / error（带重试入口）/ empty** 三个非 success 态的处理。
 - 用户确认/修正后，把确认结论原文记进 ledger，再进 Step 2。
 
 `bugfix` 类不暂停，直接进 Step 2（根因纪律已在 Step 1 强制）。
@@ -73,6 +77,8 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
   上游**全部**结果（join/dedup/early-exit）。说不出理由 = 用 `pipeline`。
 - 结构化产出的叶子必须给 `schema`。
 - 有截断/采样/上限 → `log()` 出被丢弃的部分，禁止静默截断。
+- 🔴 动代码任务：**implement 叶的 prompt 必须内嵌 plan 鲁棒性清单中与其负责范围对应
+  的条目，review 叶按同一清单逐项核验**——清单只活在 plan 里、实现叶看不见 = 白写。
 
 ### 3. 执行
 跑 Workflow。把最终脚本原文 + 每个 `agent()` 的路由表（label → 档位 → 判断/机械）抄进 ledger。
@@ -96,6 +102,7 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 | 暂停纪律 | `需求` 类是否在 1.5 真正暂停等确认；UI 需求是否给了具体 UI 方案 |
 | 计划纪律 | 动代码任务是否真派了 Opus plan 叶 + grill 叶（而非主循环闭门自产方案） |
 | 验收闭环 | 验收标准是否执行前锁定；Step 4 是否附真实命令输出（bugfix：红 → 绿） |
+| 鲁棒性 | 清单是否逐项覆盖（N/A 有理由）；implement 叶是否带清单；验收含非 happy path |
 | 流程忠实度 | 各步是否照走，有无跳步/合并/自创步骤 |
 
 ## 分档 rubric（判断 vs 机械）
@@ -107,6 +114,19 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 | 根因分析、冲突结论的仲裁与合成 | 收集 / 罗列 / 跑命令并转述输出 |
 
 边界情形按"答错的代价"判：答错要返工或误导决策 → `判断`。
+
+## 鲁棒性清单（plan 叶必填）
+
+LLM 写方案天然只写 happy path——所以把非 happy path 做成必填表。每项要么给出设计，
+要么写 `N/A + 一句理由`；**禁止留空，留空 = 没想过 ≠ 不适用**。
+
+| 维度 | 必须回答 |
+|---|---|
+| 外部调用失败 | 每个 API / DB / LLM / 文件调用失败时的行为：报错文案、降级、是否重试 |
+| 弱网与超时 | 超时阈值、重试策略（次数 / 退避）、慢网与离线下的行为 |
+| 输入边界 | 空值 / 超长 / 非法格式 / 重复提交（幂等、双击防抖） |
+| 失败后状态 | 中途失败的回滚或恢复路径，不留半成品状态 |
+| UI 四态 | 涉 UI 必填：loading / error（含重试入口）/ empty / success 四态齐全 |
 
 ## Run Ledger 模板
 
@@ -151,7 +171,8 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 3. **已知失败模式**（评审 Fable ledger 时重点盯）：跳步/合并步骤、agent() 漏标 model、
    判断步配了便宜档、**便宜档主循环闭门自产 plan（没派 Opus plan/grill 叶）**、
    全 barrier 或全 pipeline（不做区分）、静默截断、**验收标准事后补写 / 无真实输出**、
-   ledger 字段缺漏、**`需求` 类不在 1.5 暂停自顾自跑**（历史上最高频的违规，重点验）。
+   **鲁棒性清单留空或全 N/A 糊弄（happy-path-only plan）**、ledger 字段缺漏、
+   **`需求` 类不在 1.5 暂停自顾自跑**（历史上最高频的违规，重点验）。
 4. 基准任务（两臂都没跑过的新任务亦可）：
    > 审计一个 Rust+SQLx 代码库的 SQL 列漂移：找出所有硬编码列清单的 SELECT，
    > 从 migrations 推导各表现行 schema，比对并报告每处漂移（file:line、表、缺/多/错序列、严重度）。
