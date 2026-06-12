@@ -100,7 +100,6 @@ Plan 确认后（步骤 1.6 完成），orchestrator 自动输出 `/goal` 命令
 
 - Claude 自主驱动 Phase 2（执行）+ Phase 3（验证）全流程
 - Phase 2 执行走 ultracode Workflow implement→review pipeline：每个 plan task 实现完立即对抗性 review（设计稿保真度 / spec 合同 / 质量三视角），并在 2.5 合并成 code-review 硬 gate。tests 绿 ≠ 长得像设计稿
-- 🔴 Phase 2 = 推理档（model tier）：2.0 implement→review pipeline 和 2.5 多视角 review 的 dynamic workflow 里，每个 `agent()` 都必须显式 `model: 'opus'`，不继承主模型。Phase 2/3 无硬 hook、整段 /goal 自主驱动，本条与"禁止并行改重叠文件"等同属 instruction 级强约束（执行力相同，非弱于其它 Phase 2 规则）。fastship 在 Phase 2 无 hook 回看 workflow 内每个 agent 的实际模型，故这是 instruction 级"确保"，非门禁级证明
 - Haiku 评估器通过 `[FASTSHIP_GOAL]` 状态行判断是否完成
 - 每步完成后 Claude 运行 `status`，评估器解析 `step=` / `test_passed=` / `e2e_executed=` 等字段
 - Loop Record fail 时 Claude 自主选择 continue（在 3 次上限内），3 次后暂停等用户介入

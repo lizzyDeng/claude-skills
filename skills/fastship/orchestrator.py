@@ -2310,13 +2310,6 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
   将输出的 /goal 命令呈现给用户，请用户执行。
 
 /goal 模式下用 dynamic workflow（ultracode）执行 plan —— 由你读 plan 自主决定扇出：
-
-🔴 模型档位（Phase 2 = 推理档）：你为本阶段编写的 dynamic workflow 里，【每一个 implement
-   agent 和 review agent 的 agent() 调用都必须显式传 model: 'opus'】，不得省略、不得继承可能
-   更弱的主模型档位。implement→review 是全流程推理最重的活。Phase 2 无硬 hook，本条与
-   "禁止并行改重叠文件" 同属 instruction 级强约束，执行力等同其它 Phase 2 规则。
-   （只有一条串行链、直接 subagent-driven 时，同样对每个 implement/review subagent 用 opus。）
-
   1. 选择开发方式（worktree / 新分支 / 当前分支）。整个 implement 在【同一个 session worktree】里跑。
   2. 读已确认 plan 的 task 列表，做【依赖感知拆分】：
        - 文件【不相交】的 task → 可并行组；有先后依赖或改同一批文件的 → 串行链。
@@ -2345,8 +2338,7 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
     Step("2.5", "Code Review", 2, validator=validate_code_review,
          instruction="""🔴 Phase 2 硬 gate：对写出的代码做对抗性 code review（execute 阶段已逐 task review，这里合并成可审查产物 + 卡门）。
 
-用 ultracode Workflow 跑多视角 review，对照三条 lens
-（🔴 Phase 2 = 推理档：每个 review agent 的 agent() 调用必须显式传 model: 'opus'，不继承主模型）：
+用 ultracode Workflow 跑多视角 review，对照三条 lens：
   1. 设计稿/spec 保真度 —— 逐屏/逐组件拿实现对着 plan 引用的设计依据（设计稿 HTML / spec / 截图）比对，
      列出所有偏差。tests 绿 ≠ 长得像设计稿。
   2. spec 合同 —— P0/P1 需求是否真的实现，有无被悄悄降级 / 漏做。
