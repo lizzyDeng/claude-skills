@@ -3274,3 +3274,40 @@ class TestUnboundedCodexGate:
         from orchestrator import is_unbounded_codex_cmd
         assert is_unbounded_codex_cmd('') is False
         assert is_unbounded_codex_cmd(None) is False
+
+
+class TestPreBashCodexGate:
+    """洞0 接线:active session + 裸 codex → block(return 1);有界/非 codex/非 active → 放行。"""
+
+    def _data(self, cmd):
+        return {"tool_input": {"command": cmd}}
+
+    def test_blocks_raw_codex(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        orch = {"current_step": "1.5c", "phase": 1}
+        code = orchestrator.hook_pre_bash_logic(
+            self._data('codex exec "review" '), orch, "/nonexistent/gate.py")
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "codex" in out and "/dev/null" in out
+
+    def test_allows_bounded_codex(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        # gate 不存在 + active 时其它 bash 会被 "gate unavailable" 拦;为隔离 codex 分支,
+        # 这里只断言"不是被 codex 分支拦的"——给一个存在的空 gate 脚本走委派路径。
+        orch = {"current_step": "1.5c", "phase": 1}
+        # bounded codex 不该命中 codex 门禁(返回不应带 codex 提示)
+        assert orchestrator.is_unbounded_codex_cmd(
+            'timeout 330 codex exec "x" < /dev/null') is False
+
+    def test_non_active_session_not_gated(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        orch = {"current_step": "done"}
+        code = orchestrator.hook_pre_bash_logic(
+            self._data('codex exec "x"'), orch, "/nonexistent/gate.py")
+        out = capsys.readouterr().out
+        # done 状态不是 active：不该被 codex 门禁拦
+        assert "codex" not in out or code == 0

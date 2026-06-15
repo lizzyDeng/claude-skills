@@ -2844,6 +2844,15 @@ def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
             print(_branch_mismatch_text(orch_state))
             return 1
 
+    # 洞0：active session 下拦截裸起 codex（缺 timeout 包裹或 stdin 接 /dev/null）。
+    if _is_active(orch_state):
+        cmd = data.get("tool_input", {}).get("command", "")
+        if is_unbounded_codex_cmd(cmd):
+            print("🔴 BLOCKED: 检测到裸起 codex（缺 timeout 包裹或 stdin 未接 /dev/null）。")
+            print("   背景 codex 阻塞在 stdin 会永不退出 → 无完成事件 → harness 永不唤醒 → 流程静坐。")
+            print(SAFE_CODEX_HINT)
+            return 1
+
     if os.path.exists(gate_path):
         code, stdout = delegate_to_gate(gate_path, "pre_bash", data)
         if stdout:
