@@ -2844,6 +2844,15 @@ def hook_pre_bash_logic(data: dict, orch_state: Optional[dict],
             print(_branch_mismatch_text(orch_state))
             return 1
 
+    # 洞0：active session 下拦截裸起 codex（缺 timeout 包裹或 stdin 接 /dev/null）。
+    if _is_active(orch_state):
+        cmd = data.get("tool_input", {}).get("command", "")
+        if is_unbounded_codex_cmd(cmd):
+            print("🔴 BLOCKED: 检测到裸起 codex（缺 timeout 包裹或 stdin 未接 /dev/null）。")
+            print("   背景 codex 阻塞在 stdin 会永不退出 → 无完成事件 → harness 永不唤醒 → 流程静坐。")
+            print(SAFE_CODEX_HINT)
+            return 1
+
     if os.path.exists(gate_path):
         code, stdout = delegate_to_gate(gate_path, "pre_bash", data)
         if stdout:
@@ -2951,6 +2960,8 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
         elif orch.get("current_step") == "done":
             print(f"\n✅ Step {detected} 完成 → 🎉 全部完成！可以合入 main。")
 
+    for line in _loop_liveness_alert_lines(orch):
+        print(line)
     return 0
 
 
@@ -3114,6 +3125,8 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
         elif orch.get("current_step") == "done":
             print(f"\n✅ Step {detected} 完成 → 🎉 全部完成！")
 
+    for line in _loop_liveness_alert_lines(orch):
+        print(line)
     return 0
 
 
@@ -3256,6 +3269,35 @@ def format_next(orch: dict) -> str:
         f"{instruction}\n"
         f"{'─' * 50}"
     )
+
+
+# ── 洞0：裸 codex 启动门禁（纯字符串 predicate，仿 ship_verify_gate 风格）──────────
+# 背景 codex 阻塞在 "Reading additional input from stdin" 会永不退出 → 无完成事件 →
+# harness 永不唤醒驱动 → 流程静坐。要求 codex 启动同时具备 timeout 包裹 + stdin 接
+# /dev/null（gstack codex skill 既有的安全形式）。窄门禁：只盯 `codex`（用户决策）。
+_CODEX_TOKEN_RE = re.compile(r'(^|[\s;&|(])codex(\s|$)')
+_STDIN_DEVNULL_RE = re.compile(r'<\s*/dev/null')
+_TIMEOUT_WRAP_RE = re.compile(
+    r'(^|[\s;&|(])(timeout|gtimeout)\s|_gstack_codex_timeout_wrapper\b')
+
+SAFE_CODEX_HINT = (
+    "   改用有界形式（timeout 包裹 + stdin 接 /dev/null），或直接走 /codex review 安全路径：\n"
+    "     timeout 330 codex exec -s read-only \"<prompt>\" "
+    "-c 'model_reasoning_effort=\"high\"' < /dev/null 2>/tmp/codex.err"
+)
+
+
+def is_unbounded_codex_cmd(cmd) -> bool:
+    """True 当且仅当 cmd 启动 `codex` 但缺【timeout 包裹】或【stdin 接 /dev/null】之一。
+    纯字符串判定，无副作用，可脱离活体 session 单测。窄门禁：非 codex 命令一律 False。
+    已知折中：`echo "... codex "`（带尾空格的 echo 提及）会误命中——窄安全门禁可接受，
+    提示里给了改法。"""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if not _CODEX_TOKEN_RE.search(cmd):
+        return False
+    bounded = bool(_STDIN_DEVNULL_RE.search(cmd)) and bool(_TIMEOUT_WRAP_RE.search(cmd))
+    return not bounded
 
 
 # ── Sniff（后台存活监控）────────────────────────────────────────────────────
@@ -3561,22 +3603,26 @@ def _session_id_for_start(requirement: str) -> str:
     return fastship_state.session_id_from_requirement(requirement)
 
 
-def _print_sniff_hint(session_id: str, state_repo: str):
-    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。Claude Code 主路径：驱动
-    agent 见到本段应立即按 SKILL.md 指示后台自动启动；CLI/Codex：用户手动粘贴。
-    命令必须可原样执行：FASTSHIP_STATE_HOME 被显式设置时一并嵌入（state 解析一致）。"""
-    interval = _sniff_interval_s()
+def _sniff_loop_command(session_id: str, state_repo: str, interval: int = None) -> str:
+    """`/loop <interval>s 跑 `<sniff_cmd>`` 单行。单源:start hint(_print_sniff_hint)
+    与驱动活动存活告警(_loop_liveness_alert_lines)共用，避免命令构造漂移。"""
+    if interval is None:
+        interval = _sniff_interval_s()
     env_bits = []
     if os.environ.get("FASTSHIP_STATE_HOME"):
         env_bits.append(f"FASTSHIP_STATE_HOME={shlex.quote(os.environ['FASTSHIP_STATE_HOME'])}")
     env_bits.append(f"FASTSHIP_SESSION={shlex.quote(session_id)}")
-    # --session 与 env 前缀双保险：loop agent 转述命令时若剥掉 env 前缀，
-    # 显式参数仍把 sniff 钉在本 session 上（绝不静默落到 registry current_session）。
     sniff_cmd = (f"cd {shlex.quote(state_repo)} && " + " ".join(env_bits)
                  + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff"
                  + f" --session {shlex.quote(session_id)}")
+    return f"/loop {interval}s 跑 `{sniff_cmd}`"
+
+
+def _print_sniff_hint(session_id: str, state_repo: str):
+    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。"""
+    loop_cmd = _sniff_loop_command(session_id, state_repo)
     print("🕵️  嗅探 loop（后台存活监控）— Claude Code 下驱动 agent 应立即后台自动启动；CLI 手动粘贴：")
-    print(f"   /loop {interval}s 跑 `{sniff_cmd}` 并解析 [FASTSHIP_SNIFF] 行：")
+    print(f"   {loop_cmd} 并解析 [FASTSHIP_SNIFF] 行：")
     print("      action=resume → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒（绝不 kill 进程）；")
     print("      action=notify_user → 立即用最醒目可用通道通知用户，原样附上整行证据；")
     print("      verdict=session_done / no_session → 停止本 loop。判定纯本地零 LLM。\n")
@@ -3654,6 +3700,8 @@ def cmd_next() -> int:
         print("❌ 没有活跃 session。先 start。")
         return 1
     print(format_next(st))
+    for line in _loop_liveness_alert_lines(st):
+        print(line)
     return 0
 
 
@@ -3816,6 +3864,8 @@ def cmd_done(argv: list) -> int:
     if next_step:
         print()
         print(format_next(st))
+        for line in _loop_liveness_alert_lines(st):
+            print(line)
         if step.id == "1.6" and st.get("current_step") == "2.0":
             _print_goal_hint(st)
     elif st.get("current_step") == "done":
@@ -3839,6 +3889,29 @@ def _sniff_status_lines(orch: dict) -> list:
         return [f"⚠️  watchdog stale: 嗅探最后心跳 {data['last_check_at']}（{age}s 前 > "
                 f"2×{interval}s）— 嗅探 loop 可能已死，需重新启动"]
     return [f"🕵️  嗅探心跳: {data['last_check_at']}（{age}s 前）"]
+
+
+def _loop_liveness_alert_lines(orch) -> list:
+    """洞1:驱动每次活动(next/done/hook 推进)附带的存活告警。loop 未起/超龄 → 返回
+    [告警, 重启命令];心跳新鲜或流程终态 → []（保持安静,不污染正常输出）。纯只读。"""
+    step = (orch or {}).get("current_step")
+    if step in ("done", "stopped", None):
+        return []
+    sid = (orch or {}).get("session_id") or fastship_state.current_session_id()
+    if not sid:
+        return []
+    data = fastship_state.load_json(fastship_state.sniff_state_path(sid))
+    interval = _sniff_interval_s()
+    state_repo = ((orch.get("worktree") or {}).get("path")
+                  or orch.get("repo_root") or _repo_root())
+    restart = "   重启嗅探 loop: " + _sniff_loop_command(sid, state_repo, interval)
+    if not data or not data.get("last_check_at"):
+        return ["🕵️  嗅探 loop 未运行 — 全流程无存活监控,重启:", restart]
+    age = _iso_age_s(datetime.now(), data["last_check_at"])
+    if age > 2 * interval:
+        return [f"⚠️  watchdog stale: 嗅探最后心跳 {age}s 前（>2×{interval}s）,loop 可能已死,重启:",
+                restart]
+    return []
 
 
 def cmd_status() -> int:

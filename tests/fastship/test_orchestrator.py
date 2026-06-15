@@ -3233,3 +3233,182 @@ class TestSniffDocs:
         assert "绝不 kill" in text         # 软 resume 语义
         assert "session_done" in text      # 停止条件
         assert "interval_s" in text        # 间隔可配（P2 修正：文档与实现一致）
+
+
+class TestUnboundedCodexGate:
+    """洞0 纯 predicate:只拦 `codex` 且缺 timeout 包裹或 stdin 未接 /dev/null。"""
+
+    def test_raw_codex_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('codex exec -s read-only "review this"') is True
+
+    def test_codex_with_stdin_but_no_timeout_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('codex exec "x" < /dev/null') is True
+
+    def test_codex_with_timeout_but_no_stdin_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('timeout 330 codex exec "x"') is True
+
+    def test_bounded_codex_is_ok(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('timeout 330 codex exec "x" < /dev/null') is False
+
+    def test_gstack_wrapper_form_is_ok(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd(
+            '_gstack_codex_timeout_wrapper 330 codex review "x" < /dev/null 2>"$E"') is False
+
+    def test_non_codex_command_not_flagged(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('sleep 999 &') is False
+        assert is_unbounded_codex_cmd('cargo test') is False
+
+    def test_codex_substring_not_flagged(self):
+        from orchestrator import is_unbounded_codex_cmd
+        # mycodex / codexfoo 不是 codex 启动
+        assert is_unbounded_codex_cmd('mycodex run') is False
+        assert is_unbounded_codex_cmd('echo codexfoo') is False
+
+    def test_empty_or_nonstr_safe(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('') is False
+        assert is_unbounded_codex_cmd(None) is False
+
+
+class TestPreBashCodexGate:
+    """洞0 接线:active session + 裸 codex → block(return 1);有界/非 codex/非 active → 放行。"""
+
+    def _data(self, cmd):
+        return {"tool_input": {"command": cmd}}
+
+    def test_blocks_raw_codex(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        orch = {"current_step": "1.5c", "phase": 1}
+        code = orchestrator.hook_pre_bash_logic(
+            self._data('codex exec "review" '), orch, "/nonexistent/gate.py")
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "codex" in out and "/dev/null" in out
+
+    def test_allows_bounded_codex(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        # gate 不存在 + active 时其它 bash 会被 "gate unavailable" 拦;为隔离 codex 分支,
+        # 这里只断言"不是被 codex 分支拦的"——给一个存在的空 gate 脚本走委派路径。
+        orch = {"current_step": "1.5c", "phase": 1}
+        # bounded codex 不该命中 codex 门禁(返回不应带 codex 提示)
+        assert orchestrator.is_unbounded_codex_cmd(
+            'timeout 330 codex exec "x" < /dev/null') is False
+
+    def test_non_active_session_not_gated(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "_branch_mismatch", lambda st: False)
+        orch = {"current_step": "done"}
+        code = orchestrator.hook_pre_bash_logic(
+            self._data('codex exec "x"'), orch, "/nonexistent/gate.py")
+        out = capsys.readouterr().out
+        # done 状态不是 active：不该被 codex 门禁拦
+        assert "codex" not in out or code == 0
+
+
+class TestLoopLivenessAlert:
+    """洞1:无心跳/超龄 → 返回告警+重启命令;心跳新鲜/终态 → 返回 []（不污染正常输出）。"""
+
+    def _orch(self, step="1.5c"):
+        return {"current_step": step, "phase": 1, "session_id": "sess-x",
+                "repo_root": "/tmp/repo"}
+
+    def test_no_heartbeat_returns_alert(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        lines = orchestrator._loop_liveness_alert_lines(self._orch())
+        assert lines and any("未运行" in ln for ln in lines)
+        assert any("/loop" in ln for ln in lines)
+
+    def test_stale_heartbeat_returns_alert(self, monkeypatch):
+        import orchestrator
+        old = (datetime.now() - timedelta(seconds=10000)).isoformat()
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": old})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        lines = orchestrator._loop_liveness_alert_lines(self._orch())
+        assert lines and any("stale" in ln.lower() for ln in lines)
+        assert any("/loop" in ln for ln in lines)
+
+    def test_fresh_heartbeat_returns_empty(self, monkeypatch):
+        import orchestrator
+        fresh = datetime.now().isoformat()
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": fresh})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        assert orchestrator._loop_liveness_alert_lines(self._orch()) == []
+
+    def test_terminal_step_returns_empty(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        assert orchestrator._loop_liveness_alert_lines(self._orch(step="done")) == []
+        assert orchestrator._loop_liveness_alert_lines(self._orch(step="stopped")) == []
+
+    def test_sniff_loop_command_shared_shape(self):
+        import orchestrator
+        cmd = orchestrator._sniff_loop_command("sess-x", "/tmp/repo", 240)
+        assert cmd.startswith("/loop 240s 跑 `")
+        assert "sniff" in cmd and "--session sess-x" in cmd
+
+
+class TestLoopLivenessWired:
+    """洞1 接线:loop 死时 cmd_next / hook_post_bash 的输出含告警;新鲜时不含。"""
+
+    def test_cmd_next_surfaces_dead_loop(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "load_orch_state",
+                            lambda *a, **k: {"current_step": "1.5c", "phase": 1,
+                                             "session_id": "s", "repo_root": "/tmp/r"})
+        monkeypatch.setattr(orchestrator, "format_next", lambda st: "NEXT-STEP-TEXT")
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/r")
+        rc = orchestrator.cmd_next()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "NEXT-STEP-TEXT" in out
+        assert "嗅探 loop 未运行" in out and "/loop" in out
+
+    def test_cmd_next_quiet_when_loop_fresh(self, monkeypatch, capsys):
+        import orchestrator
+        fresh = datetime.now().isoformat()
+        monkeypatch.setattr(orchestrator, "load_orch_state",
+                            lambda *a, **k: {"current_step": "1.5c", "phase": 1,
+                                             "session_id": "s", "repo_root": "/tmp/r"})
+        monkeypatch.setattr(orchestrator, "format_next", lambda st: "NEXT")
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": fresh})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/r")
+        orchestrator.cmd_next()
+        out = capsys.readouterr().out
+        assert "未运行" not in out and "watchdog stale" not in out
+
+
+class TestSkillSoftPrescription:
+    """洞0 软处方 + 洞1 说明必须落进 SKILL.md（CLI 模式无 hook,靠文案约束）。"""
+
+    def _skill_text(self):
+        p = os.path.join(os.path.dirname(__file__), '..', '..',
+                         'skills', 'fastship', 'SKILL.md')
+        with open(p, encoding='utf-8') as f:
+            return f.read()
+
+    def test_codex_bounded_prescription_present(self):
+        t = self._skill_text()
+        assert "< /dev/null" in t and "timeout" in t
+        assert "codex" in t
+
+    def test_forbids_raw_background_codex(self):
+        t = self._skill_text()
+        assert "禁止" in t and "codex" in t  # 明文禁裸起背景 codex
+
+    def test_loop_self_check_note_present(self):
+        t = self._skill_text()
+        assert "存活自检" in t or "存活检查" in t
