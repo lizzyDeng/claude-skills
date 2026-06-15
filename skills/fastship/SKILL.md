@@ -42,6 +42,11 @@ fastship 支持并行多个活跃需求。每个需求有独立 session/state：
 `.claude/fastship.project.json` 的 `sniff` 段覆盖
 （`{"sniff": {"threshold_default_s": 3600, "thresholds": {"3.1": 7200}, "interval_s": 240}}`）。
 
+🔴 **loop 存活自检（洞1）**：驱动每次 `next` / `done` / hook 推进时,orchestrator 会自动
+检查嗅探 loop 心跳——未运行或超龄(>2×interval)即在输出末尾打印告警 + 可复制的 /loop
+重启命令。配合洞0(子进程必有界 → 驱动必周期性活动)形成闭环:loop 死掉会在下一次驱动
+活动时被发现并提示重启,不再依赖人工去看 `fastship status`。
+
 ## 双模工作方式
 
 ### Claude Code（hook 模式 — 最强）
@@ -64,6 +69,17 @@ orchestrator 是 hook 入口。每次 Edit/Write/Bash 自动触发：
 全部 19 步需手动 done，但 protected validators 不允许 filesystem fallback。
 无 hook/gate state 的关键步骤（plan provenance、Codex review、E2E、report、gate、loop pass、knowledge）必须失败，不能靠文件存在自动通过。
 Codex/CLI 模式下，文件产物步骤必须显式绑定 artifact：`done --brief <path>`、`done --requirements <path>`、`done --plan <path>`、`done --grill <path>`、`done --codex-review <path>`、`done --code-review <path>`、`done --report <path>`、`done --knowledge <path>`。没有绑定就不能通过。
+
+### 🔴 启动 codex 评审的唯一安全方式（洞0）
+
+1.5c Codex Review 必须以**有界形式**启动,禁止裸起背景 codex(背景 codex 阻塞在
+"Reading additional input from stdin" 会永不退出 → 无完成事件 → harness 永不唤醒 →
+流程静坐)。canonical 形式(timeout 包裹 + stdin 接 /dev/null):
+
+    timeout 330 codex exec -s read-only "<prompt>" -c 'model_reasoning_effort="high"' < /dev/null 2>/tmp/codex.err
+
+或直接走 `/codex review` 安全路径(已自带 timeout+stdin 重定向)。Claude Code hook 模式下
+pre_bash 会硬拦裸起 codex;CLI/Codex 模式无 hook,须靠本处方自律。
 
 ## 流程概览
 

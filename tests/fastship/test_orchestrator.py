@@ -3389,3 +3389,26 @@ class TestLoopLivenessWired:
         orchestrator.cmd_next()
         out = capsys.readouterr().out
         assert "未运行" not in out and "watchdog stale" not in out
+
+
+class TestSkillSoftPrescription:
+    """洞0 软处方 + 洞1 说明必须落进 SKILL.md（CLI 模式无 hook,靠文案约束）。"""
+
+    def _skill_text(self):
+        p = os.path.join(os.path.dirname(__file__), '..', '..',
+                         'skills', 'fastship', 'SKILL.md')
+        with open(p, encoding='utf-8') as f:
+            return f.read()
+
+    def test_codex_bounded_prescription_present(self):
+        t = self._skill_text()
+        assert "< /dev/null" in t and "timeout" in t
+        assert "codex" in t
+
+    def test_forbids_raw_background_codex(self):
+        t = self._skill_text()
+        assert "禁止" in t and "codex" in t  # 明文禁裸起背景 codex
+
+    def test_loop_self_check_note_present(self):
+        t = self._skill_text()
+        assert "存活自检" in t or "存活检查" in t
