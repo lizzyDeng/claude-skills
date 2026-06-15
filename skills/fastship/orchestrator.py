@@ -3599,22 +3599,26 @@ def _session_id_for_start(requirement: str) -> str:
     return fastship_state.session_id_from_requirement(requirement)
 
 
-def _print_sniff_hint(session_id: str, state_repo: str):
-    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。Claude Code 主路径：驱动
-    agent 见到本段应立即按 SKILL.md 指示后台自动启动；CLI/Codex：用户手动粘贴。
-    命令必须可原样执行：FASTSHIP_STATE_HOME 被显式设置时一并嵌入（state 解析一致）。"""
-    interval = _sniff_interval_s()
+def _sniff_loop_command(session_id: str, state_repo: str, interval: int = None) -> str:
+    """`/loop <interval>s 跑 \`<sniff_cmd>\`` 单行。单源:start hint(_print_sniff_hint)
+    与驱动活动存活告警(_loop_liveness_alert_lines)共用，避免命令构造漂移。"""
+    if interval is None:
+        interval = _sniff_interval_s()
     env_bits = []
     if os.environ.get("FASTSHIP_STATE_HOME"):
         env_bits.append(f"FASTSHIP_STATE_HOME={shlex.quote(os.environ['FASTSHIP_STATE_HOME'])}")
     env_bits.append(f"FASTSHIP_SESSION={shlex.quote(session_id)}")
-    # --session 与 env 前缀双保险：loop agent 转述命令时若剥掉 env 前缀，
-    # 显式参数仍把 sniff 钉在本 session 上（绝不静默落到 registry current_session）。
     sniff_cmd = (f"cd {shlex.quote(state_repo)} && " + " ".join(env_bits)
                  + f" python3 {shlex.quote(os.path.abspath(__file__))} sniff"
                  + f" --session {shlex.quote(session_id)}")
+    return f"/loop {interval}s 跑 `{sniff_cmd}`"
+
+
+def _print_sniff_hint(session_id: str, state_repo: str):
+    """start 后输出可复制的 /loop 嗅探命令（AC-START-1）。"""
+    loop_cmd = _sniff_loop_command(session_id, state_repo)
     print("🕵️  嗅探 loop（后台存活监控）— Claude Code 下驱动 agent 应立即后台自动启动；CLI 手动粘贴：")
-    print(f"   /loop {interval}s 跑 `{sniff_cmd}` 并解析 [FASTSHIP_SNIFF] 行：")
+    print(f"   {loop_cmd} 并解析 [FASTSHIP_SNIFF] 行：")
     print("      action=resume → 向 fastship 驱动 session 注入一次「继续当前 step」软唤醒（绝不 kill 进程）；")
     print("      action=notify_user → 立即用最醒目可用通道通知用户，原样附上整行证据；")
     print("      verdict=session_done / no_session → 停止本 loop。判定纯本地零 LLM。\n")
@@ -3877,6 +3881,29 @@ def _sniff_status_lines(orch: dict) -> list:
         return [f"⚠️  watchdog stale: 嗅探最后心跳 {data['last_check_at']}（{age}s 前 > "
                 f"2×{interval}s）— 嗅探 loop 可能已死，需重新启动"]
     return [f"🕵️  嗅探心跳: {data['last_check_at']}（{age}s 前）"]
+
+
+def _loop_liveness_alert_lines(orch) -> list:
+    """洞1:驱动每次活动(next/done/hook 推进)附带的存活告警。loop 未起/超龄 → 返回
+    [告警, 重启命令];心跳新鲜或流程终态 → []（保持安静,不污染正常输出）。纯只读。"""
+    step = (orch or {}).get("current_step")
+    if step in ("done", "stopped", None):
+        return []
+    sid = (orch or {}).get("session_id") or fastship_state.current_session_id()
+    if not sid:
+        return []
+    data = fastship_state.load_json(fastship_state.sniff_state_path(sid))
+    interval = _sniff_interval_s()
+    state_repo = ((orch.get("worktree") or {}).get("path")
+                  or orch.get("repo_root") or _repo_root())
+    restart = "   重启嗅探 loop: " + _sniff_loop_command(sid, state_repo, interval)
+    if not data or not data.get("last_check_at"):
+        return ["🕵️  嗅探 loop 未运行 — 全流程无存活监控,重启:", restart]
+    age = _iso_age_s(datetime.now(), data["last_check_at"])
+    if age > 2 * interval:
+        return [f"⚠️  watchdog stale: 嗅探最后心跳 {age}s 前（>2×{interval}s）,loop 可能已死,重启:",
+                restart]
+    return []
 
 
 def cmd_status() -> int:

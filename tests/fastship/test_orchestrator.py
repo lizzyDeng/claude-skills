@@ -3311,3 +3311,49 @@ class TestPreBashCodexGate:
         out = capsys.readouterr().out
         # done 状态不是 active：不该被 codex 门禁拦
         assert "codex" not in out or code == 0
+
+
+class TestLoopLivenessAlert:
+    """洞1:无心跳/超龄 → 返回告警+重启命令;心跳新鲜/终态 → 返回 []（不污染正常输出）。"""
+
+    def _orch(self, step="1.5c"):
+        return {"current_step": step, "phase": 1, "session_id": "sess-x",
+                "repo_root": "/tmp/repo"}
+
+    def test_no_heartbeat_returns_alert(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        lines = orchestrator._loop_liveness_alert_lines(self._orch())
+        assert lines and any("未运行" in ln for ln in lines)
+        assert any("/loop" in ln for ln in lines)
+
+    def test_stale_heartbeat_returns_alert(self, monkeypatch):
+        import orchestrator
+        old = (datetime.now() - timedelta(seconds=10000)).isoformat()
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": old})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        lines = orchestrator._loop_liveness_alert_lines(self._orch())
+        assert lines and any("stale" in ln.lower() for ln in lines)
+        assert any("/loop" in ln for ln in lines)
+
+    def test_fresh_heartbeat_returns_empty(self, monkeypatch):
+        import orchestrator
+        fresh = datetime.now().isoformat()
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": fresh})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/repo")
+        assert orchestrator._loop_liveness_alert_lines(self._orch()) == []
+
+    def test_terminal_step_returns_empty(self, monkeypatch):
+        import orchestrator
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        assert orchestrator._loop_liveness_alert_lines(self._orch(step="done")) == []
+        assert orchestrator._loop_liveness_alert_lines(self._orch(step="stopped")) == []
+
+    def test_sniff_loop_command_shared_shape(self):
+        import orchestrator
+        cmd = orchestrator._sniff_loop_command("sess-x", "/tmp/repo", 240)
+        assert cmd.startswith("/loop 240s 跑 `")
+        assert "sniff" in cmd and "--session sess-x" in cmd
