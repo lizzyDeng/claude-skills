@@ -3604,7 +3604,7 @@ def _session_id_for_start(requirement: str) -> str:
 
 
 def _sniff_loop_command(session_id: str, state_repo: str, interval: int = None) -> str:
-    """`/loop <interval>s 跑 \`<sniff_cmd>\`` 单行。单源:start hint(_print_sniff_hint)
+    """`/loop <interval>s 跑 `<sniff_cmd>`` 单行。单源:start hint(_print_sniff_hint)
     与驱动活动存活告警(_loop_liveness_alert_lines)共用，避免命令构造漂移。"""
     if interval is None:
         interval = _sniff_interval_s()
