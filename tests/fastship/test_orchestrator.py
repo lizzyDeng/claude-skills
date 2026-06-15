@@ -3233,3 +3233,44 @@ class TestSniffDocs:
         assert "绝不 kill" in text         # 软 resume 语义
         assert "session_done" in text      # 停止条件
         assert "interval_s" in text        # 间隔可配（P2 修正：文档与实现一致）
+
+
+class TestUnboundedCodexGate:
+    """洞0 纯 predicate:只拦 `codex` 且缺 timeout 包裹或 stdin 未接 /dev/null。"""
+
+    def test_raw_codex_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('codex exec -s read-only "review this"') is True
+
+    def test_codex_with_stdin_but_no_timeout_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('codex exec "x" < /dev/null') is True
+
+    def test_codex_with_timeout_but_no_stdin_is_unbounded(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('timeout 330 codex exec "x"') is True
+
+    def test_bounded_codex_is_ok(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('timeout 330 codex exec "x" < /dev/null') is False
+
+    def test_gstack_wrapper_form_is_ok(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd(
+            '_gstack_codex_timeout_wrapper 330 codex review "x" < /dev/null 2>"$E"') is False
+
+    def test_non_codex_command_not_flagged(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('sleep 999 &') is False
+        assert is_unbounded_codex_cmd('cargo test') is False
+
+    def test_codex_substring_not_flagged(self):
+        from orchestrator import is_unbounded_codex_cmd
+        # mycodex / codexfoo 不是 codex 启动
+        assert is_unbounded_codex_cmd('mycodex run') is False
+        assert is_unbounded_codex_cmd('echo codexfoo') is False
+
+    def test_empty_or_nonstr_safe(self):
+        from orchestrator import is_unbounded_codex_cmd
+        assert is_unbounded_codex_cmd('') is False
+        assert is_unbounded_codex_cmd(None) is False

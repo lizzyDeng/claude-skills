@@ -3258,6 +3258,35 @@ def format_next(orch: dict) -> str:
     )
 
 
+# ── 洞0：裸 codex 启动门禁（纯字符串 predicate，仿 ship_verify_gate 风格）──────────
+# 背景 codex 阻塞在 "Reading additional input from stdin" 会永不退出 → 无完成事件 →
+# harness 永不唤醒驱动 → 流程静坐。要求 codex 启动同时具备 timeout 包裹 + stdin 接
+# /dev/null（gstack codex skill 既有的安全形式）。窄门禁：只盯 `codex`（用户决策）。
+_CODEX_TOKEN_RE = re.compile(r'(^|[\s;&|(])codex(\s|$)')
+_STDIN_DEVNULL_RE = re.compile(r'<\s*/dev/null')
+_TIMEOUT_WRAP_RE = re.compile(
+    r'(^|[\s;&|(])(timeout|gtimeout)\s|_gstack_codex_timeout_wrapper\b')
+
+SAFE_CODEX_HINT = (
+    "   改用有界形式（timeout 包裹 + stdin 接 /dev/null），或直接走 /codex review 安全路径：\n"
+    "     timeout 330 codex exec -s read-only \"<prompt>\" "
+    "-c 'model_reasoning_effort=\"high\"' < /dev/null 2>/tmp/codex.err"
+)
+
+
+def is_unbounded_codex_cmd(cmd) -> bool:
+    """True 当且仅当 cmd 启动 `codex` 但缺【timeout 包裹】或【stdin 接 /dev/null】之一。
+    纯字符串判定，无副作用，可脱离活体 session 单测。窄门禁：非 codex 命令一律 False。
+    已知折中：`echo "... codex "`（带尾空格的 echo 提及）会误命中——窄安全门禁可接受，
+    提示里给了改法。"""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if not _CODEX_TOKEN_RE.search(cmd):
+        return False
+    bounded = bool(_STDIN_DEVNULL_RE.search(cmd)) and bool(_TIMEOUT_WRAP_RE.search(cmd))
+    return not bounded
+
+
 # ── Sniff（后台存活监控）────────────────────────────────────────────────────
 # session-radar bg 分类的源内镜像（session_dashboard.py:191-193 + liveness() bg 分支）。
 # 写成字面量是因为引擎单文件分发到消费仓库（无 session-radar 可 import）；语义单源由
