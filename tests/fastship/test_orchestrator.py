@@ -3357,3 +3357,35 @@ class TestLoopLivenessAlert:
         cmd = orchestrator._sniff_loop_command("sess-x", "/tmp/repo", 240)
         assert cmd.startswith("/loop 240s 跑 `")
         assert "sniff" in cmd and "--session sess-x" in cmd
+
+
+class TestLoopLivenessWired:
+    """洞1 接线:loop 死时 cmd_next / hook_post_bash 的输出含告警;新鲜时不含。"""
+
+    def test_cmd_next_surfaces_dead_loop(self, monkeypatch, capsys):
+        import orchestrator
+        monkeypatch.setattr(orchestrator, "load_orch_state",
+                            lambda *a, **k: {"current_step": "1.5c", "phase": 1,
+                                             "session_id": "s", "repo_root": "/tmp/r"})
+        monkeypatch.setattr(orchestrator, "format_next", lambda st: "NEXT-STEP-TEXT")
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json", lambda p: None)
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/r")
+        rc = orchestrator.cmd_next()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "NEXT-STEP-TEXT" in out
+        assert "嗅探 loop 未运行" in out and "/loop" in out
+
+    def test_cmd_next_quiet_when_loop_fresh(self, monkeypatch, capsys):
+        import orchestrator
+        fresh = datetime.now().isoformat()
+        monkeypatch.setattr(orchestrator, "load_orch_state",
+                            lambda *a, **k: {"current_step": "1.5c", "phase": 1,
+                                             "session_id": "s", "repo_root": "/tmp/r"})
+        monkeypatch.setattr(orchestrator, "format_next", lambda st: "NEXT")
+        monkeypatch.setattr(orchestrator.fastship_state, "load_json",
+                            lambda p: {"last_check_at": fresh})
+        monkeypatch.setattr(orchestrator, "_repo_root", lambda: "/tmp/r")
+        orchestrator.cmd_next()
+        out = capsys.readouterr().out
+        assert "未运行" not in out and "watchdog stale" not in out

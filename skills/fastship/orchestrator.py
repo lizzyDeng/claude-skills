@@ -2960,6 +2960,8 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
         elif orch.get("current_step") == "done":
             print(f"\n✅ Step {detected} 完成 → 🎉 全部完成！可以合入 main。")
 
+    for line in _loop_liveness_alert_lines(orch):
+        print(line)
     return 0
 
 
@@ -3123,6 +3125,8 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
         elif orch.get("current_step") == "done":
             print(f"\n✅ Step {detected} 完成 → 🎉 全部完成！")
 
+    for line in _loop_liveness_alert_lines(orch):
+        print(line)
     return 0
 
 
@@ -3696,6 +3700,8 @@ def cmd_next() -> int:
         print("❌ 没有活跃 session。先 start。")
         return 1
     print(format_next(st))
+    for line in _loop_liveness_alert_lines(st):
+        print(line)
     return 0
 
 
@@ -3858,6 +3864,8 @@ def cmd_done(argv: list) -> int:
     if next_step:
         print()
         print(format_next(st))
+        for line in _loop_liveness_alert_lines(st):
+            print(line)
         if step.id == "1.6" and st.get("current_step") == "2.0":
             _print_goal_hint(st)
     elif st.get("current_step") == "done":
