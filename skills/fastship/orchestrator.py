@@ -1130,6 +1130,7 @@ def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
     if not isinstance(rev_manifests, list):
         return False, "Code review 缺少 reviewed_manifests 数组"
     manifest_nodes = set()
+    claimed = set()           # every file any manifest claims to have changed (canonical)
     for mf in rev_manifests:
         if not isinstance(mf, dict):
             continue
@@ -1148,6 +1149,10 @@ def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
         if not okf:
             return False, (f"Code review node {nid} 改动越界(files_changed ⊄ node.files): "
                            + ", ".join(off))
+        for f in mf_changed:
+            ck = plan_tree.canon_path(f)
+            if ck:
+                claimed.add(ck)
         manifest_nodes.add(nid)
     # every required node must carry a manifest — otherwise omitting a node's manifest
     # would silently skip its per-node boundary check (codex confirm High).
@@ -1155,6 +1160,21 @@ def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
     if missing_mf:
         return False, "Code review reviewed_manifests 未覆盖 node(每个 node 须有 manifest): " + ", ".join(missing_mf)
     if changed:
+        # Tie manifests to the REAL diff: every actually-changed file that lies in some
+        # node's declared territory must be CLAIMED by that node's manifest. Closes the
+        # empty-manifest bypass (files_changed:[] passes files_changed_within vacuously,
+        # but an unclaimed real change to a node file is caught here). codex confirm #1.
+        all_node_files = set()
+        for fl in files_by_id.values():
+            for f in fl:
+                ck = plan_tree.canon_path(f)
+                if ck:
+                    all_node_files.add(ck)
+        changed_canon = {ck for ck in (plan_tree.canon_path(c) for c in changed) if ck}
+        unclaimed = sorted((changed_canon & all_node_files) - claimed)
+        if unclaimed:
+            return False, ("Code review 有落在 node 领地的实际改动未被任何 manifest 认领"
+                           "(防空 manifest 绕过 per-node 边界): " + ", ".join(unclaimed))
         root = _repo_root()
         reviewed_canon = {ck for ck in (_canon_repo_rel(rf, root) for rf in reviewed_files) if ck}
         uncovered = []

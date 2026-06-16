@@ -155,6 +155,29 @@ def test_manifest_out_of_bounds_fails(tmp_path, monkeypatch):
     assert not ok and "越界" in msg
 
 
+def test_empty_manifest_with_real_change_fails(tmp_path, monkeypatch):
+    # task-1 reports files_changed:[] but a.rs (its territory) IS in the real diff →
+    # unclaimed → FAIL (closes the empty-manifest bypass, codex confirm #1).
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={
+        "reviewed_files": ["src/a.rs"],
+        "reviewed_manifests": [{"node_id": "task-1", "files_changed": []},
+                               {"node_id": "task-2", "files_changed": []}]})
+    monkeypatch.setattr(o, "_changed_files", lambda *a, **k: {"src/a.rs"})
+    ok, msg = o.validate_code_review(orch, {})
+    assert not ok and "未被任何 manifest 认领" in msg and "src/a.rs" in msg
+
+
+def test_claimed_change_passes(tmp_path, monkeypatch):
+    # same real change, but task-1's manifest claims a.rs → covered → PASS
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={
+        "reviewed_files": ["src/a.rs"],
+        "reviewed_manifests": [{"node_id": "task-1", "files_changed": ["src/a.rs"]},
+                               {"node_id": "task-2", "files_changed": []}]})
+    monkeypatch.setattr(o, "_changed_files", lambda *a, **k: {"src/a.rs"})
+    ok, msg = o.validate_code_review(orch, {})
+    assert ok, msg
+
+
 # ── [FASTSHIP_GOAL] status line — node-progress fields ──────────────────────
 def _goal_line(status_text):
     for line in status_text.splitlines():
