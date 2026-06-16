@@ -336,9 +336,12 @@ CODEX_REVIEW_REQUIRED_EMPTY_FIELDS = (
 )
 
 # ── Code Review (Step 2.5) gate contract — reviews the IMPLEMENTATION, not the plan ──
-# Binding is to the design source (reviewed_against) + changed files, NOT a plan hash:
-# a code review checks the implementation against the design, so plan-hash binding
-# (as 1.5c uses) would be meaningless here.
+# Binds to the design source (reviewed_against) + changed files. It does NOT bind to
+# the plan TEXT hash (a code review checks code against design, not against plan prose).
+# It DOES bind to the 计划树 tree_hash WHEN a plan tree exists (feature): the review must
+# match the current tree, confirm every required node is done in the driver-owned
+# skeleton, and cover every changed file (changed ⊆ reviewed_files). Bugfix runs carry
+# no tree, so those checks are skipped and only the design+diff anchors apply.
 CODE_REVIEW_REQUIRED_TRUE_FIELDS = (
     "design_fidelity_reviewed",
     "spec_compliance_reviewed",
@@ -524,6 +527,39 @@ def _record_plan_tree_artifact(orch: dict, prov: dict):
 def _plan_tree_record(orch: dict) -> dict:
     """The trusted 计划树 provenance record, or {} if none (bugfix / pre-1.4)."""
     return orch.get("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {}).get(PLAN_TREE_LEDGER_KEY, {}) or {}
+
+
+def _plan_tree_progress(orch: dict) -> dict:
+    """Node-level progress sourced from skeleton.json — the driver-owned single
+    progress source (spec L103/L111). Degrades to zeros/'-' when there is no plan
+    tree (bugfix / pre-2.0 / missing skeleton), so format_status never crashes."""
+    out = {"nodes_total": 0, "nodes_done": 0, "nodes_failed": 0,
+           "current_node": "-", "plan_tree_hash": "-"}
+    rec = _plan_tree_record(orch)
+    sk_path = rec.get("skeleton_path")
+    if not sk_path or not os.path.exists(sk_path):
+        return out
+    try:
+        sk = json.loads(open(sk_path, encoding="utf-8").read())
+    except (OSError, json.JSONDecodeError):
+        return out
+    if not isinstance(sk, dict):
+        return out
+    nodes = sk.get("nodes", []) if isinstance(sk.get("nodes"), list) else []
+    out["plan_tree_hash"] = (sk.get("tree_hash") or rec.get("tree_hash") or "-")[:12]
+    out["nodes_total"] = len(nodes)
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if n.get("status") == "done":
+            out["nodes_done"] += 1
+        elif n.get("status") == "failed":
+            out["nodes_failed"] += 1
+    for n in nodes:                       # current = first not-done node
+        if isinstance(n, dict) and n.get("status") != "done":
+            out["current_node"] = n.get("id", "-")
+            break
+    return out
 
 
 def _verify_step_artifact(orch: dict, step_id: str, path: str) -> tuple[bool, str, dict]:
@@ -1040,6 +1076,66 @@ def _changed_files(base_sha: Optional[str] = None) -> set:
     return files
 
 
+def _canon_repo_rel(p: str, root: str):
+    """Canonical repo-relative key for a reviewed_files entry (abs or relative)."""
+    if os.path.isabs(p):
+        try:
+            p = os.path.relpath(p, root)
+        except ValueError:
+            return None
+    return plan_tree.canon_path(p)
+
+
+def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
+                                     changed: set, reviewed_files: list) -> tuple:
+    """计划树覆盖 (spec §2.5): when a plan tree exists, the 2.5 review must (a) bind to
+    the CURRENT tree hash, (b) confirm every required node is done in the driver-owned
+    skeleton, (c) name reviewed_node_ids covering those nodes, (d) carry reviewed_manifests,
+    and (e) cover EVERY changed file (changed ⊆ reviewed_files, full repo-relative path —
+    not the looser basename intersection the no-tree path uses)."""
+    if gate.get("reviewed_plan_tree_sha256") != tree_rec.get("tree_hash"):
+        return False, "Code review reviewed_plan_tree_sha256 与当前计划树 tree_hash 不一致（禁止复用旧 review）"
+    sk_path = tree_rec.get("skeleton_path")
+    try:
+        sk = json.loads(open(sk_path, encoding="utf-8").read())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False, "Code review 无法读取计划树 skeleton.json 复核 node 完成度"
+    nodes = sk.get("nodes", []) if isinstance(sk, dict) else []
+    node_ids = {n.get("id") for n in nodes if isinstance(n, dict)}
+    status_by_id = {n.get("id"): n.get("status") for n in nodes if isinstance(n, dict)}
+    required = set()
+    for e in (sk.get("ac_mapping") or []):
+        if isinstance(e, dict):
+            for t in (e.get("tasks") or []):
+                if isinstance(t, str):
+                    required.add(t)
+    undone = sorted(r for r in required if status_by_id.get(r) != "done")
+    if undone:
+        return False, "Code review 时仍有 required node 未完成(skeleton 非 done): " + ", ".join(undone)
+    rev_node_ids = gate.get("reviewed_node_ids")
+    if not isinstance(rev_node_ids, list):
+        return False, "Code review 缺少 reviewed_node_ids（须覆盖所有 required node）"
+    missing_nodes = sorted(required - {x for x in rev_node_ids if isinstance(x, str)})
+    if missing_nodes:
+        return False, "Code review reviewed_node_ids 未覆盖 required node: " + ", ".join(missing_nodes)
+    rev_manifests = gate.get("reviewed_manifests")
+    if not isinstance(rev_manifests, list):
+        return False, "Code review 缺少 reviewed_manifests 数组"
+    for mf in rev_manifests:
+        nid = mf.get("node_id") if isinstance(mf, dict) else None
+        if nid is not None and nid not in node_ids:
+            return False, f"Code review reviewed_manifests 含未知 node_id: {nid}"
+    if changed:
+        root = _repo_root()
+        reviewed_canon = {ck for ck in (_canon_repo_rel(rf, root) for rf in reviewed_files) if ck}
+        uncovered = sorted({ck for ck in (plan_tree.canon_path(c) for c in changed)
+                            if ck and ck not in reviewed_canon})
+        if uncovered:
+            return False, ("Code review reviewed_files 未覆盖全部改动文件(须 ⊇ git diff 全路径): "
+                           + ", ".join(uncovered))
+    return True, ""
+
+
 def validate_classify(orch: dict, hook: dict) -> tuple:
     if hook.get("request_classified"):
         return True, f"classified: {hook.get('request_type')}"
@@ -1449,7 +1545,14 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
         if not os.path.exists(rf_abs):
             return False, f"Code review reviewed_files 含不存在的文件: {rf}"
     changed = _changed_files(orch.get("base_sha"))
-    if changed:
+    tree_rec = _plan_tree_record(orch)
+    if tree_rec:
+        # 计划树存在(feature): bind to tree hash + require all nodes done + changed ⊆ reviewed_files.
+        ok, msg = _check_code_review_tree_coverage(orch, gate, tree_rec, changed, reviewed_files)
+        if not ok:
+            return False, msg
+    elif changed:
+        # legacy / bugfix path (no plan tree): basename intersection is sufficient.
         changed_base = {os.path.basename(c) for c in changed}
         reviewed_base = {os.path.basename(_normalize(rf)) for rf in reviewed_files}
         if not (changed_base & reviewed_base):
@@ -2438,7 +2541,7 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
   - 机器可验证 JSON gate（最后一个 json 代码块）字段：
       gate                    "PASS" | "FAIL"
       reviewed_against        plan 引用的设计稿/spec 路径（必须真实存在）
-      reviewed_files          实际改动且审查过的文件列表（须与 git diff 相交）
+      reviewed_files          实际改动且审查过的文件列表（计划树存在时须⊇ git diff 全部改动文件,全路径）
       design_fidelity_reviewed  true
       spec_compliance_reviewed  true
       quality_reviewed          true
@@ -2446,9 +2549,15 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
       spec_gaps                 []
       quality_issues            []
       unverified_claims         []
+    🌳 计划树存在时(feature)还须含：
+      reviewed_plan_tree_sha256  当前计划树 tree_hash（status 里的 plan_tree_hash，须一致防复用旧 review）
+      reviewed_node_ids          覆盖所有 required node（被 ac_mapping.tasks 引用的 node）的列表
+      reviewed_manifests         逐 node 的 diff manifest 列表（{node_id, files_changed, ...}）
 
 🔴 任一 deviations/gaps/issues 数组非空 → GATE: FAIL → 修复实现后重新 review（留在 2.5，不回退 plan）。
-🔴 reviewed_against 必须指向真实存在的设计依据；reviewed_files 必须与实际 git diff 相交（防橡皮图章）。
+🔴 reviewed_against 必须指向真实存在的设计依据。计划树存在时引擎硬验证：reviewed_plan_tree_sha256 == 当前
+   tree_hash、所有 required node 在 skeleton 里 status=done、reviewed_node_ids 覆盖 required node、
+   reviewed_files ⊇ git diff 全部改动文件（全路径）；否则（bugfix/无树）只需 reviewed_files 与 git diff 相交。
 
 提交: "$(git rev-parse --show-toplevel)/.claude/tools/fastship" done --code-review .claude/.fastship-code-review.md"""),
 
@@ -2803,7 +2912,9 @@ def _apply_codex_fail_rollback(orch: dict, target_step: str):
     if target_step == REQUIREMENTS_STEP_ID:
         arts.pop("requirements_path", None)
         clear_steps = [REQUIREMENTS_STEP_ID] + clear_steps
-    _clear_trusted_artifacts(orch, tuple(clear_steps))
+    # 1.4 is re-earned → drop the stale 计划树 provenance too (the next 1.4 validate
+    # re-materializes a fresh tree; materialize also rmtree's the on-disk dir).
+    _clear_trusted_artifacts(orch, tuple(clear_steps) + (PLAN_TREE_LEDGER_KEY,))
     orch["completed_steps"] = [s for s in orch.get("completed_steps", []) if s not in clear_steps]
     orch["current_step"] = target_step
     orch["phase"] = 1
@@ -3310,6 +3421,7 @@ def format_status(orch: dict) -> str:
         lines.append("\n🛑 已停止")
 
     gate = _read_gate_state_file()
+    tree = _plan_tree_progress(orch)
     lines.append("")
     lines.append(
         f"[FASTSHIP_GOAL] step={cs} phase={orch.get('phase', '?')}"
@@ -3319,6 +3431,10 @@ def format_status(orch: dict) -> str:
         f" code_reviewed={str('2.5' in orch.get('completed_steps', [])).lower()}"
         f" knowledge_acknowledged={str(gate.get('knowledge_acknowledged', False)).lower()}"
         f" loop={orch.get('loop_count', 0)}/3"
+        f" nodes_done={tree['nodes_done']}/{tree['nodes_total']}"
+        f" nodes_failed={tree['nodes_failed']}"
+        f" current_node={tree['current_node']}"
+        f" plan_tree_hash={tree['plan_tree_hash']}"
     )
     return "\n".join(lines)
 
@@ -4112,11 +4228,19 @@ def cmd_render_plan(argv: list) -> int:
 def goal_condition(orch: dict) -> str:
     """Generate a /goal condition string based on current orchestrator state."""
     req = orch.get("requirement", "?")
-    return (
+    cond = (
         f"fastship 完成「{req}」的交付 — "
         f"运行 status 命令确认 [FASTSHIP_GOAL] 显示 step=done"
         f" test_passed=true e2e_executed=true e2e_gate_passed=true code_reviewed=true knowledge_acknowledged=true"
     )
+    # 计划树执行入口: surface the skeleton path so the /goal driver reads the skeleton
+    # (not the whole plan) and dispatches briefs/<id>.md. Conditional — bugfix sessions
+    # carry no plan tree, so their /goal output stays byte-identical.
+    sk = _plan_tree_record(orch).get("skeleton_path")
+    if sk:
+        cond += (f"。🌳执行入口 skeleton_path={sk}"
+                 f"（读 skeleton 按拓扑序扇出，每 subagent 只发 briefs/<id>.md，driver 不读 node 正文）")
+    return cond
 
 
 def _print_goal_hint(orch: dict):
