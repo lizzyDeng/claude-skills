@@ -91,11 +91,18 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 
 ### 4. Phase 2 执行(走树)
 
-- 驱动只 load `skeleton.json`(几 KB),按拓扑序扇出。
-- 每个 leaf subagent 的 brief = `root.md` + `nodes/<id>.md` + 其 `deps` 节点的 **`outputs` 契约**(不是 deps 的实现/正文)。
-- 上游完成后,其 outputs(声明 + 实际产出符号)回填给下游 brief。
+🔴 **隔离靠"指针派发 + 预拼 brief",不靠驱动自觉**——光有 `nodes/<id>.md` 文件 ≠ 隔离。
+现状(SKILL.md L199:"扇出由 Claude 读 plan 决定"):驱动读整份 plan,subagent 拿到的是驱动塞进 `agent(prompt)` 的任意内容,无任何机制保证"只拿自己那片"。改成:
 
-**效果(her-loops 实测体量):驱动 51KB → ~2KB;每 leaf 恒 ~6–14KB,不随 feature 体量涨。**
+- **驱动只 load `skeleton.json`**(几 KB,id/deps/contracts),按拓扑序扇出。驱动**绝不读 node 正文**——一旦它逐个读 `nodes/<id>.md` 拼 prompt,N 片正文全累进驱动 context → 驱动原地复爆回满 plan。驱动只**派指针**(node id + brief 路径)。
+- **orchestrator 预拼 brief(确定性代码,零 LLM context)**:为每 node 生成 `briefs/<id>.md` = `root.md` + 本 `nodes/<id>.md` + 解析后的 `deps` 节点 `outputs` 契约。workflow 只下达「执行 `briefs/<id>.md`」。
+- **subagent 自己读** `briefs/<id>.md`(单一自包含文件)。**有界是构造出来的,不是约定出来的。**
+- 上游完成后,其 outputs(声明 + 实际产出符号)回填进下游 brief 文件。
+- ⚠️ **「子 plan 有界 ≠ 代码世界受限」**:subagent 照常 read/grep 仓库源码(root.md 带 verified signatures),只是不背其它 node 的 plan 正文。
+
+**门禁强度(诚实声明):** Phase 2 无 hook(同 model:opus,L119 仅 instruction 级"确保")。本节是 **instruction 级 + 结构兜底**(预拼 brief 使"只读一份"成为阻力最小默认路径),**非硬门禁**。要硬门禁须给 Phase 2 加 hook 校验每个 agent 输入不含全 plan——更大改动,见未决 5。
+
+**效果(her-loops 实测体量):驱动 51KB → ~2KB;每 leaf brief 恒 ~6–14KB,不随 feature 体量涨。**
 
 ## 唯一硬骨头:契约完整性
 
@@ -123,3 +130,4 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 2. `outputs` 的"实际产出符号"如何回填:节点完成后由 subagent 申报 vs orchestrator 静态取声明。
 3. `skeleton.json` 与现有 `[FASTSHIP_GOAL]` 状态行 / `cmd_goal`(L4051)的衔接。
 4. 1B 指令(L2191 起)如何要求总结者产 `nodes[]` 图——措辞与硬约束。
+5. 是否给 Phase 2 加 hook,把"每个 agent 输入不含全 plan"从 instruction 级 + 结构兜底升成**硬门禁**(现 Phase 2 无 hook)。
