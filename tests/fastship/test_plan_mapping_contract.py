@@ -21,10 +21,13 @@ def check(p0_ac_ids, plan_gate):
 
 
 def valid_mapping():
-    return {"ac_mapping": [
-        {"ac_id": "ac-1", "tasks": ["实现改名 API"], "e2e": ["E2E-rename-persists"]},
-        {"ac_id": "ac-2", "tasks": ["前端改名表单"], "e2e": ["E2E-rename-ui"]},
-    ]}
+    # ac_mapping.tasks now REFERENCE nodes[].id (计划树迁移); _check_plan_mapping
+    # derives the node-id set from the same contract block.
+    return {"nodes": [{"id": "task-1"}, {"id": "task-2"}],
+            "ac_mapping": [
+                {"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-rename-persists"]},
+                {"ac_id": "ac-2", "tasks": ["task-2"], "e2e": ["E2E-rename-ui"]},
+            ]}
 
 
 P0 = ["ac-1", "ac-2"]
@@ -101,9 +104,18 @@ def test_blank_task_entry_fails():
     assert ok is False and "tasks" in msg
 
 
+def test_task_not_a_node_id_fails():
+    # 计划树迁移: a task that is not a declared node id (free-text) FAILs.
+    g = valid_mapping()
+    g["ac_mapping"][0]["tasks"] = ["实现改名 API"]  # free text, not a node id
+    ok, msg = check(P0, g)
+    assert ok is False and "node id" in msg
+
+
 def test_uncovered_ac_fails():
     # The core invariant: a P0 AC with no mapping entry at all → 1B FAIL.
-    g = {"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}]}
+    g = {"nodes": [{"id": "task-1"}],
+         "ac_mapping": [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}]}
     ok, msg = check(P0, g)
     assert ok is False and "ac-2" in msg and "未在技术方案中映射" in msg
 
@@ -131,30 +143,62 @@ def test_collect_required_ac_ids_includes_p1():
     assert _collect_required_ac_ids(gate) == {"ac-1", "ac-2", "ac-3"}
 
 
-def test_extract_plan_mapping_gate_picks_the_ac_mapping_block():
+def test_extract_plan_mapping_gate_picks_the_contract_block():
+    # Marker-driven: the ONE <!-- fastship:contract --> block is picked; an echoed
+    # example ```json (no marker) is ignored — never mis-paired (codex Critical).
     from orchestrator import _extract_plan_mapping_gate
+    contract = {"nodes": [{"id": "task-1"}],
+                "ac_mapping": [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}],
+                "exclusive_forks": []}
     plan = (
         "# Plan\n```mermaid\nflowchart TD\nA-->B\n```\n"
-        '```json\n{"unrelated": true}\n```\n'
-        '```json\n{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}]}\n```\n'
+        '这是一个**示例**契约(无 marker,应被忽略):\n```json\n{"ac_mapping": [{"ac_id": "ac-zzz"}]}\n```\n'
+        "<!-- fastship:contract -->\n```json\n" + json.dumps(contract, ensure_ascii=False) + "\n```\n"
     )
-    gate = _extract_plan_mapping_gate(plan)
-    assert gate is not None and "ac_mapping" in gate
+    gate, err = _extract_plan_mapping_gate(plan)
+    assert err is None and gate is not None and "ac_mapping" in gate
     assert gate["ac_mapping"][0]["ac_id"] == "ac-1"
 
 
 def test_extract_plan_mapping_gate_none_when_absent():
     from orchestrator import _extract_plan_mapping_gate
-    assert _extract_plan_mapping_gate("# Plan\nno json here at all\n") is None
+    gate, err = _extract_plan_mapping_gate("# Plan\nno json here at all\n")
+    assert gate is None and err is None
 
 
 # ── validate_plan end-to-end (feature requires mapping; bugfix skips) ───────
 
-def _signed_plan(body_json=None):
+def _n(nid, deps=None):
+    """A valid contract node (passes check_plan_node_graph): unique output/file,
+    root: input unless deps are wired by the caller."""
+    return {"id": nid, "title": f"Task {nid}", "deps": deps or [],
+            "inputs": ["root:base"], "outputs": [f"sym:{nid}"], "files": [f"src/{nid}.rs"]}
+
+
+def _contract(ac_mapping, nodes=None, forks=None):
+    """Build a full contract block. If nodes is omitted, derive one valid node per
+    distinct task id referenced by ac_mapping (so every node has coverage)."""
+    if nodes is None:
+        ids = []
+        for e in ac_mapping:
+            for t in e.get("tasks", []):
+                if t not in ids:
+                    ids.append(t)
+        nodes = [_n(i) for i in ids]
+    return {"nodes": nodes, "ac_mapping": ac_mapping, "exclusive_forks": forks or []}
+
+
+def _signed_plan(contract=None):
+    """A writing-plans-signed plan. When contract is given, emit one anchored
+    `### Task` section per node + the marked contract block, so materialize_plan_tree
+    can split it (the 1.4 hard step). None → signature-only (no contract)."""
     base = ("# Plan\n> **For agentic workers:** REQUIRED\n"
             "**Goal:** rename\n- [ ] **Step 1:** test\n")
-    if body_json is not None:
-        base += "## AC→task+E2E\n```json\n" + json.dumps(body_json, ensure_ascii=False) + "\n```\n"
+    if contract is not None:
+        for nd in contract.get("nodes", []):
+            base += (f"<!-- fastship:node {nd['id']} -->\n### {nd.get('title', nd['id'])}\n"
+                     f"实现 {nd['id']} 的完整内容（保丰富度）。\n\n")
+        base += "<!-- fastship:contract -->\n```json\n" + json.dumps(contract, ensure_ascii=False) + "\n```\n"
     return base
 
 
@@ -218,7 +262,7 @@ def _setup(tmp_path, monkeypatch, plan_body, request_type="feature", seed_1a=Tru
 def test_validate_plan_feature_passes_with_full_mapping(tmp_path, monkeypatch):
     o, orch, _ = _setup(
         tmp_path, monkeypatch,
-        _signed_plan({"ac_mapping": [{"ac_id": "ac-1", "tasks": ["改名 API"], "e2e": ["E2E-rename"]}]}))
+        _signed_plan(_contract([{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-rename"]}])))
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
 
@@ -228,7 +272,7 @@ def test_validate_plan_feature_fails_dangling_ac(tmp_path, monkeypatch):
     # The dangling reference is caught first (技术方案 can't invent coverage).
     o, orch, _ = _setup(
         tmp_path, monkeypatch,
-        _signed_plan({"ac_mapping": [{"ac_id": "ac-other", "tasks": ["x"], "e2e": ["E2E-x"]}]}))
+        _signed_plan(_contract([{"ac_id": "ac-other", "tasks": ["task-1"], "e2e": ["E2E-x"]}])))
     ok, msg = o.validate_plan(orch, {})
     assert ok is False and "ac-other" in msg
 
@@ -242,7 +286,7 @@ def test_validate_plan_feature_fails_missing_mapping_block(tmp_path, monkeypatch
 def test_validate_plan_feature_fails_without_1a_requirements(tmp_path, monkeypatch):
     o, orch, _ = _setup(
         tmp_path, monkeypatch,
-        _signed_plan({"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}]}),
+        _signed_plan(_contract([{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}])),
         seed_1a=False)
     ok, msg = o.validate_plan(orch, {})
     assert ok is False and "requirements_path" in msg
@@ -260,7 +304,7 @@ def test_validate_plan_feature_fails_uncovered_p1_ac(tmp_path, monkeypatch):
     # P1 is a hard mapping gate too: plan covers p0 (ac-1) but leaves p1 (ac-2) unmapped → FAIL.
     o, orch, _ = _setup(
         tmp_path, monkeypatch,
-        _signed_plan({"ac_mapping": [{"ac_id": "ac-1", "tasks": ["改名 API"], "e2e": ["E2E-rename"]}]}),
+        _signed_plan(_contract([{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-rename"]}])),
         req_md=_requirements_md_with_p1())
     ok, msg = o.validate_plan(orch, {})
     assert ok is False and "ac-2" in msg
@@ -270,10 +314,10 @@ def test_validate_plan_feature_passes_with_p0_and_p1_mapping(tmp_path, monkeypat
     # Mapping both the p0 AC and the p1 AC passes — P1 is covered, not waived.
     o, orch, _ = _setup(
         tmp_path, monkeypatch,
-        _signed_plan({"ac_mapping": [
-            {"ac_id": "ac-1", "tasks": ["改名 API"], "e2e": ["E2E-rename"]},
-            {"ac_id": "ac-2", "tasks": ["写操作日志"], "e2e": ["E2E-rename-audit"]},
-        ]}),
+        _signed_plan(_contract([
+            {"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-rename"]},
+            {"ac_id": "ac-2", "tasks": ["task-2"], "e2e": ["E2E-rename-audit"]},
+        ])),
         req_md=_requirements_md_with_p1())
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
@@ -323,29 +367,26 @@ def test_check_exclusive_forks_resolved_without_resolution_fails():
 
 
 def test_validate_plan_stashes_open_forks(tmp_path, monkeypatch):
-    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
-        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
-        "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "open"}],
-    }))
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan(_contract(
+        [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}],
+        forks=[{"id": "tf-1", "decision": "存哪", "status": "open"}])))
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
     assert orch["artifacts"]["plan_open_fork_ids"] == ["tf-1"]
 
 
 def test_validate_plan_stashes_empty_when_no_fork(tmp_path, monkeypatch):
-    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
-        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
-    }))
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan(_contract(
+        [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}])))
     ok, msg = o.validate_plan(orch, {})
     assert ok, msg
     assert orch["artifacts"]["plan_open_fork_ids"] == []
 
 
 def test_validate_plan_rejects_malformed_fork(tmp_path, monkeypatch):
-    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan({
-        "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
-        "exclusive_forks": [{"id": "tf-1", "decision": "存哪", "status": "huh"}],
-    }))
+    o, orch, _ = _setup(tmp_path, monkeypatch, _signed_plan(_contract(
+        [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}],
+        forks=[{"id": "tf-1", "decision": "存哪", "status": "huh"}])))
     ok, msg = o.validate_plan(orch, {})
     assert ok is False and "exclusive_forks" in msg
 

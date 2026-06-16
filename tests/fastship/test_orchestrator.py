@@ -1288,13 +1288,19 @@ class TestIntegrationFullFlow:
         plan_dir = tmp_path / "docs" / "superpowers" / "plans"
         plan_dir.mkdir(parents=True)
         plan_file = plan_dir / "2026-05-18-dark.md"
+        plan_contract = {
+            "nodes": [{"id": "task-1", "title": "实现暗色切换", "deps": [], "inputs": ["root:base"],
+                       "outputs": ["sym:dark-toggle"], "files": ["src/theme.ts"]}],
+            "ac_mapping": [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-dark-toggle"]}],
+            "exclusive_forks": [{"id": "tf-1", "decision": "主题存 localStorage 还是 profile",
+                                 "status": "open"}],
+        }
         plan_file.write_text(
             "# Plan\n> **For agentic workers:** REQUIRED\n"
             "**Goal:** dark mode\n- [ ] **Step 1:** test\n"
-            "## AC→task+E2E\n```json\n"
-            '{"ac_mapping": [{"ac_id": "ac-1", "tasks": ["实现暗色切换"], "e2e": ["E2E-dark-toggle"]}],'
-            ' "exclusive_forks": [{"id": "tf-1", "decision": "主题存 localStorage 还是 profile", "status": "open"}]}\n'
-            "```\n"
+            "<!-- fastship:node task-1 -->\n### 实现暗色切换\n切换主题的完整实现。\n\n"
+            "<!-- fastship:contract -->\n```json\n"
+            + json.dumps(plan_contract, ensure_ascii=False) + "\n```\n"
         )
         hook["plan_ready"] = True
         hook["plan_file"] = str(plan_file)
@@ -2616,11 +2622,14 @@ def make_trusted_plan_with_forks(tmp_path, monkeypatch, forks):
     plan_dir = tmp_path / "docs" / "superpowers" / "plans"
     plan_dir.mkdir(parents=True, exist_ok=True)
     plan = plan_dir / "2026-06-08-feat.md"
-    mapping = {"ac_mapping": [{"ac_id": "ac-1", "tasks": ["t"], "e2e": ["E2E-x"]}],
+    mapping = {"nodes": [{"id": "task-1", "title": "T", "deps": [], "inputs": ["root:base"],
+                          "outputs": ["sym:task-1"], "files": ["src/task-1.rs"]}],
+               "ac_mapping": [{"ac_id": "ac-1", "tasks": ["task-1"], "e2e": ["E2E-x"]}],
                "exclusive_forks": forks}
     plan.write_text(
         "# Plan\n> **For agentic workers:** REQUIRED\n**Goal:** x\n- [ ] **Step 1:** t\n"
-        "## AC→task+E2E\n```json\n" + json.dumps(mapping, ensure_ascii=False) + "\n```\n"
+        "<!-- fastship:node task-1 -->\n### T\n实现 task-1。\n\n"
+        "<!-- fastship:contract -->\n```json\n" + json.dumps(mapping, ensure_ascii=False) + "\n```\n"
     )
     monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
     orch = {"plan_path": str(plan), "artifacts": {}, "request_type": "feature"}
