@@ -1088,51 +1088,69 @@ def _canon_repo_rel(p: str, root: str):
 
 def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
                                      changed: set, reviewed_files: list) -> tuple:
-    """计划树覆盖 (spec §2.5): when a plan tree exists, the 2.5 review must (a) bind to
-    the CURRENT tree hash, (b) confirm every required node is done in the driver-owned
-    skeleton, (c) name reviewed_node_ids covering those nodes, (d) carry reviewed_manifests,
-    and (e) cover EVERY changed file (changed ⊆ reviewed_files, full repo-relative path —
-    not the looser basename intersection the no-tree path uses)."""
-    if gate.get("reviewed_plan_tree_sha256") != tree_rec.get("tree_hash"):
+    """计划树覆盖 (spec §2.5): when a plan tree exists, the 2.5 review must (a) bind to the
+    CURRENT tree hash AND recompute it from disk (anti-tamper), (b) confirm EVERY node is
+    done in the driver-owned skeleton — the required set comes from the TRUSTED ledger,
+    not the mutable skeleton (a forged skeleton with emptied ac_mapping can't shrink it),
+    (c) name reviewed_node_ids covering every node, (d) per-node manifest files ⊆ that
+    node's declared files, and (e) cover EVERY changed file (changed ⊆ reviewed_files, full
+    repo-relative path, fail-closed)."""
+    tree_hash = tree_rec.get("tree_hash")
+    if gate.get("reviewed_plan_tree_sha256") != tree_hash:
         return False, "Code review reviewed_plan_tree_sha256 与当前计划树 tree_hash 不一致（禁止复用旧 review）"
+    # anti-tamper: recompute tree_hash from on-disk root.md + nodes/*.md + skeleton core.
+    # Catches a tamperer who edits node bodies / graph / ac_mapping (status excluded).
+    tok, tmsg = plan_tree.verify_tree_integrity(tree_rec.get("plan_tree_dir", ""), tree_hash)
+    if not tok:
+        return False, "Code review 计划树完整性校验失败: " + tmsg
     sk_path = tree_rec.get("skeleton_path")
     try:
         sk = json.loads(open(sk_path, encoding="utf-8").read())
     except (OSError, json.JSONDecodeError, TypeError):
         return False, "Code review 无法读取计划树 skeleton.json 复核 node 完成度"
     nodes = sk.get("nodes", []) if isinstance(sk, dict) else []
-    node_ids = {n.get("id") for n in nodes if isinstance(n, dict)}
     status_by_id = {n.get("id"): n.get("status") for n in nodes if isinstance(n, dict)}
-    required = set()
-    for e in (sk.get("ac_mapping") or []):
-        if isinstance(e, dict):
-            for t in (e.get("tasks") or []):
-                if isinstance(t, str):
-                    required.add(t)
+    files_by_id = {n.get("id"): (n.get("files") or []) for n in nodes if isinstance(n, dict)}
+    # REQUIRED = every node, taken from the TRUSTED ledger (not the mutable skeleton).
+    # supporting_for nodes are real work too — none may be silently skipped (codex/auditor).
+    required = set(tree_rec.get("node_ids") or [n.get("id") for n in nodes if isinstance(n, dict)])
     undone = sorted(r for r in required if status_by_id.get(r) != "done")
     if undone:
-        return False, "Code review 时仍有 required node 未完成(skeleton 非 done): " + ", ".join(undone)
+        return False, "Code review 时仍有 node 未完成(skeleton 非 done): " + ", ".join(undone)
     rev_node_ids = gate.get("reviewed_node_ids")
     if not isinstance(rev_node_ids, list):
-        return False, "Code review 缺少 reviewed_node_ids（须覆盖所有 required node）"
+        return False, "Code review 缺少 reviewed_node_ids（须覆盖所有 node）"
     missing_nodes = sorted(required - {x for x in rev_node_ids if isinstance(x, str)})
     if missing_nodes:
-        return False, "Code review reviewed_node_ids 未覆盖 required node: " + ", ".join(missing_nodes)
+        return False, "Code review reviewed_node_ids 未覆盖 node: " + ", ".join(missing_nodes)
     rev_manifests = gate.get("reviewed_manifests")
     if not isinstance(rev_manifests, list):
         return False, "Code review 缺少 reviewed_manifests 数组"
     for mf in rev_manifests:
-        nid = mf.get("node_id") if isinstance(mf, dict) else None
-        if nid is not None and nid not in node_ids:
+        if not isinstance(mf, dict):
+            continue
+        nid = mf.get("node_id")
+        if nid is not None and nid not in required:
             return False, f"Code review reviewed_manifests 含未知 node_id: {nid}"
+        # per-node runtime recheck: a node's recorded diff must stay within its files.
+        mf_changed = mf.get("files_changed")
+        if nid is not None and isinstance(mf_changed, list):
+            okf, off = plan_tree.files_changed_within(files_by_id.get(nid, []), mf_changed)
+            if not okf:
+                return False, (f"Code review node {nid} 改动越界(files_changed ⊄ node.files): "
+                               + ", ".join(off))
     if changed:
         root = _repo_root()
         reviewed_canon = {ck for ck in (_canon_repo_rel(rf, root) for rf in reviewed_files) if ck}
-        uncovered = sorted({ck for ck in (plan_tree.canon_path(c) for c in changed)
-                            if ck and ck not in reviewed_canon})
+        uncovered = []
+        for c in changed:
+            ck = plan_tree.canon_path(c)
+            key = ck if ck is not None else (c or "").strip()   # fail-closed, never drop
+            if key and key not in reviewed_canon:
+                uncovered.append(key)
         if uncovered:
             return False, ("Code review reviewed_files 未覆盖全部改动文件(须 ⊇ git diff 全路径): "
-                           + ", ".join(uncovered))
+                           + ", ".join(sorted(uncovered)))
     return True, ""
 
 
@@ -1201,6 +1219,13 @@ def validate_plan(orch: dict, hook: dict) -> tuple:
     normalized = _normalize(plan_path)
     if PLAN_DIR_MARKER not in normalized or not normalized.endswith(".md"):
         return False, f"plan_path 非合法 plan 产物: {plan_path}"
+    # Repo containment: PLAN_DIR_MARKER is a substring check, so an out-of-repo path
+    # like /tmp/x/docs/superpowers/plans/a.md would pass it — then materialize would
+    # rmtree /tmp/x/.../a.plantree OUTSIDE the repo. Require realpath under repo root.
+    real_plan = os.path.realpath(plan_path)
+    real_root = os.path.realpath(_repo_root())
+    if real_plan != real_root and not real_plan.startswith(real_root + os.sep):
+        return False, f"plan_path 不在仓库内（禁止仓库外路径，计划树拆分会写/删该目录）: {plan_path}"
     if not os.path.exists(plan_path):
         return False, f"plan 文件不存在: {plan_path}"
     ok, msg, rec_14 = _verify_step_artifact(orch, "1.4", plan_path)
@@ -1487,26 +1512,31 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
     if len(content) < 200:
         return False, f"Code review 太短 ({len(content)}B < 200B)，需逐 task review + 设计稿保真度比对"
 
-    m = CODEX_GATE_RE.search(content)
-    if not m:
-        return False, "Code review 缺少显式 GATE 判定行（格式: ### GATE: PASS 或 ### GATE: FAIL）"
-    verdict = m.group(1).upper()
+    # Strict fence-aware parse (same model as 1.5c _extract_codex_review_gate): EXACTLY
+    # ONE full-line verdict outside fences + EXACTLY ONE contract-shaped json gate, gate
+    # == verdict. Defeats "reuse an old PASS review + append a fresh JSON gate" splicing
+    # (the old first-match verdict + last-block JSON let that through).
+    markers = _codex_verdict_markers(content)
+    if len(markers) != 1:
+        return False, ("Code review 须恰好一个顶格 GATE 判定行（### GATE: PASS/FAIL，代码块内/缩进/多行均不算）"
+                       f"，实得 {len(markers)} 个")
+    verdict = markers[0]
     if verdict == "FAIL":
         return False, "code review FAIL — 修复实现后重新 review（留在 2.5，不回退 plan）"
-
-    matches = CODEX_GATE_JSON_RE.findall(content)
-    if not matches:
-        return False, "Code review 缺少机器可验证 JSON gate，禁止纯文本 PASS"
-    try:
-        gate = json.loads(matches[-1])
-    except json.JSONDecodeError as e:
-        return False, f"Code review JSON gate 解析失败: {e}"
-    if not isinstance(gate, dict):
-        return False, "Code review JSON gate 必须是 object"
-
+    contract_gates = []
+    for blk in _codex_gate_jsons(content):
+        try:
+            obj = json.loads(blk)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(obj, dict) and str(obj.get("gate", "")).upper() in {"PASS", "FAIL"}
+                and all(isinstance(obj.get(f), list) for f in CODE_REVIEW_REQUIRED_EMPTY_FIELDS)):
+            contract_gates.append(obj)
+    if len(contract_gates) != 1:
+        return False, ("Code review 须恰好一个 contract-shaped JSON gate（顶格 ```json + gate + 全部覆盖数组），"
+                       f"实得 {len(contract_gates)} 个 — 禁止纯文本 PASS / 拼接旧 review")
+    gate = contract_gates[0]
     json_verdict = str(gate.get("gate", "")).upper()
-    if json_verdict not in {"PASS", "FAIL"}:
-        return False, "Code review JSON gate 缺少 gate=PASS/FAIL"
     if json_verdict != verdict:
         return False, f"Code review 文本 GATE={verdict} 与 JSON gate={json_verdict} 不一致"
     if json_verdict == "FAIL":
@@ -1861,7 +1891,12 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
     mapping = plan_gate.get(PLAN_MAPPING_FIELD)
     if not isinstance(mapping, list) or not mapping:
         return False, f"plan 缺少非空 {PLAN_MAPPING_FIELD} 数组 — 每条 1A P0/P1 AC 须映射到 task+E2E"
-    node_ids = {n.get("id") for n in plan_gate.get("nodes", [])
+    # `.get("nodes", [])` only defaults when the key is ABSENT; a present-but-null
+    # (or scalar) `nodes` would otherwise crash the comprehension with a TypeError
+    # that escapes validate_plan as a raw traceback. Guard the type; the real
+    # structural verdict comes from check_plan_node_graph right after.
+    _nodes = plan_gate.get("nodes")
+    node_ids = {n.get("id") for n in (_nodes if isinstance(_nodes, list) else [])
                 if isinstance(n, dict) and isinstance(n.get("id"), str)}
     mapped = set()
     for m in mapping:
@@ -2511,7 +2546,10 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
   4. 🔴 运行期复核（无 hook 的结构兜底）：每个 node 完成后，driver 捕获该 node 的实际 git diff，
        校验 files_changed ⊆ node.files（越界 = 该 node FAIL，打回）；上游实际产出的 output 符号回填 skeleton
        的 manifest，供下游 brief 使用真实产出（不靠静态声明）。
-       【driver 是 skeleton.json 的唯一 writer】——并行 subagent 不得各自写 skeleton（JSON 竞态）。
+       🔴 回填【只用】单一原子写入口（driver 是 skeleton.json 唯一 writer，禁止手搓 JSON / 并行写）：
+         "$(git rev-parse --show-toplevel)/.claude/tools/fastship" node-update --node <id> --status done \
+            --manifest '{"files_changed":["<改过的文件>", ...]}'
+       并行 subagent 不得各自写 skeleton（JSON 竞态）。
   5. 逐 node 的结构化 verdict（node / files_changed / 三视角结论）写入【session 绑定】的
        ledger：{git-dir}/fastship/sessions/<sid>/implement-verdicts.md
        （路径用 fastship_state.implement_verdicts_path() 解析；非门禁，作 2.5 的输入证据）。
@@ -4266,6 +4304,42 @@ def cmd_goal() -> int:
     return 0
 
 
+def cmd_node_update(argv) -> int:
+    """Phase-2 driver entry: atomically set a 计划树 node's status/manifest in skeleton.json
+    (single writer). The driver calls this instead of hand-writing the skeleton JSON."""
+    st = load_orch_state()
+    if not st:
+        print("❌ 没有活跃 session。")
+        return 1
+    sk_path = _plan_tree_record(st).get("skeleton_path")
+    if not sk_path:
+        print("❌ 当前 session 无计划树（非 feature / 未到 1.4 完成）。")
+        return 1
+    node_id = status = manifest = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--node" and i + 1 < len(argv):
+            node_id, i = argv[i + 1], i + 2
+        elif a == "--status" and i + 1 < len(argv):
+            status, i = argv[i + 1], i + 2
+        elif a == "--manifest" and i + 1 < len(argv):
+            try:
+                manifest = json.loads(argv[i + 1])
+            except json.JSONDecodeError as e:
+                print(f"❌ --manifest 不是合法 JSON: {e}")
+                return 1
+            i += 2
+        else:
+            i += 1
+    if not node_id:
+        print("Usage: node-update --node <id> [--status pending|in_progress|done|failed] [--manifest '<json>']")
+        return 1
+    ok, msg = plan_tree.update_node_status(sk_path, node_id, status=status, manifest=manifest)
+    print(("✅ " if ok else "❌ ") + msg)
+    return 0 if ok else 1
+
+
 def cmd_adopt_branch() -> int:
     st = load_orch_state()
     if not st:
@@ -4415,6 +4489,8 @@ def main():
         sys.exit(cmd_sweep_worktrees(argv[1:]))
     elif cmd == "render-plan":
         sys.exit(cmd_render_plan(argv[1:]))
+    elif cmd == "node-update":
+        sys.exit(cmd_node_update(argv[1:]))
     elif cmd == "sniff":
         sys.exit(cmd_sniff(argv[1:]))
     elif cmd in handlers:

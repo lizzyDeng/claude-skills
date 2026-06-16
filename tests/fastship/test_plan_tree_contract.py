@@ -400,3 +400,148 @@ def test_files_changed_within():
     assert ok and off == []
     ok, off = pt.files_changed_within(["src/a.rs"], ["src/a.rs", "src/evil.rs"])
     assert not ok and off == ["src/evil.rs"]
+
+
+# ── hardening fixes (codex + auditors) ───────────────────────────────────────
+def test_bracket_filename_allowed():
+    # Next.js/Remix dynamic routes are literal filenames, NOT globs.
+    assert pt.canon_path("app/routes/[id].tsx") == "app/routes/[id].tsx"
+    b = block([node("a", files=["app/routes/[id].tsx"])])
+    ok, msg = pt.check_plan_node_graph(b)
+    assert ok, msg
+
+
+def test_star_still_rejected():
+    assert pt.canon_path("src/*.rs") is None
+
+
+def test_output_root_prefix_fails():
+    b = block([node("a", outputs=["root:sneaky"], files=["src/a.rs"])])
+    ok, msg = pt.check_plan_node_graph(b)
+    assert not ok and "root:" in msg
+
+
+def test_supporting_for_unknown_ac_fails():
+    b = block([
+        node("a", outputs=["sym:a"], files=["src/a.rs"]),
+        node("b", outputs=["sym:b"], files=["src/b.rs"], supporting_for=["NOPE"]),
+    ], ac_mapping=[{"ac_id": "ac-1", "tasks": ["a"], "e2e": ["E2E"]}])
+    ok, msg = pt.check_plan_node_graph(b)
+    assert not ok and "supporting_for" in msg and "NOPE" in msg
+
+
+def test_ac_mapping_non_list_fails_clearly():
+    b = {"nodes": [node("a")], "ac_mapping": {"not": "a list"}, "exclusive_forks": []}
+    ok, msg = pt.check_plan_node_graph(b)
+    assert not ok and "ac_mapping" in msg and "数组" in msg
+
+
+def test_id_with_trailing_newline_fails():
+    b = block([node("task-1\n", files=["src/a.rs"])])
+    ok, msg = pt.check_plan_node_graph(b)
+    assert not ok and "id" in msg
+
+
+def test_case_insensitive_file_overlap_fails():
+    b = block([
+        node("a", outputs=["sym:a"], files=["src/Foo.rs"]),
+        node("b", outputs=["sym:b"], files=["src/foo.rs"]),
+    ])
+    ok, msg = pt.check_plan_node_graph(b)
+    assert not ok and "共享文件" in msg
+
+
+def test_contract_before_last_anchor_fails():
+    md = "\n".join([
+        "# Plan", "",
+        "<!-- fastship:node task-1 -->", "### Task 1", "a", "",
+        "<!-- fastship:contract -->", "```json",
+        json.dumps(block([node("task-1", outputs=["sym:a"], files=["src/a.rs"]),
+                          node("task-2", deps=["task-1"], inputs=["sym:a"], outputs=["sym:b"], files=["src/b.rs"])],
+                         ac_mapping=[{"ac_id":"ac-1","tasks":["task-1","task-2"],"e2e":["E"]}])),
+        "```", "",
+        "<!-- fastship:node task-2 -->", "### Task 2", "b", "",
+    ])
+    blk, _ = pt.extract_contract_block(md)
+    root, bodies, err = pt.split_plan_tree(md, blk)
+    assert err is not None and "之后" in err
+
+
+def test_indented_fence_hides_anchor():
+    # a marker inside a ≤3-space-indented code fence must NOT be a real anchor
+    md = "\n".join([
+        "# Plan", "",
+        "<!-- fastship:node task-1 -->", "### Task 1", "body",
+        "   ```", "   <!-- fastship:node fake -->", "   ```",
+        "more task-1", "",
+        "<!-- fastship:contract -->", "```json",
+        json.dumps(block([node("task-1", outputs=["sym:a"], files=["src/a.rs"])],
+                         ac_mapping=[{"ac_id":"ac-1","tasks":["task-1"],"e2e":["E"]}])),
+        "```", "",
+    ])
+    blk, err = pt.extract_contract_block(md)
+    assert err is None
+    root, bodies, serr = pt.split_plan_tree(md, blk)
+    assert serr is None and set(bodies) == {"task-1"} and "more task-1" in bodies["task-1"]
+
+
+def test_verify_tree_integrity(tmp_path):
+    out = str(tmp_path / "p.plantree")
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok
+    vok, vmsg = pt.verify_tree_integrity(out, prov["tree_hash"])
+    assert vok, vmsg
+    # tamper a node body → integrity FAILs
+    p = os.path.join(out, "nodes", "task-1.md")
+    open(p, "w").write("HIJACKED")
+    vok, vmsg = pt.verify_tree_integrity(out, prov["tree_hash"])
+    assert not vok and "篡改" in vmsg
+
+
+def test_verify_tree_integrity_ignores_status(tmp_path):
+    out = str(tmp_path / "p.plantree")
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok
+    # flipping status / manifest must NOT break integrity (mutable progress)
+    sok, _ = pt.update_node_status(os.path.join(out, "skeleton.json"), "task-1",
+                                   status="done", manifest={"files_changed": ["src/a.rs"]})
+    assert sok
+    vok, vmsg = pt.verify_tree_integrity(out, prov["tree_hash"])
+    assert vok, vmsg
+    sk = json.load(open(os.path.join(out, "skeleton.json")))
+    n1 = next(n for n in sk["nodes"] if n["id"] == "task-1")
+    assert n1["status"] == "done" and n1["manifest"]["files_changed"] == ["src/a.rs"]
+
+
+def test_update_node_status_unknown_node(tmp_path):
+    out = str(tmp_path / "p.plantree")
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok
+    sok, smsg = pt.update_node_status(prov["skeleton_path"], "ghost", status="done")
+    assert not sok and "无此 node" in smsg
+
+
+def test_update_node_status_bad_status(tmp_path):
+    out = str(tmp_path / "p.plantree")
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok
+    sok, smsg = pt.update_node_status(prov["skeleton_path"], "task-1", status="bogus")
+    assert not sok and "status" in smsg
+
+
+def test_materialize_preserves_progress_on_unchanged_hash(tmp_path):
+    out = str(tmp_path / "p.plantree")
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok
+    pt.update_node_status(prov["skeleton_path"], "task-1", status="done")
+    # re-materialize the SAME plan → progress must be preserved (no wipe)
+    ok2, msg2, prov2 = pt.materialize_plan_tree(plan_with_contract(), out, "sha")
+    assert ok2 and prov2["tree_hash"] == prov["tree_hash"]
+    sk = json.load(open(prov["skeleton_path"]))
+    n1 = next(n for n in sk["nodes"] if n["id"] == "task-1")
+    assert n1["status"] == "done", "progress wiped on unchanged-hash re-materialize"
+
+
+def test_prov_carries_node_ids(tmp_path):
+    ok, _, prov = pt.materialize_plan_tree(plan_with_contract(), str(tmp_path / "p.plantree"), "sha")
+    assert ok and prov["node_ids"] == ["task-1", "task-2"]

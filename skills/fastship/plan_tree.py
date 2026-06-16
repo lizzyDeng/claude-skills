@@ -31,16 +31,23 @@ import re
 import shutil
 
 # ── anchors / markers ────────────────────────────────────────────────────────
-NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+# \A..\Z (not ^..$): Python's $ matches before a trailing \n, which would let an id
+# carry a newline and become a control-char filename nodes/<id>.md.
+NODE_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]*\Z")
+# Fence lines tolerate ≤3 leading spaces (CommonMark), so a marker inside a slightly
+# indented code fence is correctly treated as code, not a real anchor.
+_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 _NODE_ANCHOR_RE = re.compile(r"^\s*<!--\s*fastship:node\s+(\S+)\s*-->\s*$")
 _ROOT_OPEN_RE = re.compile(r"^\s*<!--\s*fastship:root\s*-->\s*$")
 _ROOT_CLOSE_RE = re.compile(r"^\s*<!--\s*fastship:/root\s*-->\s*$")
 _CONTRACT_RE = re.compile(r"^\s*<!--\s*fastship:contract\s*-->\s*$")
-_JSON_FENCE_OPEN_RE = re.compile(r"^(`{3,}|~{3,})\s*json\s*$", re.IGNORECASE)
+_JSON_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})\s*json\s*$", re.IGNORECASE)
 
 SKELETON_VERSION = 1
-_GLOB_CHARS = set("*?[]")
+# Only real wildcards reject a node.files declaration. Literal brackets are legal in
+# framework filenames (Next.js/Remix dynamic routes: app/routes/[id].tsx), so they are
+# NOT treated as glob — a changed file like [id].tsx must canonicalize, not vanish.
+_GLOB_CHARS = set("*?")
 
 
 # ── fence-aware line scanning ────────────────────────────────────────────────
@@ -201,6 +208,9 @@ def check_plan_node_graph(block):
             canon.append(ck)
         files_by_node[nid] = set(canon)
         for out in n["outputs"]:
+            if out.startswith("root:"):
+                return False, (f"node {nid} 的 output 不能用 root: 前缀: {out} "
+                               "— root: 是 root 层声明,会让下游用 root:x 掩盖真实 node 依赖")
             if out in all_outputs:
                 return False, f"outputs 全局重复: {out}（{all_outputs[out]} 与 {nid} 都产出 — 会让下游 input 解析歧义）"
             all_outputs[out] = nid
@@ -251,32 +261,45 @@ def check_plan_node_graph(block):
             return False, f"node {nid} 的 input 悬空（非 root: 声明、非任何上游 output）: {inp}"
     # ac_mapping.tasks reference + orphan coverage
     ac_mapping = block.get("ac_mapping")
+    if ac_mapping is not None and not isinstance(ac_mapping, list):
+        return False, "ac_mapping 必须是数组"
     referenced = set()
+    ac_ids = set()
     if isinstance(ac_mapping, list):
         for entry in ac_mapping:
             if isinstance(entry, dict):
+                aid = entry.get("ac_id")
+                if isinstance(aid, str) and aid.strip():
+                    ac_ids.add(aid)
                 tasks = entry.get("tasks")
                 if isinstance(tasks, list):
                     for t in tasks:
                         if isinstance(t, str):
                             referenced.add(t)
-    for entry_tasks in referenced:
-        if entry_tasks not in id_set:
-            return False, f"ac_mapping.tasks 引用不存在的 node id: {entry_tasks}"
+    for ref in referenced:
+        if ref not in id_set:
+            return False, f"ac_mapping.tasks 引用不存在的 node id: {ref}"
     for n in nodes:
         nid = n["id"]
         if nid in referenced:
             continue
         sup = n.get("supporting_for")
         if isinstance(sup, list) and sup and all(isinstance(s, str) and s.strip() for s in sup):
+            unknown = sorted(s for s in sup if s not in ac_ids)
+            if unknown:
+                return False, (f"node {nid} 的 supporting_for 引用不存在的 ac_id: {unknown} "
+                               "— 必须引用真实 ac_mapping[].ac_id,否则覆盖归属是空的")
             continue
-        return False, (f"游离 node {nid}：既未被 ac_mapping.tasks 引用、又无非空 supporting_for "
-                       "— 无覆盖归属")
-    # file overlap without a dependency edge
+        return False, (f"游离 node {nid}：既未被 ac_mapping.tasks 引用、又无（引用真实 ac_id 的）"
+                       "supporting_for — 无覆盖归属")
+    # file overlap without a dependency edge. case-insensitive: macOS APFS / Windows
+    # treat src/Foo.rs and src/foo.rs as ONE physical file — two parallel nodes editing
+    # it would still collide, which is exactly what this gate prevents.
+    casefold_files = {nid: {f.casefold() for f in files_by_node[nid]} for nid in ids}
     for i in range(len(ids)):
         for j in range(i + 1, len(ids)):
             a, b = ids[i], ids[j]
-            shared = files_by_node[a] & files_by_node[b]
+            shared = casefold_files[a] & casefold_files[b]
             if not shared:
                 continue
             if b in _ancestors(a, dep_map) or a in _ancestors(b, dep_map):
@@ -337,6 +360,12 @@ def split_plan_tree(plan_md, block):
     anchor_positions = sorted(node_anchor_at.keys())
     first_anchor = anchor_positions[0]
 
+    # The contract block must sit AFTER every node anchor (it is the plan tail). A
+    # contract before the last anchor would otherwise be sliced into root.md / a node
+    # body, leaking every node's I/O wiring into root and every leaf brief.
+    if contract_idx is not None and contract_idx < anchor_positions[-1]:
+        return None, None, "contract 块（<!-- fastship:contract -->）须在所有 node 锚点之后"
+
     # root = lines[0 : first_anchor], stripping any explicit root wrapper lines
     root_lines = []
     for idx in range(0, first_anchor):
@@ -354,7 +383,9 @@ def split_plan_tree(plan_md, block):
         end = boundaries[k + 1]
         if contract_idx is not None and start < contract_idx < end:
             end = contract_idx
-        body_lines = lines[start + 1:end]
+        # drop any stray root-wrapper markers (a misplaced </root> after first anchor)
+        body_lines = [ln for ln in lines[start + 1:end]
+                      if not (_ROOT_OPEN_RE.match(ln) or _ROOT_CLOSE_RE.match(ln))]
         node_bodies[nid] = "\n".join(body_lines).strip() + "\n"
     return root_text, node_bodies, None
 
@@ -433,32 +464,56 @@ def materialize_plan_tree(plan_md, out_dir, source_plan_sha256):
         "exclusive_forks": block.get("exclusive_forks", []),
     }
     tree_hash = compute_tree_hash(root_text, node_bodies, skeleton_core)
-
-    # idempotent: wipe the tree dir so a removed node leaves no stale nodes/briefs
-    try:
-        if os.path.isdir(out_dir):
-            shutil.rmtree(out_dir)
-        os.makedirs(os.path.join(out_dir, "nodes"), exist_ok=True)
-        os.makedirs(os.path.join(out_dir, "briefs"), exist_ok=True)
-        _write(os.path.join(out_dir, "root.md"), root_text)
-        for nid, body in node_bodies.items():
-            _write(os.path.join(out_dir, "nodes", f"{nid}.md"), body)
-            brief = build_brief(root_text, body, nodes_by_id[nid], nodes_by_id)
-            _write(os.path.join(out_dir, "briefs", f"{nid}.md"), brief)
-        skeleton = dict(skeleton_core)
-        skeleton["tree_hash"] = tree_hash
-        skeleton["source_plan_sha256"] = source_plan_sha256
-        skeleton_path = os.path.join(out_dir, "skeleton.json")
-        _write(skeleton_path, json.dumps(skeleton, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-    except OSError as e:
-        return False, f"写计划树失败: {e}", None
-
-    return True, f"计划树已生成（{len(node_bodies)} 节点，tree_hash={tree_hash[:12]}）", {
+    skeleton_path = os.path.join(out_dir, "skeleton.json")
+    prov = {
         "plan_tree_dir": os.path.abspath(out_dir),
         "skeleton_path": os.path.abspath(skeleton_path),
         "tree_hash": tree_hash,
         "source_plan_sha256": source_plan_sha256,
+        "node_ids": [n["id"] for n in nodes],
     }
+
+    # Progress preservation: if an existing tree has the SAME tree_hash, the plan is
+    # structurally unchanged — keep the driver's node status/manifest, do NOT wipe
+    # (a Phase-2 re-validate of an unchanged plan must not reset progress).
+    if os.path.exists(skeleton_path):
+        try:
+            old = json.loads(open(skeleton_path, encoding="utf-8").read())
+            if isinstance(old, dict) and old.get("tree_hash") == tree_hash:
+                return True, f"计划树未变(tree_hash={tree_hash[:12]})，保留进度", prov
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Atomic rebuild: build into a temp sibling dir and swap in, so a failure leaves
+    # the OLD tree intact (never a half-written tree mistaken for valid).
+    tmp_dir = out_dir + ".tmp-build"
+    try:
+        if os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(os.path.join(tmp_dir, "nodes"))
+        os.makedirs(os.path.join(tmp_dir, "briefs"))
+        _write(os.path.join(tmp_dir, "root.md"), root_text)
+        for nid, body in node_bodies.items():
+            _write(os.path.join(tmp_dir, "nodes", f"{nid}.md"), body)
+            _write(os.path.join(tmp_dir, "briefs", f"{nid}.md"),
+                   build_brief(root_text, body, nodes_by_id[nid], nodes_by_id))
+        skeleton = dict(skeleton_core)
+        skeleton["tree_hash"] = tree_hash
+        skeleton["source_plan_sha256"] = source_plan_sha256
+        _write(os.path.join(tmp_dir, "skeleton.json"),
+               json.dumps(skeleton, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)
+        os.rename(tmp_dir, out_dir)
+    except OSError as e:
+        try:
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir)
+        except OSError:
+            pass
+        return False, f"写计划树失败: {e}", None
+
+    return True, f"计划树已生成（{len(node_bodies)} 节点，tree_hash={tree_hash[:12]}）", prov
 
 
 def _write(path, text):
@@ -467,18 +522,86 @@ def _write(path, text):
         f.write(text)
 
 
+def verify_tree_integrity(plan_tree_dir, expected_tree_hash):
+    """Recompute tree_hash from on-disk root.md + nodes/*.md + skeleton CORE (status
+    and manifest excluded — those are mutable progress) and compare to the trusted
+    ledger hash. Detects tampering of node bodies / graph / ac_mapping that a
+    status-only edit can't hide. (ok, msg)."""
+    try:
+        root_text = open(os.path.join(plan_tree_dir, "root.md"), encoding="utf-8").read()
+        sk = json.loads(open(os.path.join(plan_tree_dir, "skeleton.json"), encoding="utf-8").read())
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"无法读取计划树复算 hash: {e}"
+    if not isinstance(sk, dict) or not isinstance(sk.get("nodes"), list):
+        return False, "skeleton.json 结构损坏"
+    node_bodies = {}
+    core_nodes = []
+    for n in sk["nodes"]:
+        if not isinstance(n, dict):
+            return False, "skeleton.json node 结构损坏"
+        nid = n.get("id")
+        try:
+            node_bodies[nid] = open(os.path.join(plan_tree_dir, "nodes", f"{nid}.md"),
+                                    encoding="utf-8").read()
+        except OSError as e:
+            return False, f"无法读取 node 正文复算 hash: {e}"
+        core = {k: n.get(k) for k in ("id", "title", "deps", "inputs", "outputs", "files")}
+        core["status"] = "pending"
+        core["manifest"] = None
+        core_nodes.append(core)
+    skeleton_core = {
+        "version": sk.get("version", SKELETON_VERSION),
+        "nodes": core_nodes,
+        "ac_mapping": sk.get("ac_mapping", []),
+        "exclusive_forks": sk.get("exclusive_forks", []),
+    }
+    if compute_tree_hash(root_text, node_bodies, skeleton_core) != expected_tree_hash:
+        return False, "计划树被篡改：磁盘内容重算 tree_hash 与可信记录不一致"
+    return True, "tree integrity OK"
+
+
+def update_node_status(skeleton_path, node_id, status=None, manifest=None):
+    """Single-writer ATOMIC update of one node's status/manifest in skeleton.json —
+    the Phase-2 driver calls this instead of hand-writing JSON (spec L113). status and
+    manifest are excluded from tree_hash, so integrity stays intact. (ok, msg)."""
+    try:
+        sk = json.loads(open(skeleton_path, encoding="utf-8").read())
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"无法读取 skeleton: {e}"
+    nodes = sk.get("nodes") if isinstance(sk, dict) else None
+    if not isinstance(nodes, list):
+        return False, "skeleton 结构损坏"
+    hit = next((n for n in nodes if isinstance(n, dict) and n.get("id") == node_id), None)
+    if hit is None:
+        return False, f"skeleton 无此 node: {node_id}"
+    if status is not None:
+        if status not in ("pending", "in_progress", "done", "failed"):
+            return False, f"非法 status: {status}"
+        hit["status"] = status
+    if manifest is not None:
+        hit["manifest"] = manifest
+    tmp = skeleton_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(sk, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, skeleton_path)
+    except OSError as e:
+        return False, f"写 skeleton 失败: {e}"
+    return True, f"node {node_id} 更新 (status={status})"
+
+
 # ── runtime helper: enforce a node's diff stays within its declared files ─────
 def files_changed_within(node_files, changed_files):
-    """(ok, offending). Both canonicalized; offending = changed - declared.
-    Used by the Phase-2 driver's per-node git-diff recheck and the 2.5 gate."""
+    """(ok, offending). Both canonicalized; offending = changed - declared. A changed
+    file that fails canonicalization is FAIL-CLOSED (counted as offending), never
+    silently dropped. Used by the Phase-2 driver's per-node git-diff recheck + 2.5 gate."""
     declared = set(f for f in (canon_path(x) for x in node_files) if f)
     offending = []
     for c in changed_files:
         ck = canon_path(c)
-        if ck is None:
-            continue
-        if ck not in declared:
-            offending.append(ck)
+        key = ck if ck is not None else (c or "").strip()
+        if key and key not in declared:
+            offending.append(key)
     return (not offending), sorted(offending)
 
 
