@@ -146,9 +146,16 @@ Phase 2 无 hook(L119),manifest/root 冻结**不能只靠自报**:
 
 ---
 
-## 未决(交实现阶段)
+## 已决(实现阶段拍板,已落地)
 
-1. `root.md` 边界标记 / node 锚点的具体语法(`<!-- fastship:root -->` / `<!-- fastship:node <id> -->`)。
-2. output manifest 的 schema。
-3. 是否给 Phase 2 加 hook,把"每个 agent 输入不含全 plan" + "root 冻结"升成硬门禁(现为 instruction + 结构兜底 + git diff 兜底)。
-4. `skeleton.json` 与既有 session artifact ledger / state 的具体存储形态。
+1. **锚点/边界语法** → 单一必需锚点 `<!-- fastship:node <id> -->`(段首)；root = 首锚点前内容(可选 `<!-- fastship:root -->`/`<!-- fastship:/root -->` 包裹,切分时剥离)；契约块由唯一 `<!-- fastship:contract -->` 标记 + ```json,且**必须在所有 node 锚点之后**(否则切进 root/brief = FAIL)。HTML 注释隐形、fence-aware 跳过、绝不与真标题撞。
+2. **output manifest schema** → `{node_id, files_changed:[...], ...}`,driver 经 `node-update --node <id> --status done --manifest '<json>'` 原子回填到 `skeleton.nodes[id].manifest`；2.5 校验每 node `files_changed ⊆ node.files`。
+3. **Phase 2 hook** → 本迭代**不加**。门禁强度 = instruction + 预拼 brief 结构兜底 + 运行期 git-diff 复核 + 2.5 树覆盖硬 gate(`reviewed_plan_tree_sha256==tree_hash` + `verify_tree_integrity` 磁盘重算反篡改 + 全 node done + per-node manifest ⊆ files)。hook 升级留 follow-up。
+4. **skeleton 存储** → 真文件落 sibling 目录 `<plan_stem>.plantree/`(root.md/nodes/briefs/skeleton.json)；**可信 ledger 只存指针+hash**(`1.4_tree`: plan_tree_dir/skeleton_path/tree_hash/source_plan_sha256/node_ids)。skeleton.json 是 driver 唯一可写的进度源(`update_node_status` 原子单写者),status/manifest 不计入 tree_hash 故可变进度不破坏完整性。
+
+## 实现落地(commit on `fastship/plan-tree-decomposition`)
+
+- 纯模块 `plan_tree.py`(extract_contract_block / check_plan_node_graph / split_plan_tree / build_brief / materialize_plan_tree / verify_tree_integrity / update_node_status / files_changed_within)。
+- orchestrator 接入:唯一 contract extractor、node-id tasks、node graph gate、1.4 materialize 硬步骤 + 可信 ledger、2.5 树覆盖、状态行 node 进度、goal skeleton 入口、`node-update` CLI、1.4/2.0 指令 + SKILL 改述。
+- 经一轮 codex 技术审查 + 一轮 5-路对抗审计,吸收全部 Critical/High/Med(信任边界、原子性、fence-aware、supporting_for、canon glob、仓库 containment、严格 gate 解析)。
+- 验证:单测 ~70 项(plan_tree 纯函数每分支 + 2.5 树覆盖 + 状态行) + 引擎 e2e runner(6 scenario/34 turn,真 git 零 mock) + 全栈 496 测试全绿。实测 9-node/29KB plan:driver 持 3KB skeleton(10× 缩),每 leaf brief ~3.4KB 且不随节点数涨。
