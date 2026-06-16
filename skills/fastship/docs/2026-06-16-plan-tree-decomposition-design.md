@@ -25,6 +25,8 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 
 树已经在那,只是以 51KB 单 blob 发给执行层。**病根是打包,不是计划本身。**
 
+> 术语精确化(grill G4):严格说这是 **root 共享层 + 叶子 DAG**(节点带 `deps`,无中间层级节点——多层 milestone 树被 YAGNI 砍了)。"树化"是俗称,实际结构是"一个 root + 一张叶子依赖图"。
+
 ## 不变量
 
 > 执行侧任何单个 context 都不得持有全量 plan——驱动线程不持有,叶子 subagent 不持有。
@@ -86,6 +88,7 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 - 环:`deps` 有环(拓扑排不出);
 - **悬空 input**:某 `input` 既不是 root 声明符号、也不是任何上游节点的 `output`;
 - `ac_mapping.tasks` 引用了不存在的 node id。
+- **文件重叠必须有依赖边(grill G3)**:两 node 的 `files` 有交集、却无 `deps` 路径相连 = FAIL(并行编辑同文件必冲突;隔离靠 dep 排序 + subagent 读真实当前文件,不靠 brief 带兄弟正文)。
 
 挂进 `validate_plan`(non-bugfix),与 AC 覆盖同档**硬 gate,不等 codex**。
 
@@ -99,6 +102,7 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 - **subagent 自己读** `briefs/<id>.md`(单一自包含文件)。**有界是构造出来的,不是约定出来的。**
 - 上游完成后,其 outputs(声明 + 实际产出符号)回填进下游 brief 文件。
 - ⚠️ **「子 plan 有界 ≠ 代码世界受限」**:subagent 照常 read/grep 仓库源码(root.md 带 verified signatures),只是不背其它 node 的 plan 正文。
+- 🔴 **执行期 root 冻结(grill G2)**:root.md 是共享接口层;leaf 不得就地改 root 声明的接口。某 leaf 实现中发现 root 接口必须改 → 升级为该子图 re-plan,**而非默默改 root**(否则下游 brief 按旧 root 拼 = 照错接口写,backfill 只管 node outputs、不管 root 突变)。
 
 **门禁强度(诚实声明):** Phase 2 无 hook(同 model:opus,L119 仅 instruction 级"确保")。本节是 **instruction 级 + 结构兜底**(预拼 brief 使"只读一份"成为阻力最小默认路径),**非硬门禁**。要硬门禁须给 Phase 2 加 hook 校验每个 agent 输入不含全 plan——更大改动,见未决 5。
 
@@ -110,12 +114,24 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 
 缓解:`_check_plan_node_graph` 机器查"无悬空 input" + codex 1.5c 加审"节点图是否漏声明跨 task 依赖"。**与今天审 AC 覆盖是同一套纪律,非新风险类别。**
 
+**leaf 自包含纪律(grill G5):** 机械按 `### Task N` 切片后,node 正文若有"见 Task 2 / 如前述"这类**跨节点 prose 引用**,切成独立文件即悬空。强制 1B 写 task 段**只引 root 符号、不引兄弟节点**;加 lint:node 正文出现 `Task \d` / "前述/上文" → 告警。
+
 ## 范围与 YAGNI
 
 - **不碰 Phase 1 authoring 的 context**(用户明确另议)。
 - **不加人工确认点**(保持全自动)。
 - bugfix 路径无 `ac_mapping` / 无 1A → 无 `nodes`,split 跳过,**行为不变**。
 - **不做 size gate**:拆包是确定性代码、零成本;小 feature(1–2 task)skeleton ≈ 整 plan,负担可忽略;统一处理,避免分支特判(策略一致性 > 微优化)。
+
+## 本 spec 不解决什么(scope 诚实声明 · grill G1)
+
+🔴 **本 spec 必要、非充分**(回应你那次 17 步、四症全中)。它修的是执行层 context 体量 → 缓解**执行漂移(症状1)+ 长 context 降智导致的平庸(症状3 的一部分)**。它**不修**:
+
+- **过度拆分(症状4)**:节点数由 1A/1B 决定,生在 Phase 1 authoring。
+- **意图跑偏(症状2)**:plan 是否接住真实意图,也在 Phase 1。
+- **整体不成体系(症状3 另一半)**:无 feature 级整体验收,只有逐 leaf review。
+
+⚠️ 推论:**只上这个,再跑那个 17 步 feature 很可能仍不满意**——烂在 plan,完美隔离地执行烂 plan 结果照样烂。症状 2/4 需单独的 Phase-1 件(你已明确另议),但要清醒:**本 spec 不是那次不满的完整解药。**
 
 ## 验证
 
@@ -127,7 +143,7 @@ Phase 2 执行驱动为了做依赖感知扇出,**必须把整份 plan 读进一
 ## 未决(交 writing-plans 阶段细化)
 
 1. `root.md` 的精确切分锚点:按 `##` 标题白名单 vs 在 plan 里下显式标记。
-2. `outputs` 的"实际产出符号"如何回填:节点完成后由 subagent 申报 vs orchestrator 静态取声明。
+2. ~~`outputs` 回填~~ → **grill G6 定:上游 subagent 完成时返回小 output manifest(实际产出符号/签名),orchestrator 记进 skeleton,下游 brief 用 manifest 不用声明**(有界、不 parse diff)。剩余:manifest schema。
 3. `skeleton.json` 与现有 `[FASTSHIP_GOAL]` 状态行 / `cmd_goal`(L4051)的衔接。
 4. 1B 指令(L2191 起)如何要求总结者产 `nodes[]` 图——措辞与硬约束。
 5. 是否给 Phase 2 加 hook,把"每个 agent 输入不含全 plan"从 instruction 级 + 结构兜底升成**硬门禁**(现 Phase 2 无 hook)。
