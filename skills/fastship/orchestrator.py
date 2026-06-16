@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Optional, Callable, Any, Union
 
 import fastship_state
+import plan_tree
 
 
 # ━━━━━━━━━━━━ Context Compact Advisory ━━━━━━━━━━━━
@@ -501,6 +502,28 @@ def _clear_trusted_artifacts(orch: dict, step_ids: tuple[str, ...]):
     trusted = orch.setdefault("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {})
     for step_id in step_ids:
         trusted.pop(step_id, None)
+
+
+PLAN_TREE_LEDGER_KEY = "1.4_tree"
+
+
+def _record_plan_tree_artifact(orch: dict, prov: dict):
+    """Register 计划树 provenance in the TRUSTED ledger (NOT the best-effort
+    plan_html_path field). prov = {plan_tree_dir, skeleton_path, tree_hash,
+    source_plan_sha256}. tree_hash binds the derived tree to the validated plan;
+    Phase 2 / 2.5 read skeleton_path + tree_hash from here. A distinct key (not
+    "1.4") avoids colliding with the plan's own _verify_step_artifact("1.4") record."""
+    if not prov:
+        return
+    rec = dict(prov)
+    rec["step_id"] = PLAN_TREE_LEDGER_KEY
+    rec["recorded_at"] = datetime.now().isoformat()
+    _trusted_artifacts(orch)[PLAN_TREE_LEDGER_KEY] = rec
+
+
+def _plan_tree_record(orch: dict) -> dict:
+    """The trusted 计划树 provenance record, or {} if none (bugfix / pre-1.4)."""
+    return orch.get("artifacts", {}).get(TRUSTED_ARTIFACTS_KEY, {}).get(PLAN_TREE_LEDGER_KEY, {}) or {}
 
 
 def _verify_step_artifact(orch: dict, step_id: str, path: str) -> tuple[bool, str, dict]:
@@ -1084,7 +1107,7 @@ def validate_plan(orch: dict, hook: dict) -> tuple:
         return False, f"plan_path 非合法 plan 产物: {plan_path}"
     if not os.path.exists(plan_path):
         return False, f"plan 文件不存在: {plan_path}"
-    ok, msg, _rec = _verify_step_artifact(orch, "1.4", plan_path)
+    ok, msg, rec_14 = _verify_step_artifact(orch, "1.4", plan_path)
     if not ok:
         return False, msg
     try:
@@ -1104,6 +1127,17 @@ def validate_plan(orch: dict, hook: dict) -> tuple:
         ok, msg = _validate_plan_ac_mapping(orch, content)
         if not ok:
             return False, msg
+        # 计划树 hard step (spec L72-82): split the validated plan into root.md /
+        # nodes/<id>.md / briefs/<id>.md / skeleton.json so Phase 2 never holds the
+        # whole plan. This is NOT best-effort like attach_plan_html — a materialize
+        # failure FAILs 1.4 (the contract block was already node-graph-validated above,
+        # so failure here means anchors/contract are inconsistent with the node set).
+        source_sha = (rec_14 or {}).get("sha256") or hashlib.sha256(content.encode("utf-8")).hexdigest()
+        tree_dir = plan_tree.plan_tree_dir_for(plan_path)
+        ok, msg, prov = plan_tree.materialize_plan_tree(content, tree_dir, source_sha)
+        if not ok:
+            return False, "计划树拆分失败(1.4 不通过): " + msg
+        _record_plan_tree_artifact(orch, prov)
     return True, f"plan: {os.path.relpath(plan_path, _repo_root())}"
 
 
@@ -1715,6 +1749,8 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
       - duplicate ac_id: would let the coverage diff hide a gap — the same dup-id
         bypass the 1A concern/AC checks close;
       - empty tasks/e2e: an AC named with no task or no E2E scenario is not mapped;
+      - task not a node id: tasks now REFERENCE nodes[].id (计划树迁移) — a free-text
+        task or one absent from the node set FAILs (the engine splits per node);
       - uncovered: a P0/P1 AC with no mapping entry at all — the core 「缺映射当场 FAIL」.
     """
     if not isinstance(plan_gate, dict):
@@ -1722,6 +1758,8 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
     mapping = plan_gate.get(PLAN_MAPPING_FIELD)
     if not isinstance(mapping, list) or not mapping:
         return False, f"plan 缺少非空 {PLAN_MAPPING_FIELD} 数组 — 每条 1A P0/P1 AC 须映射到 task+E2E"
+    node_ids = {n.get("id") for n in plan_gate.get("nodes", [])
+                if isinstance(n, dict) and isinstance(n.get("id"), str)}
     mapped = set()
     for m in mapping:
         if not isinstance(m, dict):
@@ -1741,6 +1779,10 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
             for x in v:
                 if not isinstance(x, str) or not x.strip():
                     return False, f"AC {aid} 的 {fld} 含空项"
+        for t in m["tasks"]:
+            if t not in node_ids:
+                return False, (f"AC {aid} 的 task 引用了不存在的 node id: {t} — "
+                               "ac_mapping.tasks 须引用 nodes[].id(计划树),不能是自由文本")
         mapped.add(aid)
     uncovered = sorted(required_ac_ids - mapped)
     if uncovered:
@@ -1750,17 +1792,15 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
 
 
 def _extract_plan_mapping_gate(plan_content: str):
-    """Scan the plan's ```json blocks and return the last one carrying an
-    `ac_mapping` key (the plan also holds mermaid/dot/other blocks). None if absent."""
-    found = None
-    for block in CODEX_GATE_JSON_RE.findall(plan_content):
-        try:
-            obj = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and PLAN_MAPPING_FIELD in obj:
-            found = obj
-    return found
+    """Return (block, err) for the plan's ONE fastship contract block — marked by
+    `<!-- fastship:contract -->` above a ```json fence, carrying nodes + ac_mapping
+    + exclusive_forks together (plan_tree.extract_contract_block). validate / split
+    (materialize) / grill all consume THIS one block, so they agree byte-for-byte on
+    which JSON is "the contract" — an echoed example block can never be mistaken for
+    it (codex Critical: the old "last block carrying ac_mapping" mis-paired once
+    nodes[] + example blocks appeared). block is None when absent (err None) or
+    ambiguous/malformed (err set)."""
+    return plan_tree.extract_contract_block(plan_content)
 
 
 def _validate_plan_ac_mapping(orch: dict, plan_content: str) -> tuple:
@@ -1792,13 +1832,22 @@ def _validate_plan_ac_mapping(orch: dict, plan_content: str) -> tuple:
     if not required_ac_ids:
         return False, "1A 需求定稿无 P0/P1 AC id,无法做 1B 映射校验"
 
-    plan_gate = _extract_plan_mapping_gate(plan_content)
+    plan_gate, gerr = _extract_plan_mapping_gate(plan_content)
+    if gerr:
+        return False, "plan 契约块错误: " + gerr
     if plan_gate is None:
-        return False, (f"plan 缺少机器可验证的 {PLAN_MAPPING_FIELD} JSON 契约块 — "
-                       "1B 须为每条 1A P0/P1 AC 显式映射 task+E2E")
+        return False, (f"plan 缺少机器可验证的 contract block — 须用 <!-- fastship:contract --> "
+                       f"标记一个含 nodes + {PLAN_MAPPING_FIELD} + exclusive_forks 的 ```json 块,"
+                       "为每条 1A P0/P1 AC 显式映射 task(node id)+E2E")
     ok, msg = _check_plan_mapping(required_ac_ids, plan_gate)
     if not ok:
         return False, msg
+    # 计划树: the contract also carries the node DAG (id/deps/inputs/outputs/files).
+    # Validate it here (non-bugfix only — this whole function is non-bugfix) so the
+    # materialize hard step in validate_plan can trust the skeleton it splits out.
+    ok, msg = plan_tree.check_plan_node_graph(plan_gate)
+    if not ok:
+        return False, "plan node graph: " + msg
     # F4: 1B may surface exclusive TECHNICAL forks (架构/选型 either/or). Validate
     # their structure and stash the OPEN ones — _advance_state reads this to decide
     # whether the 1.5 grill runs (open fork → human arbitrates) or auto-skips (none).
@@ -1869,11 +1918,14 @@ def _validate_grill_fork_resolution(orch: dict, plan_path: str, grill_content: s
         plan_content = open(abs_plan, encoding="utf-8").read()
     except Exception:
         return False, f"grill 校验无法读取 plan 取 open fork: {abs_plan}"
-    plan_gate = _extract_plan_mapping_gate(plan_content)
+    plan_gate, gerr = _extract_plan_mapping_gate(plan_content)
+    if gerr:
+        return False, "grill 校验读 plan 契约块出错: " + gerr
     if plan_gate is None:
-        # A non-bugfix plan must carry the ac_mapping block (validate_plan enforced it).
-        # Missing here means the trusted plan changed shape under us — fail closed.
-        return False, "grill 校验取不到 plan 的 ac_mapping 契约块,无法确定 open fork"
+        # A non-bugfix plan must carry the contract block (validate_plan enforced
+        # nodes + ac_mapping + exclusive_forks). Missing here means the trusted plan
+        # changed shape under us — fail closed.
+        return False, "grill 校验取不到 plan 的 contract 契约块,无法确定 open fork"
     fok, fmsg, open_fork_ids = _check_exclusive_forks(plan_gate.get("exclusive_forks", []))
     if not fok:
         return False, "plan exclusive_forks 结构错误(grill 阶段复核): " + fmsg
