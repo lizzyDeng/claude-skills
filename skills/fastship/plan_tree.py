@@ -30,6 +30,11 @@ import os
 import re
 import shutil
 
+try:
+    import fcntl  # POSIX advisory locking for the single-writer skeleton update
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
 # ── anchors / markers ────────────────────────────────────────────────────────
 # \A..\Z (not ^..$): Python's $ matches before a trailing \n, which would let an id
 # carry a newline and become a control-char filename nodes/<id>.md.
@@ -484,12 +489,15 @@ def materialize_plan_tree(plan_md, out_dir, source_plan_sha256):
         except (OSError, json.JSONDecodeError):
             pass
 
-    # Atomic rebuild: build into a temp sibling dir and swap in, so a failure leaves
-    # the OLD tree intact (never a half-written tree mistaken for valid).
+    # Atomic rebuild: build into a temp sibling dir, then swap via backup-rename so a
+    # failure mid-swap never loses the OLD tree (rename old→.bak, tmp→out, drop .bak;
+    # restore .bak if the second rename fails). Same-filesystem renames are atomic.
     tmp_dir = out_dir + ".tmp-build"
+    backup_dir = out_dir + ".bak"
     try:
-        if os.path.isdir(tmp_dir):
-            shutil.rmtree(tmp_dir)
+        for d in (tmp_dir, backup_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d)
         os.makedirs(os.path.join(tmp_dir, "nodes"))
         os.makedirs(os.path.join(tmp_dir, "briefs"))
         _write(os.path.join(tmp_dir, "root.md"), root_text)
@@ -502,15 +510,24 @@ def materialize_plan_tree(plan_md, out_dir, source_plan_sha256):
         skeleton["source_plan_sha256"] = source_plan_sha256
         _write(os.path.join(tmp_dir, "skeleton.json"),
                json.dumps(skeleton, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        if os.path.isdir(out_dir):
-            shutil.rmtree(out_dir)
-        os.rename(tmp_dir, out_dir)
-    except OSError as e:
+        had_old = os.path.isdir(out_dir)
+        if had_old:
+            os.rename(out_dir, backup_dir)
         try:
-            if os.path.isdir(tmp_dir):
-                shutil.rmtree(tmp_dir)
+            os.rename(tmp_dir, out_dir)
         except OSError:
-            pass
+            if had_old and not os.path.isdir(out_dir):
+                os.rename(backup_dir, out_dir)  # restore the old tree
+            raise
+        if os.path.isdir(backup_dir):
+            shutil.rmtree(backup_dir)
+    except OSError as e:
+        for d in (tmp_dir, backup_dir):
+            try:
+                if os.path.isdir(d):
+                    shutil.rmtree(d)
+            except OSError:
+                pass
         return False, f"写计划树失败: {e}", None
 
     return True, f"计划树已生成（{len(node_bodies)} 节点，tree_hash={tree_hash[:12]}）", prov
@@ -563,31 +580,46 @@ def verify_tree_integrity(plan_tree_dir, expected_tree_hash):
 def update_node_status(skeleton_path, node_id, status=None, manifest=None):
     """Single-writer ATOMIC update of one node's status/manifest in skeleton.json —
     the Phase-2 driver calls this instead of hand-writing JSON (spec L113). status and
-    manifest are excluded from tree_hash, so integrity stays intact. (ok, msg)."""
+    manifest are excluded from tree_hash, so integrity stays intact. The whole
+    read-modify-write is guarded by a POSIX advisory lock + a PID-unique temp file, so
+    two concurrent node-update calls can't lose each other's edit. (ok, msg)."""
+    if status is not None and status not in ("pending", "in_progress", "done", "failed"):
+        return False, f"非法 status: {status}"
+    lock_path = skeleton_path + ".lock"
+    lock_f = None
     try:
-        sk = json.loads(open(skeleton_path, encoding="utf-8").read())
-    except (OSError, json.JSONDecodeError) as e:
-        return False, f"无法读取 skeleton: {e}"
-    nodes = sk.get("nodes") if isinstance(sk, dict) else None
-    if not isinstance(nodes, list):
-        return False, "skeleton 结构损坏"
-    hit = next((n for n in nodes if isinstance(n, dict) and n.get("id") == node_id), None)
-    if hit is None:
-        return False, f"skeleton 无此 node: {node_id}"
-    if status is not None:
-        if status not in ("pending", "in_progress", "done", "failed"):
-            return False, f"非法 status: {status}"
-        hit["status"] = status
-    if manifest is not None:
-        hit["manifest"] = manifest
-    tmp = skeleton_path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(sk, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, skeleton_path)
-    except OSError as e:
-        return False, f"写 skeleton 失败: {e}"
-    return True, f"node {node_id} 更新 (status={status})"
+        if fcntl is not None:
+            lock_f = open(lock_path, "w")
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            sk = json.loads(open(skeleton_path, encoding="utf-8").read())
+        except (OSError, json.JSONDecodeError) as e:
+            return False, f"无法读取 skeleton: {e}"
+        nodes = sk.get("nodes") if isinstance(sk, dict) else None
+        if not isinstance(nodes, list):
+            return False, "skeleton 结构损坏"
+        hit = next((n for n in nodes if isinstance(n, dict) and n.get("id") == node_id), None)
+        if hit is None:
+            return False, f"skeleton 无此 node: {node_id}"
+        if status is not None:
+            hit["status"] = status
+        if manifest is not None:
+            hit["manifest"] = manifest
+        tmp = f"{skeleton_path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(sk, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            os.replace(tmp, skeleton_path)
+        except OSError as e:
+            return False, f"写 skeleton 失败: {e}"
+        return True, f"node {node_id} 更新 (status={status})"
+    finally:
+        if lock_f is not None:
+            try:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+                lock_f.close()
+            except OSError:
+                pass
 
 
 # ── runtime helper: enforce a node's diff stays within its declared files ─────

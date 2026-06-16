@@ -123,6 +123,38 @@ def test_unknown_manifest_node_fails(tmp_path, monkeypatch):
     assert not ok and "ghost" in msg
 
 
+def test_empty_manifests_fails(tmp_path, monkeypatch):
+    # empty manifest list must NOT skip the per-node boundary check (codex confirm High)
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={"reviewed_manifests": []})
+    ok, msg = o.validate_code_review(orch, {})
+    assert not ok and "reviewed_manifests 未覆盖 node" in msg
+
+
+def test_partial_manifest_coverage_fails(tmp_path, monkeypatch):
+    # only task-1 has a manifest → task-2 uncovered → FAIL
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={
+        "reviewed_manifests": [{"node_id": "task-1", "files_changed": ["src/a.rs"]}]})
+    ok, msg = o.validate_code_review(orch, {})
+    assert not ok and "task-2" in msg
+
+
+def test_manifest_missing_files_changed_fails(tmp_path, monkeypatch):
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={
+        "reviewed_manifests": [{"node_id": "task-1", "files_changed": ["src/a.rs"]},
+                               {"node_id": "task-2"}]})  # no files_changed
+    ok, msg = o.validate_code_review(orch, {})
+    assert not ok and "files_changed" in msg
+
+
+def test_manifest_out_of_bounds_fails(tmp_path, monkeypatch):
+    # task-2 claims it changed a file outside its declared node.files
+    o, orch, _ = _setup(tmp_path, monkeypatch, gate_over={
+        "reviewed_manifests": [{"node_id": "task-1", "files_changed": ["src/a.rs"]},
+                               {"node_id": "task-2", "files_changed": ["src/evil.rs"]}]})
+    ok, msg = o.validate_code_review(orch, {})
+    assert not ok and "越界" in msg
+
+
 # ── [FASTSHIP_GOAL] status line — node-progress fields ──────────────────────
 def _goal_line(status_text):
     for line in status_text.splitlines():

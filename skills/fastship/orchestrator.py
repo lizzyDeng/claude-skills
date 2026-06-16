@@ -315,7 +315,10 @@ CODEX_GATE_RE = re.compile(r"#+\s*GATE:\s*(PASS|FAIL)\b", re.IGNORECASE)
 # not counted. The placeholder `### GATE: PASS / FAIL` (trailing text) is still excluded.
 CODEX_VERDICT_LINE_RE = re.compile(r"^#+[ \t]*GATE:[ \t]*(PASS|FAIL)[ \t]*$", re.IGNORECASE)
 # A column-0 code-fence line: a run of ≥3 backticks OR ≥3 tildes (group 1, same char), then an
-# info string (group 2). Indented fences (incl. list-item content) are NOT tracked.
+# info string (group 2). Indented fences (incl. list-item content) are NOT tracked — this is
+# deliberate (test_codex_review_rejects_indented_gate_block): an indented ```json gate is NOT a
+# top-level gate, and a verdict hidden in an indented fence is COUNTED, so combined with a real
+# verdict it trips the "exactly one marker" rule → rejected. (codex confirm #3 is non-exploitable.)
 _FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 CODEX_GATE_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TRUSTED_ARTIFACTS_KEY = "trusted_artifacts"
@@ -1126,19 +1129,31 @@ def _check_code_review_tree_coverage(orch: dict, gate: dict, tree_rec: dict,
     rev_manifests = gate.get("reviewed_manifests")
     if not isinstance(rev_manifests, list):
         return False, "Code review 缺少 reviewed_manifests 数组"
+    manifest_nodes = set()
     for mf in rev_manifests:
         if not isinstance(mf, dict):
             continue
         nid = mf.get("node_id")
-        if nid is not None and nid not in required:
+        if nid is None:
+            continue
+        if nid not in required:
             return False, f"Code review reviewed_manifests 含未知 node_id: {nid}"
-        # per-node runtime recheck: a node's recorded diff must stay within its files.
+        # per-node runtime recheck: a node's recorded diff must be a list and stay
+        # within its declared files. A non-list files_changed is rejected so an empty
+        # / malformed manifest can't skip the boundary check.
         mf_changed = mf.get("files_changed")
-        if nid is not None and isinstance(mf_changed, list):
-            okf, off = plan_tree.files_changed_within(files_by_id.get(nid, []), mf_changed)
-            if not okf:
-                return False, (f"Code review node {nid} 改动越界(files_changed ⊄ node.files): "
-                               + ", ".join(off))
+        if not isinstance(mf_changed, list):
+            return False, f"Code review node {nid} 的 manifest 缺少 files_changed 数组"
+        okf, off = plan_tree.files_changed_within(files_by_id.get(nid, []), mf_changed)
+        if not okf:
+            return False, (f"Code review node {nid} 改动越界(files_changed ⊄ node.files): "
+                           + ", ".join(off))
+        manifest_nodes.add(nid)
+    # every required node must carry a manifest — otherwise omitting a node's manifest
+    # would silently skip its per-node boundary check (codex confirm High).
+    missing_mf = sorted(required - manifest_nodes)
+    if missing_mf:
+        return False, "Code review reviewed_manifests 未覆盖 node(每个 node 须有 manifest): " + ", ".join(missing_mf)
     if changed:
         root = _repo_root()
         reviewed_canon = {ck for ck in (_canon_repo_rel(rf, root) for rf in reviewed_files) if ck}
@@ -1254,7 +1269,10 @@ def validate_plan(orch: dict, hook: dict) -> tuple:
         # failure FAILs 1.4 (the contract block was already node-graph-validated above,
         # so failure here means anchors/contract are inconsistent with the node set).
         source_sha = (rec_14 or {}).get("sha256") or hashlib.sha256(content.encode("utf-8")).hexdigest()
-        tree_dir = plan_tree.plan_tree_dir_for(plan_path)
+        # Derive the tree dir from real_plan (the realpath, already verified in-repo),
+        # NOT raw plan_path — a symlink plan pointing into the repo would otherwise place
+        # (and rmtree) the .plantree dir at the symlink's OUTSIDE location.
+        tree_dir = plan_tree.plan_tree_dir_for(real_plan)
         ok, msg, prov = plan_tree.materialize_plan_tree(content, tree_dir, source_sha)
         if not ok:
             return False, "计划树拆分失败(1.4 不通过): " + msg
