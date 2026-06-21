@@ -162,10 +162,10 @@
 - **E2E**:fixture manifest → mock APImart(录制 fixture)→ 断言文件落盘 + 代码已接线 + cutout 有 alpha。
 - **真 API smoke**:env flag 后置(花钱),对齐本仓库其他 skill 把真模型测试 gate 在 env 之后的惯例。
 
-## 13. 开放项(待用户拍板)
+## 13. 决议(全部已定)
 
-1. **skill 命名**:`art-director` / `asset-forge` / 其他?(工作名 `art-director`)
-2. **API key 环境变量名**:建议 `APIMART_API_KEY`,确认?
-3. **风格前置**:是否需要在 frontend-design 前再挂一道 `design-consultation` 锁设计系统(token/配色),还是 brief 直接喂 frontend-design 即可(v1 倾向后者,YAGNI)。
-4. ~~**bg 默认分辨率**~~ — ✅ 已定:默认 `2k`,两级切换(全局 `--bg-resolution` + 逐素材 manifest 覆盖);cutout 无分辨率档,只切 size 封顶 1536(详 §6)。
+1. ✅ **skill 命名**:`art-director`。
+2. ✅ **API key 环境变量名**:`APIMART_API_KEY`(缺失立即失败)。
+3. ✅ **风格前置**:v1 brief 直接喂 frontend-design,**不挂** design-consultation(YAGNI;后续可加)。
+4. ✅ **bg 默认分辨率**:默认 `2k`,两级切换(全局 `--bg-resolution` + 逐素材 manifest 覆盖);cutout 无分辨率档,只切 size 封顶 1536(详 §6)。
 ```
