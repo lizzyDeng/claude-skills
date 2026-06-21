@@ -102,6 +102,12 @@
 实现为 handler 注册表:`HANDLERS = { "bg": build_bg_request, "cutout": build_cutout_request }`,
 新增素材类型 = 注册新 handler,不动派发逻辑(对齐项目"禁 if-else 用注册表"规约)。
 
+**分辨率可切(两级,bg 专属):**
+- **全局默认** `2k`(CLI/config 旗标 `--bg-resolution`,省钱档)。
+- **逐素材覆盖**:manifest 某条 bg 写 `"resolution":"4k"` → 单独拉满(典型:hero 4k、其余 2k)。成本随档位 $0.005→0.211/张。
+- **cutout 不可切分辨率**:gpt-image-1.5-official 无 resolution tier,只能切 size,天花板 1536。
+- 校验落在 handler:bg 断言 `resolution ∈ {1k,2k,4k}`;cutout 若传 resolution → 直接拒。
+
 ## 7. APImart 接入契约(已对真实文档核对)
 
 - **Base**:`https://api.apimart.ai/v1/images/generations` · **Auth**:`Authorization: Bearer $APIMART_API_KEY`
@@ -161,5 +167,5 @@
 1. **skill 命名**:`art-director` / `asset-forge` / 其他?(工作名 `art-director`)
 2. **API key 环境变量名**:建议 `APIMART_API_KEY`,确认?
 3. **风格前置**:是否需要在 frontend-design 前再挂一道 `design-consultation` 锁设计系统(token/配色),还是 brief 直接喂 frontend-design 即可(v1 倾向后者,YAGNI)。
-4. **bg 默认分辨率**:默认 `2k`(省钱)还是 `4k`(最佳)?
+4. ~~**bg 默认分辨率**~~ — ✅ 已定:默认 `2k`,两级切换(全局 `--bg-resolution` + 逐素材 manifest 覆盖);cutout 无分辨率档,只切 size 封顶 1536(详 §6)。
 ```
