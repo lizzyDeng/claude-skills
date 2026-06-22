@@ -1,0 +1,3 @@
+{"version":1,"style":{"brief":"cyberpunk test"},"assets":[
+ {"id":"hero-bg","kind":"bg","prompt":"neon alley","aspect":"16:9","resolution":"2k","transparent":false,"path":"assets/gen/hero-bg.png","placeholder":"url(assets/gen/hero-bg.png)"},
+ {"id":"mascot","kind":"cutout","prompt":"fox","aspect":"2:3","transparent":true,"format":"png","path":"assets/gen/mascot.png","placeholder":"src=\"assets/gen/mascot.png\""}]}
