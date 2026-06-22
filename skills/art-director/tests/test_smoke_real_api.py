@@ -13,7 +13,7 @@ def test_transparent_bg_is_rejected_by_registry():
 @pytest.mark.skipif(os.environ.get("ART_DIRECTOR_SMOKE")!="1" or not os.environ.get("APIMART_API_KEY"),
     reason="real-API smoke: set ART_DIRECTOR_SMOKE=1 + APIMART_API_KEY")
 def test_real_apimart_bg_and_cutout(tmp_path, capsys):
-    cfg=Config.from_env(); cfg.default_bg_resolution="1k"; cfg.poll_timeout=30   # 低 timeout 快失败
+    cfg=Config.from_env(); cfg.default_bg_resolution="1k"; cfg.poll_timeout=180  # 实测 gpt-image-2 渲染 ~43s,timeout 须 ≥120
     client=ApimartClient(UrllibTransport(),cfg.api_key,cfg.base_url)
     m=Manifest(version=1,style={"brief":"smoke"},assets=[
         Asset(id="smoke-bg",kind="bg",prompt="a simple blue gradient background",aspect="16:9",path="assets/gen/smoke-bg.png",placeholder="url(assets/gen/smoke-bg.png)"),
