@@ -30,3 +30,18 @@ def test_returns_headers(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", Fake(status=202, body=b"", headers={"Location":"/v1/tasks/T9"}))
     status, body, headers = UrllibTransport().post("http://x",{},{"a":1})
     assert status==202 and body=={} and headers.get("Location")=="/v1/tasks/T9"
+def test_user_agent_on_get_and_getbytes(monkeypatch):
+    # CDN 403 修复:get / get_bytes 必须带 User-Agent
+    seen={}
+    def cap(req, timeout=0):
+        seen["ua"]=req.get_header("User-agent")
+        class R:
+            status=200; headers={}
+            def read(s): return b"{}"
+            def __enter__(s): return s
+            def __exit__(s,*a): return False
+        return R()
+    monkeypatch.setattr("urllib.request.urlopen", cap)
+    UrllibTransport().get("http://x",{}); assert seen["ua"] and "Mozilla" in seen["ua"]
+    seen.clear()
+    UrllibTransport().get_bytes("http://x"); assert seen["ua"] and "Mozilla" in seen["ua"]

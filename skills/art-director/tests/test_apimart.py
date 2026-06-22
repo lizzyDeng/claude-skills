@@ -46,3 +46,24 @@ def test_fetch_image_url_later_element(tmp_path):
     c=_c(img=_png()); d=tmp_path/"a.png"; c.fetch_image({"data":[{"foo":1},{"url":"u"}]},str(d)); assert d.read_bytes().startswith(SIG)
 def test_fetch_image_none_fatal(tmp_path):
     with pytest.raises(FatalError): _c().fetch_image({"status":"succeeded"}, str(tmp_path/"a.png"))
+# ---- 真实 APImart 形状(2026-06-22 实测捕获)----
+def test_submit_real_data_list():
+    # 真实 submit:{"code":200,"data":[{"status":"submitted","task_id":...}]}
+    real=(200,{"code":200,"data":[{"status":"submitted","task_id":"task_REAL"}]},{})
+    assert _c(post=real).submit({"model":"m"})=="task_REAL"
+def test_poll_real_envelope_pending_then_completed_e2e(tmp_path):
+    # 真实 poll:信封 {"code":200,"data":{...}};完成形 result.images[].url 为 list
+    c=_c(polls=[{"code":200,"data":{"status":"pending","progress":0}},
+                {"code":200,"data":{"status":"completed","progress":100,
+                                    "result":{"images":[{"url":["https://up/x.png"]}]}}}], img=_png())
+    r=c.poll("T",10,0,clock=Clock())
+    assert str(r.get("status")).lower()=="completed"
+    d=tmp_path/"a.png"; c.fetch_image(r,str(d)); assert d.read_bytes().startswith(SIG)   # url-as-list 端到端可取图
+def test_fetch_image_real_result_images_urllist(tmp_path):
+    c=_c(img=_png()); d=tmp_path/"a.png"
+    c.fetch_image({"status":"completed","result":{"images":[{"url":["https://up/x.png"]}]}}, str(d))
+    assert d.read_bytes().startswith(SIG)
+def test_poll_real_envelope_failure_nested_status():
+    # 信封内嵌 status=failed 必须被识别(解包后判失败)
+    with pytest.raises(FatalError):
+        _c(polls=[{"code":200,"data":{"status":"failed"}}]).poll("T",10,0,clock=Clock())
