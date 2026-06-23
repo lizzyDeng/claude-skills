@@ -22,3 +22,27 @@ def test_registry_precheck_bad_aspect():
 def test_max():
     big=[Asset(**{**BG,"id":f"b{i}","path":f"assets/gen/b{i}.png"}) for i in range(20)]
     assert any("max_assets" in e for e in Manifest(version=1,style={},assets=big).validate(max_assets=12))
+def test_style_carrier_first_bg():
+    m=Manifest(version=1,style={},assets=[Asset(**CUT),Asset(**BG),Asset(**{**BG,"id":"bg2","path":"assets/gen/bg2.png"})])
+    assert m.style_carrier().id=="hero-bg"   # 第一个 kind=='bg'
+def test_style_carrier_no_bg_raises():
+    m=Manifest(version=1,style={},assets=[Asset(**CUT)])
+    with pytest.raises(ValueError) as e: m.style_carrier()
+    assert "bg" in str(e.value).lower()
+def test_carrier_by_id_rejects_cutout():
+    m=Manifest(version=1,style={},assets=[Asset(**BG),Asset(**CUT)])
+    with pytest.raises(ValueError): m.carrier_by_id("mascot")
+    assert m.carrier_by_id("hero-bg").id=="hero-bg"
+def test_apply_style_suffix_idempotent():
+    m=Manifest(version=1,style={},assets=[Asset(**BG),Asset(**CUT)])
+    changed=m.apply_style_suffix("loose oil brushwork")
+    assert set(changed)=={"hero-bg","mascot"}
+    assert m.assets[0].prompt.endswith("loose oil brushwork") and m.assets[1].prompt.endswith("loose oil brushwork")
+    # 二次调用幂等:不再追加,无改动
+    again=m.apply_style_suffix("loose oil brushwork")
+    assert again==[]
+    assert m.assets[0].prompt.count("loose oil brushwork")==1
+def test_apply_style_suffix_skip_carrier():
+    m=Manifest(version=1,style={},assets=[Asset(**BG),Asset(**CUT)])
+    changed=m.apply_style_suffix("neon noir", skip_ids={"hero-bg"})
+    assert changed==["mascot"] and "neon noir" not in m.assets[0].prompt

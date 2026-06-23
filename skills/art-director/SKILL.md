@@ -27,7 +27,9 @@ python3 "<SKILL_BASE>/cli.py" <subcommand> ...
 
 **Replace `<SKILL_BASE>` with the actual absolute path** (e.g. `python3 "/Users/you/.claude/plugins/.../skills/art-director/cli.py" validate ...`). Do NOT run the command with the literal text `<SKILL_BASE>`, and do NOT use `python3 cli.py` (a cwd-relative path fails — the skill runs in the user's project dir, not here).
 
-## The 4-stage pipeline
+## The pipeline (Stage 1 → 2 → optional 1.5 → 3 → 4)
+
+`design → validate (reconcile + cost) →` *optional* `art-direction preview (Stage 1.5, cheap 1k probe) →` `generate (full-res, paid) → wiring gate`. Stage 1.5 is a non-blocking cost gate: `validate` *suggests* it when the full-res set is expensive or large; you preview-then-lock the direction before spending on full-res gen.
 
 ### Stage 1 — design (frontend-design + asset convention)
 
@@ -55,6 +57,49 @@ python3 "<SKILL_BASE>/cli.py" validate --manifest .art-director/manifest.json --
 
 Must print `VALIDATE: PASS`. Check the `[cost]` estimate line; exceeding `max_assets` (12) is rejected as a cost guard. On `FAIL`/unsupported-markup, return to Stage 1.
 
+If `validate` prints a `💡 PREVIEW SUGGESTED:` line (the full-resolution estimate is high or there are many assets — gated by `preview_cost_threshold`/`preview_asset_threshold`), do **Stage 1.5** before spending money on full-res gen. This is a non-blocking hint: `VALIDATE: PASS/FAIL` is unchanged either way.
+
+### Stage 1.5 — art-direction preview (show, don't tell)
+
+**When to run:** when `validate` emits `💡 PREVIEW SUGGESTED`, or any time the asset set is large/expensive and the art direction is still unsettled. Don't burn a full 4K render budget on a hunch — probe the direction cheaply first, let the user *see* it, then commit.
+
+**Mechanism — low-res hero probe:** pick the manifest's **style carrier** (the first `kind:"bg"` asset) and render N different *prompt-style variants* of it, each forced to **1k** resolution (the cheapest tier, $0.02 each). The user looks at the actual images and picks a direction; the chosen style language is written back into every asset's prompt; then the original full-resolution `gen` runs with a locked, agreed direction.
+
+**Driver's job — write N variant prompts for the carrier.** For the style carrier, author N (default 3) *deliberately divergent* full generation prompts that pull the aesthetic in clearly different directions (e.g. painterly oil vs. neon-noir photography vs. flat vector). Each variant is:
+
+```json
+[
+  {"label":"painterly","prompt":"<full carrier generation prompt in this style>","style_suffix":"<short style phrase reusable on other assets>"},
+  {"label":"neon-noir","prompt":"...","style_suffix":"..."},
+  {"label":"flat-vector","prompt":"...","style_suffix":"..."}
+]
+```
+
+- `prompt` is the carrier's *complete* generation prompt for that direction.
+- `style_suffix` is a short modifier phrase (e.g. `loose oil-painting brushwork, warm muted palette`) that can be appended to *other* assets so the whole page coheres.
+- 🔴 **Fight AI slop:** make the variants genuinely different — different medium, lighting, palette, rendering. Three near-identical "safe" options waste a probe round. Pull them apart so the choice is real.
+
+**Run the probe (cheap, 1k):**
+
+```
+python3 "<SKILL_BASE>/cli.py" preview --manifest .art-director/manifest.json --project-dir . --variants-file variants.json
+```
+
+Generates one 1k PNG per variant into `.art-director/preview/<carrier_id>__<label>.png`, writes `.art-director/preview/previews.json` (the variant records, for `lock-style`), prints each generated path, and prints the total probe cost. **Open the images and show them to the user** — this is the "show, don't tell" step. Let them pick a `label`.
+
+**Lock the chosen direction back into the manifest:**
+
+```
+python3 "<SKILL_BASE>/cli.py" lock-style --manifest .art-director/manifest.json --project-dir . --variant <chosen-label>
+```
+
+Sets the carrier asset's prompt to the chosen variant's full prompt, and idempotently appends that variant's `style_suffix` to every *other* asset's prompt (re-running is a no-op). Then re-run `validate` if you like, and proceed to Stage 3 (`gen`) — now at full resolution with a direction the user actually approved.
+
+**🔴 Two honest limits — tell the user both:**
+
+1. The preview locks the **art direction (the prompt language)**, **not the final pixels**. `gpt-image` recomposes on every call, so the final full-resolution hero will differ from the 1k preview image. What you're choosing is the *style*, not the finished artwork.
+2. Cutouts have **no cheap resolution tier** ($0.06 is the only/正式 price). The probe therefore uses a **bg carrier** by default. Only probe a cutout when the cutout style is the main open question — and when you do, tell the user this step does **not** save money.
+
 ### Stage 3 — generate
 
 ```
@@ -81,14 +126,17 @@ If Stage 2 fails or raises unsupported-markup, return to Stage 1 and ask `fronte
 - `assets/gen/*.png` — the generated background(s) and transparent cutout(s).
 - `.art-director/manifest.json` — per-asset status + task_id.
 - `.art-director/run.log` — submit/poll/result/cost trace (api key redacted).
+- `.art-director/preview/*.png` + `previews.json` — Stage 1.5 art-direction probes (1k), if you ran preview.
 
 ## Red lines
 
 - If Stage 4 (`gate`) is not `PASS`, do **not** claim the page is ready.
 - Report every failed asset by id; never silently drop one.
-- If the cost estimate is high or `max_assets` is exceeded, tell the user before generating.
+- If the cost estimate is high or `max_assets` is exceeded, tell the user before generating. When `validate` prints `💡 PREVIEW SUGGESTED`, offer Stage 1.5 before spending on full-res gen.
+- When you do run a preview, tell the user the two honest limits (Stage 1.5): the probe locks the **style, not the final pixels**, and probing **cutouts does not save money** (no cheap tier — bg is the default style carrier).
 
 ## Knobs
 
 - Global default bg resolution: `--bg-resolution 1k|2k|4k` (or `ART_DIRECTOR_BG_RESOLUTION`); per-asset override via manifest `resolution`.
 - Cutouts have no resolution tier — only size (capped at 1536×1024), PNG only, no 4K (model limitation).
+- Stage 1.5 preview gate thresholds (env overrides): `ART_DIRECTOR_PREVIEW_COST_THRESHOLD` (default `0.3`), `ART_DIRECTOR_PREVIEW_ASSET_THRESHOLD` (default `6`), `ART_DIRECTOR_PREVIEW_VARIANTS` (default `3`). Probes are always forced to 1k regardless of the global bg resolution.

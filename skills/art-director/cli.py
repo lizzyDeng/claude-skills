@@ -13,9 +13,13 @@ def _log(project_dir, line):
     p=os.path.join(project_dir,".art-director","run.log"); os.makedirs(os.path.dirname(p),exist_ok=True)
     with open(p,"a",encoding="utf-8") as f: f.write(line+"\n")
 def _cmd_validate(args):
-    m=Manifest.load(args.manifest); errs=m.validate(max_assets=Config(api_key="x").max_assets)
+    cfg=Config(api_key="x")
+    m=Manifest.load(args.manifest); errs=m.validate(max_assets=cfg.max_assets)
     for e in errs: print(f"[manifest] {e}")
-    print(f"[cost] estimated ~${_estimate(m):.2f} for {len(m.assets)} assets (as-of 2026-06 prices; see run.log for actual)")
+    est=_estimate(m)
+    print(f"[cost] estimated ~${est:.2f} for {len(m.assets)} assets (as-of 2026-06 prices; see run.log for actual)")
+    if est>cfg.preview_cost_threshold or len(m.assets)>cfg.preview_asset_threshold:   # 非阻断:Stage 1.5 建议
+        print(f"💡 PREVIEW SUGGESTED: 全套成本 ~${est:.2f} / {len(m.assets)} 个资产较高,建议先 preview 锁定艺术方向再 gen")
     if args.code:
         try: r=reconcile(open(args.code,encoding="utf-8").read(), m)
         except UnsupportedMarkup as e: print(f"[reconcile] {e}"); errs.append("unsupported")
@@ -44,6 +48,58 @@ def _cmd_gen(args):
         n=degrade(m,args.project_dir,args.page)
         print(f"GEN: PARTIAL — failed {failed} ({n} degraded in {args.page}; rerun to resume)"); return 1
     print("GEN: PASS"); return 0
+def _load_variants(path):
+    import json
+    data=json.loads(open(path,encoding="utf-8").read())
+    if not isinstance(data,list) or not data: raise ValueError("variants-file must be a non-empty JSON array")
+    for v in data:
+        if not isinstance(v,dict) or not v.get("label") or not v.get("prompt"):
+            raise ValueError("each variant needs non-empty 'label' and 'prompt'")
+    return data
+def _cmd_preview(args):
+    from transport import UrllibTransport
+    from apimart import ApimartClient
+    from engine import generate_previews, PREVIEW_DIR
+    cfg=Config.from_env()
+    m=Manifest.load(args.manifest)
+    carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
+    variants=_load_variants(args.variants_file)
+    out_rel=args.out or PREVIEW_DIR
+    client=ApimartClient(UrllibTransport(),cfg.api_key,cfg.base_url)
+    probe_cost=len(variants)*_COST["bg"]["1k"]
+    _log(args.project_dir, f"{datetime.datetime.now().isoformat()} preview start: carrier={carrier.id} {len(variants)} variants @1k, est ${probe_cost:.2f}")
+    results=generate_previews(carrier,variants,args.project_dir,client,cfg,out_dir=out_rel)
+    # 落盘 previews.json(含 label/style_suffix,供 lock-style 复用)
+    import json
+    pj=os.path.join(args.project_dir,out_rel,"previews.json"); os.makedirs(os.path.dirname(pj),exist_ok=True)
+    with open(pj,"w",encoding="utf-8") as f: f.write(json.dumps({"carrier":carrier.id,"variants":results},ensure_ascii=False,indent=2))
+    for r in results:
+        print(f"[preview] {r['label']}: {r['status']} → {os.path.join(args.project_dir,r['path'])}")
+        _log(args.project_dir, f"  preview {r['label']} status={r['status']} path={r['path']}")
+    print(f"[cost] probe estimated ~${probe_cost:.2f} for {len(variants)} variants @1k (as-of 2026-06 prices)")
+    failed=[r["label"] for r in results if r["status"]!="done"]
+    if failed: print(f"PREVIEW: PARTIAL — failed {failed}"); return 1
+    print(f"PREVIEW: PASS ({len(results)} variants → {pj})"); return 0
+def _cmd_lock_style(args):
+    import json
+    m=Manifest.load(args.manifest)
+    carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
+    # 选中变体:优先 --variants-file,否则 previews.json
+    if args.variants_file: variants=_load_variants(args.variants_file)
+    else:
+        pd=args.project_dir or "."
+        pj=os.path.join(pd,".art-director","preview","previews.json")
+        if not os.path.exists(pj): print(f"[lock-style] no previews.json at {pj}; run preview first or pass --variants-file"); return 1
+        variants=json.loads(open(pj,encoding="utf-8").read()).get("variants",[])
+    chosen=next((v for v in variants if v.get("label")==args.variant), None)
+    if chosen is None: print(f"[lock-style] variant {args.variant!r} not found among {[v.get('label') for v in variants]}"); return 1
+    carrier.prompt=chosen["prompt"]                                  # carrier prompt ← 选中变体完整生成提示
+    changed=m.apply_style_suffix(chosen.get("style_suffix",""), skip_ids={carrier.id})
+    m.save_atomic(args.manifest)                                     # 回写到加载的 manifest(单源)
+    print(f"[lock-style] carrier {carrier.id}.prompt ← variant {args.variant!r}")
+    if changed: print(f"[lock-style] style_suffix appended to: {', '.join(changed)}")
+    else: print(f"[lock-style] no other asset prompts changed (already styled or empty suffix)")
+    print("LOCK-STYLE: PASS"); return 0
 def _cmd_gate(args):
     m=Manifest.load(args.manifest)
     code=open(args.code,encoding="utf-8").read() if args.code else None
@@ -57,6 +113,8 @@ def main(argv=None):
     ap=argparse.ArgumentParser(prog="art-director"); sub=ap.add_subparsers(dest="cmd",required=True)
     v=sub.add_parser("validate"); v.add_argument("--manifest",required=True); v.add_argument("--code"); v.set_defaults(fn=_cmd_validate)
     g=sub.add_parser("gen"); g.add_argument("--manifest",required=True); g.add_argument("--project-dir",required=True); g.add_argument("--bg-resolution"); g.add_argument("--page",default="index.html"); g.set_defaults(fn=_cmd_gen)
+    p=sub.add_parser("preview"); p.add_argument("--manifest",required=True); p.add_argument("--project-dir",required=True); p.add_argument("--variants-file",required=True); p.add_argument("--carrier"); p.add_argument("--out"); p.set_defaults(fn=_cmd_preview)
+    l=sub.add_parser("lock-style"); l.add_argument("--manifest",required=True); l.add_argument("--variant",required=True); l.add_argument("--variants-file"); l.add_argument("--carrier"); l.add_argument("--project-dir"); l.set_defaults(fn=_cmd_lock_style)
     t=sub.add_parser("gate"); t.add_argument("--manifest",required=True); t.add_argument("--project-dir",required=True); t.add_argument("--code"); t.set_defaults(fn=_cmd_gate)
     args=ap.parse_args(argv); return args.fn(args)
 if __name__=="__main__": sys.exit(main())

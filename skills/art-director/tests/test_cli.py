@@ -23,6 +23,82 @@ def test_gate_alpha(tmp_path, capsys):
     (tmp_path/"assets/gen").mkdir(parents=True)
     (tmp_path/"assets/gen/b.png").write_bytes(_png(2)); (tmp_path/"assets/gen/c.png").write_bytes(_png(2))
     assert main(["gate","--manifest",str(mp),"--project-dir",str(tmp_path)])!=0 and "alpha" in capsys.readouterr().out
+# ---- Stage 1.5 preview gate ----
+def test_validate_preview_suggested_high_cost(tmp_path, capsys):
+    # 一张 4k bg ($0.21) + 一张 cutout ($0.06) = $0.27 < 0.3, 但加第二张 4k → 超阈值
+    assets=[{"id":f"b{i}","kind":"bg","prompt":"p","aspect":"16:9","resolution":"4k","path":f"assets/gen/b{i}.png","placeholder":f"url(assets/gen/b{i}.png)","status":"done"} for i in range(2)]
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps({**MAN,"assets":assets}))
+    assert main(["validate","--manifest",str(mp)])==0
+    assert "PREVIEW SUGGESTED" in capsys.readouterr().out
+def test_validate_preview_suggested_many_assets(tmp_path, capsys):
+    # 7 张便宜 1k bg → 成本低 ($0.14) 但资产数 > 6 → 仍建议
+    assets=[{"id":f"b{i}","kind":"bg","prompt":"p","aspect":"16:9","resolution":"1k","path":f"assets/gen/b{i}.png","placeholder":f"url(assets/gen/b{i}.png)","status":"done"} for i in range(7)]
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps({**MAN,"assets":assets}))
+    main(["validate","--manifest",str(mp)])
+    out=capsys.readouterr().out
+    assert "PREVIEW SUGGESTED" in out and "7 个资产" in out
+def test_validate_no_preview_suggested_low(tmp_path, capsys):
+    # 默认 MAN: bg 2k ($0.06) + cutout ($0.06) = $0.12, 2 资产 → 不建议
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); main(["validate","--manifest",str(mp)])
+    assert "PREVIEW SUGGESTED" not in capsys.readouterr().out
+def test_validate_preview_does_not_change_verdict(tmp_path, capsys):
+    # 高成本但合法 → 仍 PASS;高成本且非法 kind → 仍 FAIL(门控不改判定)
+    bad=[{"id":f"b{i}","kind":"video","prompt":"p","aspect":"16:9","resolution":"4k","path":f"assets/gen/b{i}.png","placeholder":"x"} for i in range(2)]
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps({**MAN,"assets":bad}))
+    assert main(["validate","--manifest",str(mp)])!=0
+    out=capsys.readouterr().out; assert "PREVIEW SUGGESTED" in out and "VALIDATE: FAIL" in out
+class _FakeClient:
+    def __init__(self,*a,**k): self.bodies=[]
+    def submit(self,body): self.bodies.append(body); return f"T-{len(self.bodies)}"
+    def poll(self,tid,timeout,interval,clock=None): return {"status":"succeeded"}
+    def fetch_image(self,result,dest): open(dest,"wb").write(_png(2))
+def _vf(tmp_path):
+    vf=tmp_path/"variants.json"
+    vf.write_text(json.dumps([
+        {"label":"painterly","prompt":"oil alley","style_suffix":"oil brushwork"},
+        {"label":"neon","prompt":"neon alley","style_suffix":"neon noir"}]))
+    return vf
+def test_cli_preview(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("APIMART_API_KEY","sk-test")
+    import apimart; monkeypatch.setattr(apimart,"ApimartClient",_FakeClient)
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); vf=_vf(tmp_path)
+    rc=main(["preview","--manifest",str(mp),"--project-dir",str(tmp_path),"--variants-file",str(vf)])
+    out=capsys.readouterr().out
+    assert rc==0 and "PREVIEW: PASS" in out
+    # previews.json 落盘 + 两张图生成在 .art-director/preview/
+    pj=tmp_path/".art-director/preview/previews.json"; assert pj.exists()
+    data=json.loads(pj.read_text()); assert data["carrier"]=="b" and len(data["variants"])==2
+    assert (tmp_path/".art-director/preview/b__painterly.png").exists()
+    assert (tmp_path/".art-director/preview/b__neon.png").exists()
+    # 逐张生成路径打印(供 driver open)
+    assert "b__painterly.png" in out and "b__neon.png" in out
+def test_cli_lock_style(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("APIMART_API_KEY","sk-test")
+    import apimart; monkeypatch.setattr(apimart,"ApimartClient",_FakeClient)
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); vf=_vf(tmp_path)
+    main(["preview","--manifest",str(mp),"--project-dir",str(tmp_path),"--variants-file",str(vf)])
+    capsys.readouterr()
+    rc=main(["lock-style","--manifest",str(mp),"--project-dir",str(tmp_path),"--variant","painterly"])
+    out=capsys.readouterr().out
+    assert rc==0 and "LOCK-STYLE: PASS" in out
+    from manifest import Manifest
+    m2=Manifest.load(str(mp)); by={a.id:a.prompt for a in m2.assets}
+    assert by["b"]=="oil alley"                       # carrier.prompt ← 选中变体完整 prompt
+    assert by["c"].endswith("oil brushwork")          # 其它 asset append style_suffix
+    # 幂等:再 lock 同一个不重复追加
+    main(["lock-style","--manifest",str(mp),"--project-dir",str(tmp_path),"--variant","painterly"])
+    m3=Manifest.load(str(mp)); assert {a.id:a.prompt for a in m3.assets}["c"].count("oil brushwork")==1
+def test_cli_lock_style_via_variants_file(tmp_path, capsys):
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); vf=_vf(tmp_path)
+    rc=main(["lock-style","--manifest",str(mp),"--variant","neon","--variants-file",str(vf)])
+    assert rc==0 and "LOCK-STYLE: PASS" in capsys.readouterr().out
+    from manifest import Manifest
+    m2=Manifest.load(str(mp)); by={a.id:a.prompt for a in m2.assets}
+    assert by["b"]=="neon alley" and by["c"].endswith("neon noir")
+def test_cli_lock_style_unknown_variant(tmp_path, capsys):
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); vf=_vf(tmp_path)
+    rc=main(["lock-style","--manifest",str(mp),"--variant","nope","--variants-file",str(vf)])
+    assert rc!=0 and "not found" in capsys.readouterr().out
 def test_foreign_cwd_via_symlink(tmp_path):
     # 真压 self-insert:把 cli.py 软链到一个【无 sibling 模块】的目录,清空 PYTHONPATH,从无关 cwd 跑
     link_dir=tmp_path/"linkdir"; link_dir.mkdir()

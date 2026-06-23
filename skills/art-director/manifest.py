@@ -23,6 +23,28 @@ class Manifest:
         fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
         with os.fdopen(fd,"w",encoding="utf-8") as f: f.write(json.dumps(out,ensure_ascii=False,indent=2))
         os.replace(tmp, path)
+    def style_carrier(self):
+        """Stage 1.5 风格载体:manifest 中第一个 kind=='bg' 的 asset。无 bg → ValueError(preview 仅支持 bg 载体)。"""
+        c=next((a for a in self.assets if a.kind=="bg"), None)
+        if c is None: raise ValueError("no bg asset to use as style carrier; preview only supports a bg style carrier")
+        return c
+    def carrier_by_id(self, asset_id):
+        a=next((x for x in self.assets if x.id==asset_id), None)
+        if a is None: raise ValueError(f"carrier asset {asset_id!r} not found in manifest")
+        if a.kind!="bg": raise ValueError(f"carrier {asset_id!r} is kind={a.kind!r}; preview only supports a bg style carrier")
+        return a
+    def apply_style_suffix(self, style_suffix, skip_ids=()):
+        """把风格修饰串幂等 append 进所有(除 skip_ids 外)asset.prompt。已含则不重复加。返回被改动的 asset id 列表。"""
+        suffix=(style_suffix or "").strip()
+        if not suffix: return []
+        changed=[]
+        for a in self.assets:
+            if a.id in skip_ids: continue
+            base=a.prompt or ""
+            if suffix in base: continue                 # 幂等:已含该修饰 → 跳过
+            a.prompt=(base+" "+suffix).strip() if base else suffix
+            changed.append(a.id)
+        return changed
     def validate(self, max_assets=None):
         from registry import build_request   # 延迟导入避免环
         from config import Config
