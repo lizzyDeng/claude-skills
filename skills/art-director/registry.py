@@ -19,3 +19,10 @@ def build_request(a,cfg):
     h=HANDLERS.get(a.kind)
     if h is None: raise ValueError(f"{a.id}: no handler for kind {a.kind!r}")
     return h(a,cfg)
+def build_probe_request(a,cfg):
+    """Stage 1.5 探针请求:强制 resolution=1k(最便宜档)。仅 bg 载体支持。
+    复用 build_request 路径,只覆写最终 size/resolution → 不污染原 asset。"""
+    if a.kind!="bg": raise ValueError(f"{a.id}: preview probe only supports bg carrier (kind={a.kind!r})")
+    body=build_bg_request(a,cfg)
+    body["resolution"]="1k"   # 强制最廉价档,无视 asset.resolution / cfg.default_bg_resolution
+    return body
