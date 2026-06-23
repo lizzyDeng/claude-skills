@@ -99,6 +99,27 @@ def test_cli_lock_style_unknown_variant(tmp_path, capsys):
     mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN)); vf=_vf(tmp_path)
     rc=main(["lock-style","--manifest",str(mp),"--variant","nope","--variants-file",str(vf)])
     assert rc!=0 and "not found" in capsys.readouterr().out
+def test_cli_preview_no_bg_carrier(tmp_path, capsys, monkeypatch):
+    # manifest 无 bg → style_carrier ValueError → 干净 [preview] 行,return 1,非 traceback
+    monkeypatch.setenv("APIMART_API_KEY","sk-test")
+    import apimart; monkeypatch.setattr(apimart,"ApimartClient",_FakeClient)
+    man={**MAN,"assets":[MAN["assets"][1]]}  # 只有 cutout
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(man)); vf=_vf(tmp_path)
+    rc=main(["preview","--manifest",str(mp),"--project-dir",str(tmp_path),"--variants-file",str(vf)])
+    assert rc==1 and "[preview]" in capsys.readouterr().out
+def test_cli_preview_bad_variants_file(tmp_path, capsys, monkeypatch):
+    # variants-file 缺 prompt → _load_variants ValueError → 干净 [preview] 行,非 traceback
+    monkeypatch.setenv("APIMART_API_KEY","sk-test")
+    import apimart; monkeypatch.setattr(apimart,"ApimartClient",_FakeClient)
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN))
+    bad=tmp_path/"bad.json"; bad.write_text(json.dumps([{"label":"x"}]))
+    rc=main(["preview","--manifest",str(mp),"--project-dir",str(tmp_path),"--variants-file",str(bad)])
+    assert rc==1 and "[preview]" in capsys.readouterr().out
+def test_cli_lock_style_requires_project_dir(tmp_path, capsys):
+    # 无 --variants-file 且无 --project-dir → 显式报错(不静默默认 cwd 找错 previews.json)
+    mp=tmp_path/"m.json"; mp.write_text(json.dumps(MAN))
+    rc=main(["lock-style","--manifest",str(mp),"--variant","painterly"])
+    assert rc==1 and "--project-dir required" in capsys.readouterr().out
 def test_foreign_cwd_via_symlink(tmp_path):
     # 真压 self-insert:把 cli.py 软链到一个【无 sibling 模块】的目录,清空 PYTHONPATH,从无关 cwd 跑
     link_dir=tmp_path/"linkdir"; link_dir.mkdir()

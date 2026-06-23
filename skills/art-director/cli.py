@@ -62,8 +62,11 @@ def _cmd_preview(args):
     from engine import generate_previews, PREVIEW_DIR
     cfg=Config.from_env()
     m=Manifest.load(args.manifest)
-    carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
-    variants=_load_variants(args.variants_file)
+    try:
+        carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
+        variants=_load_variants(args.variants_file)
+    except ValueError as e:
+        print(f"[preview] {e}"); return 1                            # 干净错误行,非 traceback
     out_rel=args.out or PREVIEW_DIR
     client=ApimartClient(UrllibTransport(),cfg.api_key,cfg.base_url)
     probe_cost=len(variants)*_COST["bg"]["1k"]
@@ -83,14 +86,18 @@ def _cmd_preview(args):
 def _cmd_lock_style(args):
     import json
     m=Manifest.load(args.manifest)
-    carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
-    # 选中变体:优先 --variants-file,否则 previews.json
-    if args.variants_file: variants=_load_variants(args.variants_file)
-    else:
-        pd=args.project_dir or "."
-        pj=os.path.join(pd,".art-director","preview","previews.json")
-        if not os.path.exists(pj): print(f"[lock-style] no previews.json at {pj}; run preview first or pass --variants-file"); return 1
-        variants=json.loads(open(pj,encoding="utf-8").read()).get("variants",[])
+    try:
+        carrier=m.carrier_by_id(args.carrier) if args.carrier else m.style_carrier()
+        # 选中变体:优先 --variants-file,否则 previews.json(后者须显式 --project-dir,不静默默认 cwd)
+        if args.variants_file: variants=_load_variants(args.variants_file)
+        else:
+            if not args.project_dir:
+                print("[lock-style] --project-dir required to locate previews.json (or pass --variants-file)"); return 1
+            pj=os.path.join(args.project_dir,".art-director","preview","previews.json")
+            if not os.path.exists(pj): print(f"[lock-style] no previews.json at {pj}; run preview first or pass --variants-file"); return 1
+            variants=json.loads(open(pj,encoding="utf-8").read()).get("variants",[])
+    except ValueError as e:
+        print(f"[lock-style] {e}"); return 1                          # 干净错误行,非 traceback
     chosen=next((v for v in variants if v.get("label")==args.variant), None)
     if chosen is None: print(f"[lock-style] variant {args.variant!r} not found among {[v.get('label') for v in variants]}"); return 1
     carrier.prompt=chosen["prompt"]                                  # carrier prompt ← 选中变体完整生成提示
