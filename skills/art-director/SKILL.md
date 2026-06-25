@@ -27,9 +27,9 @@ python3 "<SKILL_BASE>/cli.py" <subcommand> ...
 
 **Replace `<SKILL_BASE>` with the actual absolute path** (e.g. `python3 "/Users/you/.claude/plugins/.../skills/art-director/cli.py" validate ...`). Do NOT run the command with the literal text `<SKILL_BASE>`, and do NOT use `python3 cli.py` (a cwd-relative path fails — the skill runs in the user's project dir, not here).
 
-## The pipeline (Stage 1 → 2 → optional 1.5 → 3 → 4)
+## The pipeline (Stage 1 → 2 → optional 1.5 → 3 → 3.5 → 4)
 
-`design → validate (reconcile + cost) →` *optional* `art-direction preview (Stage 1.5, cheap 1k probe) →` `generate (full-res, paid) → wiring gate`. Stage 1.5 is a non-blocking cost gate: `validate` *suggests* it when the full-res set is expensive or large; you preview-then-lock the direction before spending on full-res gen.
+`design → validate (reconcile + cost) →` *optional* `art-direction preview (Stage 1.5, cheap 1k probe) →` `generate (full-res, paid) →` **`asset confirm (Stage 3.5, mandatory human gate) →`** `wiring gate`. Stage 1.5 is a non-blocking cost gate: `validate` *suggests* it when the full-res set is expensive or large; you preview-then-lock the direction before spending on full-res gen. Stage 3.5 is a **blocking human gate**: after the real assets are generated, you show every cutout to the user and get explicit approval before wiring/finishing — the automated gate checks file structure, never whether the artwork is actually right.
 
 ### Stage 1 — design (frontend-design + asset convention)
 
@@ -108,6 +108,22 @@ python3 "<SKILL_BASE>/cli.py" gen --manifest .art-director/manifest.json --proje
 
 Submits each asset to APImart (async: submit → poll → download/decode), validates each download (real PNG; cutouts must carry an alpha channel), and persists per-asset status + task_id atomically as it goes. On partial failure the page is auto-degraded (a fallback background so it never white-screens) and you can rerun to resume only the failed assets (already-paid tasks are reused, not re-billed).
 
+### Stage 3.5 — asset confirmation (🔴 mandatory human gate)
+
+`gen` printing `GEN: PASS` does **not** mean the page is ready. The automated `gate` (Stage 4) only checks **structure** — file exists, valid PNG, cutout has an alpha channel, placeholder wired. It can **never** judge whether the cutout is the right subject, well-composed, or not visually broken. Only a human can. So before Stage 4:
+
+1. **Show the user every generated asset.** Open each `assets/gen/<id>.png` and present it inline — **every `cutout` is mandatory to show**, and show the `bg`(s) too. Don't describe them in words; the user must *see* the pixels.
+2. **Wait for explicit approval.** Do **not** run Stage 4 `gate` and do **not** claim the page is ready until the user says the assets are good.
+3. **On rejection — regenerate just that asset:**
+
+   ```
+   python3 "<SKILL_BASE>/cli.py" regen --manifest .art-director/manifest.json --project-dir . --asset <id> [--prompt "<adjusted prompt>"]
+   ```
+
+   `regen` clears that asset's `task_id` + `status` so it is **freshly generated (re-billed)**, while every other `done` asset is reused (not re-billed). `--prompt` (single `--asset` only) overwrites the prompt first — use it to steer the redo ("make the cat fluffier", "centered, plain background"). You can name multiple `--asset` to redo several at once (without `--prompt`). On failure the **old image is kept** (atomic swap), so a bad regen never white-screens — just rerun. Then **re-show the new asset and loop** until the user approves.
+
+🔴 Do not skip this gate because the assets "look fine from the manifest" or because the user is in a hurry — a wrong cutout wired into a finished page is exactly the failure this gate exists to catch.
+
 ### Stage 4 — wiring gate
 
 ```
@@ -131,6 +147,7 @@ If Stage 2 fails or raises unsupported-markup, return to Stage 1 and ask `fronte
 ## Red lines
 
 - If Stage 4 (`gate`) is not `PASS`, do **not** claim the page is ready.
+- **Stage 3.5 is mandatory**: after `gen`, every `cutout` must be shown to the user and explicitly approved before you run Stage 4 or claim completion. Wiring an unconfirmed cutout into a finished page = violation. On rejection, `regen` the asset and re-show; loop until approved.
 - Report every failed asset by id; never silently drop one.
 - If the cost estimate is high or `max_assets` is exceeded, tell the user before generating. When `validate` prints `💡 PREVIEW SUGGESTED`, offer Stage 1.5 before spending on full-res gen.
 - When you do run a preview, tell the user the two honest limits (Stage 1.5): the probe locks the **style, not the final pixels**, and probing **cutouts does not save money** (no cheap tier — bg is the default style carrier).
