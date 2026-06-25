@@ -48,6 +48,39 @@ def _cmd_gen(args):
         n=degrade(m,args.project_dir,args.page)
         print(f"GEN: PARTIAL — failed {failed} ({n} degraded in {args.page}; rerun to resume)"); return 1
     print("GEN: PASS"); return 0
+def _cmd_regen(args):
+    # Stage 3.5 定向重生:清掉命名 asset 的 task_id+status → generate() 重新计费生成该张,其它 done 的复用不重复付费
+    from transport import UrllibTransport
+    from apimart import ApimartClient
+    from engine import generate
+    cfg=Config.from_env()
+    if args.bg_resolution: cfg.default_bg_resolution=args.bg_resolution
+    m=Manifest.load(args.manifest); by={a.id:a for a in m.assets}
+    unknown=[i for i in args.asset if i not in by]
+    if unknown:                                                  # 花钱前拦截未知 id
+        print(f"[regen] asset(s) not found in manifest: {', '.join(unknown)} (have: {', '.join(by)})"); return 1
+    if args.prompt is not None and len(args.asset)!=1:           # 一个 prompt 套多张几乎都是错的
+        print(f"[regen] --prompt requires exactly a single --asset (got {len(args.asset)})"); return 1
+    if args.prompt is not None: by[args.asset[0]].prompt=args.prompt
+    for i in args.asset: by[i].task_id=None; by[i].status="pending"   # 清状态:强制重新 submit(重新计费)+进 todo
+    errs=m.validate(max_assets=cfg.max_assets)                   # 改 prompt 后再校验
+    if errs:
+        for e in errs: print(f"[manifest] {e}")
+        print("REGEN: FAIL (invalid manifest)"); return 1
+    mp_out=os.path.join(args.project_dir,cfg.manifest_path)
+    client=ApimartClient(UrllibTransport(),cfg.api_key,cfg.base_url)
+    def persist(man): man.save_atomic(mp_out)
+    persist(m)                                                   # 先落盘清掉的 task_id(提交前持久化,kill 不丢)
+    named=[by[i] for i in args.asset]
+    est=sum(_COST["cutout"] if a.kind=="cutout" else _COST["bg"].get(a.resolution or "2k",0.06) for a in named)
+    _log(args.project_dir, f"{datetime.datetime.now().isoformat()} regen start: {[a.id for a in named]}, est ${est:.2f}")
+    m=generate(m,args.project_dir,client,cfg,on_progress=persist); persist(m)
+    for a in named: _log(args.project_dir, f"  {a.id} kind={a.kind} status={a.status} task_id={a.task_id}")
+    print(f"[cost] regenerated ~${est:.2f} for {len(named)} asset(s) (as-of 2026-06 prices; see run.log for actual)")
+    failed=[a.id for a in named if a.status!="done"]
+    if failed:                                                   # 旧图被 .part→os.replace 原子保护,失败不白屏
+        print(f"REGEN: PARTIAL — failed {failed} (旧图保留;rerun regen 重试)"); return 1
+    print("REGEN: PASS"); return 0
 def _load_variants(path):
     import json
     data=json.loads(open(path,encoding="utf-8").read())
@@ -123,5 +156,6 @@ def main(argv=None):
     p=sub.add_parser("preview"); p.add_argument("--manifest",required=True); p.add_argument("--project-dir",required=True); p.add_argument("--variants-file",required=True); p.add_argument("--carrier"); p.add_argument("--out"); p.set_defaults(fn=_cmd_preview)
     l=sub.add_parser("lock-style"); l.add_argument("--manifest",required=True); l.add_argument("--variant",required=True); l.add_argument("--variants-file"); l.add_argument("--carrier"); l.add_argument("--project-dir"); l.set_defaults(fn=_cmd_lock_style)
     t=sub.add_parser("gate"); t.add_argument("--manifest",required=True); t.add_argument("--project-dir",required=True); t.add_argument("--code"); t.set_defaults(fn=_cmd_gate)
+    rg=sub.add_parser("regen"); rg.add_argument("--manifest",required=True); rg.add_argument("--project-dir",required=True); rg.add_argument("--asset",action="append",required=True); rg.add_argument("--prompt"); rg.add_argument("--bg-resolution"); rg.set_defaults(fn=_cmd_regen)
     args=ap.parse_args(argv); return args.fn(args)
 if __name__=="__main__": sys.exit(main())
