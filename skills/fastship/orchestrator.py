@@ -481,10 +481,12 @@ def _verify_setup_commands() -> list:
     return own if own else _e2e_setup_commands()
 
 
-def _verify_changed_files_arg() -> str:
-    """把当前 feature 改动文件传给 verify_gate.py（surface 派生用，确定性）。"""
+def _verify_changed_files_arg(base_sha: Optional[str] = None) -> str:
+    """把当前 feature 的【全量】改动文件传给 verify_gate.py（surface 派生用，确定性）。
+    🔴 必须用 session base_sha 取全量 diff —— Phase 2 已逐 node commit，单用 `git diff HEAD`
+    会是空集，feature 级 required-surface 检查(§13.5 safety net)会失效。"""
     try:
-        files = sorted(_changed_files())
+        files = sorted(_changed_files(base_sha))
     except Exception:
         files = []
     return ",".join(files)
@@ -2450,7 +2452,7 @@ def validate_verify_gate(orch: dict, hook: dict) -> tuple:
              "--plan", _verify_plan_path(),
              "--evidence-dir", _verify_result_dir(),
              "--judge", judge_path,
-             "--changed-files", _verify_changed_files_arg(),
+             "--changed-files", _verify_changed_files_arg(orch.get("base_sha")),
              "-o", _verify_gate_result_path()],
             capture_output=True, text=True, timeout=60,
         )
