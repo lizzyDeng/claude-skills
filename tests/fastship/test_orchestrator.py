@@ -25,6 +25,47 @@ def write_project_config(root, e2e):
     return config_path
 
 
+# ── AC 驱动验证（新 Phase 3）测试 fixture ──────────────────────────────────────
+# 镜像 skills/fastship/e2e/test_verify_gate.py 的真实 png + 正确 sha256 manifest，
+# 让结构 gate 的「证据真实(④)」检查在测试里真正执行。
+
+def _vp_png(path, content=b"\x89PNG\r\n\x1a\nFAKE"):
+    with open(path, "wb") as f:
+        f.write(content)
+    return hashlib.sha256(content).hexdigest()
+
+
+def write_verify_scenario(result_dir, *, intents, bundles, verdicts, manifest):
+    """把一套完整 AC 验证证据(plan + per-AC bundles + manifest + judge)落盘到 result_dir。"""
+    os.makedirs(result_dir, exist_ok=True)
+    with open(os.path.join(result_dir, "verification-plan.json"), "w") as f:
+        json.dump({"feature": "t", "intents": intents}, f)
+    with open(os.path.join(result_dir, "verify-judge.json"), "w") as f:
+        json.dump({"verdicts": verdicts}, f)
+    for b in bundles:
+        with open(os.path.join(result_dir, f"{b['ac_id']}.bundle.json"), "w") as f:
+            json.dump(b, f)
+    with open(os.path.join(result_dir, "evidence-manifest.json"), "w") as f:
+        json.dump({"artifacts": manifest}, f)
+
+
+def simple_pass_scenario(result_dir, ac_id="ac-1", surface="user"):
+    """单 AC 纯 UI 通过场景(真截图 + 正确 manifest)。落盘并返回 (intents, bundles, verdicts, manifest)。"""
+    os.makedirs(result_dir, exist_ok=True)
+    shot = os.path.join(result_dir, f"{ac_id}.png")
+    h = _vp_png(shot, (ac_id + "-png").encode())
+    intents = [{"ac_id": ac_id, "assertion": "目标可见", "required_surfaces": [surface],
+                "entry": "/", "goal": "g", "success_evidence": ["e"]}]
+    bundles = [{"ac_id": ac_id, "surfaces_touched": [surface],
+                "states": {"default": {"screenshots": [shot]}},
+                "realized_journey": [{"target": surface, "action": "看一眼", "ok": True, "elapsed_ms": 10}]}]
+    verdicts = [{"ac_id": ac_id, "verdict": "pass",
+                 "evidence_refs": [{"artifact": shot, "fact": "看到了"}], "reason": "ok"}]
+    manifest = {shot: h}
+    write_verify_scenario(result_dir, intents=intents, bundles=bundles, verdicts=verdicts, manifest=manifest)
+    return intents, bundles, verdicts, manifest
+
+
 def make_trusted_plan(tmp_path, monkeypatch):
     plan_dir = tmp_path / "docs" / "superpowers" / "plans"
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -784,25 +825,28 @@ class TestValidatorsPhase3:
         from orchestrator import validate_tests
         assert validate_tests({}, {})[0] is False
 
-    def test_e2e_run_pass(self):
-        from orchestrator import validate_e2e_run
-        assert validate_e2e_run({}, {"e2e_executed": True})[0] is True
+    def test_verify_plan_pass(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_plan
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        assert validate_verify_plan({}, {})[0] is True
 
-    def test_report_rejects_codex_mode_without_gate(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_report
-        f = tmp_path / "report.md"
-        f.write_text("## Report\n" + "x " * 150)
+    def test_verify_exec_rejects_codex_mode_without_gate(self, monkeypatch):
+        from orchestrator import validate_verify_exec
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_report({"report_path": str(f)}, {})
+        ok, msg = validate_verify_exec({}, {})
         assert ok is False
         assert "fallback" in msg
 
-    def test_report_fail_small_codex_mode(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_report
-        f = tmp_path / "report.md"
-        f.write_text("short")
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        assert validate_e2e_report({"report_path": str(f)}, {})[0] is False
+    def test_verify_plan_fail_missing_file(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_plan
+        rd = tmp_path / "verify"
+        rd.mkdir()
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        assert validate_verify_plan({}, {})[0] is False
 
     def test_knowledge_pass(self):
         from orchestrator import validate_knowledge
@@ -857,15 +901,13 @@ class TestValidatorsFallbackDenied:
         assert ok is True
         assert "feature" in msg
 
-    def test_e2e_run_fs_fallback_rejected(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_run
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_text(json.dumps({
-            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]
-        }))
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_run({}, {})
+    def test_verify_plan_fs_fallback_rejected(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_plan
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))  # 计划文件真实存在于磁盘
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})  # 无 gate.json
+        ok, msg = validate_verify_plan({}, {})
         assert ok is False
         assert "fallback" in msg
 
@@ -950,11 +992,15 @@ class TestDetection:
         hook = {"test_passed": True}
         assert detect_completion_post_bash("3.1", data, hook) == "3.1"
 
-    def test_detect_e2e_run(self):
-        from orchestrator import detect_completion_post_bash
-        data = {"tool_input": {"command": "python3 tests/e2e_runner.py -o /tmp/e2e_result.json"}}
-        hook = {"e2e_executed": True}
-        assert detect_completion_post_bash("3.2", data, hook) == "3.2"
+    def test_detect_verify_plan_post_edit(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/fastship-verify/verification-plan.json"}}
+        assert detect_completion_post_edit("3.2", data) == "3.2"
+
+    def test_detect_verify_exec_post_edit(self):
+        from orchestrator import detect_completion_post_edit
+        data = {"tool_input": {"file_path": "/proj/.claude/fastship-verify/evidence-manifest.json"}}
+        assert detect_completion_post_edit("3.3", data) == "3.3"
 
     def test_detect_loop_record(self):
         from orchestrator import detect_completion_post_bash
@@ -1371,49 +1417,49 @@ class TestIntegrationFullFlow:
         st = reload()
         assert st["current_step"] == "3.2"
 
-        # 3.2: e2e run (auto)
-        hook["e2e_executed"] = True
-        hook_post_bash_logic(
-            data={"tool_input": {"command": "python3 tests/e2e_runner.py -o /tmp/e2e.json"}},
-            orch_path=orch_file, hook_state=hook)
+        # 3.2: 验证意图（auto via post_edit — 写 verification-plan.json，覆盖锁定 AC ac-1）
+        verify_dir = tmp_path / ".claude" / "fastship-verify"
+        verify_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(verify_dir))
+        ac_shot = verify_dir / "ac-1.png"
+        ac_shot.write_bytes(b"\x89PNG-real-ac1")
+        shot_hash = hashlib.sha256(b"\x89PNG-real-ac1").hexdigest()
+        plan_json = verify_dir / "verification-plan.json"
+        plan_json.write_text(json.dumps({"feature": "dark", "intents": [
+            {"ac_id": "ac-1", "assertion": "切换后主题变暗", "required_surfaces": ["user"],
+             "entry": "/", "goal": "切换暗色", "success_evidence": ["主题变暗"]}]}))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"test_passed": True, "e2e_executed": True})
+        hook_post_edit_logic(
+            data={"tool_input": {"file_path": str(plan_json)}},
+            orch_path=orch_file)
         st = reload()
         assert st["current_step"] == "3.3"
 
-        # 3.3: report (auto via post_edit)
-        # Set up e2e_result.json + gate hash so validate_e2e_report passes
-        import hashlib
-        e2e_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
-        e2e_bytes = json.dumps(e2e_data, ensure_ascii=False).encode("utf-8")
-        e2e_file = tmp_path / "e2e_result.json"
-        e2e_file.write_bytes(e2e_bytes)
-        e2e_hash = hashlib.sha256(e2e_bytes).hexdigest()
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(e2e_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": e2e_hash})
-        report = tmp_path / "report.md"
-        report.write_text(f"## Report\n\ne2e_result_hash: {e2e_hash}\n" + "x " * 150)
-        st["report_path"] = str(report)
-        save_orch_state(st, orch_file)
+        # 3.3: 验证执行（auto via post_edit — 写 evidence-manifest.json，带真截图 + 正确 sha256）
+        bundle = verify_dir / "ac-1.bundle.json"
+        bundle.write_text(json.dumps({
+            "ac_id": "ac-1", "surfaces_touched": ["user"],
+            "states": {"default": {"screenshots": [str(ac_shot)]}},
+            "realized_journey": [{"target": "user", "action": "点切换", "ok": True, "elapsed_ms": 12}]}))
+        manifest = verify_dir / "evidence-manifest.json"
+        manifest.write_text(json.dumps({"artifacts": {str(ac_shot): shot_hash}}))
         hook_post_edit_logic(
-            data={"tool_input": {"file_path": str(report)}},
+            data={"tool_input": {"file_path": str(manifest)}},
             orch_path=orch_file)
         st = reload()
         assert st["current_step"] == "3.4"
 
-        # 3.4: gate (auto) — needs exit code 0 + validate_e2e_gate pass
-        gate_script = tmp_path / "tests" / "e2e_gate.py"
-        gate_script.parent.mkdir(parents=True, exist_ok=True)
-        gate_script.write_text("import sys; print('GATE PASSED'); sys.exit(0)")
+        # 3.4: 裁判 + 结构 gate（auto via post_bash — verify_gate 子进程真跑 exit 0）
+        judge = verify_dir / "verify-judge.json"
+        judge.write_text(json.dumps({"verdicts": [
+            {"ac_id": "ac-1", "verdict": "pass",
+             "evidence_refs": [{"artifact": str(ac_shot), "fact": "主题变暗"}], "reason": "ok"}]}))
         monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {
-                                "test_passed": True,
-                                "e2e_executed": True,
-                                "e2e_result_hash": e2e_hash,
-                                "e2e_gate_passed": True,
-                            })
+                            lambda: {"test_passed": True, "e2e_executed": True, "e2e_gate_passed": True})
         hook_post_bash_logic(
-            data={"tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
-                  "tool_response": {"exitCode": 0, "stdout": "GATE PASSED"}},
+            data={"tool_input": {"command": "python3 e2e/verify_gate.py --plan p --evidence-dir d --judge j"},
+                  "tool_response": {"exitCode": 0, "stdout": "GATE PASS"}},
             orch_path=orch_file, hook_state=hook)
         st = reload()
         assert st["current_step"] == "3.5"
@@ -1432,7 +1478,6 @@ class TestIntegrationFullFlow:
                             lambda: {
                                 "test_passed": True,
                                 "e2e_executed": True,
-                                "e2e_result_hash": e2e_hash,
                                 "e2e_gate_passed": True,
                                 "knowledge_acknowledged": True,
                                 "knowledge_file": str(tmp_path / "KNOWLEDGE.md"),
@@ -1697,162 +1742,169 @@ class TestStrictRunnerProvenance:
         assert ship_verify_gate.is_strict_e2e_runner('npm run test:e2e') is True
 
 
-class TestE2ERunHardened:
-    """validate_e2e_run should only trust gate.json when hooks are active."""
+class TestVerifyPlanHardened:
+    """validate_verify_plan：只在 gate.json 存在时信任，覆盖锁定 AC，hash 防篡改。"""
 
-    def test_rejects_file_when_gate_exists(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_run
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_text('{"scenarios": []}')
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": False, "branch": "test"})
-        ok, msg = validate_e2e_run({}, {})
-        assert ok is False
+    def _setup(self, tmp_path, monkeypatch, gate):
+        rd = tmp_path / "verify"
+        scen = simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: gate)
+        return rd, scen
 
-    def test_accepts_gate_executed(self, monkeypatch):
-        from orchestrator import validate_e2e_run
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
-        ok, _ = validate_e2e_run({}, {})
-        assert ok is True
+    def test_accepts_valid_plan_with_gate(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_plan
+        self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        assert validate_verify_plan({}, {})[0] is True
 
-    def test_codex_fallback_rejected_even_with_low_quality_file(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_run
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_text(json.dumps({
-            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 5}]}]
-        }))
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_run({}, {})
+    def test_codex_fallback_rejected_without_gate(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_plan
+        self._setup(tmp_path, monkeypatch, {})  # 无 gate.json
+        ok, msg = validate_verify_plan({}, {})
         assert ok is False
         assert "fallback" in msg
 
-    def test_codex_fallback_rejected_even_with_quality_file(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_run
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_text(json.dumps({
-            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]
-        }))
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_run({}, {})
+    def test_rejects_plan_missing_locked_ac(self, tmp_path, monkeypatch):
+        """计划漏掉锁定的 P0 AC（漏验）→ FAIL。"""
+        from orchestrator import validate_verify_plan
+        rd, _ = self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        # plan_path 解析出锁定 AC = {ac-1, ac-2}，但验证计划只覆盖 ac-1
+        plan_dir = tmp_path / "docs" / "superpowers" / "plans"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        plan_file = plan_dir / "2026-05-18-feat.md"
+        contract = {"nodes": [{"id": "t1"}],
+                    "ac_mapping": [{"ac_id": "ac-1", "tasks": ["t1"], "e2e": ["s1"]},
+                                   {"ac_id": "ac-2", "tasks": ["t1"], "e2e": ["s2"]}]}
+        plan_file.write_text("# Plan\n<!-- fastship:contract -->\n```json\n"
+                             + json.dumps(contract, ensure_ascii=False) + "\n```\n")
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
+        ok, msg = validate_verify_plan({"plan_path": str(plan_file)}, {})
         assert ok is False
-        assert "fallback" in msg
-
-
-class TestE2EReportHardened:
-    """validate_e2e_report must verify data integrity via gate.json hash."""
-
-    def test_rejects_without_hash(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_report
-        report = tmp_path / "report.md"
-        report.write_text("## Report\n" + "x " * 150)
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-        ok, _ = validate_e2e_report({"report_path": str(report)}, {})
-        assert ok is False
+        assert "ac-2" in msg
 
     def test_rejects_hash_mismatch(self, tmp_path, monkeypatch):
-        import hashlib
-        from orchestrator import validate_e2e_report
-        result_file = tmp_path / "e2e_result.json"
-        original = json.dumps({"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]})
-        recorded_hash = hashlib.sha256(original.encode()).hexdigest()
-        result_file.write_text('{"scenarios": [{"rounds": [{"turns": []}]}]}')
-        report = tmp_path / "report.md"
-        report.write_text("## Report\n" + "x " * 150)
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
-        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
+        """gate 记录了 verify_plan_hash，但计划文件被改 → FAIL。"""
+        from orchestrator import validate_verify_plan
+        rd, _ = self._setup(tmp_path, monkeypatch,
+                            {"e2e_executed": True, "verify_plan_hash": "deadbeef-not-matching"})
+        ok, msg = validate_verify_plan({}, {})
         assert ok is False
-        assert "mismatch" in msg.lower() or "hash" in msg.lower()
+        assert "hash" in msg.lower()
 
-    def test_passes_with_valid_hash(self, tmp_path, monkeypatch):
-        import hashlib
-        from orchestrator import validate_e2e_report
-        result_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
-        result_bytes = json.dumps(result_data, ensure_ascii=False).encode("utf-8")
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_bytes(result_bytes)
-        recorded_hash = hashlib.sha256(result_bytes).hexdigest()
-        report = tmp_path / "report.md"
-        report.write_text(f"## Report\n\ne2e_result_hash: {recorded_hash}\n" + "x " * 150)
-        orch = {"report_path": str(report), "artifacts": {}}
-        trust_artifact(orch, "3.3", report)
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
-        ok, _ = validate_e2e_report(orch, {})
-        assert ok is True
 
-    def test_rejects_report_missing_result_hash_reference(self, tmp_path, monkeypatch):
-        import hashlib
-        from orchestrator import validate_e2e_report
-        result_data = {"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]}
-        result_bytes = json.dumps(result_data, ensure_ascii=False).encode("utf-8")
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_bytes(result_bytes)
-        recorded_hash = hashlib.sha256(result_bytes).hexdigest()
-        report = tmp_path / "report.md"
-        report.write_text("## Report\n\nAll good, but no raw result hash.\n" + "x " * 150)
-        orch = {"report_path": str(report), "artifacts": {}}
-        trust_artifact(orch, "3.3", report)
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": recorded_hash})
-        ok, msg = validate_e2e_report(orch, {})
+class TestVerifyExecHardened:
+    """validate_verify_exec：每条 AC 有证据 bundle + manifest，hash 防篡改。"""
+
+    def test_passes_with_valid_evidence(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        assert validate_verify_exec({}, {})[0] is True
+
+    def test_rejects_missing_bundle(self, tmp_path, monkeypatch):
+        """计划有 AC，但没有对应证据 bundle（漏验）→ FAIL。"""
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        os.remove(os.path.join(str(rd), "ac-1.bundle.json"))  # 删掉证据
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        ok, msg = validate_verify_exec({}, {})
         assert ok is False
-        assert "e2e_result_hash" in msg
+        assert "ac-1" in msg
 
-    def test_codex_fallback_is_rejected(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_report
-        report = tmp_path / "report.md"
-        report.write_text("## Report\n" + "x " * 150)
+    def test_rejects_missing_manifest(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        os.remove(os.path.join(str(rd), "evidence-manifest.json"))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        assert validate_verify_exec({}, {})[0] is False
+
+    def test_rejects_manifest_hash_mismatch(self, tmp_path, monkeypatch):
+        """gate 记录 verify_evidence_hash，但 manifest 被改 → FAIL。"""
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file",
+                            lambda: {"e2e_executed": True, "verify_evidence_hash": "stale-hash-nope"})
+        ok, msg = validate_verify_exec({}, {})
+        assert ok is False
+        assert "hash" in msg.lower()
+
+    def test_codex_fallback_is_rejected(self, monkeypatch):
+        from orchestrator import validate_verify_exec
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
+        ok, msg = validate_verify_exec({}, {})
         assert ok is False
         assert "fallback" in msg
 
 
-class TestE2EGateHardened:
-    """validate_e2e_gate must run gate script as subprocess, not auto-pass."""
+class TestVerifyGateHardened:
+    """validate_verify_gate：以子进程复跑 bundled verify_gate.py，不自动放行。"""
 
-    def test_rejects_when_gate_script_missing(self, monkeypatch):
-        from orchestrator import validate_e2e_gate
-        monkeypatch.setattr("orchestrator._repo_root", lambda: "/nonexistent")
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-        ok, _ = validate_e2e_gate({}, {})
+    def _setup(self, tmp_path, monkeypatch, gate, *, scenario=True):
+        rd = tmp_path / "verify"
+        if scenario:
+            simple_pass_scenario(str(rd))
+        else:
+            rd.mkdir()
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: gate)
+        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))  # git diff 空 → changed-files 空
+        return rd
+
+    def test_passes_full_valid_scenario(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_gate
+        self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        ok, msg = validate_verify_gate({}, {})
+        assert ok is True, msg
+        assert "PASS" in msg
+
+    def test_rejects_when_judge_missing(self, tmp_path, monkeypatch):
+        from orchestrator import validate_verify_gate
+        rd = self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        os.remove(os.path.join(str(rd), "verify-judge.json"))
+        ok, msg = validate_verify_gate({}, {})
         assert ok is False
+        assert "裁判" in msg
 
-    def test_passes_when_gate_exits_zero(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_gate
-        gate_script = tmp_path / "tests" / "e2e_gate.py"
-        gate_script.parent.mkdir(parents=True)
-        gate_script.write_text("import sys; print('GATE PASSED'); sys.exit(0)")
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-        ok, msg = validate_e2e_gate({}, {})
-        assert ok is True
-        assert "passed" in msg.lower()
-
-    def test_rejects_when_gate_exits_nonzero(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_gate
-        gate_script = tmp_path / "tests" / "e2e_gate.py"
-        gate_script.parent.mkdir(parents=True)
-        gate_script.write_text("import sys; print('BLOCKED: not enough turns'); sys.exit(1)")
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-        ok, msg = validate_e2e_gate({}, {})
+    def test_rejects_forged_judge_ref(self, tmp_path, monkeypatch):
+        """裁判判 pass 但引用不存在的 artifact → 结构 gate exit 1 → FAIL。"""
+        from orchestrator import validate_verify_gate
+        rd = self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        with open(os.path.join(str(rd), "verify-judge.json"), "w") as f:
+            json.dump({"verdicts": [{"ac_id": "ac-1", "verdict": "pass",
+                                     "evidence_refs": [{"artifact": os.path.join(str(rd), "ghost.png"),
+                                                        "fact": "我说有"}], "reason": "硬judge"}]}, f)
+        ok, msg = validate_verify_gate({}, {})
         assert ok is False
+        assert "FAIL" in msg
+
+    def test_surface_blocked_without_confirm_then_allowed(self, tmp_path, monkeypatch):
+        """uncertain 裁判 → 结构 gate SURFACE(exit 3)：未确认阻断，verify_confirmed 后放行。"""
+        from orchestrator import validate_verify_gate
+        rd = self._setup(tmp_path, monkeypatch, {"e2e_executed": True})
+        # 改判为 uncertain
+        jp = os.path.join(str(rd), "verify-judge.json")
+        judge = json.load(open(jp))
+        judge["verdicts"][0]["verdict"] = "uncertain"
+        json.dump(judge, open(jp, "w"))
+        ok, msg = validate_verify_gate({}, {})
+        assert ok is False
+        assert "SURFACE" in msg or "verify-confirmed" in msg
+        # 人工确认后放行
+        ok2, _ = validate_verify_gate({"verify_confirmed": True}, {})
+        assert ok2 is True
 
     def test_codex_fallback_is_rejected(self, monkeypatch):
-        from orchestrator import validate_e2e_gate
+        from orchestrator import validate_verify_gate
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
-        ok, msg = validate_e2e_gate({}, {})
+        ok, msg = validate_verify_gate({}, {})
         assert ok is False
         assert "fallback" in msg
 
@@ -1865,71 +1917,26 @@ class TestProjectE2EConfig:
         monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
         assert fastship_state.load_project_config() == {}
 
-    def test_format_next_e2e_runner_uses_project_config(self, tmp_path, monkeypatch):
+    def test_format_next_verify_plan_instruction(self, tmp_path, monkeypatch):
         from orchestrator import format_next
-
-        result_path = tmp_path / "e2e_result.json"
-        write_project_config(tmp_path, {
-            "setup_commands": ["./dev_local.sh"],
-            "runner_command": f"python3 tests/e2e_runner.py --base-url http://localhost:3100 --health /health -o {result_path}",
-            "gate_command": f"python3 tests/e2e_gate.py --result {result_path} --min-turns 12",
-            "result_path": str(result_path),
-            "min_turns": 12,
-            "notes": ["Use dev_local.sh for local services."],
-        })
         monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
-
         output = format_next({"current_step": "3.2", "phase": 3})
+        assert "验证意图" in output
+        assert "verification-plan.json" in output
+        assert "min-turns" not in output  # §13.8 不再有 min_turns
 
-        assert "./dev_local.sh" in output
-        assert "--base-url http://localhost:3100" in output
-        assert f"原始结果必须写入 {result_path}" in output
-        assert "最少 12 轮" in output
-        assert "Use dev_local.sh" in output
-
-    def test_format_next_e2e_gate_uses_project_config(self, tmp_path, monkeypatch):
+    def test_format_next_verify_exec_instruction(self, tmp_path, monkeypatch):
         from orchestrator import format_next
-
-        result_path = tmp_path / "custom-result.json"
-        write_project_config(tmp_path, {
-            "gate_command": f"python3 tests/e2e_gate.py --result {result_path} --min-turns 17",
-            "result_path": str(result_path),
-            "min_turns": 17,
-        })
         monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
+        output = format_next({"current_step": "3.3", "phase": 3})
+        assert "看一眼再点" in output
 
+    def test_format_next_verify_gate_instruction(self, tmp_path, monkeypatch):
+        from orchestrator import format_next
+        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
         output = format_next({"current_step": "3.4", "phase": 3})
-
-        assert f"--result {result_path}" in output
-        assert "--min-turns 17" in output
-
-    def test_validate_e2e_gate_passes_configured_result_and_min_turns(self, tmp_path, monkeypatch):
-        from orchestrator import validate_e2e_gate
-
-        result_path = tmp_path / "custom-result.json"
-        argv_path = tmp_path / "argv.json"
-        write_project_config(tmp_path, {
-            "result_path": str(result_path),
-            "min_turns": 17,
-        })
-        gate_script = tmp_path / "tests" / "e2e_gate.py"
-        gate_script.parent.mkdir(parents=True)
-        gate_script.write_text(
-            "import json, sys\n"
-            f"open({str(argv_path)!r}, 'w').write(json.dumps(sys.argv))\n"
-            "sys.exit(0)\n"
-        )
-        monkeypatch.setattr("fastship_state.repo_root", lambda: str(tmp_path))
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-
-        ok, msg = validate_e2e_gate({}, {})
-
-        assert ok is True, msg
-        argv = json.loads(argv_path.read_text())
-        assert argv[argv.index("--result") + 1] == str(result_path)
-        assert argv[argv.index("--min-turns") + 1] == "17"
+        assert "verify_gate" in output
+        assert "裁判" in output
 
     def test_hook_gate_matches_configured_runner_and_result_path(self, tmp_path, monkeypatch):
         hooks_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'skills', 'fastship', 'hooks')
@@ -1951,29 +1958,37 @@ class TestProjectE2EConfig:
         assert ok is True, reason
 
 
-class TestDetectionE2EGateHardened:
-    """detect_completion_post_bash for 3.4 must check exit code."""
+class TestDetectionVerifyGateHardened:
+    """detect_completion_post_bash for 3.4 认 verify_gate 且必须 exit 0。"""
 
     def test_advances_on_exit_zero(self):
         from orchestrator import detect_completion_post_bash
         data = {
-            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
-            "tool_response": {"exitCode": 0, "stdout": "GATE PASSED"},
+            "tool_input": {"command": 'python3 /x/e2e/verify_gate.py --plan p --evidence-dir d --judge j'},
+            "tool_response": {"exitCode": 0, "stdout": "✅ GATE PASS"},
         }
         assert detect_completion_post_bash("3.4", data, {}) == "3.4"
 
     def test_blocks_on_exit_nonzero(self):
         from orchestrator import detect_completion_post_bash
         data = {
-            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
-            "tool_response": {"exitCode": 1, "stdout": "BLOCKED"},
+            "tool_input": {"command": "python3 /x/e2e/verify_gate.py --plan p --evidence-dir d --judge j"},
+            "tool_response": {"exitCode": 1, "stdout": "GATE FAIL"},
         }
         assert detect_completion_post_bash("3.4", data, {}) is None
 
-    def test_blocks_on_unknown_exit_no_gate_passed(self):
+    def test_blocks_on_surface_exit_three(self):
         from orchestrator import detect_completion_post_bash
         data = {
-            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
+            "tool_input": {"command": "python3 /x/e2e/verify_gate.py --plan p --evidence-dir d --judge j"},
+            "tool_response": {"exitCode": 3, "stdout": "SURFACE"},
+        }
+        assert detect_completion_post_bash("3.4", data, {}) is None
+
+    def test_blocks_on_unknown_exit_no_gate_pass(self):
+        from orchestrator import detect_completion_post_bash
+        data = {
+            "tool_input": {"command": "python3 /x/e2e/verify_gate.py --plan p --evidence-dir d --judge j"},
             "tool_response": {"stdout": "something else"},
         }
         assert detect_completion_post_bash("3.4", data, {}) is None
@@ -2019,40 +2034,27 @@ class TestLoopRecordHardened:
 class TestFabricationBlocked:
     """End-to-end test: fabrication paths must be blocked after hardening."""
 
-    def test_fake_e2e_result_blocked(self, tmp_path, monkeypatch):
-        """Claude creates /tmp/e2e_result.json directly → should not pass 3.2."""
-        from orchestrator import validate_e2e_run
+    def test_fake_plan_blocked(self, tmp_path, monkeypatch):
+        """Claude 直接捏造 verification-plan.json 但无 gate.json → 不能过 3.2。"""
+        from orchestrator import validate_verify_plan
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {})
+        ok, msg = validate_verify_plan({}, {})
+        assert ok is False, f"Fabricated plan w/o gate should be rejected, got: {msg}"
+        assert "fallback" in msg
 
-        fake_result = tmp_path / "e2e_result.json"
-        fake_result.write_text(json.dumps({
-            "scenarios": [{"rounds": [{"turns": [{"status": 200}] * 15}]}]
-        }))
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(fake_result))
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": False, "branch": "test"})
-
-        ok, msg = validate_e2e_run({}, {})
-        assert ok is False, f"Fabricated e2e_result.json should be rejected, got: {msg}"
-
-    def test_fake_report_blocked(self, tmp_path, monkeypatch):
-        """Claude writes a >=200B report but gate.json has no hash → should not pass 3.3."""
-        from orchestrator import validate_e2e_report
-
-        report = tmp_path / "e2e-quality-report.md"
-        report.write_text(
-            "## E2E 质量检测报告\n\n"
-            "本 feature 涉及 LLM 意图识别，无法自动化 E2E。\n"
-            "手动验证结果如下：\n"
-            "1. 测试对话场景 A — 通过\n"
-            "2. 测试对话场景 B — 通过\n"
-            "3. 边界测试 — 通过\n\n"
-            "总体通过率: 100%\n"
-        )
-        monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True})
-
-        ok, msg = validate_e2e_report({"report_path": str(report)}, {})
-        assert ok is False, f"Fabricated report should be rejected, got: {msg}"
+    def test_fake_evidence_blocked(self, tmp_path, monkeypatch):
+        """计划声明了 AC，却没有对应证据 bundle → 不能过 3.3。"""
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        os.remove(os.path.join(str(rd), "ac-1.bundle.json"))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
+        monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
+        ok, msg = validate_verify_exec({}, {})
+        assert ok is False, f"Missing evidence should be rejected, got: {msg}"
 
     def test_self_grading_pass_blocked(self, monkeypatch):
         """Claude calls done --outcome pass but gate shows tests failed → blocked."""
@@ -2065,25 +2067,17 @@ class TestFabricationBlocked:
         ok, msg = validate_loop_record(orch, {})
         assert ok is False, f"Self-grading should be rejected, got: {msg}"
 
-    def test_hash_tampered_between_steps(self, tmp_path, monkeypatch):
-        """e2e_result.json modified between 3.3 and 3.4 → gate recheck catches it."""
-        import hashlib
-        from orchestrator import validate_e2e_gate
-
-        original = json.dumps({"scenarios": [{"rounds": [{"turns": [{"status": 200}] * 12}]}]})
-        original_hash = hashlib.sha256(original.encode()).hexdigest()
-
-        result_file = tmp_path / "e2e_result.json"
-        result_file.write_text('{"scenarios": [{"rounds": [{"turns": []}]}]}')
-
-        monkeypatch.setattr("orchestrator.E2E_RESULT_PATH", str(result_file))
+    def test_manifest_tampered_between_steps(self, tmp_path, monkeypatch):
+        """evidence-manifest.json 在 3.3→3.4 间被改 → validate_verify_exec hash 复核拦截。"""
+        from orchestrator import validate_verify_exec
+        rd = tmp_path / "verify"
+        simple_pass_scenario(str(rd))
+        monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
         monkeypatch.setattr("orchestrator._read_gate_state_file",
-                            lambda: {"e2e_executed": True, "e2e_result_hash": original_hash})
-        monkeypatch.setattr("orchestrator._repo_root", lambda: str(tmp_path))
-
-        ok, msg = validate_e2e_gate({}, {})
+                            lambda: {"e2e_executed": True, "verify_evidence_hash": "recorded-but-now-changed"})
+        ok, msg = validate_verify_exec({}, {})
         assert ok is False
-        assert "mismatch" in msg.lower() or "hash" in msg.lower()
+        assert "hash" in msg.lower()
 
     def test_fake_e2e_cmd_no_provenance(self):
         """A command containing 'e2e' but not a real runner → no hash recorded."""
@@ -2109,12 +2103,12 @@ class TestFabricationBlocked:
         assert ship_verify_gate.is_state_file_write_cmd(
             'echo \'{"e2e_executed":true}\' > .git/fastship/gate.json') is True
 
-    def test_e2e_gate_exit_nonzero_blocked(self):
-        """e2e_gate command with exit code 1 must not advance step 3.4."""
+    def test_verify_gate_exit_nonzero_blocked(self):
+        """verify_gate command with exit code 1 must not advance step 3.4."""
         from orchestrator import detect_completion_post_bash
         data = {
-            "tool_input": {"command": "python3 tests/e2e_gate.py --result /tmp/e2e.json"},
-            "tool_response": {"exitCode": 1, "stdout": "BLOCKED: not enough turns"},
+            "tool_input": {"command": "python3 /x/e2e/verify_gate.py --plan p --evidence-dir d --judge j"},
+            "tool_response": {"exitCode": 1, "stdout": "GATE FAIL"},
         }
         assert detect_completion_post_bash("3.4", data, {}) is None
 
