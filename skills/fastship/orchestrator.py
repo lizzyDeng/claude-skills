@@ -1079,6 +1079,36 @@ def _changed_files(base_sha: Optional[str] = None) -> set:
     return files
 
 
+def _deleted_files(base_sha: Optional[str] = None) -> set:
+    """Canonical repo-relative paths this feature DELETED (working tree / staged /
+    since base). The 2.5 reviewed_files existence check uses this so a file the
+    feature legitimately removed is accepted — it can't exist on disk yet it must
+    still be reviewed (the coverage check keeps requiring it; its review is recorded
+    via the dead-node manifest). Anti-rubber-stamp is preserved: a path that is
+    neither on disk NOR a real diff-deletion is still rejected as fabricated."""
+    root = _repo_root()
+    files: set = set()
+    cmds = [
+        ["git", "-C", root, "diff", "--name-only", "--diff-filter=D", "HEAD"],
+        ["git", "-C", root, "diff", "--name-only", "--diff-filter=D", "--cached"],
+    ]
+    if base_sha:
+        cmds.append(["git", "-C", root, "diff", "--name-only", "--diff-filter=D",
+                     f"{base_sha}...HEAD"])
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    ck = plan_tree.canon_path(_normalize(line))
+                    if ck:
+                        files.add(ck)
+        except Exception:
+            pass
+    return files
+
+
 def _canon_repo_rel(p: str, root: str):
     """Canonical repo-relative key for a reviewed_files entry (abs or relative)."""
     if os.path.isabs(p):
@@ -1606,11 +1636,19 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
     reviewed_files = gate.get("reviewed_files")
     if not isinstance(reviewed_files, list) or not reviewed_files:
         return False, "Code review 缺少 reviewed_files（实际审查的文件列表）"
+    deleted_canon = _deleted_files(orch.get("base_sha"))
     for rf in reviewed_files:
         if not isinstance(rf, str):
             return False, "Code review reviewed_files 含非字符串项"
         rf_abs = rf if os.path.isabs(rf) else os.path.join(_repo_root(), rf)
         if not os.path.exists(rf_abs):
+            # A file this feature deleted legitimately isn't on disk. Its review is
+            # still mandatory — the coverage check below keeps requiring it and it's
+            # recorded via the node manifest — so accept it iff it's a real deletion
+            # in the diff. A path that is neither on disk nor a diff-deletion stays
+            # rejected as fabricated (anti-rubber-stamp).
+            if _canon_repo_rel(rf, _repo_root()) in deleted_canon:
+                continue
             return False, f"Code review reviewed_files 含不存在的文件: {rf}"
     changed = _changed_files(orch.get("base_sha"))
     tree_rec = _plan_tree_record(orch)
