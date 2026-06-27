@@ -111,7 +111,7 @@ def empty_state(branch=None):
         "test_tool": None,
         "e2e_executed": False,                 # 语义：AC 验证执行完成(证据 manifest 落盘)
         "e2e_ts": None,
-        "e2e_result_hash": None,               # 语义：evidence-manifest.json 的 sha256(per-AC artifact 清单)
+        "e2e_result_hash": None,               # 语义：evidence-manifest.json 的 sha256(旅程每步截图清单)
         "e2e_result_turns": None,              # 旧字段保留兼容；AC 模型下不再有意义
         "e2e_runner_cmd": None,
         "e2e_gate_passed": False,              # 语义：verify_gate.py 结构 gate exit 0

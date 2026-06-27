@@ -524,60 +524,73 @@ def _surfaces_brief() -> str:
 
 
 def _verify_plan_instruction(_orch: dict = None) -> str:
-    return f"""【3.2 验证意图生成】从锁定的 P0/P1 AC 派生验证计划，写入：
+    return f"""【3.2 验证意图生成 · 旅程脚本】把锁定的 P0/P1 AC 编成【正常用户路径】，写入：
   {_verify_plan_path()}
 
-可用表面（required_surfaces 取值 + diff→表面映射）：
+可用表面（surface 取值 + diff→表面映射）：
 {_surfaces_brief()}
 
-为【每一条 P0/P1 AC】产一个 intent（JSON 数组 "intents"），字段：
-  ac_id          —— 与锁定 AC 的 id 完全一致（不得新增/漏掉任一 P0/P1 AC）
-  assertion      —— 抄锁定 AC 原文
-  required_surfaces —— 这条 AC 要触达的表面（按本次实现 diff 落在哪个 app_paths 推导；
-                      cross-端 AC 同时含 admin+user）
-  entry / goal / success_evidence  —— 入口 URL / 验证目标 / 期望可观察证据（≥1 条）
-  hints_from_diff —— 语义定位提示(role/text/label/testid)，文案从实现 diff 取真实值；🔴禁脆 CSS、禁臆造
-  differential   —— 被 config/toggle 门控的 AC 必填 {{flag, on_state, off_state}}；否则 null
+产 JSON：{{ "feature": ..., "journeys": [ JOURNEY ] }}。
+🔴 验证单元是【一条正常用户路径(journey)】，不是孤立 AC，更不是 turn。
+   像真用户那样把 feature 从头走到尾，AC 是沿途检查点。一条主路径通常够；
+   差分/多入口可拆多条 journey。所有步骤的 proves_acs 并集必须覆盖每条 P0/P1 AC。
 
-🔴 验证单元是 AC 不是 turn。计划必须覆盖每一条 P0/P1 AC（结构 gate 复核覆盖，缺/漂移 FAIL）。
+JOURNEY = {{
+  id            —— 旅程短 id（如 main / toggle）
+  title         —— 人读标题（如「触发吃醋并哄好」）
+  differential  —— 被 config/toggle 门控的旅程必填 {{flag, on_state, off_state}}；否则省略
+  steps: [ STEP ]  —— 有序用户步骤
+}}
+STEP = {{
+  no            —— 步序 1,2,3...
+  surface       —— 这步在哪个表面（user/admin/api）
+  action        —— open/click/type/observe/toggle
+  intent        —— 用户这步做什么（人话）
+  expect        —— 应看到什么
+  proves_acs    —— 这步顺带证哪条 AC（纯导航步可空 []）
+  hints         —— 语义定位提示(role/text/label/testid)，文案从实现 diff 取真实值；🔴禁脆 CSS、禁臆造
+}}
+
+🔴 cross-端 AC：旅程要真实跨表面（admin 改配置 → user 看效果），别只走一端。
 🔴 用 Write 工具写文件。hook 自动记录 verify_plan_hash。"""
 
 
 def _verify_exec_instruction(_orch: dict = None) -> str:
     setup = _verify_setup_commands()
     setup_block = ("准备服务（按顺序执行，保持可用）：\n" + _command_block(setup) + "\n\n") if setup else ""
-    return f"""【3.3 验证执行 · 看一眼再点】驱动 = {_verify_driver()}。逐条 intent 真实走查，收证据。
+    return f"""【3.3 验证执行 · 按用户路径走一遍，每步截图】驱动 = {_verify_driver()}。
 
-{setup_block}对每条 intent 走「看一眼再点」循环（不预写死脚本）：
-  open <entry> → snapshot 读真实 a11y 树 → 看到真实元素再 find/click/type → 关键状态 screenshot
-  → 采 network / DOM 事实 → 记录【真实走过的】realized_journey（每步带 target=哪个表面）
-cross-端 AC：旅程跨多个表面，每步用 target 标 admin/user/api。
-differential AC：admin 置 ON→user 验 ON 态(截图)→admin 置 OFF→user 验 OFF 态(截图)→teardown 恢复原值。
+{setup_block}逐条 journey 顺序走「看一眼再点」循环（不预写死脚本）：
+  open <入口> → snapshot 读真实 a11y 树 → 看到真实元素再 find/click/type
+  → 🔴【每走一步都 screenshot 一张】→ 采 network/DOM 事实 → 记成有序时间线
+差分旅程：admin 置 ON → user 走一遍(state=on，每步截图) → admin 置 OFF → user 再走一遍(state=off，每步截图) → teardown 恢复原值。
 
-每条 AC 写一个证据 bundle：{_verify_result_dir()}/<ac_id>.bundle.json
-  states: 非差分 {{"default": ...}}；差分 {{"on": ..., "off": ...}}，每态含 screenshots/dom_facts/network
-并写 {_verify_result_dir()}/evidence-manifest.json（{{"artifacts": {{"<路径>":"<sha256>"}}}}，每个截图/快照都登记）。
+每条 journey 写一个真实证据：{_verify_result_dir()}/<journey_id>.journey.json
+  {{ "journey_id", "title", "steps": [ {{no, surface, state, action, ok, screenshot, caption, proves_acs, network?, dom_facts?}} ] }}
+  🔴 每个 UI 步必须有 screenshot（API 步可用 network/api_responses 替代）。
+  🔴 caption 写人话：这步用户看到/做了什么（报告直接用它讲点击路径）。
+并写 {_verify_result_dir()}/evidence-manifest.json（{{"artifacts": {{"<截图路径>":"<sha256>"}}}}，每张截图都登记）。
 
-🔴 截图是硬要求：每条 UI AC ≥1 张关键状态截图；差分 AC 每态各一张。
 🔴 manifest 的 sha256 必须是采集当下的真实哈希（gate 复核，采集后被改即 FAIL）。
 🔴 写完 manifest 后 orchestrator/hook 自动检测。"""
 
 
 def _verify_gate_instruction(_orch: dict = None) -> str:
-    return f"""【3.4 AC 裁判 + 结构 gate + 报告】
+    return f"""【3.4 AC 裁判 + 结构 gate + 测试报告】
 
 ① 派【独立对抗裁判】（≠ 实现者的 subagent，真看截图）逐条 AC 判定，写：
    {_verify_judge_path()}
    每条 verdict: {{ac_id, verdict: pass|fail|uncertain, evidence_refs:[{{artifact, fact}}], reason}}
-   🔴 每条 verdict 必须引用真实存在的 artifact（指向不存在/别的 AC 的文件→结构 gate FAIL）。
-   🔴 逐 AC 出证，禁一句话总判；差分 AC 须分别引用 ON/OFF 两态 artifact。
+   🔴 每条 verdict 必须引用【证该 AC 的那一步】真实存在的截图（指向不存在/别的 AC 步骤的文件→结构 gate FAIL）。
+   🔴 逐 AC 出证，禁一句话总判；差分 AC 须分别引用 ON/OFF 两态截图。
 
-② 跑结构 gate（确定性，复核覆盖/证据/裁判引用）：
+② 跑结构 gate（确定性，复核覆盖/必经表面/证据真实/裁判引用）：
    {_verify_gate_command()}
    exit 0=PASS · exit 3=SURFACE(证据弱，看报告后人工确认) · exit 1=FAIL
 
 ③ 生成 HTML 测试报告（永远生成，给你过目）：
    {_verify_html_command()}
+   报告 = 用户旅程时间线：有序点击路径 + 每步截图 + 该步证了哪条 AC。
 
 🔴 Validator 以子进程复跑 verify_gate.py 验 exit code。min_turns 不参与判定。"""
 
@@ -2386,16 +2399,24 @@ def validate_verify_plan(orch: dict, hook: dict) -> tuple:
         errs = mod.validate_plan_doc(plan)
         if errs:
             return False, "验证计划 schema 失败: " + "; ".join(errs[:3])
+    # 计划覆盖的 AC = 所有 journey 步骤 proves_acs 的并集
+    plan_ids = set()
+    journeys = plan.get("journeys", []) if isinstance(plan, dict) else []
+    for j in journeys:
+        if not isinstance(j, dict):
+            continue
+        for st in (j.get("steps") or []):
+            if isinstance(st, dict):
+                plan_ids.update(a for a in (st.get("proves_acs") or []) if isinstance(a, str) and a.strip())
     locked = _locked_ac_ids(orch)
     if locked is not None:
-        plan_ids = {it.get("ac_id") for it in plan.get("intents", []) if isinstance(it, dict)}
         missing = sorted(locked - plan_ids)
         if missing:
-            return False, "验证计划漏掉 P0/P1 AC（漏验）: " + ", ".join(missing)
+            return False, "验证计划（旅程步骤）漏掉 P0/P1 AC（漏验）: " + ", ".join(missing)
         drift = sorted(plan_ids - locked)
         if drift:
             return False, "验证计划含计划外 AC（漂移出需求）: " + ", ".join(drift)
-    return True, f"验证计划 OK（{len(plan.get('intents', []))} 条 AC intent，覆盖锁定 AC）"
+    return True, f"验证计划 OK（{len(journeys)} 条旅程，覆盖 {len(plan_ids)} 条 AC）"
 
 
 def validate_verify_exec(orch: dict, hook: dict) -> tuple:
@@ -2412,17 +2433,27 @@ def validate_verify_exec(orch: dict, hook: dict) -> tuple:
         return False, f"验证计划解析失败: {e}"
     result_dir = _verify_result_dir()
     mod = _load_verify_gate_mod()
-    bundles = mod._load_bundles(result_dir) if mod else []
-    bundle_ids = {b.get("ac_id") for b in bundles}
-    plan_ids = [it.get("ac_id") for it in plan.get("intents", []) if isinstance(it, dict)]
-    missing = sorted(set(plan_ids) - bundle_ids)
-    if missing:
-        return False, "以下 AC 缺证据 bundle（漏验）: " + ", ".join(missing)
+    journeys = mod._load_journeys(result_dir) if mod else []
+    if not journeys:
+        return False, "无任何 *.journey.json 真实旅程证据（3.3 未走查）"
     if mod:
-        for b in bundles:
-            errs = mod.validate_bundle(b)
+        for j in journeys:
+            if isinstance(j, dict) and "_load_error" in j:
+                return False, f"journey 证据加载失败: {j['_load_error']}"
+            errs = mod.validate_journey(j)
             if errs:
-                return False, "证据 bundle schema 失败: " + "; ".join(errs[:2])
+                return False, "旅程证据 schema 失败: " + "; ".join(errs[:2])
+        # 真实旅程证到的 AC（ok 且有证据）须覆盖计划/锁定的全部 AC
+        realized = mod._ac_proven(mod._flat_steps(journeys))
+        plan_ids = set()
+        for j in plan.get("journeys", []):
+            if isinstance(j, dict):
+                for st in (j.get("steps") or []):
+                    if isinstance(st, dict):
+                        plan_ids.update(a for a in (st.get("proves_acs") or []) if isinstance(a, str) and a.strip())
+        missing = sorted(plan_ids - realized)
+        if missing:
+            return False, "以下 AC 旅程没有【带证据的步骤】证它（漏验）: " + ", ".join(missing)
     manifest_path = os.path.join(result_dir, "evidence-manifest.json")
     if not os.path.exists(manifest_path):
         return False, "evidence-manifest.json 缺失（无 artifact 防篡改基线）"
@@ -2431,7 +2462,8 @@ def validate_verify_exec(orch: dict, hook: dict) -> tuple:
         with open(manifest_path, "rb") as f:
             if hashlib.sha256(f.read()).hexdigest() != stored:
                 return False, "evidence-manifest.json hash 与 gate 记录不符（执行后被改）"
-    return True, f"验证执行 OK（{len(bundles)} 条 AC 收证 + manifest 完整）"
+    steps = mod._flat_steps(journeys) if mod else []
+    return True, f"验证执行 OK（{len(journeys)} 条旅程 / {len(steps)} 步收证 + manifest 完整）"
 
 
 def validate_verify_gate(orch: dict, hook: dict) -> tuple:

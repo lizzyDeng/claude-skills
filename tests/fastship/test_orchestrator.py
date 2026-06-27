@@ -35,35 +35,37 @@ def _vp_png(path, content=b"\x89PNG\r\n\x1a\nFAKE"):
     return hashlib.sha256(content).hexdigest()
 
 
-def write_verify_scenario(result_dir, *, intents, bundles, verdicts, manifest):
-    """把一套完整 AC 验证证据(plan + per-AC bundles + manifest + judge)落盘到 result_dir。"""
+def write_verify_scenario(result_dir, *, plan_journeys, real_journeys, verdicts, manifest):
+    """把一套完整 AC 驱动【旅程】验证证据(plan + per-journey 证据 + manifest + judge)落盘。"""
     os.makedirs(result_dir, exist_ok=True)
     with open(os.path.join(result_dir, "verification-plan.json"), "w") as f:
-        json.dump({"feature": "t", "intents": intents}, f)
+        json.dump({"feature": "t", "journeys": plan_journeys}, f)
     with open(os.path.join(result_dir, "verify-judge.json"), "w") as f:
         json.dump({"verdicts": verdicts}, f)
-    for b in bundles:
-        with open(os.path.join(result_dir, f"{b['ac_id']}.bundle.json"), "w") as f:
-            json.dump(b, f)
+    for rj in real_journeys:
+        with open(os.path.join(result_dir, f"{rj['journey_id']}.journey.json"), "w") as f:
+            json.dump(rj, f)
     with open(os.path.join(result_dir, "evidence-manifest.json"), "w") as f:
         json.dump({"artifacts": manifest}, f)
 
 
 def simple_pass_scenario(result_dir, ac_id="ac-1", surface="user"):
-    """单 AC 纯 UI 通过场景(真截图 + 正确 manifest)。落盘并返回 (intents, bundles, verdicts, manifest)。"""
+    """单 AC 纯 UI 旅程通过场景(真截图 + 正确 manifest)。落盘并返回 (plan_journeys, real_journeys, verdicts, manifest)。"""
     os.makedirs(result_dir, exist_ok=True)
     shot = os.path.join(result_dir, f"{ac_id}.png")
     h = _vp_png(shot, (ac_id + "-png").encode())
-    intents = [{"ac_id": ac_id, "assertion": "目标可见", "required_surfaces": [surface],
-                "entry": "/", "goal": "g", "success_evidence": ["e"]}]
-    bundles = [{"ac_id": ac_id, "surfaces_touched": [surface],
-                "states": {"default": {"screenshots": [shot]}},
-                "realized_journey": [{"target": surface, "action": "看一眼", "ok": True, "elapsed_ms": 10}]}]
+    plan_journeys = [{"id": "main", "title": "看一眼", "steps": [
+        {"no": 1, "surface": surface, "action": "observe", "intent": "看目标", "expect": "可见",
+         "proves_acs": [ac_id]}]}]
+    real_journeys = [{"journey_id": "main", "title": "看一眼", "steps": [
+        {"no": 1, "surface": surface, "state": "default", "action": "observe", "ok": True,
+         "screenshot": shot, "caption": "看到目标", "proves_acs": [ac_id]}]}]
     verdicts = [{"ac_id": ac_id, "verdict": "pass",
                  "evidence_refs": [{"artifact": shot, "fact": "看到了"}], "reason": "ok"}]
     manifest = {shot: h}
-    write_verify_scenario(result_dir, intents=intents, bundles=bundles, verdicts=verdicts, manifest=manifest)
-    return intents, bundles, verdicts, manifest
+    write_verify_scenario(result_dir, plan_journeys=plan_journeys, real_journeys=real_journeys,
+                          verdicts=verdicts, manifest=manifest)
+    return plan_journeys, real_journeys, verdicts, manifest
 
 
 def make_trusted_plan(tmp_path, monkeypatch):
@@ -1425,9 +1427,10 @@ class TestIntegrationFullFlow:
         ac_shot.write_bytes(b"\x89PNG-real-ac1")
         shot_hash = hashlib.sha256(b"\x89PNG-real-ac1").hexdigest()
         plan_json = verify_dir / "verification-plan.json"
-        plan_json.write_text(json.dumps({"feature": "dark", "intents": [
-            {"ac_id": "ac-1", "assertion": "切换后主题变暗", "required_surfaces": ["user"],
-             "entry": "/", "goal": "切换暗色", "success_evidence": ["主题变暗"]}]}))
+        plan_json.write_text(json.dumps({"feature": "dark", "journeys": [
+            {"id": "main", "title": "切换暗色主题", "steps": [
+                {"no": 1, "surface": "user", "action": "click", "intent": "点切换",
+                 "expect": "主题变暗", "proves_acs": ["ac-1"]}]}]}))
         monkeypatch.setattr("orchestrator._read_gate_state_file",
                             lambda: {"test_passed": True, "e2e_executed": True})
         hook_post_edit_logic(
@@ -1437,11 +1440,11 @@ class TestIntegrationFullFlow:
         assert st["current_step"] == "3.3"
 
         # 3.3: 验证执行（auto via post_edit — 写 evidence-manifest.json，带真截图 + 正确 sha256）
-        bundle = verify_dir / "ac-1.bundle.json"
-        bundle.write_text(json.dumps({
-            "ac_id": "ac-1", "surfaces_touched": ["user"],
-            "states": {"default": {"screenshots": [str(ac_shot)]}},
-            "realized_journey": [{"target": "user", "action": "点切换", "ok": True, "elapsed_ms": 12}]}))
+        journey = verify_dir / "main.journey.json"
+        journey.write_text(json.dumps({
+            "journey_id": "main", "title": "切换暗色主题", "steps": [
+                {"no": 1, "surface": "user", "state": "default", "action": "click", "ok": True,
+                 "screenshot": str(ac_shot), "caption": "点切换，主题变暗", "proves_acs": ["ac-1"]}]}))
         manifest = verify_dir / "evidence-manifest.json"
         manifest.write_text(json.dumps({"artifacts": {str(ac_shot): shot_hash}}))
         hook_post_edit_logic(
@@ -1804,11 +1807,15 @@ class TestVerifyExecHardened:
         assert validate_verify_exec({}, {})[0] is True
 
     def test_rejects_missing_bundle(self, tmp_path, monkeypatch):
-        """计划有 AC，但没有对应证据 bundle（漏验）→ FAIL。"""
+        """计划有 AC，但旅程没有【带证据的步骤】证它（漏验）→ FAIL。"""
         from orchestrator import validate_verify_exec
         rd = tmp_path / "verify"
         simple_pass_scenario(str(rd))
-        os.remove(os.path.join(str(rd), "ac-1.bundle.json"))  # 删掉证据
+        # 旅程步骤不再 proves ac-1（计划仍要求 ac-1）→ 漏验
+        jp = os.path.join(str(rd), "main.journey.json")
+        j = json.load(open(jp))
+        j["steps"][0]["proves_acs"] = []
+        json.dump(j, open(jp, "w"))
         monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
         ok, msg = validate_verify_exec({}, {})
@@ -2046,11 +2053,11 @@ class TestFabricationBlocked:
         assert "fallback" in msg
 
     def test_fake_evidence_blocked(self, tmp_path, monkeypatch):
-        """计划声明了 AC，却没有对应证据 bundle → 不能过 3.3。"""
+        """计划声明了 AC，却没有任何真实旅程证据 → 不能过 3.3。"""
         from orchestrator import validate_verify_exec
         rd = tmp_path / "verify"
         simple_pass_scenario(str(rd))
-        os.remove(os.path.join(str(rd), "ac-1.bundle.json"))
+        os.remove(os.path.join(str(rd), "main.journey.json"))
         monkeypatch.setattr("orchestrator._verify_result_dir", lambda: str(rd))
         monkeypatch.setattr("orchestrator._read_gate_state_file", lambda: {"e2e_executed": True})
         ok, msg = validate_verify_exec({}, {})
