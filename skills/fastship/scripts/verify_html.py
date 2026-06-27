@@ -4,6 +4,8 @@ verify_html.py — 把 AC 驱动【用户旅程】验证渲染成离线自包含
 
 spec §7。永远生成、不进可信账本（gitignore）、生成失败不阻断。
 镜像 scripts/plan_html.py 的自包含单文件套路：截图 base64 内嵌，无外链。
+大图自动降采样重压（Pillow 在则缩到 ~1600px/JPEG，多 MB → 几百 KB，必内嵌且报告不爆）；
+Pillow 不可用时原图直嵌（≤ 内嵌上限），只有超大/缺失/损坏才退化并写明原因。
 
 报告 = 头号交付：把【正常用户路径】当成时间线讲给人看——
   - 顶部总判（PASS / FAIL / 待确认）+ 旅程/步数 + AC 通过数 + diff 派生必经表面
@@ -78,7 +80,11 @@ h2{font-size:16px;margin:26px 0 10px;border-bottom:1px solid var(--ln);padding-b
 .ok{color:var(--ok)}.no{color:var(--bad)}
 """
 
-MAX_EMBED_BYTES = 4 * 1024 * 1024  # 单图内嵌上限，超过只显示路径，避免报告爆炸
+# Pillow 不可用时的原图直嵌上限。Pillow 在则先降采样，几乎不会触顶；抬到 16MB 让真实全页 PNG 也能内嵌。
+MAX_EMBED_BYTES = 16 * 1024 * 1024
+_DOWNSCALE_TRIGGER = 512 * 1024     # 超过此体积才尝试降采样；小图原样内嵌（保真省 CPU）
+_DOWNSCALE_MAX_W = 1600             # 报告 CSS 仅显示到 420px，1600 宽已足够清晰且体积小
+_JPEG_QUALITY = 85
 _STATE_ORDER = {"default": 0, "on": 1, "off": 2}
 
 
@@ -86,18 +92,75 @@ def _esc(s):
     return _html.escape(str(s if s is not None else ""))
 
 
-def _img_data_uri(path, base_dir):
-    rp = path if os.path.isabs(path) else os.path.join(base_dir, path)
+def _downscale_data_uri(rp):
+    """用 Pillow 把大图缩到 _DOWNSCALE_MAX_W 宽并重压，返回 data URI。
+    Pillow 不可用 / 打不开 / 编码失败 → None（调用方回退原图直嵌）。"""
     try:
-        if not os.path.exists(rp) or os.path.getsize(rp) == 0 or os.path.getsize(rp) > MAX_EMBED_BYTES:
-            return None
-        ext = os.path.splitext(rp)[1].lower().lstrip(".") or "png"
-        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "gif": "gif"}.get(ext, "png")
-        with open(rp, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        import io
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        with Image.open(rp) as im:
+            im.load()
+            has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+            if im.width > _DOWNSCALE_MAX_W:
+                h = max(1, round(im.height * _DOWNSCALE_MAX_W / im.width))
+                im = im.resize((_DOWNSCALE_MAX_W, h), resample)
+            buf = io.BytesIO()
+            if has_alpha:
+                im.convert("RGBA").save(buf, format="PNG", optimize=True)
+                mime = "png"
+            else:
+                im.convert("RGB").save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+                mime = "jpeg"
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         return f"data:image/{mime};base64,{b64}"
     except Exception:
         return None
+
+
+def _img_data_uri(path, base_dir):
+    """返回 (data_uri | None, reason | None)。内嵌成功是默认路径；失败时 reason 写明原因便于排查。
+
+    路线 A：大图 → Pillow 降采样重压（多 MB → 几百 KB，必内嵌、报告不爆）。
+    路线 B：小图 / 降采样失败 / Pillow 不可用 → 原图直嵌（≤ MAX_EMBED_BYTES）。
+    路线 C：超大且无法降采样 → 退化，给原因。
+    """
+    rp = path if os.path.isabs(path) else os.path.join(base_dir, path)
+    try:
+        if not os.path.exists(rp):
+            return None, "文件缺失"
+        size = os.path.getsize(rp)
+    except OSError as e:
+        return None, f"读取失败（{e.__class__.__name__}）"
+    if size == 0:
+        return None, "文件为空（0 字节）"
+
+    # 路线 A：大图优先降采样（几乎总能内嵌且体积小）
+    if size > _DOWNSCALE_TRIGGER:
+        uri = _downscale_data_uri(rp)
+        if uri:
+            return uri, None
+
+    # 路线 B：原图直嵌（小图，或降采样不可用/失败时的兜底）
+    if size <= MAX_EMBED_BYTES:
+        ext = os.path.splitext(rp)[1].lower().lstrip(".") or "png"
+        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "gif": "gif"}.get(ext, "png")
+        try:
+            with open(rp, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            return f"data:image/{mime};base64,{b64}", None
+        except Exception as e:
+            return None, f"读取失败（{e.__class__.__name__}）"
+
+    # 路线 C：超大且无法降采样
+    return None, (f"图 {size / 1024 / 1024:.1f}MB 超内嵌上限 "
+                  f"{MAX_EMBED_BYTES // 1024 // 1024}MB（装 Pillow 可自动降采样内嵌）")
 
 
 def _load_journeys(evidence_dir):
@@ -149,12 +212,12 @@ def _render_step(step, base_dir):
         out.append('<div class="proves">证 AC：' + "，".join(f"<b>{_esc(a)}</b>" for a in proves) + "</div>")
     shot = step.get("screenshot")
     if isinstance(shot, str) and shot.strip():
-        uri = _img_data_uri(shot, base_dir)
+        uri, reason = _img_data_uri(shot, base_dir)
         cn = _esc(os.path.basename(shot))
         if uri:
             out.append(f'<div class="shot"><div class="cn">{cn}</div><img src="{uri}"/></div>')
         else:
-            out.append(f'<div class="noshot">截图未内嵌：{_esc(shot)}</div>')
+            out.append(f'<div class="noshot">截图未内嵌（{_esc(reason)}）：{_esc(shot)}</div>')
     facts = []
     for n in (step.get("network") or []):
         facts.append(f"<div>↳ {_esc(n.get('method', '?'))} {_esc(n.get('url', '?'))} → "

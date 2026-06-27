@@ -84,6 +84,73 @@ def main():
                 print(f"  - {m}")
             sys.exit(1)
         print("✅ verify_html 冒烟通过（自包含 HTML：旅程时间线/每步 base64 截图/caption/差分两态/PASS banner 齐）")
+    _smoke_large_image_embeds()
+
+
+def _smoke_large_image_embeds():
+    """大图（>4MB，旧硬上限）必须仍被内嵌——不再静默丢成「截图未内嵌」外链。
+
+    分两类：① 真·大图（Pillow 生成的高分辨率噪声 PNG）走降采样路线；
+    ② 非法/损坏的 >4MB 文件走原图直嵌兜底（≤16MB）。两者都必须出现在报告里。"""
+    with tempfile.TemporaryDirectory() as d:
+        big_real = os.path.join(d, "big-real.png")
+        big_raw = os.path.join(d, "big-raw.png")
+
+        real_is_large = False
+        try:
+            from PIL import Image  # noqa
+            import random as _r
+            _r.seed(7)
+            w, h = 2600, 2000  # 远超 _DOWNSCALE_MAX_W=1600；噪声不可压 → 文件远超 512KB 触发降采样
+            im = Image.new("RGB", (w, h))
+            im.putdata([(_r.randint(0, 255), _r.randint(0, 255), _r.randint(0, 255)) for _ in range(w * h)])
+            im.save(big_real, format="PNG")
+            real_is_large = os.path.getsize(big_real) > 4 * 1024 * 1024
+        except Exception:
+            real_is_large = False
+
+        # 非法 PNG 字节，但体积 >4MB：降采样打不开 → 必须走原图直嵌兜底
+        with open(big_raw, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * (5 * 1024 * 1024))
+
+        plan = {"feature": "big-shot", "journeys": [
+            {"id": "main", "title": "大图内嵌", "steps": [
+                {"no": 1, "surface": "user", "action": "看大图A", "proves_acs": ["AC-1"]},
+                {"no": 2, "surface": "user", "action": "看大图B", "proves_acs": ["AC-1"]}]}]}
+        journey = {"journey_id": "main", "title": "大图内嵌", "steps": [
+            {"no": 1, "surface": "user", "state": "default", "action": "看大图A", "ok": True,
+             "screenshot": big_real, "caption": "高分辨率真图", "proves_acs": ["AC-1"]},
+            {"no": 2, "surface": "user", "state": "default", "action": "看大图B", "ok": True,
+             "screenshot": big_raw, "caption": "5MB 兜底图", "proves_acs": ["AC-1"]}]}
+        judge = {"verdicts": [{"ac_id": "AC-1", "verdict": "pass", "evidence_refs": [], "reason": "ok"}]}
+        for name, obj in (("verification-plan.json", plan), ("verify-judge.json", judge),
+                          ("main.journey.json", journey)):
+            with open(os.path.join(d, name), "w") as f:
+                json.dump(obj, f)
+
+        out = vh.render_verify_file(os.path.join(d, "verification-plan.json"), d,
+                                    os.path.join(d, "verify-judge.json"), None,
+                                    os.path.join(d, "report.html"))
+        html = open(out, encoding="utf-8").read()
+
+        problems = []
+        # 5MB 兜底图：旧逻辑会被 4MB 上限丢弃，新逻辑必须内嵌
+        if "data:image/png;base64," not in html:
+            problems.append("5MB 兜底图未内嵌（疑似仍受 4MB 旧上限）")
+        if "截图未内嵌" in html:
+            problems.append(f"出现退化文案「截图未内嵌」：{html[html.find('截图未内嵌'):][:80]}")
+        # Pillow 在且生成了真·大图时，降采样路线应产出 JPEG data URI
+        if real_is_large and "data:image/jpeg;base64," not in html:
+            problems.append("真·大图未走降采样（缺 JPEG data URI）")
+
+        if problems:
+            print("❌ verify_html 大图内嵌冒烟失败:")
+            for m in problems:
+                print(f"  - {m}")
+            sys.exit(1)
+        extra = "（Pillow 在：真图降采样为 JPEG + 5MB 兜底直嵌）" if real_is_large \
+            else "（Pillow 不可用/未触发：5MB 兜底直嵌已验）"
+        print(f"✅ verify_html 大图内嵌冒烟通过：>4MB 截图不再被丢弃 {extra}")
 
 
 if __name__ == "__main__":
