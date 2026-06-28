@@ -49,6 +49,7 @@ ship_verify_gate.py — E2E 验证硬性 Gate（通用版）
 import sys
 import os
 import json
+import hashlib
 import subprocess
 import re
 from datetime import datetime
@@ -108,13 +109,21 @@ def empty_state(branch=None):
         "test_passed": False,
         "test_ts": None,
         "test_tool": None,
-        "e2e_executed": False,
+        "e2e_executed": False,                 # 语义：AC 验证执行完成(证据 manifest 落盘)
         "e2e_ts": None,
-        "e2e_result_hash": None,
-        "e2e_result_turns": None,
+        "e2e_result_hash": None,               # 语义：evidence-manifest.json 的 sha256(旅程每步截图清单)
+        "e2e_result_turns": None,              # 旧字段保留兼容；AC 模型下不再有意义
         "e2e_runner_cmd": None,
-        "e2e_gate_passed": False,
+        "e2e_gate_passed": False,              # 语义：verify_gate.py 结构 gate exit 0
         "e2e_gate_ts": None,
+        # AC 驱动旅程验证（新 Phase 3）provenance + 结构 gate 维度（spec §11）
+        "verify_plan_hash": None,              # 3.2 verification-plan.json sha256
+        "verify_evidence_hash": None,          # 3.3 evidence-manifest.json sha256（= e2e_result_hash 同源）
+        "judge_output_hash": None,             # 3.4 verify-judge.json sha256
+        "ac_coverage_ok": None,                # 结构 gate ① 计划∩证据∩裁判 覆盖
+        "surface_coverage_ok": None,           # 结构 gate ② required-surface 覆盖
+        "differential_ok": None,               # 结构 gate ③ ON/OFF 差分覆盖
+        "verify_confirmed": False,             # 智能人工门(§8)：SURFACE 时用户显式确认
         "plan_ready": False,
         "plan_file": None,
         "plan_ts": None,
@@ -420,12 +429,39 @@ def is_e2e_cmd(cmd):
 
 
 def is_e2e_gate_cmd(cmd):
-    """检测 E2E Gate 脚本命令"""
+    """检测 E2E Gate 脚本命令（legacy）"""
     if not cmd:
         return False
     if _command_matches_configured(cmd, configured_e2e_gate_command()):
         return True
     return bool(re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE))
+
+
+def is_verify_gate_cmd(cmd):
+    """检测 AC 结构 gate 脚本命令（verify_gate.py，新 Phase 3）"""
+    if not cmd:
+        return False
+    return bool(re.search(r'\bverify[_-]?gate\b', cmd, re.IGNORECASE))
+
+
+def _project_verify_config():
+    cfg = fastship_state.load_project_config()
+    v = cfg.get("verify") if isinstance(cfg, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def verify_result_dir():
+    """AC 验证证据目录（与 orchestrator._verify_result_dir 同源：verify.result_dir，默认 .claude/fastship-verify）。"""
+    path = _config_str(_project_verify_config().get("result_dir"), ".claude/fastship-verify")
+    return _absolute_project_path(path)
+
+
+def _sha256_file(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
 
 
 E2E_RUNNER_STRICT_PATTERNS = [
@@ -696,6 +732,33 @@ def gate_post_edit():
             st["knowledge_skip_reason"] = None
             changed = True
             print(f"✅ Gate: 检测到 KNOWLEDGE.md 更新，knowledge_acknowledged=true ({file_path})")
+
+        # AC 驱动旅程验证（新 Phase 3）artifact 写入探测 + provenance
+        vbase = os.path.basename(normalize_path(file_path))
+        if vbase == "verification-plan.json":
+            h = _sha256_file(file_path)
+            if h:
+                st["verify_plan_hash"] = h
+                changed = True
+                print(f"✅ Gate: 验证计划已写入，verify_plan_hash 记录 ({file_path})")
+        elif vbase == "evidence-manifest.json":
+            h = _sha256_file(file_path)
+            if h:
+                st["verify_evidence_hash"] = h
+                st["e2e_result_hash"] = h            # 同源账本：沿用 e2e_result_hash 字段记 manifest hash
+                st["e2e_executed"] = True            # 语义：AC 验证执行完成
+                st["e2e_ts"] = now
+                st["e2e_gate_passed"] = False         # 证据更新 → 结构 gate 须重判
+                st["e2e_gate_ts"] = None
+                st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
+                changed = True
+                print(f"✅ Gate: 证据 manifest 已写入，e2e_executed=true + hash 记录 ({file_path})")
+        elif vbase == "verify-judge.json":
+            h = _sha256_file(file_path)
+            if h:
+                st["judge_output_hash"] = h
+                changed = True
+                print(f"✅ Gate: 裁判输出已写入，judge_output_hash 记录 ({file_path})")
 
         if changed:
             if not require_branch_match(st, branch):
@@ -1233,63 +1296,32 @@ def gate_post_bash():
             else:
                 print(f"⚠️ Gate: {stack} test 已执行，但未检测到通过标志")
 
-        # 检测 E2E 验证（必须成功才标记）
-        if is_e2e_cmd(cmd) and not is_e2e_gate_cmd(cmd):
-            ok, reason = e2e_succeeded(data)
-            if ok:
-                st["e2e_executed"] = True
-                st["e2e_ts"] = now
-                st["e2e_gate_passed"] = False
-                st["e2e_gate_ts"] = None
-                st["e2e_runs_since_last_record"] = st.get("e2e_runs_since_last_record", 0) + 1
-                changed = True
-                # Provenance: only hash if the command matches strict runner pattern
-                result_path = e2e_result_path()
-                if is_strict_e2e_runner(cmd) and os.path.exists(result_path):
-                    try:
-                        import hashlib
-                        with open(result_path, "rb") as f:
-                            st["e2e_result_hash"] = hashlib.sha256(f.read()).hexdigest()
-                        with open(result_path, encoding="utf-8") as f:
-                            rdata = json.load(f)
-                        st["e2e_result_turns"] = sum(
-                            len(r.get("turns", []))
-                            for s in rdata.get("scenarios", [])
-                            for r in s.get("rounds", [])
-                        )
-                        st["e2e_runner_cmd"] = cmd[:200]
-                    except Exception:
-                        pass
-                print(f"✅ Gate: E2E 验证通过（{reason}），loop {st.get('loop_count', 0) + 1} 进行中，待 loop_record")
-            else:
-                print(f"⚠️ Gate: E2E 命令已执行但未通过（{reason}），e2e_executed 保持 false")
-                print("   请排查问题后重跑 E2E")
-
-        # 检测 E2E Gate 脚本执行结果
-        if is_e2e_gate_cmd(cmd):
+        # AC 驱动验证：e2e_executed 由证据 manifest 写入(post_edit)置位，不再由单条浏览器命令置位。
+        # 这里只处理 verify_gate.py 结构 gate 的执行结果 + 抄确定性结构维度。
+        if is_verify_gate_cmd(cmd):
             exit_code = extract_exit_code(data)
-            if exit_code == 0:
-                st["e2e_gate_passed"] = True
-                st["e2e_gate_ts"] = now
-                changed = True
-                print("✅ Gate: E2E Gate 通过，已记录")
-            elif exit_code is None:
-                output = extract_output(data)
-                if "GATE PASSED" in output:
-                    st["e2e_gate_passed"] = True
-                    st["e2e_gate_ts"] = now
-                    changed = True
-                    print("✅ Gate: E2E Gate 通过（via stdout），已记录")
-                else:
-                    st["e2e_gate_passed"] = False
-                    st["e2e_gate_ts"] = None
-                    changed = True
-                    print("⚠️ Gate: E2E Gate 结果不明（无 exit code 且无 GATE PASSED），已清除旧状态")
+            passed = (exit_code == 0)
+            if exit_code is None:
+                passed = "GATE PASS" in (extract_output(data) or "")
+            st["e2e_gate_passed"] = bool(passed)
+            st["e2e_gate_ts"] = now if passed else None
+            changed = True
+            # 从 verify-gate-result.json 抄六道里的覆盖维度（确定性，gate 自己算的）
+            try:
+                rp = os.path.join(verify_result_dir(), "verify-gate-result.json")
+                if os.path.exists(rp):
+                    with open(rp, encoding="utf-8") as f:
+                        gr = json.load(f)
+                    checks = gr.get("checks", {}) if isinstance(gr, dict) else {}
+                    st["ac_coverage_ok"] = not checks.get("ac_coverage")
+                    st["surface_coverage_ok"] = not checks.get("surface_coverage")
+                    st["differential_ok"] = not checks.get("differential")
+            except Exception:
+                pass
+            if passed:
+                print("✅ Gate: 结构 gate 通过（verify_gate exit 0），已记录")
             else:
-                st["e2e_gate_passed"] = False
-                st["e2e_gate_ts"] = None
-                changed = True
-                print(f"⚠️ Gate: E2E Gate 失败 (exit {exit_code})，e2e_gate_passed 已清除")
+                print(f"⚠️ Gate: 结构 gate 未通过 (exit {exit_code})，e2e_gate_passed 已清除")
 
         if changed:
             save_state(st)
@@ -1384,16 +1416,16 @@ def gate_pre_bash():
         print(_localize_cli("\n".join(lines)))
         return 1
 
-    # --- Gate 2: 跑 E2E Gate 前必须测试 + E2E Runner 都完成 ---
-    # （必须在 Gate 1 之前，因为 e2e_gate 也匹配 is_e2e_cmd）
-    if is_e2e_gate_cmd(cmd):
+    # --- Gate 2: 跑结构 gate 前必须测试 + 验证执行(证据 manifest) 都完成 ---
+    # （必须在 Gate 1 之前，因为 e2e_gate 也匹配 is_e2e_cmd；verify_gate 不匹配但同样前置）
+    if is_e2e_gate_cmd(cmd) or is_verify_gate_cmd(cmd):
         blocks = []
         if not st.get("test_passed"):
             blocks.append("项目测试未通过")
         if not st.get("e2e_executed"):
-            blocks.append("E2E Runner 未执行")
+            blocks.append("验证执行未完成（证据 manifest 未落盘）")
         if blocks:
-            lines = ["🔴 BLOCKED: 验证未完成，禁止执行 E2E Gate"]
+            lines = ["🔴 BLOCKED: 验证未完成，禁止执行结构 gate"]
             for b in blocks:
                 lines.append(f"   ❌ {b}")
             print(_localize_cli("\n".join(lines)))
@@ -1601,6 +1633,20 @@ def gate_reset():
     return 0
 
 
+def gate_verify_confirm():
+    """智能人工门(§8)：结构 gate 判 SURFACE(证据弱/不确定) 时，用户看 HTML 报告后显式放行。"""
+    branch = get_current_branch()
+    with fastship_state.state_lock():
+        st = ensure_branch_state(load_state(), branch)
+        st["verify_confirmed"] = True
+        st["verify_confirmed_ts"] = datetime.now().isoformat()
+        if not require_branch_match(st, branch):
+            return 0
+        save_state(st)
+    print("✅ Gate: 已记录人工确认 verify_confirmed=true（SURFACE → 放行）")
+    return 0
+
+
 # ---------- 入口 ----------
 
 def strip_global_session_arg(argv):
@@ -1644,6 +1690,7 @@ def main():
         "loop_record": gate_loop_record,
         "bug_diagnosis": gate_bug_diagnosis,
         "classify": gate_classify,
+        "verify_confirm": gate_verify_confirm,
     }
     handler = handlers.get(sys.argv[1])
     if handler:

@@ -229,8 +229,15 @@ class Step:
 
 BRIEF_FILENAME = ".fastship-brief.md"
 PLAN_DIR_MARKER = "docs/superpowers/plans/"
-E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"
-E2E_MIN_TURNS = 10
+E2E_RESULT_PATH = ".claude/fastship-e2e-result.json"   # legacy http-driver 证据来源（迁移期保留）
+E2E_MIN_TURNS = 10                                     # 降级：仅可选 liveness 信号，不参与任何终判(§13.8)
+# ── AC 驱动旅程验证（新 Phase 3）的 artifact 契约（spec §10）──
+VERIFY_RESULT_DIR = ".claude/fastship-verify"          # 证据 bundle + manifest + 报告目录
+VERIFY_PLAN_FILENAME = "verification-plan.json"        # 3.2 验证意图（每条 AC 一个）
+VERIFY_JUDGE_FILENAME = "verify-judge.json"            # 3.4 独立对抗裁判输出
+VERIFY_GATE_RESULT_FILENAME = "verify-gate-result.json"  # verify_gate.py 结构判定结果
+_VERIFY_GATE_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "e2e", "verify_gate.py")
+_VERIFY_HTML_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts", "verify_html.py")
 GRILL_RESULT_FILENAME = ".fastship-grill-result.md"
 CODEX_REVIEW_FILENAME = ".fastship-codex-review.md"
 CODE_REVIEW_FILENAME = ".fastship-code-review.md"
@@ -432,42 +439,160 @@ def _e2e_gate_command() -> str:
     return _config_str(_project_e2e_config().get("gate_command"), default)
 
 
+# ── AC 驱动验证配置（verify 段，回退 e2e 段）──────────────────────────────────
+
+def _project_verify_config() -> dict:
+    cfg = fastship_state.load_project_config()
+    v = cfg.get("verify") if isinstance(cfg, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def _verify_result_dir() -> str:
+    path = _config_str(_project_verify_config().get("result_dir"), VERIFY_RESULT_DIR)
+    if not os.path.isabs(path):
+        path = os.path.join(_repo_root(), path)
+    return os.path.abspath(path)
+
+
+def _verify_plan_path() -> str:
+    return os.path.join(_verify_result_dir(), VERIFY_PLAN_FILENAME)
+
+
+def _verify_judge_path() -> str:
+    return os.path.join(_verify_result_dir(), VERIFY_JUDGE_FILENAME)
+
+
+def _verify_gate_result_path() -> str:
+    return os.path.join(_verify_result_dir(), VERIFY_GATE_RESULT_FILENAME)
+
+
+def _verify_driver() -> str:
+    return _config_str(_project_verify_config().get("driver"), "agent-browser")
+
+
+def _verify_surfaces() -> dict:
+    s = _project_verify_config().get("surfaces")
+    return s if isinstance(s, dict) else {}
+
+
+def _verify_setup_commands() -> list:
+    """优先 verify.setup_commands；回退旧 e2e.setup_commands（迁移期）。"""
+    own = _config_list(_project_verify_config().get("setup_commands"))
+    return own if own else _e2e_setup_commands()
+
+
+def _verify_changed_files_arg(base_sha: Optional[str] = None) -> str:
+    """把当前 feature 的【全量】改动文件传给 verify_gate.py（surface 派生用，确定性）。
+    🔴 必须用 session base_sha 取全量 diff —— Phase 2 已逐 node commit，单用 `git diff HEAD`
+    会是空集，feature 级 required-surface 检查(§13.5 safety net)会失效。"""
+    try:
+        files = sorted(_changed_files(base_sha))
+    except Exception:
+        files = []
+    return ",".join(files)
+
+
+def _verify_gate_command() -> str:
+    return (f'python3 "{_VERIFY_GATE_SCRIPT}" --plan "{_verify_plan_path()}" '
+            f'--evidence-dir "{_verify_result_dir()}" --judge "{_verify_judge_path()}" '
+            f'-o "{_verify_gate_result_path()}"')
+
+
+def _verify_html_command() -> str:
+    return (f'python3 "{_VERIFY_HTML_SCRIPT}" --plan "{_verify_plan_path()}" '
+            f'--evidence-dir "{_verify_result_dir()}" --judge "{_verify_judge_path()}" '
+            f'--gate-result "{_verify_gate_result_path()}"')
+
+
 def _command_block(commands: list) -> str:
     return "\n".join(f"  {cmd}" for cmd in commands)
 
 
-def _e2e_runner_instruction(_orch: dict = None) -> str:
-    lines = ["运行项目 E2E Runner 采集数据："]
-    setup = _e2e_setup_commands()
-    if setup:
-        lines.extend(["", "准备服务（按顺序执行，保持服务可用）：", _command_block(setup)])
-    lines.extend(["", "采集数据：", f"  {_e2e_runner_command()}"])
-    notes = _e2e_notes()
-    if notes:
-        lines.extend(["", "项目说明："])
-        lines.extend(f"- {note}" for note in notes)
-    lines.append(f"🔴 最少 {_e2e_min_turns()} 轮。Runner 只采集不判断。orchestrator 自动检测。")
-    lines.append(f"🔴 原始结果必须写入 {_e2e_result_path()}，hook/gate 会记录 hash。")
-    return "\n".join(lines)
+def _surfaces_brief() -> str:
+    """把配置的 surfaces（名字 + base_url + app_paths）摊给 agent，用于派生 required_surfaces。"""
+    surfaces = _verify_surfaces()
+    if not surfaces:
+        return "（项目未配 verify.surfaces；UI feature 请在 .claude/fastship.project.json 配 surfaces）"
+    rows = []
+    for name, sc in surfaces.items():
+        if not isinstance(sc, dict):
+            continue
+        url = sc.get("base_url", "?")
+        paths = "，".join(sc.get("app_paths") or []) or "-"
+        rows.append(f"  · {name}: {url}（改动落在 {paths} 即必须覆盖此表面）")
+    return "\n".join(rows)
 
 
-def _e2e_report_instruction(_orch: dict = None) -> str:
-    result_path = _e2e_result_path()
-    return f"""读 {result_path}，写 E2E 质量检测报告到文件。
-报告含: 覆盖度 / 逐轮审查(完整输出) / 总结 / gate.json 中的 e2e_result_hash。
-🔴 通过率 < 80% 或 AC 未覆盖 → 不合入。
-🔴 Validator 自动验证 {result_path} 完整性（hash 比对 gate.json 记录）。
-🔴 禁止手动创建或修改 {result_path}。
-用 Write 工具保存报告。orchestrator 自动检测文件写入。"""
+def _verify_plan_instruction(_orch: dict = None) -> str:
+    return f"""【3.2 验证意图生成 · 旅程脚本】把锁定的 P0/P1 AC 编成【正常用户路径】，写入：
+  {_verify_plan_path()}
+
+可用表面（surface 取值 + diff→表面映射）：
+{_surfaces_brief()}
+
+产 JSON：{{ "feature": ..., "journeys": [ JOURNEY ] }}。
+🔴 验证单元是【一条正常用户路径(journey)】，不是孤立 AC，更不是 turn。
+   像真用户那样把 feature 从头走到尾，AC 是沿途检查点。一条主路径通常够；
+   差分/多入口可拆多条 journey。所有步骤的 proves_acs 并集必须覆盖每条 P0/P1 AC。
+
+JOURNEY = {{
+  id            —— 旅程短 id（如 main / toggle）
+  title         —— 人读标题（如「触发吃醋并哄好」）
+  differential  —— 被 config/toggle 门控的旅程必填 {{flag, on_state, off_state}}；否则省略
+  steps: [ STEP ]  —— 有序用户步骤
+}}
+STEP = {{
+  no            —— 步序 1,2,3...
+  surface       —— 这步在哪个表面（user/admin/api）
+  action        —— open/click/type/observe/toggle
+  intent        —— 用户这步做什么（人话）
+  expect        —— 应看到什么
+  proves_acs    —— 这步顺带证哪条 AC（纯导航步可空 []）
+  hints         —— 语义定位提示(role/text/label/testid)，文案从实现 diff 取真实值；🔴禁脆 CSS、禁臆造
+}}
+
+🔴 cross-端 AC：旅程要真实跨表面（admin 改配置 → user 看效果），别只走一端。
+🔴 用 Write 工具写文件。hook 自动记录 verify_plan_hash。"""
 
 
-def _e2e_gate_instruction(_orch: dict = None) -> str:
-    return f"""运行 Gate 脚本：
-  {_e2e_gate_command()}
-Gate 展示原始数据给用户对照。FAIL → 禁止合入。
-🔴 Validator 以子进程方式运行 e2e_gate.py，检查 exit code。
-🔴 Gate 必须 exit 0 才能通过，exit 非 0 自动拦截。
-🔴 Auto-detection 同时验证 exit code，命令失败不推进。"""
+def _verify_exec_instruction(_orch: dict = None) -> str:
+    setup = _verify_setup_commands()
+    setup_block = ("准备服务（按顺序执行，保持可用）：\n" + _command_block(setup) + "\n\n") if setup else ""
+    return f"""【3.3 验证执行 · 按用户路径走一遍，每步截图】驱动 = {_verify_driver()}。
+
+{setup_block}逐条 journey 顺序走「看一眼再点」循环（不预写死脚本）：
+  open <入口> → snapshot 读真实 a11y 树 → 看到真实元素再 find/click/type
+  → 🔴【每走一步都 screenshot 一张】→ 采 network/DOM 事实 → 记成有序时间线
+差分旅程：admin 置 ON → user 走一遍(state=on，每步截图) → admin 置 OFF → user 再走一遍(state=off，每步截图) → teardown 恢复原值。
+
+每条 journey 写一个真实证据：{_verify_result_dir()}/<journey_id>.journey.json
+  {{ "journey_id", "title", "steps": [ {{no, surface, state, action, ok, screenshot, caption, proves_acs, network?, dom_facts?}} ] }}
+  🔴 每个 UI 步必须有 screenshot（API 步可用 network/api_responses 替代）。
+  🔴 caption 写人话：这步用户看到/做了什么（报告直接用它讲点击路径）。
+并写 {_verify_result_dir()}/evidence-manifest.json（{{"artifacts": {{"<截图路径>":"<sha256>"}}}}，每张截图都登记）。
+
+🔴 manifest 的 sha256 必须是采集当下的真实哈希（gate 复核，采集后被改即 FAIL）。
+🔴 写完 manifest 后 orchestrator/hook 自动检测。"""
+
+
+def _verify_gate_instruction(_orch: dict = None) -> str:
+    return f"""【3.4 AC 裁判 + 结构 gate + 测试报告】
+
+① 派【独立对抗裁判】（≠ 实现者的 subagent，真看截图）逐条 AC 判定，写：
+   {_verify_judge_path()}
+   每条 verdict: {{ac_id, verdict: pass|fail|uncertain, evidence_refs:[{{artifact, fact}}], reason}}
+   🔴 每条 verdict 必须引用【证该 AC 的那一步】真实存在的截图（指向不存在/别的 AC 步骤的文件→结构 gate FAIL）。
+   🔴 逐 AC 出证，禁一句话总判；差分 AC 须分别引用 ON/OFF 两态截图。
+
+② 跑结构 gate（确定性，复核覆盖/必经表面/证据真实/裁判引用）：
+   {_verify_gate_command()}
+   exit 0=PASS · exit 3=SURFACE(证据弱，看报告后人工确认) · exit 1=FAIL
+
+③ 生成 HTML 测试报告（永远生成，给你过目）：
+   {_verify_html_command()}
+   报告 = 用户旅程时间线：有序点击路径 + 每步截图 + 该步证了哪条 AC。
+
+🔴 Validator 以子进程复跑 verify_gate.py 验 exit code。min_turns 不参与判定。"""
 
 
 def _file_fingerprint(path: str) -> tuple[str, int]:
@@ -1079,6 +1204,36 @@ def _changed_files(base_sha: Optional[str] = None) -> set:
     return files
 
 
+def _deleted_files(base_sha: Optional[str] = None) -> set:
+    """Canonical repo-relative paths this feature DELETED (working tree / staged /
+    since base). The 2.5 reviewed_files existence check uses this so a file the
+    feature legitimately removed is accepted — it can't exist on disk yet it must
+    still be reviewed (the coverage check keeps requiring it; its review is recorded
+    via the dead-node manifest). Anti-rubber-stamp is preserved: a path that is
+    neither on disk NOR a real diff-deletion is still rejected as fabricated."""
+    root = _repo_root()
+    files: set = set()
+    cmds = [
+        ["git", "-C", root, "diff", "--name-only", "--diff-filter=D", "HEAD"],
+        ["git", "-C", root, "diff", "--name-only", "--diff-filter=D", "--cached"],
+    ]
+    if base_sha:
+        cmds.append(["git", "-C", root, "diff", "--name-only", "--diff-filter=D",
+                     f"{base_sha}...HEAD"])
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    ck = plan_tree.canon_path(_normalize(line))
+                    if ck:
+                        files.add(ck)
+        except Exception:
+            pass
+    return files
+
+
 def _canon_repo_rel(p: str, root: str):
     """Canonical repo-relative key for a reviewed_files entry (abs or relative)."""
     if os.path.isabs(p):
@@ -1606,11 +1761,19 @@ def validate_code_review(orch: dict, hook: dict) -> tuple:
     reviewed_files = gate.get("reviewed_files")
     if not isinstance(reviewed_files, list) or not reviewed_files:
         return False, "Code review 缺少 reviewed_files（实际审查的文件列表）"
+    deleted_canon = _deleted_files(orch.get("base_sha"))
     for rf in reviewed_files:
         if not isinstance(rf, str):
             return False, "Code review reviewed_files 含非字符串项"
         rf_abs = rf if os.path.isabs(rf) else os.path.join(_repo_root(), rf)
         if not os.path.exists(rf_abs):
+            # A file this feature deleted legitimately isn't on disk. Its review is
+            # still mandatory — the coverage check below keeps requiring it and it's
+            # recorded via the node manifest — so accept it iff it's a real deletion
+            # in the diff. A path that is neither on disk nor a diff-deletion stays
+            # rejected as fabricated (anti-rubber-stamp).
+            if _canon_repo_rel(rf, _repo_root()) in deleted_canon:
+                continue
             return False, f"Code review reviewed_files 含不存在的文件: {rf}"
     changed = _changed_files(orch.get("base_sha"))
     tree_rec = _plan_tree_record(orch)
@@ -1959,6 +2122,19 @@ def _check_plan_mapping(required_ac_ids: set, plan_gate: dict) -> tuple:
             if t not in node_ids:
                 return False, (f"AC {aid} 的 task 引用了不存在的 node id: {t} — "
                                "ac_mapping.tasks 须引用 nodes[].id(计划树),不能是自由文本")
+        # §6.4 cross-端覆盖契约：被 config/toggle 门控的 AC 若声明 differential，必须写全
+        # {flag,on_state,off_state} + 列出 required_surfaces（well-formed 校验）。「是否必须声明
+        # differential」的硬强制留在 3.4 结构 gate 用 diff 兜底（§12 启发风险），此处封住「声明了却写错」。
+        diff = m.get("differential")
+        if diff is not None:
+            if not isinstance(diff, dict):
+                return False, f"AC {aid} 的 differential 必须是 object 或省略"
+            for k in ("flag", "on_state", "off_state"):
+                if not isinstance(diff.get(k), str) or not diff[k].strip():
+                    return False, f"AC {aid} 的 differential 缺非空 {k}（config-gated AC 须写 ON/OFF 两态）"
+            rs = m.get("required_surfaces")
+            if not isinstance(rs, list) or not rs or not all(isinstance(s, str) and s.strip() for s in rs):
+                return False, f"AC {aid} 声明了 differential 却缺非空 required_surfaces（cross-端须列出表面）"
         mapped.add(aid)
     uncovered = sorted(required_ac_ids - mapped)
     if uncovered:
@@ -2163,108 +2339,169 @@ def validate_tests(orch: dict, hook: dict) -> tuple:
     return False, "项目测试未通过"
 
 
-def validate_e2e_run(orch: dict, hook: dict) -> tuple:
-    if hook.get("e2e_executed"):
-        return True, "e2e executed"
+_VERIFY_GATE_MOD = None
+
+
+def _load_verify_gate_mod():
+    """Lazy-import the bundled verify_gate.py 纯函数（schema 校验 / bundle 加载）。失败返回 None。"""
+    global _VERIFY_GATE_MOD
+    if _VERIFY_GATE_MOD is not None:
+        return _VERIFY_GATE_MOD
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verify_gate", _VERIFY_GATE_SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _VERIFY_GATE_MOD = mod
+    except Exception:
+        _VERIFY_GATE_MOD = None
+    return _VERIFY_GATE_MOD
+
+
+def _locked_ac_ids(orch: dict):
+    """锁定的 P0/P1 AC 全集（来自可信 plan 的 ac_mapping）。取不到返回 None（bugfix 等无树流程）。"""
+    plan_path = orch.get("plan_path")
+    if not plan_path or not os.path.exists(plan_path):
+        return None
+    try:
+        content = open(plan_path, encoding="utf-8").read()
+    except Exception:
+        return None
+    block, err = _extract_plan_mapping_gate(content)
+    if err or not isinstance(block, dict):
+        return None
+    mapping = block.get(PLAN_MAPPING_FIELD)
+    if not isinstance(mapping, list):
+        return None
+    ids = {m.get("ac_id") for m in mapping if isinstance(m, dict) and isinstance(m.get("ac_id"), str)}
+    return ids or None
+
+
+def validate_verify_plan(orch: dict, hook: dict) -> tuple:
+    """3.2 验证意图：verification-plan.json 存在 + schema 合法 + 覆盖全部锁定 P0/P1 AC（无漏无漂移）。"""
     gate = _read_gate_state_file()
-    if gate.get("e2e_executed"):
-        return True, "e2e executed (via state file)"
     if not gate:
-        return False, "gate.json 不存在，禁止 Codex/filesystem fallback 通过 E2E Runner"
-    return False, "E2E Runner 未执行"
+        return False, "gate.json 不存在，禁止 Codex/filesystem fallback 通过验证计划"
+    plan_path = _verify_plan_path()
+    if not os.path.exists(plan_path):
+        return False, f"验证计划不存在: {plan_path}（3.2 未产出 verification-plan.json）"
+    stored = gate.get("verify_plan_hash")
+    if stored:
+        with open(plan_path, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() != stored:
+                return False, "verification-plan.json hash 与 gate 记录不符（写后被改）"
+    try:
+        plan = json.load(open(plan_path, encoding="utf-8"))
+    except Exception as e:
+        return False, f"验证计划解析失败: {e}"
+    mod = _load_verify_gate_mod()
+    if mod:
+        errs = mod.validate_plan_doc(plan)
+        if errs:
+            return False, "验证计划 schema 失败: " + "; ".join(errs[:3])
+    # 计划覆盖的 AC = 所有 journey 步骤 proves_acs 的并集
+    plan_ids = set()
+    journeys = plan.get("journeys", []) if isinstance(plan, dict) else []
+    for j in journeys:
+        if not isinstance(j, dict):
+            continue
+        for st in (j.get("steps") or []):
+            if isinstance(st, dict):
+                plan_ids.update(a for a in (st.get("proves_acs") or []) if isinstance(a, str) and a.strip())
+    locked = _locked_ac_ids(orch)
+    if locked is not None:
+        missing = sorted(locked - plan_ids)
+        if missing:
+            return False, "验证计划（旅程步骤）漏掉 P0/P1 AC（漏验）: " + ", ".join(missing)
+        drift = sorted(plan_ids - locked)
+        if drift:
+            return False, "验证计划含计划外 AC（漂移出需求）: " + ", ".join(drift)
+    return True, f"验证计划 OK（{len(journeys)} 条旅程，覆盖 {len(plan_ids)} 条 AC）"
 
 
-def validate_e2e_report(orch: dict, hook: dict) -> tuple:
+def validate_verify_exec(orch: dict, hook: dict) -> tuple:
+    """3.3 验证执行：每条计划 AC 有证据 bundle + schema 合法 + manifest 存在且 hash 匹配（防篡改）。"""
     gate = _read_gate_state_file()
-    stored_hash = gate.get("e2e_result_hash") if gate else None
-    result_path = _e2e_result_path()
-    min_turns = _e2e_min_turns()
-
-    if stored_hash:
-        # Hook mode: verify e2e_result.json integrity
-        if not os.path.exists(result_path):
-            return False, f"{result_path} not found"
-        with open(result_path, "rb") as f:
-            actual_hash = hashlib.sha256(f.read()).hexdigest()
-        if actual_hash != stored_hash:
-            return False, "e2e_result.json hash mismatch — 文件在 runner 执行后被修改"
-        try:
-            with open(result_path, encoding="utf-8") as f:
-                data = json.load(f)
-            turns = sum(
-                len(r.get("turns", []))
-                for s in data.get("scenarios", [])
-                for r in s.get("rounds", [])
-            )
-            if turns < min_turns:
-                return False, f"e2e_result.json turns 不足 ({turns} < {min_turns})"
-        except Exception as e:
-            return False, f"e2e_result.json 解析失败: {e}"
-        path = orch.get("report_path")
-        if not path:
-            return False, "report_path 未由当前 step 写入记录，禁止 filesystem fallback"
-        ok, msg, _rec = _verify_step_artifact(orch, "3.3", path)
-        if not ok:
-            return False, msg
-        if not os.path.exists(path):
-            return False, "报告文件不存在"
-        try:
-            rsize = os.path.getsize(path)
-        except OSError:
-            rsize = 0
-        if rsize < 200:
-            return False, f"报告太短 ({rsize}B < 200B)"
-        try:
-            report_content = open(path, encoding="utf-8").read()
-        except Exception:
-            return False, f"无法读取报告: {path}"
-        if stored_hash not in report_content:
-            return False, "E2E 报告未引用 gate.json 中的 e2e_result_hash，禁止报告自证"
-        return True, f"report verified (artifact + result hash match, {turns} turns)"
-
     if not gate:
-        return False, "gate.json 不存在，禁止 Codex/filesystem fallback 通过 E2E 报告"
+        return False, "gate.json 不存在，禁止 fallback 通过验证执行"
+    plan_path = _verify_plan_path()
+    if not os.path.exists(plan_path):
+        return False, "验证计划缺失（3.2 未完成）"
+    try:
+        plan = json.load(open(plan_path, encoding="utf-8"))
+    except Exception as e:
+        return False, f"验证计划解析失败: {e}"
+    result_dir = _verify_result_dir()
+    mod = _load_verify_gate_mod()
+    journeys = mod._load_journeys(result_dir) if mod else []
+    if not journeys:
+        return False, "无任何 *.journey.json 真实旅程证据（3.3 未走查）"
+    if mod:
+        for j in journeys:
+            if isinstance(j, dict) and "_load_error" in j:
+                return False, f"journey 证据加载失败: {j['_load_error']}"
+            errs = mod.validate_journey(j)
+            if errs:
+                return False, "旅程证据 schema 失败: " + "; ".join(errs[:2])
+        # 真实旅程证到的 AC（ok 且有证据）须覆盖计划/锁定的全部 AC
+        realized = mod._ac_proven(mod._flat_steps(journeys))
+        plan_ids = set()
+        for j in plan.get("journeys", []):
+            if isinstance(j, dict):
+                for st in (j.get("steps") or []):
+                    if isinstance(st, dict):
+                        plan_ids.update(a for a in (st.get("proves_acs") or []) if isinstance(a, str) and a.strip())
+        missing = sorted(plan_ids - realized)
+        if missing:
+            return False, "以下 AC 旅程没有【带证据的步骤】证它（漏验）: " + ", ".join(missing)
+    manifest_path = os.path.join(result_dir, "evidence-manifest.json")
+    if not os.path.exists(manifest_path):
+        return False, "evidence-manifest.json 缺失（无 artifact 防篡改基线）"
+    stored = gate.get("verify_evidence_hash")
+    if stored:
+        with open(manifest_path, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() != stored:
+                return False, "evidence-manifest.json hash 与 gate 记录不符（执行后被改）"
+    steps = mod._flat_steps(journeys) if mod else []
+    return True, f"验证执行 OK（{len(journeys)} 条旅程 / {len(steps)} 步收证 + manifest 完整）"
 
-    # gate.json exists but no hash — e2e_runner wasn't run or hash not recorded
-    return False, "gate.json 无 e2e_result_hash — E2E Runner 未正常执行"
 
-
-def validate_e2e_gate(orch: dict, hook: dict) -> tuple:
+def validate_verify_gate(orch: dict, hook: dict) -> tuple:
+    """3.4 结构 gate：子进程复跑 verify_gate.py。exit 0=PASS / 3=SURFACE(需 verify_confirmed) / 1=FAIL。"""
     gate = _read_gate_state_file()
-    result_path = _e2e_result_path()
     if not gate:
-        return False, "gate.json 不存在，禁止 Codex fallback 通过 E2E Gate"
+        return False, "gate.json 不存在，禁止 Codex fallback 通过结构 gate"
     if not gate.get("e2e_executed"):
-        return False, "e2e_executed not set in gate.json"
-    stored_hash = gate.get("e2e_result_hash")
-    if stored_hash and os.path.exists(result_path):
-        import hashlib
-        with open(result_path, "rb") as f:
-            actual_hash = hashlib.sha256(f.read()).hexdigest()
-        if actual_hash != stored_hash:
-            return False, "e2e_result.json hash mismatch — 文件在 3.3→3.4 间被修改"
-    root = _repo_root()
-    gate_script = None
-    for candidate in ["tests/e2e_gate.py", ".claude/e2e/e2e_gate.py", "e2e/e2e_gate.py"]:
-        path = os.path.join(root, candidate)
-        if os.path.exists(path):
-            gate_script = path
-            break
-    if not gate_script:
-        return False, "e2e_gate.py not found in project"
+        return False, "验证执行未完成（e2e_executed 未置）"
+    judge_path = _verify_judge_path()
+    if not os.path.exists(judge_path):
+        return False, f"裁判输出缺失: {judge_path}（3.4① 未派对抗裁判）"
+    if not os.path.exists(_VERIFY_GATE_SCRIPT):
+        return False, "verify_gate.py 缺失（fastship 安装不完整）"
     try:
         result = subprocess.run(
-            [sys.executable, gate_script, "--result", result_path, "--min-turns", str(_e2e_min_turns())],
-            capture_output=True, text=True, timeout=30,
+            [sys.executable, _VERIFY_GATE_SCRIPT,
+             "--plan", _verify_plan_path(),
+             "--evidence-dir", _verify_result_dir(),
+             "--judge", judge_path,
+             "--changed-files", _verify_changed_files_arg(orch.get("base_sha")),
+             "-o", _verify_gate_result_path()],
+            capture_output=True, text=True, timeout=60,
         )
-        if result.returncode != 0:
-            output_tail = result.stdout[-500:] if result.stdout else ""
-            return False, f"E2E Gate failed (exit {result.returncode}):\n{output_tail}"
-        return True, "E2E Gate passed (subprocess verified, hash intact)"
     except subprocess.TimeoutExpired:
-        return False, "E2E Gate timed out (30s)"
+        return False, "结构 gate 超时(60s)"
     except Exception as e:
-        return False, f"E2E Gate execution error: {e}"
+        return False, f"结构 gate 执行错误: {e}"
+    code = result.returncode
+    tail = (result.stdout or "")[-600:]
+    if code == 0:
+        return True, "结构 gate PASS（子进程复核：覆盖/证据真实/裁判引用齐，min_turns 未参与）"
+    if code == 3:
+        if orch.get("verify_confirmed") or gate.get("verify_confirmed"):
+            return True, "结构 gate SURFACE → 已人工确认（verify_confirmed）"
+        return False, ("结构 gate SURFACE：证据弱/不确定，已生成 HTML 报告。"
+                       "看报告后 done --verify-confirmed 显式确认，或判 FAIL 回退。\n" + tail)
+    return False, f"结构 gate FAIL (exit {code}):\n{tail}"
 
 
 VALID_OUTCOMES = {"pass", "fail"}
@@ -2289,13 +2526,12 @@ def validate_loop_record(orch: dict, hook: dict) -> tuple:
             if not gate.get("e2e_gate_passed"):
                 return False, "outcome=pass 但 gate.json e2e_gate_passed=false — E2E Gate 未通过不能自判 pass"
             stored_hash = gate.get("e2e_result_hash")
-            result_path = _e2e_result_path()
-            if stored_hash and os.path.exists(result_path):
-                import hashlib
-                with open(result_path, "rb") as f:
+            manifest_path = os.path.join(_verify_result_dir(), "evidence-manifest.json")
+            if stored_hash and os.path.exists(manifest_path):
+                with open(manifest_path, "rb") as f:
                     actual_hash = hashlib.sha256(f.read()).hexdigest()
                 if actual_hash != stored_hash:
-                    return False, "e2e_result.json hash mismatch — 文件在验证链中被篡改"
+                    return False, "evidence-manifest.json hash mismatch — 证据在验证链中被篡改"
         return True, "pass (gate verified, hash intact)"
     decision = orch.get("artifacts", {}).get("loop_decision")
     if not decision:
@@ -2648,14 +2884,14 @@ Codex 输出后写结果到 .claude/{CODEX_REVIEW_FILENAME}：
          instruction="""运行项目全量测试。hook 自动检测通过。
 失败 → 修复后重跑。orchestrator 自动检测 test pass。"""),
 
-    Step("3.2", "E2E Runner", 3, validator=validate_e2e_run,
-         instruction=_e2e_runner_instruction),
+    Step("3.2", "验证意图", 3, validator=validate_verify_plan,
+         instruction=_verify_plan_instruction),
 
-    Step("3.3", "E2E 报告", 3, validator=validate_e2e_report,
-         instruction=_e2e_report_instruction),
+    Step("3.3", "验证执行", 3, validator=validate_verify_exec,
+         instruction=_verify_exec_instruction),
 
-    Step("3.4", "E2E Gate", 3, validator=validate_e2e_gate,
-         instruction=_e2e_gate_instruction),
+    Step("3.4", "AC 裁判+结构 gate", 3, validator=validate_verify_gate,
+         instruction=_verify_gate_instruction),
 
     Step("3.5", "Loop Record", 3, validator=validate_loop_record,
          instruction="""记录本轮结果：
@@ -2710,21 +2946,17 @@ def detect_completion_post_bash(current_step: str, data: dict, hook: dict) -> Op
         if any(re.search(p, cmd) for p in test_pats):
             return "3.1"
 
-    if current_step == "3.2" and hook.get("e2e_executed"):
-        e2e_pats = [r'\be2e', r'\bcurl\s.*localhost', r'\bplaywright\b', r'\bcypress\b']
-        if any(re.search(p, cmd, re.IGNORECASE) for p in e2e_pats):
-            return "3.2"
-
-    if current_step == "3.4" and re.search(r'\be2e[_-]?gate\b', cmd, re.IGNORECASE):
+    # 3.2/3.3 改为文件写入完成检测（见 detect_completion_post_edit）。
+    if current_step == "3.4" and re.search(r'\bverify[_-]?gate\b', cmd, re.IGNORECASE):
         exit_code = _extract_exit_code(data)
         if exit_code == 0:
             return "3.4"
         if exit_code is None:
             output = data.get("tool_response", {})
             stdout = output.get("stdout", "") if isinstance(output, dict) else ""
-            if "GATE PASSED" in stdout:
+            if "GATE PASS" in stdout:
                 return "3.4"
-        return None
+        return None  # exit 3(SURFACE)/1(FAIL) 不自动推进，等人工 done --verify-confirmed 或修复
 
     if current_step == "3.5" and "loop_record" in cmd:
         return "3.5"
@@ -2759,9 +2991,11 @@ def detect_completion_post_edit(current_step: str, data: dict) -> Optional[str]:
     if current_step == "2.5" and CODE_REVIEW_FILENAME in file_path:
         return "2.5"
 
-    if current_step == "3.3" and file_path.endswith(".md"):
-        if "e2e" in file_path.lower() or "report" in file_path.lower() or "质量" in file_path:
-            return "3.3"
+    if current_step == "3.2" and file_path.endswith(VERIFY_PLAN_FILENAME):
+        return "3.2"
+
+    if current_step == "3.3" and os.path.basename(file_path) == "evidence-manifest.json":
+        return "3.3"
 
     if current_step == "3.6" and os.path.basename(file_path).upper() == "KNOWLEDGE.MD":
         return "3.6"
@@ -3189,9 +3423,9 @@ def hook_post_bash_logic(data: dict, orch_path: str = None,
             orch["request_type"] = hook["request_type"]
 
         if detected == "3.4":
-            ok, msg = validate_e2e_gate(orch, hook)
+            ok, msg = validate_verify_gate(orch, hook)
             if not ok:
-                print(f"⚠️ E2E Gate 命令已检测，但验证未通过: {msg}")
+                print(f"⚠️ 结构 gate 命令已检测，但验证未通过: {msg}")
                 save_orch_state(orch, orch_path)
                 return 0
 
@@ -3354,17 +3588,24 @@ def hook_post_edit_logic(data: dict, orch_path: str = None) -> int:
                 save_orch_state(orch, orch_path)
                 return 0
 
+        if detected == "3.2":
+            hook = load_hook_state()
+            ok, msg = validate_verify_plan(orch, hook)
+            if not ok:
+                print(f"⚠️ 验证计划已写入，但校验未通过: {msg}")
+                save_orch_state(orch, orch_path)
+                return 0
+
         if detected == "3.3":
-            orch["report_path"] = file_path
             ok, msg = record_step_artifact(orch, "3.3", file_path)
             if not ok:
-                print(f"⚠️ 报告 artifact 记录失败: {msg}")
+                print(f"⚠️ 证据 manifest artifact 记录失败: {msg}")
                 save_orch_state(orch, orch_path)
                 return 0
             hook = load_hook_state()
-            ok, msg = validate_e2e_report(orch, hook)
+            ok, msg = validate_verify_exec(orch, hook)
             if not ok:
-                print(f"⚠️ 报告写入已检测，但验证未通过: {msg}")
+                print(f"⚠️ 证据已写入，但校验未通过: {msg}")
                 save_orch_state(orch, orch_path)
                 return 0
 
@@ -3447,8 +3688,9 @@ VALUED_FLAGS = {
     "--knowledge",
     "--outcome",
     "--decision",
+    "--verify-judge",
 }
-BOOLEAN_FLAGS = {"--grill-complete", "--user-confirmed", "--shared"}
+BOOLEAN_FLAGS = {"--grill-complete", "--user-confirmed", "--shared", "--verify-confirmed"}
 
 
 def parse_done_args(argv: list) -> dict:
@@ -4062,6 +4304,11 @@ def cmd_done(argv: list) -> int:
         if not ok:
             print(f"❌ KNOWLEDGE artifact 记录失败: {msg}")
             return 1
+    if "--verify-judge" in args:
+        artifacts["verify_judge_path"] = args["--verify-judge"]
+    if "--verify-confirmed" in args:
+        # 智能人工门（§8）：结构 gate 判 SURFACE 时，用户看 HTML 报告后显式确认。
+        st["verify_confirmed"] = True
     if "--outcome" in args:
         artifacts["loop_outcome"] = args["--outcome"]
     if "--decision" in args:
