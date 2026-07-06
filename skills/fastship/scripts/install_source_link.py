@@ -28,6 +28,7 @@ FASTSHIP_LINKS = {
     ".claude/tools/fastship": ENGINE_DIR / "fastship",
     ".claude/tools/fastship_orchestrator.py": ENGINE_DIR / "orchestrator.py",
     ".claude/tools/fastship_state.py": ENGINE_DIR / "fastship_state.py",
+    ".claude/tools/devlog": ENGINE_DIR / "devlog",
 }
 
 FORGE_LINKS = {
@@ -43,6 +44,7 @@ FASTSHIP_GITIGNORE_LINES = [
     ".claude/.fastship-orchestrator-state.json",
     ".claude/state/",
     ".claude/worktrees/",
+    ".claude/logs/",
     ".claude/fastship-e2e-result.json",
     ".claude/.fastship-brief.md",
     ".claude/.fastship-requirements.md",
@@ -51,6 +53,32 @@ FASTSHIP_GITIGNORE_LINES = [
     ".claude/.fastship-code-review.md",
     "docs/superpowers/plans/*.plan.html",
 ]
+
+
+# Pointer block appended to the consumer project's CLAUDE.md so *every* agent
+# (not just the fastship/forge driver) knows to read the running dev server's
+# mirrored output when debugging. Idempotent: replaced in place between markers
+# on re-run, so updating the block here refreshes existing installs.
+DEVLOG_MARK_START = "<!-- fastship:devlog:start -->"
+DEVLOG_MARK_END = "<!-- fastship:devlog:end -->"
+DEVLOG_POINTER_BLOCK = f"""{DEVLOG_MARK_START}
+## Dev server logs (for agents)
+
+When debugging, if `.claude/logs/dev.log` exists, read its **last ~100 lines** for the
+live output of the running dev server — panics, stack traces, request logs, build errors —
+even a server you do **not** own. Check the `===== devlog start … =====` header for
+freshness and which command produced it; the tail may lag ~1s behind the terminal.
+
+To produce it, run your dev / long-running server through the wrapper (truncated each
+start, so it never grows unbounded):
+
+```bash
+.claude/tools/devlog ./dev_local.sh      # or: .claude/tools/devlog npm run dev
+```
+
+It mirrors stdout+stderr to `.claude/logs/dev.log` without the agent needing to own the
+process. Custom sink: `DEVLOG_FILE=.claude/logs/api.log .claude/tools/devlog cargo run`.
+{DEVLOG_MARK_END}"""
 
 
 def _git_root(path: Path) -> Path:
@@ -196,7 +224,32 @@ def _merge_gitignore(project: Path, dry_run: bool) -> str:
     return "updated"
 
 
-def install(project: Path, replace: bool, with_forge: bool, no_hooks: bool, dry_run: bool) -> list[str]:
+def _merge_claude_md_pointer(project: Path, dry_run: bool) -> str:
+    path = project / "CLAUDE.md"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    if DEVLOG_MARK_START in existing and DEVLOG_MARK_END in existing:
+        pre, _, rest = existing.partition(DEVLOG_MARK_START)
+        _, _, post = rest.partition(DEVLOG_MARK_END)
+        updated = pre + DEVLOG_POINTER_BLOCK + post
+        if updated == existing:
+            return "exists"
+        if dry_run:
+            return "refresh"
+        path.write_text(updated, encoding="utf-8")
+        return "refreshed"
+
+    if dry_run:
+        return "append" if existing else "create"
+    if existing:
+        sep = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+        path.write_text(existing + sep + DEVLOG_POINTER_BLOCK + "\n", encoding="utf-8")
+        return "appended"
+    path.write_text(DEVLOG_POINTER_BLOCK + "\n", encoding="utf-8")
+    return "created"
+
+
+def install(project: Path, replace: bool, with_forge: bool, no_hooks: bool, no_claude_md: bool, dry_run: bool) -> list[str]:
     project = _git_root(project)
     links = dict(FASTSHIP_LINKS)
     if with_forge:
@@ -212,6 +265,9 @@ def install(project: Path, replace: bool, with_forge: bool, no_hooks: bool, dry_
         results.append(f"{status:8} .claude/settings.local.json hooks")
     status = _merge_gitignore(project, dry_run=dry_run)
     results.append(f"{status:8} .gitignore fastship artifacts")
+    if not no_claude_md:
+        status = _merge_claude_md_pointer(project, dry_run=dry_run)
+        results.append(f"{status:8} CLAUDE.md devlog pointer")
     return results
 
 
@@ -221,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replace", action="store_true", help="replace existing copied files with symlinks")
     parser.add_argument("--with-forge", action="store_true", help="also source-link forge command/gate/dashboard")
     parser.add_argument("--no-hooks", action="store_true", help="do not merge Claude hook settings")
+    parser.add_argument("--no-claude-md", action="store_true", help="do not append the devlog pointer to CLAUDE.md")
     parser.add_argument("--dry-run", action="store_true", help="print intended changes without writing")
     args = parser.parse_args(argv)
 
@@ -229,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         replace=args.replace,
         with_forge=args.with_forge,
         no_hooks=args.no_hooks,
+        no_claude_md=args.no_claude_md,
         dry_run=args.dry_run,
     ):
         print(line)

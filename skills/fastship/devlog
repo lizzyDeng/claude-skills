@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# devlog — run a dev / long-running command while mirroring its stdout+stderr to
+# a stable log file, so agents can read the live output of a server they do NOT
+# own (the human, or another process, keeps the server in the foreground).
+#
+#   .claude/tools/devlog ./dev_local.sh
+#   .claude/tools/devlog npm run dev
+#   .claude/tools/devlog docker compose up          # foreground Docker
+#   DEVLOG_FILE=.claude/logs/api.log .claude/tools/devlog cargo run   # custom sink
+#
+# The log is TRUNCATED on each start and stamped with a header (timestamp + cmd)
+# so agents can tell freshness and which command produced it. Output is
+# line-buffered where possible so the file reflects live output.
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+LOG="${DEVLOG_FILE:-$ROOT/.claude/logs/dev.log}"
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: devlog <command> [args...]   (mirrors stdout+stderr to $LOG)" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "$LOG")"
+
+# Truncate + header: agents read this to judge staleness and origin.
+{
+  echo "===== devlog start $(date '+%Y-%m-%d %H:%M:%S %z') ====="
+  echo "cmd: $*"
+  echo "cwd: $(pwd)"
+  echo "====================================================="
+} > "$LOG"
+
+# Reduce buffering so the log tracks live output; degrade gracefully if stdbuf
+# is unavailable (e.g. bare macOS without coreutils).
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf -oL -eL "$@" 2>&1 | tee -a "$LOG"
+else
+  "$@" 2>&1 | tee -a "$LOG"
+fi
+
+# Propagate the wrapped command's exit code, not tee's.
+exit "${PIPESTATUS[0]}"

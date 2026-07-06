@@ -15,6 +15,12 @@ python3 /path/to/claude-skills/skills/fastship/scripts/install_source_link.py --
 
 `--replace` 会把旧的 copied `.claude/commands/fastship.md`、`.claude/tools/fastship_orchestrator.py`、`.claude/hooks/ship_verify_gate.py` 等文件替换成 symlink。`.claude/settings.local.json` 里的 hook 仍调用项目本地稳定路径，但这些路径最终解析到 `claude-skills` 源文件。
 
+安装器还会（默认开启，均幂等）：
+
+- source-link **devlog wrapper** 到 `.claude/tools/devlog`——把任意长驻 dev server 的 stdout+stderr 镜像进 `.claude/logs/dev.log`，让 agent 不用拥有进程也能读实时报错（详见下方「Dev server 日志（devlog）」一节）。
+- 向项目 `CLAUDE.md` 追加一个带 `<!-- fastship:devlog -->` 标记的 **调试指针块**，告诉所有 agent「调试先读 dev.log」。不想动 CLAUDE.md 用 `--no-claude-md`。
+- 把 `.claude/logs/` 加进 `.gitignore`。
+
 下面是依赖和手动安装细节。
 
 ## 0. 前置依赖
@@ -307,6 +313,27 @@ Gate 脚本会自动检测项目技术栈并识别对应的测试命令：
 
 E2E 命令识别（通用）：`curl localhost`, `playwright`, `cypress`, `puppeteer`, `selenium`, `agent-browser`, `*e2e*`
 
+## 6. Dev server 日志（devlog）
+
+让 agent 在调试时能看到**不属于它的进程**（用户手动跑的 dev server、或别的进程持有）的实时输出——把长驻服务包一层 `devlog` wrapper 即可。source-linked 安装会自动 link 到 `.claude/tools/devlog`；手动安装：
+
+```bash
+mkdir -p .claude/tools
+ln -sfn /path/to/claude-skills/skills/fastship/devlog .claude/tools/devlog
+chmod +x .claude/tools/devlog
+```
+
+用法（把你原来的启动命令原样包进去）：
+
+```bash
+.claude/tools/devlog ./dev_local.sh                         # 本地 Rust
+.claude/tools/devlog npm run dev                            # Vite 前端
+.claude/tools/devlog docker compose up                      # 前台 Docker
+DEVLOG_FILE=.claude/logs/api.log .claude/tools/devlog cargo run   # 自定义落盘路径
+```
+
+wrapper 把 stdout+stderr 镜像到 `.claude/logs/dev.log`（**每次启动截断** + 写时间戳/命令头，不会无限膨胀），并**透传原命令退出码**。agent 侧约定：调试时读该文件最后 ~100 行，先看 `===== devlog start … =====` 头判断新鲜度。安装器会把这条约定写进项目 `CLAUDE.md`（带 `<!-- fastship:devlog -->` 标记，幂等；`--no-claude-md` 可关）。
+
 ## .gitignore
 
 建议在项目 `.gitignore` 中添加：
@@ -316,6 +343,7 @@ E2E 命令识别（通用）：`curl localhost`, `playwright`, `cypress`, `puppe
 .claude/.fastship-orchestrator-state.json
 .claude/state/
 .claude/worktrees/
+.claude/logs/
 .claude/fastship-e2e-result.json
 .claude/.fastship-brief.md
 .claude/.fastship-requirements.md
