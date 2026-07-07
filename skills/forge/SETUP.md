@@ -9,15 +9,16 @@ description: "在当前项目中安装 /forge skill（项目级 harness：roadma
 
 ## Step 1: 检查前置依赖
 
-确认 fastship 已安装：
+确认 fastship 已安装（含 devlog dev-server 日志约定，forge 从 fastship 继承）：
 
 ```bash
 ls .claude/commands/fastship.md
 ls .claude/hooks/ship_verify_gate.py
 ls .claude/tools/fastship_orchestrator.py
+ls .claude/tools/devlog        # dev server 日志 wrapper（调试证据）
 ```
 
-如果任一文件不存在，告知用户先运行 `/fastship-setup`，然后停止。
+如果任一文件不存在，告知用户先运行 `/fastship-setup`，然后停止。`devlog` 缺失说明 fastship 是旧版安装——重跑 `install_source_link.py --replace`（或按 fastship `INSTALL.md` 第 6 节手动 link）即可补齐 `.claude/tools/devlog` + `CLAUDE.md` 调试指针。
 
 ## Step 2: 复制 skill 定义
 

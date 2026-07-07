@@ -206,6 +206,18 @@ UI feature 不再需要 N/A 死墙。
 
 `surfaces.*.app_paths` 是 **required-surface 派生的依据**（diff 命中哪个 app_paths → 该表面成为必需）。旧 `e2e` 段在迁移期保留（`http` 驱动可读其 `setup_commands`），但判定走 `verify`。
 
+### Dev server 日志（调试证据，非门禁）
+
+Phase 3 旅程失败、或 `setup_commands` 起的服务行为异常时，**先读 `.claude/logs/dev.log` 最后 ~100 行**看真实报错（panic / stack trace / 请求日志 / 构建错误），再动代码——别靠猜。读之前看头部 `===== devlog start … =====` 判断新鲜度和是哪条命令产出的。
+
+该文件由 `devlog` wrapper 产出：把长驻服务包一层即把 stdout+stderr 镜像进去（每次启动截断，不会无限膨胀）：
+
+```bash
+.claude/tools/devlog ./dev_local.sh        # 或 .claude/tools/devlog npm run dev
+```
+
+即便服务是用户或别的进程起的、fastship **不拥有**该进程，也能读到实时输出。wrapper 由 fastship 安装器 source-link 到 `.claude/tools/devlog`，日志目录 `.claude/logs/` 已 gitignore。
+
 ## 核心红线
 
 - Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）
