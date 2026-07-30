@@ -100,3 +100,48 @@ def test_orphan_feature_dirs_are_emitted(tmp_path):
 def test_registry_exposes_forge():
     from sources import REGISTRY
     assert "forge" in REGISTRY
+
+
+def test_md_reader_parses_heartstory_real_file():
+    nodes = {n["id"]: n for n in collect("heartstory_roadmap.md")}
+    goal = nodes["goal:name:他认识我"]
+    assert goal["meta"]["target_metric"].startswith("每周角色主动引用记忆")
+    assert nodes["forge:name:生图角色形象一致性"]["progress"] == 0.5   # in_progress
+    assert nodes["forge:name:生图角色形象一致性"]["parent"] == "goal:name:他认识我"
+    assert nodes["forge:name:AI 伴侣生图发图"]["progress"] == 0.85     # measuring
+    assert nodes["forge:name:AI 伴侣生图发图"]["meta"]["shipped_at"] == "05-07"
+
+
+def test_md_reader_skips_summary_heading_and_header_rows():
+    ids = {n["id"] for n in collect("heartstory_roadmap.md")}
+    assert "goal:name:Summary" not in ids
+    assert not any(i.startswith("forge:name:Feature") for i in ids)
+    assert not any(set(i.split("forge:name:")[-1]) <= set("-: ") for i in ids
+                   if i.startswith("forge:name:"))
+
+
+def test_md_reader_emits_no_north_star_when_undefined():
+    ids = {n["id"] for n in collect("heartstory_roadmap.md")}
+    assert "forge:north-star" not in ids   # "(undefined)" 不算北极星
+
+
+def test_md_goal_with_empty_table_survives_as_empty_group():
+    nodes = {n["id"]: n for n in collect("heartstory_roadmap.md")}
+    lonely = nodes["goal:name:我们之间有独特的东西"]
+    assert lonely["kind"] == model.KIND_GOAL
+    rolled = {n["id"]: n for n in model.rollup(list(nodes.values()))}
+    assert rolled[lonely["id"]]["progress"] is None
+    assert "empty" in rolled[lonely["id"]]["badges"]
+
+
+def test_json_missing_falls_back_to_sibling_md(tmp_path):
+    (tmp_path / "project-roadmap").mkdir()
+    (tmp_path / "project-roadmap" / "roadmap.md").write_text(
+        "# Project Roadmap\n\n> North Star: NS\n\n## G\nTarget: T\n\n"
+        "| Feature | Status | Shipped | Harvest |\n|---|---|---|---|\n"
+        "| F | ✅ concluded | 05-01 | achieved |\n",
+        encoding="utf-8")
+    nodes = {n["id"]: n for n in forge.collect(
+        {"type": "forge", "path": "project-roadmap/roadmap.json"}, Ctx(tmp_path))}
+    assert nodes["forge:name:F"]["progress"] == 1.0
+    assert nodes["forge:north-star"]["title"] == "NS"
