@@ -21,3 +21,4 @@
 - `/deeplearn-setup` — 将 /deeplearn 安装为全局或项目级 skill
 - `/forge` — 项目级 Harness：roadmap 管理 + /fastship 交付 + 收益回收闭环（含 hooks Gate 脚本）
 - `/forge-setup` — 在当前项目一键安装 /forge 所需的 hooks、Gate 脚本和 skill 定义
+- `/roadmap-radar` — goal 拓扑与进度可视化：forge roadmap + wayfinder issue 合成一张自包含 HTML（含 frontier 和未归位体检）
