@@ -93,3 +93,56 @@ def _block_containing(html, needle):
     end = index + html[index:].find("</details>") if "</details>" in html[index:] \
         else len(html)
     return html[start:end]
+
+
+# --- 未挂载节点不得被丢弃（真数据回归：hyoteam 上 27/94 个节点曾静默消失） ---
+
+UNPARENTED_GRAPH = {
+    "nodes": [
+        {"id": "goal:obj-1", "kind": "goal", "title": "有主的目标", "url": None,
+         "parent": None, "progress": 0.5, "state": None, "badges": [], "meta": {}},
+        {"id": "forge:ok", "kind": "leaf", "title": "有主的 feature", "url": None,
+         "parent": "goal:obj-1", "progress": 0.5, "state": "in_progress",
+         "badges": [], "meta": {}},
+        {"id": "gh:r#28", "kind": "group", "title": "没打 obj label 的地图", "url": None,
+         "parent": None, "progress": 0.5, "state": "open", "badges": [],
+         "meta": {"decisions": [], "fog": []}},
+        {"id": "gh:r#29", "kind": "leaf", "title": "地图下的子票", "url": None,
+         "parent": "gh:r#28", "progress": 0.0, "state": "open",
+         "badges": ["frontier"], "meta": {}},
+        {"id": "gh:r#30", "kind": "leaf", "title": "光票没有家", "url": None,
+         "parent": None, "progress": 0.0, "state": "open",
+         "badges": ["frontier"], "meta": {}},
+    ],
+    "doctor": {"dangling_parents": [], "orphans": [], "empty_groups": [],
+               "unmapped_status": []},
+}
+
+
+def test_unparented_group_keeps_its_whole_subtree():
+    """没打 goal label 的地图不能连带 6 张子票一起消失。"""
+    out = render.render(UNPARENTED_GRAPH)
+    assert "没打 obj label 的地图" in out
+    assert "地图下的子票" in out
+
+
+def test_unparented_leaf_without_orphan_badge_is_shown():
+    """parent 从出生就是 None 的票没有 orphan badge，同样不能丢。"""
+    out = render.render(UNPARENTED_GRAPH)
+    assert "光票没有家" in out
+
+
+def test_unparented_nodes_land_in_the_unassigned_section():
+    out = render.render(UNPARENTED_GRAPH)
+    tail = out.split('id="unassigned"')[1]
+    assert "没打 obj label 的地图" in tail
+    assert "光票没有家" in tail
+
+
+def test_no_node_is_ever_dropped_from_html():
+    """契约：图里每个节点的标题都必须出现在 HTML 里。"""
+    import html as html_mod
+    for graph in (GRAPH, UNPARENTED_GRAPH):
+        out = render.render(graph)
+        for node in graph["nodes"]:
+            assert html_mod.escape(node["title"], quote=True) in out, node["id"]

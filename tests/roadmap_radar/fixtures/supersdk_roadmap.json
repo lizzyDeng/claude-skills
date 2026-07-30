@@ -1,19 +1,44 @@
 {
-  "project": "让宿主 App 通过一个 SDK 获得 WebView 容器 + 登录/支付/广告能力",
+  "project": {
+    "name": "SuperSDK",
+    "north_star": "让宿主 App 通过一个 SDK 获得 WebView 容器 + 登录/支付/广告等全套商业化能力，H5 一行代码调用"
+  },
   "created_at": "2026-05-16",
   "objectives": [
-    {"id": "obj-1", "name": "用户体系",
-     "target_metric": "Demo App 登录+支付全流程走通率 = 100%"},
-    {"id": "obj-2", "name": "变现体系",
-     "target_metric": "支持广告类型数 = 3（Banner + Interstitial + Reward）"}
+    {
+      "id": "obj-1",
+      "name": "用户体系",
+      "target_metric": "Demo App 登录+支付全流程走通率 = 100%"
+    },
+    {
+      "id": "obj-2",
+      "name": "变现体系",
+      "target_metric": "支持广告类型数 = 3（Banner + Interstitial + Reward）"
+    }
   ],
   "features": [
-    {"slug": "login-bridge", "name": "登录 Bridge", "objective": "obj-1",
-     "status": "measuring", "created_at": "2026-05-16", "shipped_at": "2026-05-19",
-     "harvest_due": "2026-05-26"},
-    {"slug": "pay-bridge", "name": "支付 Bridge", "objective": "obj-1",
-     "status": "draft", "created_at": "2026-05-16"},
-    {"slug": "ad-bridge", "name": "广告 Bridge", "objective": "obj-2",
-     "status": "draft", "created_at": "2026-05-16"}
+    {
+      "slug": "login-bridge",
+      "name": "登录 Bridge",
+      "objective": "obj-1",
+      "status": "measuring",
+      "created_at": "2026-05-16",
+      "shipped_at": "2026-05-19",
+      "harvest_due": "2026-05-26"
+    },
+    {
+      "slug": "pay-bridge",
+      "name": "支付 Bridge",
+      "objective": "obj-1",
+      "status": "draft",
+      "created_at": "2026-05-16"
+    },
+    {
+      "slug": "ad-bridge",
+      "name": "广告 Bridge",
+      "objective": "obj-2",
+      "status": "draft",
+      "created_at": "2026-05-16"
+    }
   ]
 }

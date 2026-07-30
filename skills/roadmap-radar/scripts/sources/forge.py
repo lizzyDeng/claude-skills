@@ -58,6 +58,23 @@ def _probe(candidates, has):
     return None
 
 
+def _banner_text(value):
+    """把北极星字段归一成一行字符串，或 None。
+
+    三种真实形状都要吃下：
+      aifriends   "north_star": "成为用户日均使用 30 分钟的…"        —— 直接是字符串
+      supersdk    "project": {"name":…, "north_star": "让宿主 App…"}  —— 嵌套对象
+      heartstory  "> North Star: (undefined)"                        —— 占位，等于没有
+    直接把 dict 当标题用会让页面打出 `{'name': ...}`。
+    """
+    if isinstance(value, dict):
+        value = value.get("north_star") or value.get("name")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return None if not value or value == "(undefined)" else value
+
+
 def _feature_node(slug, name, goal_raw, status, table, meta):
     progress = table.get(status)
     badges = [] if progress is not None else [BADGE_UNMAPPED]
@@ -87,8 +104,8 @@ def _read_json(path, config):
     )
 
     nodes = []
-    banner = data.get(title_field) if title_field else None
-    if banner and banner != "(undefined)":
+    banner = _banner_text(data.get(title_field) if title_field else None)
+    if banner:
         nodes.append(model.node(NORTH_STAR_ID, model.KIND_GOAL, banner,
                                 meta={"source": "forge", "kind": "north-star"}))
 

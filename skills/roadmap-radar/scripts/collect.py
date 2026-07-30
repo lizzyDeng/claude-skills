@@ -63,6 +63,13 @@ def doctor(nodes):
             if n["parent"] is not None and n["parent"] not in ids
         ],
         "orphans": [n for n in marked if BADGE_ORPHAN in n["badges"]],
+        # 「没挂上」和「断链」是两回事：断链的 parent 指向了不存在的 id（有证据），
+        # 没挂上的 parent 从出生就是 None —— 比如 issue 没打 goal label。两类都要报。
+        "no_goal": [
+            n for n in marked
+            if n["kind"] != KIND_GOAL and n["parent"] is None
+            and BADGE_ORPHAN not in n["badges"]
+        ],
         "empty_groups": [
             n for n in marked
             if n["kind"] in (KIND_GOAL, KIND_GROUP) and BADGE_EMPTY in n["badges"]

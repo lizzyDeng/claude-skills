@@ -101,3 +101,19 @@ def test_build_raises_on_unknown_source_type_and_lists_known():
         assert "nope" in str(exc) and "fake" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_doctor_reports_nodes_that_never_had_a_goal():
+    """parent 从出生就是 None 的非 goal 节点也要报 —— 它不是「断链」，是「没挂上」。"""
+    nodes = [
+        m.node("goal:obj-1", m.KIND_GOAL, "goal"),
+        m.node("forge:ok", m.KIND_LEAF, "ok", parent="goal:obj-1", progress=1.0),
+        m.node("gh:r#28", m.KIND_GROUP, "没打 label 的地图", parent=None),
+        m.node("gh:r#30", m.KIND_LEAF, "光票", parent=None, progress=0.0),
+    ]
+    report = c.doctor(nodes)
+    ids = [n["id"] for n in report["no_goal"]]
+    assert "gh:r#28" in ids
+    assert "gh:r#30" in ids
+    assert "goal:obj-1" not in ids   # goal 自己是根，不算没挂上
+    assert "forge:ok" not in ids

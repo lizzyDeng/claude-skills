@@ -158,19 +158,27 @@ def _link(node):
 
 
 def _unassigned(nodes, report, by_id):
-    orphans = [n for n in nodes if "orphan" in n["badges"]]
+    """未归位区。
+
+    🔴 这里是「永不丢节点」的最后一道闸：任何挂不到 goal 下面的非 goal 节点都必须
+    落在这里，**连它的整棵子树一起**。否则一张没打 goal label 的地图会带着它所有
+    子票一起从页面上消失 —— 页面于是安静地少报了工作量。
+    """
+    unparented = [n for n in nodes
+                  if n["kind"] != model.KIND_GOAL
+                  and (n["parent"] is None or n["parent"] not in by_id)]
     dangling = report.get("dangling_parents") or []
     empty = report.get("empty_groups") or []
     unmapped = report.get("unmapped_status") or []
-    if not (orphans or dangling or empty or unmapped):
+    if not (unparented or dangling or empty or unmapped):
         return ""
     out = ['<div id="unassigned"><h2>⚠️ 未归位 / 需要体检</h2>']
-    if orphans:
-        out.append("<div><b>没有归属的节点（%d）</b><ul>" % len(orphans))
-        for node in orphans:
+    if unparented:
+        out.append("<div><b>没有挂到任何 goal（%d）</b><ul>" % len(unparented))
+        for node in unparented:
             reason = (node["meta"] or {}).get("reason") or ""
-            out.append("<li>%s <span class=\"tag\">%s</span></li>"
-                       % (_link(node), esc(reason)))
+            tag = '<span class="tag">%s</span>' % esc(reason) if reason else ""
+            out.append("<li>%s%s</li>" % (_group_or_leaf(node, nodes), tag))
         out.append("</ul></div>")
     if dangling:
         out.append("<div><b>父节点找不到（迁仓断链）</b>"

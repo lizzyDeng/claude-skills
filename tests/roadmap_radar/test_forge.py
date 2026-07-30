@@ -145,3 +145,23 @@ def test_json_missing_falls_back_to_sibling_md(tmp_path):
         {"type": "forge", "path": "project-roadmap/roadmap.json"}, Ctx(tmp_path))}
     assert nodes["forge:name:F"]["progress"] == 1.0
     assert nodes["forge:north-star"]["title"] == "NS"
+
+
+# --- 真数据回归：supersdk 的 project 是嵌套对象，不是字符串 ---
+
+def test_nested_title_field_is_unwrapped_not_used_as_title():
+    """supersdk 的 project = {"name":..., "north_star":...}。
+    直接拿 dict 当标题会让 render 打出 {'name': ...}。"""
+    nodes = {n["id"]: n for n in collect("supersdk_roadmap.json")}
+    banner = nodes["forge:north-star"]
+    assert isinstance(banner["title"], str)
+    assert "WebView" in banner["title"]
+    assert "north_star" not in banner["title"]   # 不是 dict 的 repr
+
+
+def test_every_node_title_is_a_string():
+    """契约：Node.title 永远是 str —— 下游 render/排序都指着它。"""
+    for fixture in ("aifriends_roadmap.json", "supersdk_roadmap.json",
+                    "heartstory_roadmap.md"):
+        for node in collect(fixture):
+            assert isinstance(node["title"], str), (fixture, node["id"])
