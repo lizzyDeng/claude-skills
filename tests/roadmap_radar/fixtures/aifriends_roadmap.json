@@ -1,0 +1,31 @@
+{
+  "north_star": "成为用户日均使用 30 分钟的 AI 情感陪伴平台",
+  "created_at": "2026-05-07",
+  "objectives": [
+    {"id": "obj-1", "name": "对话粘性", "description": "用户愿意持续与 AI 聊天",
+     "target_metric": "日均会话时长 >= 30min，次日留存 >= 40%"},
+    {"id": "obj-3", "name": "变现能力", "description": "免费用户转付费",
+     "target_metric": "免费→付费转化率 >= 8%，月付费留存 >= 70%"},
+    {"id": "obj-7", "name": "引擎可演进性 / 工程健康", "description": "核心对话引擎可维护",
+     "target_metric": "核心引擎无 >300 LOC 巨石函数"}
+  ],
+  "features": [
+    {"slug": "gift-system", "name": "Gift System", "objective_id": "obj-1",
+     "status": "concluded", "created_at": "2026-05-02", "shipped_at": "2026-05-14",
+     "concluded_at": "2026-05-28"},
+    {"slug": "core-tracking-events", "name": "Core Tracking Events",
+     "objective_id": "obj-1", "status": "draft", "created_at": "2026-05-10"},
+    {"slug": "weekend-date-foundation", "name": "Weekend Date Foundation",
+     "objective_id": "obj-3", "status": "draft", "created_at": "2026-07-08"},
+    {"slug": "video-generation", "name": "Video Generation",
+     "objective_id": "obj-3", "status": "draft", "created_at": "2026-07-08"},
+    {"slug": "chat-route-service-extraction", "name": "Chat Route Service Extraction",
+     "objective_id": "obj-7", "status": "concluded", "created_at": "2026-06-20",
+     "shipped_at": "2026-06-25", "concluded_at": "2026-07-02"},
+    {"slug": "her-world-gift-wall", "name": "F1 礼物墙", "objective_id": "obj-6",
+     "status": "measuring", "created_at": "2026-06-01", "shipped_at": "2026-07-10",
+     "harvest_due": "2026-07-24"},
+    {"slug": "mystery-status", "name": "Mystery Status", "objective_id": "obj-1",
+     "status": "totally-new-word", "created_at": "2026-07-30"}
+  ]
+}
