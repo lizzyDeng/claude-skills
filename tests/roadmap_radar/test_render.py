@@ -1,3 +1,4 @@
+import html as html_mod
 import json
 import re
 import sys
@@ -87,27 +88,36 @@ def test_renders_without_north_star_root():
 
 
 def _block_containing(html, needle):
-    """取包含 needle 的那个节点盒（到下一个节点盒为止），用于局部断言。"""
+    """取包含 needle 的那个 SVG 节点（<a|g class="n" …>…</a|g>），用于局部断言。"""
     index = html.index(needle)
-    start = html.rfind('<div class="node', 0, index)
-    nxt = html.find('<div class="node', index)
-    return html[start:nxt if nxt != -1 else len(html)]
+    start = html.rfind('data-id="', 0, index)
+    ends = [e for e in (html.find("</a>", index), html.find("</g>", index))
+            if e != -1]
+    return html[start:min(ends) if ends else len(html)]
 
 
-# --- 拓扑树结构与一句话简介 ---
+def _cx(html, node_id):
+    """节点圆点的 x 坐标（列位置）。"""
+    match = re.search(r'data-id="%s"[^>]*>[^<]*<circle[^>]*cx="([\d.]+)"'
+                      % re.escape(node_id), html)
+    assert match, node_id
+    return float(match.group(1))
 
-def test_goal_renders_as_topology_tree():
-    """每个 goal 一张树，不再是纯文字罗列。"""
+
+# --- 圆点连线拓扑图与一句话简介 ---
+
+def test_goal_renders_as_dot_and_line_svg_tree():
+    """每个 goal 一张圆点+连线 SVG，不再是纯文字罗列。"""
     assert 'class="goal-sec"' in HTML
-    assert 'class="tree"' in HTML
+    assert '<svg class="tree"' in HTML
+    assert 'class="edge"' in HTML      # 贝塞尔连线
+    assert 'class="dot' in HTML        # 圆点
 
 
-def test_children_nest_in_ul_after_parent_node_box():
-    """map 的子票必须嵌在 map 节点盒后面的 <ul> 里（拓扑连线的锚）。"""
-    map_i = HTML.index("issues/14")             # 「看广告换额度」map 节点
-    ul_i = HTML.index("<ul>", map_i)
-    child_i = HTML.index("issues/22", map_i)    # 它的子票
-    assert ul_i < child_i
+def test_child_dot_sits_one_column_right_of_parent_dot():
+    """#22 是 map #14 的子票：子点必须在父点右边一列（拓扑分层）。"""
+    repo = "gh:hyoteam/aifriends"
+    assert _cx(HTML, "%s#14" % repo) < _cx(HTML, "%s#22" % repo)
 
 
 def test_node_summary_one_liner_is_rendered():
@@ -120,8 +130,8 @@ def test_node_summary_one_liner_is_rendered():
          "meta": {"summary": "接入 SSV 回调"}},
     ], "doctor": {}}
     out = render.render(graph)
-    assert '<div class="sum">让用户愿意回来</div>' in out
-    assert '<div class="sum">接入 SSV 回调</div>' in out
+    assert "让用户愿意回来" in out          # goal head 一句话
+    assert "接入 SSV 回调" in out           # leaf tooltip 一句话
 
 
 def test_map_sections_collapse_to_counts_not_bullet_dump():

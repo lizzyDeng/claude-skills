@@ -5,7 +5,8 @@ description: Use when the user wants to see the topology and progress of a proje
 
 # roadmap-radar
 
-把 forge roadmap 和 wayfinder GitHub issue 合成一张自包含 HTML，回答三个问题：
+把 forge roadmap 和 wayfinder GitHub issue 合成一张自包含 HTML（每个 goal 一张
+「圆点 + 连线」的 tidy tree 拓扑图，SVG 由 Python 直接算好，零 JS），回答三个问题：
 
 1. 每个 goal 整体走到哪了（跨 feature + issue 的 rollup）
 2. 现在能动的是哪张票（frontier）
@@ -45,6 +46,8 @@ python3 $SCRIPT --root /path/to/project --config /tmp/that.radar.json --out /tmp
 ## 关键行为
 
 - **goal id 跨 source 统一成 `goal:<raw>`** —— forge 的 `obj-3` 和 GitHub label `obj-3` 因此合成同一个节点，这是 goal 进度能跨两个数据源的机制。
+- **层级 = GitHub sub-issues，一次分页 GraphQL 拉全仓的边** —— 子票挂在上游 issue 下（不只挂 map 下、任意深度）也能建出链；跨仓子票被过滤（拿 number 撞本仓会乱挂）。有子票的票不算 frontier。
+- **节点标题/一句话简介/决策全文在 hover tooltip** —— 图面只放圆点、截断标题和 done/total 计数；一句话简介 = issue body 首个有效行 / forge objective 的 description。
 - **进度每层等权** —— 一张 6 票的 map 和一个 feature 在 goal 眼里各算一票。
 - **空地图不显示 0%**，显示「空」并且不把父级分母拉大。
 - **未映射的状态词不当 0%**，返回未知并在体检里报出来。

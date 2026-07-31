@@ -1,7 +1,9 @@
 """通用 GitHub source。任何仓库都能用，不含任何 wayfinder/forge 知识。
 
-goal 从 label 正则或 milestone 来；层级从 GitHub sub-issues 来；
-frontier = open + 无 assignee + 无 open blocker。
+goal 从 label 正则或 milestone 来；层级从 GitHub sub-issues 来 ——
+一次分页 GraphQL 拉全仓 sub-issue 边，所以子票挂在上游 issue 下（任意深度）
+也能建出父子链，不只挂在 map 下。
+frontier = open + 无 assignee + 无 open blocker + 自己没有子票。
 """
 
 import re
@@ -86,19 +88,19 @@ def collect(config, ctx):
         nodes.append(node)
         by_number[issue["number"]] = node
 
-    # 层级：GitHub sub-issues。只对 group 节点问，成本 = group 数量。
+    # 层级：GitHub sub-issues。一次分页 GraphQL 拉全仓的边，任意深度都在。
+    edges = _sub_issue_edges(ctx, repo)
     child_numbers = set()
-    for node in nodes:
-        if node["kind"] != model.KIND_GROUP:
+    for parent_number, children in edges.items():
+        parent_node = by_number.get(parent_number)
+        if parent_node is None:
             continue
-        for child in ctx.gh_json([
-            "api", "repos/%s/issues/%s/sub_issues" % (repo, node["meta"]["number"])
-        ]) or []:
-            target = by_number.get(child["number"])
+        for child_number in children:
+            target = by_number.get(child_number)
             if target is None:
                 continue
-            target["parent"] = node["id"]
-            child_numbers.add(child["number"])
+            target["parent"] = parent_node["id"]
+            child_numbers.add(child_number)
 
     # blocker：只查 group 名下的 open 子票，避免 N 次 API
     blocked = set()
@@ -116,10 +118,49 @@ def collect(config, ctx):
     for number, node in by_number.items():
         if (node["kind"] == model.KIND_LEAF and node["state"] == "open"
                 and not any(b.startswith("claimed:") for b in node["badges"])
-                and number not in blocked):
+                and number not in blocked
+                and number not in edges):     # 有子票的票不是可直接上手的票
             node["badges"].append("frontier")
 
     return list(goals.values()) + nodes
+
+
+_SUB_ISSUES_QUERY = """
+query($owner:String!,$name:String!,$cursor:String){
+  repository(owner:$owner,name:$name){
+    issues(first:100,after:$cursor,states:[OPEN,CLOSED]){
+      pageInfo{hasNextPage endCursor}
+      nodes{number subIssues(first:100){
+        nodes{number repository{nameWithOwner}}}}
+    }
+  }
+}""".strip()
+
+
+def _sub_issue_edges(ctx, repo):
+    """{parent_number: [child_number, ...]}，只保留同仓子票（跨仓边挂不上，丢会误导）。"""
+    owner, name = repo.split("/", 1)
+    edges = {}
+    cursor = None
+    while True:
+        args = ["api", "graphql", "-f", "query=%s" % _SUB_ISSUES_QUERY,
+                "-F", "owner=%s" % owner, "-F", "name=%s" % name]
+        if cursor:
+            args += ["-F", "cursor=%s" % cursor]
+        data = ctx.gh_json(args) or {}
+        block = (((data.get("data") or {}).get("repository") or {})
+                 .get("issues") or {})
+        for row in block.get("nodes") or []:
+            children = [c["number"]
+                        for c in (row.get("subIssues") or {}).get("nodes") or []
+                        if (c.get("repository") or {}).get("nameWithOwner",
+                                                           repo) == repo]
+            if children:
+                edges[row["number"]] = children
+        page = block.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return edges
+        cursor = page.get("endCursor")
 
 
 def _goal_raws(issue, goal_from):

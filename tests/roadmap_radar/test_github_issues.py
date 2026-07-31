@@ -27,10 +27,9 @@ class FakeCtx:
         joined = " ".join(args)
         if "issue" in args and "list" in args:
             return json.loads((FIX / "gh_issues.json").read_text(encoding="utf-8"))
-        if "/sub_issues" in joined:
-            number = joined.rsplit("/issues/", 1)[1].split("/")[0]
-            path = FIX / ("gh_sub_issues_%s.json" % number)
-            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        if "graphql" in args:
+            return json.loads(
+                (FIX / "gh_graphql_sub_issues.json").read_text(encoding="utf-8"))
         if "/issues/" in joined:
             number = int(joined.rsplit("/issues/", 1)[1])
             return {"number": number,
@@ -74,10 +73,30 @@ def test_issue_state_maps_to_binary_progress():
 
 def test_frontier_badge_needs_open_unassigned_unblocked():
     nodes = {n["id"]: n for n in collect()}
-    assert "frontier" in nodes["gh:%s#13" % REPO]["badges"]        # open + 无 assignee
+    assert "frontier" in nodes["gh:%s#30" % REPO]["badges"]        # open + 无 assignee
     assert "frontier" not in nodes["gh:%s#22" % REPO]["badges"]    # 有 assignee
     assert "claimed:lizzydeng" in nodes["gh:%s#22" % REPO]["badges"]
     assert "frontier" not in nodes["gh:%s#25" % REPO]["badges"]    # 已关
+
+
+def test_issue_with_sub_issues_is_not_frontier():
+    """#13 自己还有子票 #30，不是可直接上手的票 —— frontier 给 #30。"""
+    nodes = {n["id"]: n for n in collect()}
+    assert "frontier" not in nodes["gh:%s#13" % REPO]["badges"]
+
+
+def test_sub_issue_of_non_map_issue_chains_to_upstream_issue():
+    """子票挂在上游 issue（非 map）下也要建边：12 → 13 → 30。"""
+    nodes = {n["id"]: n for n in collect()}
+    assert nodes["gh:%s#30" % REPO]["parent"] == "gh:%s#13" % REPO
+    assert nodes["gh:%s#13" % REPO]["parent"] == "gh:%s#12" % REPO
+
+
+def test_cross_repo_sub_issues_are_filtered_out():
+    """#14 的子票在别的仓 —— 不能拿 number 撞本仓的票乱挂。"""
+    nodes = collect()
+    map14 = "gh:%s#14" % REPO
+    assert not [n for n in nodes if n["parent"] == map14]
 
 
 def test_blocked_issue_is_not_frontier():
@@ -94,13 +113,13 @@ def test_dependencies_not_fetched_by_default_keeps_call_count_low():
                    for a in ctx.calls)
 
 
-def test_dependency_fetch_only_targets_open_children_of_groups():
+def test_dependency_fetch_only_targets_open_sub_issue_children():
     ctx = FakeCtx()
     collect(ctx=ctx, fetch_dependencies=True)
     probed = [a for a in ctx.calls
               if "/issues/" in " ".join(a) and "/sub_issues" not in " ".join(a)]
     numbers = {int(" ".join(a).rsplit("/issues/", 1)[1]) for a in probed}
-    assert numbers == {13}   # 22/16 不是 map 的子票；25 已关；99 无 goal
+    assert numbers == {13, 30}   # 22/16 不是任何票的子票；25 已关；99 无 goal
 
 
 def test_issue_without_goal_or_parent_is_kept_not_dropped():
