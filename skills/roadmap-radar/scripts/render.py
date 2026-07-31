@@ -22,13 +22,10 @@ CLIP_LABEL = 300   # 标签最大像素宽
 DOT_BIN = "dot"
 
 CSS = """
-:root { color-scheme: light dark; --fg:#111; --dim:#666; --line:#ddd; --edge:#a8a8a8;
+/* 固定浅色主题：不跟随系统暗色（用户拍板，暗色太丑） */
+:root { color-scheme: light; --fg:#111; --dim:#666; --line:#ddd; --edge:#a8a8a8;
         --bar:#3b82f6; --ok:#16a34a; --doing:#f59e0b; --todo:#8b9199;
         --warn:#dc2626; --card:#fff; --bg:#fafafa; }
-@media (prefers-color-scheme: dark) {
-  :root { --fg:#e7e7e7; --dim:#999; --line:#333; --edge:#666; --todo:#7a8087;
-          --card:#1a1a1a; --bg:#111; }
-}
 * { box-sizing: border-box; }
 body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
        font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",
