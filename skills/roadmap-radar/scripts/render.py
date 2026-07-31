@@ -124,22 +124,48 @@ def _text_w(text, size=FS):
     return width
 
 
+def _is_cjk(ch):
+    return ord(ch) >= 0x2E80
+
+
+_BREAK_AFTER = set(" -—_:：/·,，+)）」』…")
+
+
 def _wrap(text, line_w=LINE_W, max_lines=MAX_LINES):
-    """标题 → 最多 max_lines 行（按估算像素宽断行），超出截断加 …。"""
+    """标题 → 最多 max_lines 行，超出截断加 …。
+
+    断行优先落在词边界（空格 / CJK 两侧 / 标点后），半角单词不腰斩 ——
+    纯按像素宽硬切会把 aifriend 断成 aifrien|d。整行没有断点才硬切。
+    """
     lines = []
     cur = ""
+    brk = 0            # cur[:brk] 是最后一个合法断点前的内容
     for ch in text:
-        if _text_w(cur + ch) > line_w:
-            lines.append(cur)
+        if cur and _text_w(cur + ch) > line_w:
+            if brk > 0:
+                lines.append(cur[:brk].rstrip())
+                cur = (cur[brk:] + ch).lstrip()
+            else:
+                lines.append(cur)
+                cur = ch
+            brk = 0
+            for i in range(1, len(cur)):
+                if (cur[i - 1] in _BREAK_AFTER or _is_cjk(cur[i - 1])
+                        or _is_cjk(cur[i])):
+                    brk = i
             if len(lines) == max_lines:
-                last = lines[-1]
-                while last and _text_w(last + "…") > line_w:
-                    last = last[:-1]
-                lines[-1] = last + "…"
-                return lines
-            cur = ch
+                break
         else:
             cur += ch
+            if len(cur) > 1 and (cur[-2] in _BREAK_AFTER or _is_cjk(cur[-2])
+                                 or _is_cjk(cur[-1])):
+                brk = len(cur) - 1
+    if len(lines) == max_lines:
+        last = lines[-1]
+        while last and _text_w(last + "…") > line_w:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + "…"
+        return lines
     if cur:
         lines.append(cur)
     return lines
@@ -259,7 +285,7 @@ def _to_dot(members, ghosts, anchors=True):
 
     out = ["digraph radar {",
            '  rankdir=LR; bgcolor="transparent";',
-           '  pack=true; packmode="array_c1";',
+           '  pack=44; packmode="array_c1";',   # pack 值 = component 间距（pt），孤票的下方标签才不叠
            '  graph [nodesep=0.78, ranksep=1.85, margin=0.05];',
            '  node [shape=circle, label="", width=0.17, height=0.17,'
            ' fixedsize=true];',

@@ -95,6 +95,25 @@ def test_out_of_lane_blocker_appears_as_ghost_dot():
     assert "#29" in lane
 
 
+def test_wrap_never_splits_latin_words():
+    """断行不腰斩半角单词：aifriend 不能变成 aifrien|d。"""
+    lines = render._wrap("[research] aifriend 耦合点盘点:换皮施工图全景与迁移顺序")
+    for line in lines:
+        assert not line.endswith("aifrien"), lines
+    joined = "".join(lines).replace("…", "")
+    assert "aifriend" in "".join(lines) or joined in "[research] aifriend 耦合点盘点:换皮施工图全景与迁移顺序"
+    lines2 = render._wrap("sys_config 补 callers.chat —— 主聊天模型脱离 env 热更")
+    assert not any(line.endswith("calle") for line in lines2), lines2
+
+
+def test_wrap_caps_lines_and_appends_ellipsis():
+    lines = render._wrap("很长的标题" * 20)
+    assert len(lines) == render.MAX_LINES
+    assert lines[-1].endswith("…")
+    short = render._wrap("短标题")
+    assert short == ["短标题"]
+
+
 def test_lane_has_start_and_end_anchors():
     """每条泳道有唯一入口/出口：开始 → 无前置的票 … 末端票 → 完成。"""
     lane = _lane_html(HTML, "live-chat 实施路线")
