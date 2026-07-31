@@ -50,6 +50,12 @@ a { color:inherit; }
 .lane-head .sum { color:var(--dim); font-size:12px; margin-top:2px; }
 .tag { display:inline-block; font-size:10.5px; padding:0 5px; border-radius:9px;
        border:1px solid var(--line); color:var(--dim); margin-left:6px; }
+.prio { display:inline-block; font-size:11px; font-weight:700; padding:0 7px;
+        border-radius:9px; color:#fff; margin-right:8px; vertical-align:1px; }
+.prio.p0 { background:var(--warn); }
+.prio.p1 { background:var(--doing); }
+.prio.p2 { background:var(--bar); }
+.prio.pn { background:var(--todo); }
 
 /* ---- graphviz SVG：几何来自 dot，颜色全在这里；标题由 _inject_labels
        画在圆点正下方（text.nlabel） ---- */
@@ -189,6 +195,10 @@ def render(graph, generated_at=None):
 
     non_goal = [n for n in nodes if n["kind"] != model.KIND_GOAL]
     lanes = [n for n in non_goal if is_top(n) and kids.get(n["id"])]
+    # 泳道按优先级排（P0 最前）；没打 priority label 的排最后、保持原顺序
+    lanes.sort(key=lambda n: ((n["meta"] or {}).get("priority")
+                              if (n["meta"] or {}).get("priority") is not None
+                              else 99))
     strays = [n for n in non_goal if is_top(n) and not kids.get(n["id"])]
     goals = [n for n in nodes if n["kind"] == model.KIND_GOAL]
 
@@ -237,10 +247,15 @@ def _lane_section(root, by_id, kids):
     parent = by_id.get(root["parent"] or "")
     if parent is not None and parent["kind"] == model.KIND_GOAL:
         chips = '<span class="tag">%s</span>' % esc(parent["title"])
+    priority = (root["meta"] or {}).get("priority")
+    badge = ""
+    if priority is not None:
+        cls = "p%d" % priority if priority <= 2 else "pn"
+        badge = '<span class="prio %s">P%d</span>' % (cls, priority)
     out = ['<section class="lane">',
-           '<div class="lane-head" title="%s"><b>%s</b>'
+           '<div class="lane-head" title="%s">%s<b>%s</b>'
            '<span class="cnt">%d/%d</span>%s</div>'
-           % (esc(_tooltip(root)), _link(root), done, len(members), chips)]
+           % (esc(_tooltip(root)), badge, _link(root), done, len(members), chips)]
     summary = (root["meta"] or {}).get("summary")
     if summary:
         out.append('<div class="lane-head"><div class="sum">%s</div></div>'

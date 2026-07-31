@@ -114,6 +114,36 @@ def test_wrap_caps_lines_and_appends_ellipsis():
     assert short == ["短标题"]
 
 
+def test_lanes_sorted_by_priority_label_with_badge():
+    """P0 泳道排最前带红徽标；没打 priority 的泳道排最后无徽标。"""
+    graph = {"nodes": [
+        {"id": "gh:r#1", "kind": "group", "title": "无优先级地图", "url": None,
+         "parent": None, "progress": 0.0, "state": "open", "badges": [],
+         "meta": {}},
+        {"id": "gh:r#2", "kind": "leaf", "title": "T1", "url": None,
+         "parent": "gh:r#1", "progress": 0.0, "state": "open", "badges": [],
+         "meta": {}},
+        {"id": "gh:r#3", "kind": "group", "title": "P0地图", "url": None,
+         "parent": None, "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"priority": 0}},
+        {"id": "gh:r#4", "kind": "leaf", "title": "T2", "url": None,
+         "parent": "gh:r#3", "progress": 0.0, "state": "open", "badges": [],
+         "meta": {}},
+        {"id": "gh:r#5", "kind": "group", "title": "P2地图", "url": None,
+         "parent": None, "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"priority": 2}},
+        {"id": "gh:r#6", "kind": "leaf", "title": "T3", "url": None,
+         "parent": "gh:r#5", "progress": 0.0, "state": "open", "badges": [],
+         "meta": {}},
+    ], "doctor": {}}
+    out = _plain(render.render(graph))
+    assert out.index("P0地图") < out.index("P2地图") < out.index("无优先级地图")
+    assert '<span class="prio p0">P0</span>' in out
+    assert '<span class="prio p2">P2</span>' in out
+    head = out[out.index("无优先级地图") - 200:out.index("无优先级地图")]
+    assert 'class="prio' not in head
+
+
 def test_lane_has_start_and_end_anchors():
     """每条泳道有唯一入口/出口：开始 → 无前置的票 … 末端票 → 完成。"""
     lane = _lane_html(HTML, "live-chat 实施路线")

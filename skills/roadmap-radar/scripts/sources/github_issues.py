@@ -17,6 +17,7 @@ ISSUE_FIELDS = "number,title,state,labels,assignees,url,body,milestone"
 DEFAULT_LIMIT = 300
 
 SUMMARY_MAX = 120
+PRIORITY_RE = re.compile(r"^[Pp](\d)$")
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 # 整行都是结构噪音：标题、图片、代码围栏、表格行、分隔线
@@ -86,6 +87,7 @@ def collect(config, ctx):
             meta={"source": "github-issues", "repo": repo,
                   "number": issue["number"], "body": issue.get("body") or "",
                   "summary": summary_of(issue.get("body")),
+                  "priority": _priority_of(issue),
                   "labels": [label["name"] for label in issue.get("labels", [])]},
         )
         nodes.append(node)
@@ -170,6 +172,15 @@ def _sub_issue_edges(ctx, repo):
         if not page.get("hasNextPage"):
             return edges
         cursor = page.get("endCursor")
+
+
+def _priority_of(issue):
+    """P0/P1/… label -> int。没打返回 None（渲染层排最后、不显示徽标）。"""
+    for label in issue.get("labels", []):
+        match = PRIORITY_RE.match(label["name"])
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def _goal_raws(issue, goal_from):

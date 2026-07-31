@@ -199,6 +199,22 @@ def test_collect_puts_summary_into_meta():
     assert nodes["gh:%s#13" % REPO]["meta"]["summary"] == "分层阈值怎么定"
 
 
+def test_priority_label_lands_in_meta():
+    class PrioCtx(FakeCtx):
+        def gh_json(self, args):
+            if "issue" in args and "list" in args:
+                rows = super().gh_json(args)
+                for row in rows:
+                    if row["number"] == 12:
+                        row["labels"] = row["labels"] + [{"name": "P0"}]
+                return rows
+            return super().gh_json(args)
+
+    nodes = {n["id"]: n for n in collect(ctx=PrioCtx())}
+    assert nodes["gh:%s#12" % REPO]["meta"]["priority"] == 0
+    assert nodes["gh:%s#13" % REPO]["meta"]["priority"] is None
+
+
 def test_unknown_goal_from_form_raises():
     try:
         collect(goal_from="magic:xyz")
