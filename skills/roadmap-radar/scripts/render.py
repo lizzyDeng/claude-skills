@@ -17,8 +17,11 @@ import subprocess
 
 import model
 
-FS = 12.5          # 标签像素宽估算的字号基准
-CLIP_LABEL = 300   # 标签最大像素宽
+FS = 10.5          # 节点下方标题的字号（px），像素宽估算基准
+LINE_W = 118       # 标题单行最大像素宽
+MAX_LINES = 2      # 标题最多两行，超出截断加 …
+LABEL_DY = 16      # 圆点中心到第一行标题的垂直距离
+LINE_H = 13        # 标题行高
 DOT_BIN = "dot"
 
 CSS = """
@@ -48,17 +51,23 @@ a { color:inherit; }
 .tag { display:inline-block; font-size:10.5px; padding:0 5px; border-radius:9px;
        border:1px solid var(--line); color:var(--dim); margin-left:6px; }
 
-/* ---- graphviz SVG：几何来自 dot，颜色全在这里 ---- */
+/* ---- graphviz SVG：几何来自 dot，颜色全在这里；标题由 _inject_labels
+       画在圆点正下方（text.nlabel） ---- */
 svg.dag { display:block; margin-top:4px; }
 svg.dag text { fill:var(--fg); }
-svg.dag .node path { fill:var(--card); stroke:var(--todo); stroke-width:1.3; }
-svg.dag .node.todo path { fill:var(--todo); fill-opacity:.13; }
-svg.dag .node.doing path { fill:var(--doing); fill-opacity:.18;
-                                 stroke:var(--doing); }
-svg.dag .node.done path { fill:var(--ok); fill-opacity:.15; stroke:var(--ok); }
-svg.dag .node.done text { fill:var(--dim); text-decoration:line-through; }
-svg.dag .node.frontier path { stroke:var(--bar); stroke-width:2.2; }
-svg.dag .node.ghost path { fill:none; stroke:var(--dim); stroke-dasharray:3 3; }
+svg.dag text.nlabel { font:10.5px -apple-system,BlinkMacSystemFont,"Segoe UI",
+                      "PingFang SC",sans-serif;
+                      paint-order:stroke; stroke:var(--card); stroke-width:3px;
+                      stroke-linejoin:round; }
+svg.dag .node ellipse { fill:var(--card); stroke:var(--todo); stroke-width:1.5; }
+svg.dag .node.todo ellipse { fill:var(--todo); fill-opacity:.25; }
+svg.dag .node.doing ellipse { fill:var(--doing); stroke:var(--doing); }
+svg.dag .node.done ellipse { fill:var(--ok); stroke:var(--ok); }
+svg.dag .node.done text.nlabel { fill:var(--dim);
+                                 text-decoration:line-through; }
+svg.dag .node.frontier ellipse { stroke:var(--bar); stroke-width:2.4; }
+svg.dag .node.ghost ellipse { fill:none; stroke:var(--dim);
+                              stroke-dasharray:3 3; }
 svg.dag .node.ghost text { fill:var(--dim); }
 svg.dag .edge path { fill:none; stroke:var(--edge); stroke-width:1.3; }
 svg.dag .edge polygon { fill:var(--edge); stroke:var(--edge); }
@@ -115,15 +124,25 @@ def _text_w(text, size=FS):
     return width
 
 
-def _clip(text, max_w=CLIP_LABEL):
-    if _text_w(text) <= max_w:
-        return text
-    out = ""
+def _wrap(text, line_w=LINE_W, max_lines=MAX_LINES):
+    """标题 → 最多 max_lines 行（按估算像素宽断行），超出截断加 …。"""
+    lines = []
+    cur = ""
     for ch in text:
-        if _text_w(out + ch) > max_w - FS:
-            return out + "…"
-        out += ch
-    return out
+        if _text_w(cur + ch) > line_w:
+            lines.append(cur)
+            if len(lines) == max_lines:
+                last = lines[-1]
+                while last and _text_w(last + "…") > line_w:
+                    last = last[:-1]
+                lines[-1] = last + "…"
+                return lines
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 def _is_done(node):
@@ -215,42 +234,46 @@ def _stray_section(strays, by_id):
 # ---------------- DOT 生成 + graphviz 渲染 ----------------
 
 def _dag_svg(members, by_id, anchors=True):
-    return _dot_to_svg(_to_dot(members, by_id, anchors))
-
-
-def _to_dot(members, by_id, anchors=True):
-    """成员 + 泳道外幽灵前置票 → DOT。布局交给 graphviz，颜色只打 class。
-
-    anchors=True 时合成「开始 ▸ … ▸ 完成」两个锚点：开始连所有无前置的
-    节点、所有末端节点汇入完成 —— 一条泳道于是有唯一的入口和出口，
-    完成节点带 done/total，全完成时变绿。散票区不加锚（本来就零散）。
-    """
     ids = {m["id"] for m in members}
     ghosts = {}
     for m in members:
         for b in (m["meta"] or {}).get("blocked_by") or []:
             if b not in ids and b not in ghosts:
                 ghosts[b] = by_id.get(b) or model.node(b, model.KIND_LEAF, b)
+    labels = {m["id"]: _wrap(m["title"]) for m in members}
+    labels.update({gid: _wrap(_ghost_label(g)) for gid, g in ghosts.items()})
+    svg = _dot_to_svg(_to_dot(members, ghosts, anchors))
+    return _inject_labels(svg, labels)
+
+
+def _to_dot(members, ghosts, anchors=True):
+    """成员 + 泳道外幽灵前置票 → DOT。布局交给 graphviz，颜色只打 class。
+
+    节点是**空 label 的小圆**（标题不进盒，渲后由 _inject_labels 精确画在
+    圆点正下方）；nodesep/ranksep 为下方两行标题留出空间。
+    anchors=True 时合成「开始 ▸ … ▸ 完成」两个锚点：开始连所有无前置的
+    节点、所有末端节点汇入完成 —— 一条泳道于是有唯一的入口和出口，
+    完成节点带 done/total，全完成时变绿。散票区不加锚（本来就零散）。
+    """
+    ids = {m["id"] for m in members}
 
     out = ["digraph radar {",
            '  rankdir=LR; bgcolor="transparent";',
            '  pack=true; packmode="array_c1";',
-           '  graph [nodesep=0.1, ranksep=0.6, margin=0.05];',
-           '  node [shape=box, style=rounded, fontsize=11.5, height=0.32,'
-           ' margin="0.14,0.07", fontname="Helvetica,PingFang SC"];',
+           '  graph [nodesep=0.78, ranksep=1.85, margin=0.05];',
+           '  node [shape=circle, label="", width=0.17, height=0.17,'
+           ' fixedsize=true];',
            '  edge [arrowsize=0.7];']
 
     for m in members:
-        out.append('  "%s" [label="%s", class="%s", href="%s",'
-                   ' tooltip="%s"];'
-                   % (_dq(m["id"]), _dq(_clip(m["title"])), _node_class(m),
+        out.append('  "%s" [class="%s", href="%s", tooltip="%s"];'
+                   % (_dq(m["id"]), _node_class(m),
                       _dq(m["url"] or "#"), _dq(_tooltip(m))))
     for gid, ghost in ghosts.items():
-        out.append('  "%s" [label="%s", class="ghost", href="%s",'
-                   ' tooltip="%s"];'
-                   % (_dq(gid), _dq(_ghost_label(ghost)),
-                      _dq(ghost["url"] or "#"), _dq(_tooltip(ghost))))
+        out.append('  "%s" [class="ghost", href="%s", tooltip="%s"];'
+                   % (_dq(gid), _dq(ghost["url"] or "#"), _dq(_tooltip(ghost))))
 
+    member_by_id = {m["id"]: m for m in members}
     known = ids | set(ghosts)
     has_in = set()
     has_out = set()
@@ -258,7 +281,7 @@ def _to_dot(members, by_id, anchors=True):
         for b in (m["meta"] or {}).get("blocked_by") or []:
             if b not in known:
                 continue
-            blocker = by_id.get(b) or ghosts.get(b)
+            blocker = member_by_id.get(b) or ghosts.get(b)
             hot = blocker is not None and not _is_done(blocker)
             out.append('  "%s" -> "%s" [class="dep%s"];'
                        % (_dq(b), _dq(m["id"]), " hot" if hot else ""))
@@ -269,9 +292,12 @@ def _to_dot(members, by_id, anchors=True):
         done_n = sum(1 for m in members if _is_done(m))
         all_done = done_n == len(members)
         out.append('  "__start" [label="开始", shape=circle, class="anchor",'
-                   ' fontsize=10, margin=0, tooltip="起点：从无前置的票开始"];')
+                   ' fixedsize=false, width=0.5, fontsize=10, margin=0,'
+                   ' fontname="Helvetica,PingFang SC",'
+                   ' tooltip="起点：从无前置的票开始"];')
         out.append('  "__end" [label="完成\\n%d/%d", shape=doublecircle,'
-                   ' class="anchor%s", fontsize=10, margin=0,'
+                   ' class="anchor%s", fixedsize=false, width=0.5,'
+                   ' fontsize=10, margin=0, fontname="Helvetica,PingFang SC",'
                    ' tooltip="泳道完成度 %d/%d"];'
                    % (done_n, len(members), " ok" if all_done else "",
                       done_n, len(members)))
@@ -304,7 +330,59 @@ def _ghost_label(node):
     number = (node["meta"] or {}).get("number")
     if number:
         title = "#%s %s" % (number, title)
-    return _clip(title)
+    return title
+
+
+_NODE_G_RE = None   # 延迟编译（模块头不 import re，这里补）
+
+
+def _inject_labels(svg, labels):
+    """把每个节点的标题画在圆点正下方（居中，最多两行）。
+
+    graphviz 的 xlabel 位置不可控，所以标题不进 dot：渲完拿每个节点
+    <g> 块里的 <title>（node id）和第一个 <ellipse> 的圆心，自己插 <text>。
+    锚点（__start/__end）自带盒内 label，跳过。
+    """
+    import re
+    pattern = re.compile(
+        r'(<g id="node\d+" class="node[^"]*">\s*<title>([^<]*)</title>'
+        r'.*?<ellipse[^>]*cx="([-\d.]+)"[^>]*cy="([-\d.]+)"[^>]*/>)',
+        re.S)
+
+    def _unescape(text):
+        return (text.replace("&#45;", "-").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">"))
+
+    def add_label(match):
+        block, node_id = match.group(1), _unescape(match.group(2))
+        lines = labels.get(node_id)
+        if not lines:
+            return block
+        x, y = float(match.group(3)), float(match.group(4))
+        texts = "".join(
+            '<text class="nlabel" x="%.1f" y="%.1f" text-anchor="middle">%s'
+            '</text>' % (x, y + LABEL_DY + i * LINE_H, esc(line))
+            for i, line in enumerate(lines))
+        return block + texts
+
+    return _expand_viewbox(pattern.sub(add_label, svg))
+
+
+def _expand_viewbox(svg, pad_x=58, pad_bottom=42):
+    """注入的下方标题会超出 graphviz 算的画布：左右和底部扩边，防裁切。"""
+    import re
+    match = re.search(r'viewBox="([-\d.]+) ([-\d.]+) ([-\d.]+) ([-\d.]+)"', svg)
+    if not match:
+        return svg
+    minx, miny, width, height = (float(match.group(i)) for i in range(1, 5))
+    new_vb = 'viewBox="%.2f %.2f %.2f %.2f"' % (
+        minx - pad_x, miny, width + pad_x * 2, height + pad_bottom)
+    svg = svg.replace(match.group(0), new_vb, 1)
+    svg = re.sub(r'width="[\d.]+pt"',
+                 'width="%dpt"' % round(width + pad_x * 2), svg, count=1)
+    svg = re.sub(r'height="[\d.]+pt"',
+                 'height="%dpt"' % round(height + pad_bottom), svg, count=1)
+    return svg
 
 
 def _dot_to_svg(dot_text):
