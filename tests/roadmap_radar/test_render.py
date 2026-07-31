@@ -12,79 +12,7 @@ import render  # noqa: E402
 
 GRAPH = json.loads((FIX / "graph.json").read_text(encoding="utf-8"))
 HTML = render.render(GRAPH)
-
-
-def test_is_one_self_contained_document():
-    assert HTML.lstrip().startswith("<!DOCTYPE html>")
-    assert "<style>" in HTML
-    assert "http://" not in HTML.split("<body")[0]      # head 里没有外链
-    assert "<script src=" not in HTML
-
-
-def test_north_star_is_the_banner():
-    head = HTML.split("</header>")[0]
-    assert "日均使用 30 分钟" in head
-
-
-def test_each_goal_renders_a_percentage():
-    assert "12%" in HTML     # obj-3
-    assert "100%" in HTML    # obj-7
-
-
-def test_goal_target_metric_is_shown():
-    assert "免费→付费转化率 &gt;= 8%" in HTML
-
-
-def test_map_shows_done_over_total():
-    assert "1/2" in HTML     # 看广告换额度：#25 closed / #22 open
-
-
-def test_empty_map_is_flagged_not_shown_as_zero_percent():
-    block = _block_containing(HTML, "约会探针《周末在家》")
-    assert "0%" not in block
-    assert "空" in block or "empty" in block
-
-
-def test_frontier_ticket_is_marked():
-    block = _block_containing(HTML, "ads SSV 服务端验证")
-    assert "frontier" in block
-
-
-def test_unassigned_section_lists_orphans_and_dangling_parents():
-    tail = HTML.split('id="unassigned"')[1]
-    assert "ghost-one" in tail
-    assert "embedding 模型独立配 provider" in tail
-    assert "#404" in tail          # 断链证据要显示出来
-
-
-def test_every_node_with_url_is_a_link():
-    assert 'href="https://github.com/hyoteam/aifriends/issues/22"' in HTML
-
-
-def test_html_escapes_titles():
-    graph = {"nodes": [{"id": "g", "kind": "goal", "title": "<script>x</script>",
-                        "url": None, "parent": None, "progress": 0.5, "state": None,
-                        "badges": [], "meta": {}}],
-             "doctor": {"dangling_parents": [], "orphans": [], "empty_groups": [],
-                        "unmapped_status": []}}
-    out = render.render(graph)
-    assert "<script>x</script>" not in out.split("<body")[1]
-    assert "&lt;script&gt;" in out
-
-
-def test_renders_without_north_star_root():
-    """github-issues-only 项目没有北极星节点，也要出得来。"""
-    graph = {"nodes": [
-        {"id": "goal:obj-1", "kind": "goal", "title": "G", "url": None,
-         "parent": None, "progress": 0.5, "state": None, "badges": [], "meta": {}},
-        {"id": "gh:r#1", "kind": "leaf", "title": "T", "url": None,
-         "parent": "goal:obj-1", "progress": 0.5, "state": "open",
-         "badges": [], "meta": {}},
-    ], "doctor": {"dangling_parents": [], "orphans": [], "empty_groups": [],
-                  "unmapped_status": []}}
-    out = render.render(graph)
-    assert "50%" in out
-    assert "G" in out
+REPO = "gh:hyoteam/aifriends"
 
 
 def _block_containing(html, needle):
@@ -96,108 +24,144 @@ def _block_containing(html, needle):
     return html[start:min(ends) if ends else len(html)]
 
 
-def _cx(html, node_id):
-    """节点圆点的 x 坐标（列位置）。"""
+def _cx(html, node_id, lane=None):
+    """节点圆点的 x 坐标（列位置）。lane 限定在某泳道的局部 HTML 里找。"""
+    scope = lane if lane is not None else html
     match = re.search(r'data-id="%s"[^>]*>[^<]*<circle[^>]*cx="([\d.]+)"'
-                      % re.escape(node_id), html)
+                      % re.escape(node_id), scope)
     assert match, node_id
     return float(match.group(1))
 
 
-# --- 圆点连线拓扑图与一句话简介 ---
-
-def test_goal_renders_as_dot_and_line_svg_tree():
-    """每个 goal 一张圆点+连线 SVG，不再是纯文字罗列。"""
-    assert 'class="goal-sec"' in HTML
-    assert '<svg class="tree"' in HTML
-    assert 'class="edge"' in HTML      # 贝塞尔连线
-    assert 'class="dot' in HTML        # 圆点
+def _lane_html(html, needle):
+    """取包含 needle 的那个 <section class="lane">…</section>。"""
+    index = html.index(needle)
+    start = html.rfind('<section class="lane">', 0, index)
+    return html[start:html.index("</section>", index)]
 
 
-def test_child_dot_sits_one_column_right_of_parent_dot():
-    """#22 是 map #14 的子票：子点必须在父点右边一列（拓扑分层）。"""
-    repo = "gh:hyoteam/aifriends"
-    assert _cx(HTML, "%s#14" % repo) < _cx(HTML, "%s#22" % repo)
+def test_is_one_self_contained_document():
+    assert HTML.lstrip().startswith("<!DOCTYPE html>")
+    assert "<style>" in HTML
+    assert "http://" not in HTML.split("<body")[0]      # head 里没有外链
+    assert "<script src=" not in HTML
 
 
-def test_node_summary_one_liner_is_rendered():
+def test_each_containment_root_is_a_lane():
+    assert HTML.count('<section class="lane">') >= 3    # 两张 map + 散票区
+    assert "[map] her live-chat 实施路线" in HTML
+    assert "[map] her 渠道「看广告换额度」" in HTML
+
+
+def test_blocking_chain_layers_left_to_right():
+    """29→32→34 是三层链：列坐标必须严格递增；31 无前置和 29 同列。"""
+    lane = _lane_html(HTML, "live-chat 实施路线")
+    x29 = _cx(HTML, "%s#29" % REPO, lane)
+    x31 = _cx(HTML, "%s#31" % REPO, lane)
+    x32 = _cx(HTML, "%s#32" % REPO, lane)
+    x34 = _cx(HTML, "%s#34" % REPO, lane)
+    assert x29 < x32 < x34
+    assert x31 == x29
+
+
+def test_edges_have_arrowheads_and_hot_marks_open_blockers():
+    lane = _lane_html(HTML, "live-chat 实施路线")
+    assert "marker-end" in lane
+    assert 'class="dep hot"' in lane        # 30 还 open，30→33 是卡住边
+    assert re.search(r'class="dep" marker-end', lane)   # 29 已关，29→32 正常边
+
+
+def test_dot_color_encodes_state():
+    assert '<circle class="done"' in _block_containing(HTML, "C 端接入")
+    assert '<circle class="doing"' in _block_containing(HTML, "ads SSV 服务端验证")
+    block31 = _block_containing(HTML, "决策: live-chat 三个产品口径")
+    assert '<circle class="todo frontier"' in block31
+
+
+def test_frontier_ring_survives_closed_blockers():
+    """#32 的前置 #29 已关 → 可上手，蓝圈还在。"""
+    assert '<circle class="todo frontier"' in \
+        _block_containing(HTML, "sys_config 补 callers.chat")
+
+
+def test_out_of_lane_blocker_appears_as_ghost_dot():
+    """#22 的前置 #29 在另一条泳道 → 本泳道画虚线幽灵点，带票号。"""
+    lane = _lane_html(HTML, "看广告换额度")
+    assert '<circle class="ghost"' in lane
+    assert "#29" in lane
+
+
+def test_strays_land_in_stray_lane_not_dropped():
+    lane = _lane_html(HTML, "散票")
+    assert "随便一个没挂地图的 bug" in lane
+    assert "ghost-one" in lane
+    assert "约会探针《周末在家》" in lane      # 空地图无子票，也落散票区
+
+
+def test_goal_is_a_footnote_not_structure():
+    """forge 已砍：goal 只是泳道 chip + 页脚一行，永远不是泳道/分区标题。"""
+    tail = HTML.split('id="goals"')[1]
+    assert "变现能力" in tail
+    assert "<b>变现能力</b>" not in HTML           # 不是任何泳道的标题
+    assert '<span class="tag">变现能力</span>' in HTML   # 只是 map 头上的小标签
+
+
+def test_doctor_reports_dangling_and_empty():
+    tail = HTML.split('id="doctor"')[1]
+    assert "#404" in tail
+    assert "约会探针《周末在家》" in tail
+
+
+def test_tooltip_carries_summary_and_sections():
+    block = _block_containing(HTML, "spike: 确认 apimart 可用型号清单")
+    assert "是否透传非推理模型" in block                 # 一句话简介进 tooltip
+    lane_head = _lane_html(HTML, "live-chat 实施路线")
+    assert "决策 2" in lane_head                          # map 决策收计数进 tooltip
+    assert "延迟地板 800ms" in lane_head
+
+
+def test_every_node_with_url_is_a_link():
+    assert 'href="https://github.com/hyoteam/aifriends/issues/22"' in HTML
+
+
+def test_html_escapes_titles():
+    graph = {"nodes": [{"id": "x", "kind": "leaf", "title": "<script>x</script>",
+                        "url": None, "parent": None, "progress": 0.5, "state": None,
+                        "badges": [], "meta": {}}],
+             "doctor": {}}
+    out = render.render(graph)
+    assert "<script>x</script>" not in out.split("<body")[1]
+    assert "&lt;script&gt;" in out
+
+
+def test_renders_issue_only_graph_without_any_goal():
     graph = {"nodes": [
-        {"id": "goal:g", "kind": "goal", "title": "G", "url": None, "parent": None,
-         "progress": 0.5, "state": None, "badges": [],
-         "meta": {"summary": "让用户愿意回来"}},
-        {"id": "gh:r#1", "kind": "leaf", "title": "T", "url": None,
-         "parent": "goal:g", "progress": 0.0, "state": "open", "badges": [],
-         "meta": {"summary": "接入 SSV 回调"}},
+        {"id": "gh:r#1", "kind": "group", "title": "M", "url": None,
+         "parent": None, "progress": 0.0, "state": "open", "badges": [],
+         "meta": {}},
+        {"id": "gh:r#2", "kind": "leaf", "title": "T", "url": None,
+         "parent": "gh:r#1", "progress": 0.0, "state": "open",
+         "badges": ["frontier"], "meta": {}},
     ], "doctor": {}}
     out = render.render(graph)
-    assert "让用户愿意回来" in out          # goal head 一句话
-    assert "接入 SSV 回调" in out           # leaf tooltip 一句话
-
-
-def test_map_sections_collapse_to_counts_not_bullet_dump():
-    """决策/迷雾不再逐条罗列，只显示计数，全文进 tooltip。"""
-    graph = {"nodes": [
-        {"id": "goal:g", "kind": "goal", "title": "G", "url": None, "parent": None,
-         "progress": 0.0, "state": None, "badges": [], "meta": {}},
-        {"id": "gh:r#2", "kind": "group", "title": "M", "url": None,
-         "parent": "goal:g", "progress": 0.0, "state": "open", "badges": [],
-         "meta": {"decisions": ["拆两轨", "手填为准"], "fog": ["阈值未定"]}},
-    ], "doctor": {}}
-    out = render.render(graph)
-    assert "决策 2" in out
-    assert "迷雾 1" in out
-    assert "拆两轨" in out          # 全文还在（tooltip），不是丢了
-    assert '<div class="sections">' not in out
-
-
-# --- 未挂载节点不得被丢弃（真数据回归：hyoteam 上 27/94 个节点曾静默消失） ---
-
-UNPARENTED_GRAPH = {
-    "nodes": [
-        {"id": "goal:obj-1", "kind": "goal", "title": "有主的目标", "url": None,
-         "parent": None, "progress": 0.5, "state": None, "badges": [], "meta": {}},
-        {"id": "forge:ok", "kind": "leaf", "title": "有主的 feature", "url": None,
-         "parent": "goal:obj-1", "progress": 0.5, "state": "in_progress",
-         "badges": [], "meta": {}},
-        {"id": "gh:r#28", "kind": "group", "title": "没打 obj label 的地图", "url": None,
-         "parent": None, "progress": 0.5, "state": "open", "badges": [],
-         "meta": {"decisions": [], "fog": []}},
-        {"id": "gh:r#29", "kind": "leaf", "title": "地图下的子票", "url": None,
-         "parent": "gh:r#28", "progress": 0.0, "state": "open",
-         "badges": ["frontier"], "meta": {}},
-        {"id": "gh:r#30", "kind": "leaf", "title": "光票没有家", "url": None,
-         "parent": None, "progress": 0.0, "state": "open",
-         "badges": ["frontier"], "meta": {}},
-    ],
-    "doctor": {"dangling_parents": [], "orphans": [], "empty_groups": [],
-               "unmapped_status": []},
-}
-
-
-def test_unparented_group_keeps_its_whole_subtree():
-    """没打 goal label 的地图不能连带 6 张子票一起消失。"""
-    out = render.render(UNPARENTED_GRAPH)
-    assert "没打 obj label 的地图" in out
-    assert "地图下的子票" in out
-
-
-def test_unparented_leaf_without_orphan_badge_is_shown():
-    """parent 从出生就是 None 的票没有 orphan badge，同样不能丢。"""
-    out = render.render(UNPARENTED_GRAPH)
-    assert "光票没有家" in out
-
-
-def test_unparented_nodes_land_in_the_unassigned_section():
-    out = render.render(UNPARENTED_GRAPH)
-    tail = out.split('id="unassigned"')[1]
-    assert "没打 obj label 的地图" in tail
-    assert "光票没有家" in tail
+    assert "M" in out and "T" in out
+    assert 'id="goals"' not in out
 
 
 def test_no_node_is_ever_dropped_from_html():
     """契约：图里每个节点的标题都必须出现在 HTML 里。"""
-    import html as html_mod
-    for graph in (GRAPH, UNPARENTED_GRAPH):
-        out = render.render(graph)
-        for node in graph["nodes"]:
-            assert html_mod.escape(node["title"], quote=True) in out, node["id"]
+    for node in GRAPH["nodes"]:
+        assert html_mod.escape(node["title"], quote=True) in HTML, node["id"]
+
+
+def test_dependency_cycle_does_not_hang_render():
+    graph = {"nodes": [
+        {"id": "gh:r#1", "kind": "leaf", "title": "A", "url": None, "parent": None,
+         "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"blocked_by": ["gh:r#2"]}},
+        {"id": "gh:r#2", "kind": "leaf", "title": "B", "url": None, "parent": None,
+         "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"blocked_by": ["gh:r#1"]}},
+    ], "doctor": {}}
+    out = render.render(graph)
+    assert "A" in out and "B" in out

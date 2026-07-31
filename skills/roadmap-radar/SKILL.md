@@ -5,12 +5,16 @@ description: Use when the user wants to see the topology and progress of a proje
 
 # roadmap-radar
 
-把 forge roadmap 和 wayfinder GitHub issue 合成一张自包含 HTML（每个 goal 一张
-「圆点 + 连线」的 tidy tree 拓扑图，SVG 由 Python 直接算好，零 JS），回答三个问题：
+把 GitHub issue 的**先后依赖关系**（native blocking）渲成一张自包含 HTML：
+每个 map / 带子票的上游票一条「泳道」，泳道内按 longest-path 分层 ——
+无前置的票在第 0 列，被 block 的票在其所有前置右边，箭头 = 先做左边才能做右边。
+圆点 + 连线，SVG 由 Python 直接算好，零 JS。回答三个问题：
 
-1. 每个 goal 整体走到哪了（跨 feature + issue 的 rollup）
-2. 现在能动的是哪张票（frontier）
-3. 什么东西没归位（孤儿 feature / 无 goal 的 issue / 迁仓断链）
+1. 一张 map 里的票谁先谁后、几条链在哪汇聚
+2. 现在能动的是哪张票（frontier = 前置全关 + 没人认领，灰点蓝圈）
+3. 什么在卡（红箭头 = open blocker）、什么没归位（散票 / 迁仓断链）
+
+颜色：绿=已关、橘=正在做（有认领）、灰=未开始；泳道外的前置票画虚线幽灵点。
 
 ## 用法
 
@@ -45,9 +49,11 @@ python3 $SCRIPT --root /path/to/project --config /tmp/that.radar.json --out /tmp
 
 ## 关键行为
 
-- **goal id 跨 source 统一成 `goal:<raw>`** —— forge 的 `obj-3` 和 GitHub label `obj-3` 因此合成同一个节点，这是 goal 进度能跨两个数据源的机制。
-- **层级 = GitHub sub-issues，一次分页 GraphQL 拉全仓的边** —— 子票挂在上游 issue 下（不只挂 map 下、任意深度）也能建出链；跨仓子票被过滤（拿 number 撞本仓会乱挂）。有子票的票不算 frontier。
-- **节点标题/一句话简介/决策全文在 hover tooltip** —— 图面只放圆点、截断标题和 done/total 计数；一句话简介 = issue body 首个有效行 / forge objective 的 description。
+- **先后边 = GitHub native blocking，逐票拉 `/dependencies/blocked_by` 全列表**（含已关票 —— 链条历史不完整会看不懂一张票为什么能动）；正文里文字写的「依赖 #x」不解析（噪音）。跨仓 blocker 被过滤。
+- **归属边 = GitHub sub-issues，一次分页 GraphQL 拉全仓** —— 只用来分泳道（谁属于哪张 map），不参与先后布局；子票挂上游 issue 下（任意深度）也认。
+- **frontier = open + 无认领 + 自己没子票 + 前置全关**，和 DAG 语义合一。
+- **goal 已降级为标签**：不再是页面结构（forge 解耦）。issue 有 obj label 时 goal 只出现在泳道 chip 和页脚一行；forge source 仍可配（其 feature 会落散票区），但默认建议不配。
+- **节点标题/一句话简介/决策全文在 hover tooltip** —— 图面只放圆点和截断标题；一句话简介 = issue body 首个有效行。
 - **进度每层等权** —— 一张 6 票的 map 和一个 feature 在 goal 眼里各算一票。
 - **空地图不显示 0%**，显示「空」并且不把父级分母拉大。
 - **未映射的状态词不当 0%**，返回未知并在体检里报出来。

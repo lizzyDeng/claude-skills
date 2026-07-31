@@ -12,8 +12,18 @@ from sources import github_issues  # noqa: E402
 REPO = "hyoteam/aifriends"
 
 
+SAME_REPO_URL = "https://api.github.com/repos/hyoteam/aifriends"
+
+
+def dep(number, state="open", repo_url=SAME_REPO_URL):
+    return {"number": number, "state": state, "repository_url": repo_url}
+
+
 class FakeCtx:
-    """录制回放：把 gh 调用按 args 特征映射到 fixture。"""
+    """录制回放：把 gh 调用按 args 特征映射到 fixture。
+
+    deps = {票号: [dep(...), ...]} —— /dependencies/blocked_by 的回放数据。
+    """
 
     def __init__(self, deps=None):
         self.deps = deps or {}
@@ -30,11 +40,9 @@ class FakeCtx:
         if "graphql" in args:
             return json.loads(
                 (FIX / "gh_graphql_sub_issues.json").read_text(encoding="utf-8"))
-        if "/issues/" in joined:
-            number = int(joined.rsplit("/issues/", 1)[1])
-            return {"number": number,
-                    "issue_dependencies_summary": {
-                        "blocked_by": self.deps.get(number, 0)}}
+        if "/dependencies/blocked_by" in joined:
+            number = int(joined.rsplit("/issues/", 1)[1].split("/")[0])
+            return self.deps.get(number, [])
         raise AssertionError("unexpected gh call: %r" % (args,))
 
 
@@ -99,27 +107,46 @@ def test_cross_repo_sub_issues_are_filtered_out():
     assert not [n for n in nodes if n["parent"] == map14]
 
 
-def test_blocked_issue_is_not_frontier():
-    ctx = FakeCtx(deps={13: 1})
+def test_open_blocker_marks_blocked_and_kills_frontier():
+    ctx = FakeCtx(deps={30: [dep(16, "open")]})
     nodes = {n["id"]: n for n in collect(ctx=ctx, fetch_dependencies=True)}
-    assert "blocked" in nodes["gh:%s#13" % REPO]["badges"]
-    assert "frontier" not in nodes["gh:%s#13" % REPO]["badges"]
+    node = nodes["gh:%s#30" % REPO]
+    assert node["meta"]["blocked_by"] == ["gh:%s#16" % REPO]
+    assert "blocked" in node["badges"]
+    assert "frontier" not in node["badges"]
+
+
+def test_closed_blockers_keep_edge_but_not_blocked():
+    """前置全关 = 链条历史仍在（画绿点），但票可上手。"""
+    ctx = FakeCtx(deps={30: [dep(25, "closed")]})
+    nodes = {n["id"]: n for n in collect(ctx=ctx, fetch_dependencies=True)}
+    node = nodes["gh:%s#30" % REPO]
+    assert node["meta"]["blocked_by"] == ["gh:%s#25" % REPO]
+    assert "blocked" not in node["badges"]
+    assert "frontier" in node["badges"]
+
+
+def test_cross_repo_blockers_are_filtered_out():
+    ctx = FakeCtx(deps={30: [dep(30, "open",
+                               "https://api.github.com/repos/other/repo")]})
+    nodes = {n["id"]: n for n in collect(ctx=ctx, fetch_dependencies=True)}
+    assert "blocked_by" not in nodes["gh:%s#30" % REPO]["meta"]
 
 
 def test_dependencies_not_fetched_by_default_keeps_call_count_low():
     ctx = FakeCtx()
     collect(ctx=ctx)
-    assert not any("/issues/" in " ".join(a) and "/sub_issues" not in " ".join(a)
-                   for a in ctx.calls)
+    assert not any("/dependencies/" in " ".join(a) for a in ctx.calls)
 
 
-def test_dependency_fetch_only_targets_open_sub_issue_children():
+def test_dependency_fetch_covers_every_issue_including_closed():
+    """已关票的前置也要拉 —— 链条历史不完整会看不懂一张票为什么能动。"""
     ctx = FakeCtx()
     collect(ctx=ctx, fetch_dependencies=True)
-    probed = [a for a in ctx.calls
-              if "/issues/" in " ".join(a) and "/sub_issues" not in " ".join(a)]
-    numbers = {int(" ".join(a).rsplit("/issues/", 1)[1]) for a in probed}
-    assert numbers == {13, 30}   # 22/16 不是任何票的子票；25 已关；99 无 goal
+    probed = [a for a in ctx.calls if "/dependencies/blocked_by" in " ".join(a)]
+    numbers = {int(" ".join(a).rsplit("/issues/", 1)[1].split("/")[0])
+               for a in probed}
+    assert numbers == {12, 13, 14, 16, 22, 25, 30, 99}
 
 
 def test_issue_without_goal_or_parent_is_kept_not_dropped():

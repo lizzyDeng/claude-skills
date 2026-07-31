@@ -3,7 +3,10 @@
 goal 从 label 正则或 milestone 来；层级从 GitHub sub-issues 来 ——
 一次分页 GraphQL 拉全仓 sub-issue 边，所以子票挂在上游 issue 下（任意深度）
 也能建出父子链，不只挂在 map 下。
-frontier = open + 无 assignee + 无 open blocker + 自己没有子票。
+先后关系 = GitHub native blocking：fetch_dependencies 开着时逐票
+（含已关的，链条历史要完整）拉 /dependencies/blocked_by 全列表，
+存进 meta.blocked_by（node id 列表，同仓过滤）。
+frontier = open + 无 assignee + 自己没子票 + 所有前置 blocker 都已关。
 """
 
 import re
@@ -102,16 +105,22 @@ def collect(config, ctx):
             target["parent"] = parent_node["id"]
             child_numbers.add(child_number)
 
-    # blocker：只查 group 名下的 open 子票，避免 N 次 API
+    # 先后边：native blocking，逐票拉全列表（含已关票 —— 链条历史要完整）
     blocked = set()
     if fetch_deps:
-        for number in sorted(child_numbers):
+        for number in sorted(by_number):
             node = by_number[number]
-            if node["state"] != "open":
+            rows = ctx.gh_json([
+                "api", "repos/%s/issues/%s/dependencies/blocked_by" % (repo, number)
+            ]) or []
+            blockers = [r for r in rows
+                        if (r.get("repository_url") or "/repos/%s" % repo)
+                        .endswith("/repos/%s" % repo)]
+            if not blockers:
                 continue
-            detail = ctx.gh_json(["api", "repos/%s/issues/%s" % (repo, number)]) or {}
-            summary = detail.get("issue_dependencies_summary") or {}
-            if summary.get("blocked_by", 0) > 0:
+            node["meta"]["blocked_by"] = [nid(r["number"]) for r in blockers]
+            if node["state"] == "open" and any(
+                    str(r.get("state", "")).lower() == "open" for r in blockers):
                 blocked.add(number)
                 node["badges"].append("blocked")
 

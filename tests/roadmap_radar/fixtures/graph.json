@@ -1,53 +1,253 @@
 {
-  "nodes": [
-    {"id": "forge:north-star", "kind": "goal", "title": "日均使用 30 分钟的 AI 情感陪伴平台",
-     "url": null, "parent": null, "progress": 0.46, "state": null,
-     "badges": [], "meta": {"kind": "north-star"}},
-    {"id": "goal:obj-3", "kind": "goal", "title": "变现能力", "url": null,
-     "parent": "forge:north-star", "progress": 0.12, "state": null, "badges": [],
-     "meta": {"target_metric": "免费→付费转化率 >= 8%"}},
-    {"id": "goal:obj-7", "kind": "goal", "title": "工程健康", "url": null,
-     "parent": "forge:north-star", "progress": 1.0, "state": null, "badges": [],
-     "meta": {"target_metric": "无 >300 LOC 巨石函数"}},
-    {"id": "gh:hyoteam/aifriends#8", "kind": "group", "title": "约会探针《周末在家》",
-     "url": "https://github.com/hyoteam/aifriends/issues/8", "parent": "goal:obj-3",
-     "progress": null, "state": "open", "badges": ["empty", "no-count"],
-     "meta": {"decisions": ["挂 obj-3 变现"], "fog": ["准入门三条未出结论"],
-              "out_of_scope": []}},
-    {"id": "gh:hyoteam/aifriends#14", "kind": "group", "title": "看广告换额度",
-     "url": "https://github.com/hyoteam/aifriends/issues/14", "parent": "goal:obj-3",
-     "progress": 0.5, "state": "open", "badges": [],
-     "meta": {"decisions": [], "fog": [], "out_of_scope": []}},
-    {"id": "gh:hyoteam/aifriends#22", "kind": "leaf", "title": "ads SSV 服务端验证",
-     "url": "https://github.com/hyoteam/aifriends/issues/22",
-     "parent": "gh:hyoteam/aifriends#14", "progress": 0.0, "state": "open",
-     "badges": ["frontier"], "meta": {}},
-    {"id": "gh:hyoteam/aifriends#25", "kind": "leaf", "title": "C 端接入",
-     "url": "https://github.com/hyoteam/aifriends/issues/25",
-     "parent": "gh:hyoteam/aifriends#14", "progress": 1.0, "state": "closed",
-     "badges": [], "meta": {}},
-    {"id": "forge:weekend-date-foundation", "kind": "leaf", "title": "Weekend Date Foundation",
-     "url": null, "parent": "goal:obj-3", "progress": 0.0, "state": "draft",
-     "badges": [], "meta": {}},
-    {"id": "forge:chat-route-service-extraction", "kind": "leaf",
-     "title": "Chat Route Service Extraction", "url": null, "parent": "goal:obj-7",
-     "progress": 1.0, "state": "concluded", "badges": [], "meta": {}},
-    {"id": "forge:ghost-one", "kind": "leaf", "title": "ghost-one", "url": null,
-     "parent": null, "progress": null, "state": null,
-     "badges": ["orphan", "no-count"],
-     "meta": {"reason": "features/ 有目录但不在 roadmap 里"}},
-    {"id": "gh:hyoteam/aifriends#16", "kind": "leaf",
-     "title": "embedding 模型独立配 provider",
-     "url": "https://github.com/hyoteam/aifriends/issues/16", "parent": null,
-     "progress": 0.0, "state": "open", "badges": ["orphan", "frontier"], "meta": {}}
-  ],
-  "doctor": {
-    "dangling_parents": [{"id": "gh:hyoteam/aifriends#16",
-                          "title": "embedding 模型独立配 provider",
-                          "missing_parent": "gh:hyoteam/aifriends#404"}],
-    "orphans": [{"id": "forge:ghost-one", "title": "ghost-one"},
-                {"id": "gh:hyoteam/aifriends#16", "title": "embedding"}],
-    "empty_groups": [{"id": "gh:hyoteam/aifriends#8", "title": "约会探针《周末在家》"}],
-    "unmapped_status": []
+ "nodes": [
+  {
+   "id": "goal:obj-3",
+   "kind": "goal",
+   "title": "变现能力",
+   "url": null,
+   "parent": null,
+   "progress": null,
+   "state": null,
+   "badges": [],
+   "meta": {
+    "summary": "免费用户转付费"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#28",
+   "kind": "group",
+   "title": "[map] her live-chat 实施路线",
+   "url": "https://github.com/hyoteam/aifriends/issues/28",
+   "parent": null,
+   "progress": 0.17,
+   "state": "open",
+   "badges": [],
+   "meta": {
+    "number": 28,
+    "summary": "实时语音通话可行性已探明 → 实施",
+    "decisions": [
+     "延迟地板 800ms",
+     "语音走 apimart 透传"
+    ],
+    "fog": [
+     "语音历史入库口径"
+    ]
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#29",
+   "kind": "leaf",
+   "title": "spike: 确认 apimart 可用型号清单",
+   "url": "https://github.com/hyoteam/aifriends/issues/29",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 1.0,
+   "state": "closed",
+   "badges": [],
+   "meta": {
+    "number": 29,
+    "summary": "是否透传非推理模型"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#30",
+   "kind": "leaf",
+   "title": "spike: 流式与工具互斥方案设计",
+   "url": "https://github.com/hyoteam/aifriends/issues/30",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "claimed:lizzydeng"
+   ],
+   "meta": {
+    "number": 30,
+    "summary": "her 主聊天真流式化方案"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#31",
+   "kind": "leaf",
+   "title": "决策: live-chat 三个产品口径",
+   "url": "https://github.com/hyoteam/aifriends/issues/31",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "frontier"
+   ],
+   "meta": {
+    "number": 31
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#32",
+   "kind": "leaf",
+   "title": "sys_config 补 callers.chat",
+   "url": "https://github.com/hyoteam/aifriends/issues/32",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "frontier"
+   ],
+   "meta": {
+    "number": 32,
+    "blocked_by": [
+     "gh:hyoteam/aifriends#29"
+    ],
+    "summary": "主聊天模型脱离 env"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#33",
+   "kind": "leaf",
+   "title": "her 主聊天真流式化",
+   "url": "https://github.com/hyoteam/aifriends/issues/33",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "blocked"
+   ],
+   "meta": {
+    "number": 33,
+    "blocked_by": [
+     "gh:hyoteam/aifriends#30"
+    ]
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#34",
+   "kind": "leaf",
+   "title": "半双工语音 MVP",
+   "url": "https://github.com/hyoteam/aifriends/issues/34",
+   "parent": "gh:hyoteam/aifriends#28",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "blocked"
+   ],
+   "meta": {
+    "number": 34,
+    "blocked_by": [
+     "gh:hyoteam/aifriends#31",
+     "gh:hyoteam/aifriends#32",
+     "gh:hyoteam/aifriends#33"
+    ],
+    "summary": "按住说话,不碰 persona 拆分"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#14",
+   "kind": "group",
+   "title": "[map] her 渠道「看广告换额度」",
+   "url": "https://github.com/hyoteam/aifriends/issues/14",
+   "parent": "goal:obj-3",
+   "progress": 0.5,
+   "state": "open",
+   "badges": [],
+   "meta": {
+    "number": 14,
+    "summary": "激励视频 → credits"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#22",
+   "kind": "leaf",
+   "title": "ads SSV 服务端验证",
+   "url": "https://github.com/hyoteam/aifriends/issues/22",
+   "parent": "gh:hyoteam/aifriends#14",
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "claimed:lizzydeng"
+   ],
+   "meta": {
+    "number": 22,
+    "blocked_by": [
+     "gh:hyoteam/aifriends#29"
+    ],
+    "summary": "AdMob 回调端点"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#25",
+   "kind": "leaf",
+   "title": "C 端接入",
+   "url": "https://github.com/hyoteam/aifriends/issues/25",
+   "parent": "gh:hyoteam/aifriends#14",
+   "progress": 1.0,
+   "state": "closed",
+   "badges": [],
+   "meta": {
+    "number": 25
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#8",
+   "kind": "group",
+   "title": "[map] 约会探针《周末在家》",
+   "url": "https://github.com/hyoteam/aifriends/issues/8",
+   "parent": null,
+   "progress": null,
+   "state": "open",
+   "badges": [
+    "empty",
+    "no-count"
+   ],
+   "meta": {
+    "number": 8
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#99",
+   "kind": "leaf",
+   "title": "随便一个没挂地图的 bug",
+   "url": "https://github.com/hyoteam/aifriends/issues/99",
+   "parent": null,
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "frontier"
+   ],
+   "meta": {
+    "number": 99,
+    "summary": "boom"
+   }
+  },
+  {
+   "id": "gh:hyoteam/aifriends#7",
+   "kind": "leaf",
+   "title": "ghost-one",
+   "url": "https://github.com/hyoteam/aifriends/issues/7",
+   "parent": null,
+   "progress": 0.0,
+   "state": "open",
+   "badges": [
+    "orphan"
+   ],
+   "meta": {
+    "number": 7,
+    "missing_parent": "gh:hyoteam/aifriends#404"
+   }
   }
+ ],
+ "doctor": {
+  "dangling_parents": [
+   {
+    "id": "gh:hyoteam/aifriends#7",
+    "title": "ghost-one",
+    "missing_parent": "gh:hyoteam/aifriends#404"
+   }
+  ],
+  "orphans": [],
+  "no_goal": [],
+  "empty_groups": [
+   {
+    "id": "gh:hyoteam/aifriends#8",
+    "title": "[map] 约会探针《周末在家》"
+   }
+  ],
+  "unmapped_status": []
+ }
 }
