@@ -19,6 +19,7 @@ import webbrowser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import collect as collect_mod  # noqa: E402
+import priority as priority_mod  # noqa: E402
 import render as render_mod  # noqa: E402
 from sources import REGISTRY  # noqa: E402
 
@@ -40,6 +41,12 @@ class Ctx:
             raise RuntimeError("gh %s failed: %s" % (" ".join(args), proc.stderr.strip()))
         text = proc.stdout.strip()
         return json.loads(text) if text else []
+
+    def gh_run(self, args):
+        """写操作（label/edit），不解析输出。"""
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("gh %s failed: %s" % (" ".join(args), proc.stderr.strip()))
 
 
 def load_config(root, explicit):
@@ -83,7 +90,21 @@ def main(argv=None):
     parser.add_argument("--from", dest="from_graph")
     parser.add_argument("--doctor", action="store_true")
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--set-priority", metavar='"36=P0,28=P1"',
+                        help="给票打优先级 label（写操作，和展示分开）；"
+                             "会替换票上已有的 P<n> label")
     args = parser.parse_args(argv)
+
+    if args.set_priority:
+        assignments = priority_mod.parse_assignments(args.set_priority)
+        config = load_config(args.root, args.config)
+        repo = priority_mod.repo_from_config(config)
+        summary = priority_mod.set_priorities(Ctx(args.root), repo, assignments)
+        for number, old, new in summary:
+            change = ("%s → %s" % (old, new)) if old else new
+            print("#%d ← %s" % (number, change))
+        print("已写入 %s。重跑 radar 生效。" % repo)
+        return 0
 
     if args.from_graph:
         with open(args.from_graph, encoding="utf-8") as handle:

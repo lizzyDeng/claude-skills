@@ -52,7 +52,12 @@ python3 $SCRIPT --root /path/to/project --config /tmp/that.radar.json --out /tmp
 - **先后边 = GitHub native blocking，逐票拉 `/dependencies/blocked_by` 全列表**（含已关票 —— 链条历史不完整会看不懂一张票为什么能动）；正文里文字写的「依赖 #x」不解析（噪音）。跨仓 blocker 被过滤。
 - **归属边 = GitHub sub-issues，一次分页 GraphQL 拉全仓** —— 只用来分泳道（谁属于哪张 map），不参与先后布局；子票挂上游 issue 下（任意深度）也认。
 - **frontier = open + 无认领 + 自己没子票 + 前置全关**，和 DAG 语义合一。
-- **泳道优先级 = map 票上的 `P0`–`P9` label**：泳道按优先级排序（P0 最前），泳道头显示色阶徽标（P0 红 / P1 橘 / P2 蓝 / 其余灰）；没打 label 的泳道排最后、无徽标。优先级是产品决策，radar 只读不造。
+- **泳道优先级 = map 票上的 `P0`–`P9` label**：泳道按优先级排序（P0 最前），泳道头显示色阶徽标（P0 红 / P1 橘 / P2 蓝 / 其余灰）；没打 label 的泳道排最后、无徽标。
+- **打优先级和展示分开**：优先级是讨论后的产品决策，radar 不猜。定了之后一条命令写入：
+  ```bash
+  python3 $SCRIPT --set-priority "36=P0,28=P1,14=P2"   # 替换票上旧的 P<n>，label 不存在自动建
+  ```
+  重跑 radar 生效。
 - **goal 已降级为标签**：不再是页面结构（forge 解耦）。issue 有 obj label 时 goal 只出现在泳道 chip 和页脚一行；forge source 仍可配（其 feature 会落散票区），但默认建议不配。
 - **节点标题/一句话简介/决策全文在 hover tooltip** —— 图面只放圆点和截断标题；一句话简介 = issue body 首个有效行。
 - **进度每层等权** —— 一张 6 票的 map 和一个 feature 在 goal 眼里各算一票。
