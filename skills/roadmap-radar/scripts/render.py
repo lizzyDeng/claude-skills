@@ -63,8 +63,8 @@ svg.dag .node ellipse { fill:var(--card); stroke:var(--todo); stroke-width:1.5; 
 svg.dag .node.todo ellipse { fill:var(--todo); fill-opacity:.25; }
 svg.dag .node.doing ellipse { fill:var(--doing); stroke:var(--doing); }
 svg.dag .node.done ellipse { fill:var(--ok); stroke:var(--ok); }
-svg.dag .node.done text.nlabel { fill:var(--dim);
-                                 text-decoration:line-through; }
+/* 已完成只靠绿点表达；标题划删除线会和穿行的边线叠成一团不可读 */
+svg.dag .node.done text.nlabel { fill:var(--dim); }
 svg.dag .node.frontier ellipse { stroke:var(--bar); stroke-width:2.4; }
 svg.dag .node.ghost ellipse { fill:none; stroke:var(--dim);
                               stroke-dasharray:3 3; }
