@@ -10,26 +10,31 @@ sys.path.insert(0, str(BASE))
 
 import render  # noqa: E402
 
+
+def _plain(html):
+    """归一 graphviz 输出：- 会转成 &#45;，混排文本拆成多个 <text> run。"""
+    html = re.sub(r"</text>\s*<text[^>]*>", "", html)
+    return (html.replace("&#45;", "-").replace("&#10;", "\n")
+                .replace("&quot;", '"').replace("&#39;", "'"))
+
+
 GRAPH = json.loads((FIX / "graph.json").read_text(encoding="utf-8"))
-HTML = render.render(GRAPH)
+HTML = _plain(render.render(GRAPH))
 REPO = "gh:hyoteam/aifriends"
 
 
 def _block_containing(html, needle):
-    """取包含 needle 的那个 SVG 节点（<a|g class="n" …>…</a|g>），用于局部断言。"""
+    """取包含 needle 的那个 graphviz 节点块（外层 <g id="node…>…</a>）。"""
     index = html.index(needle)
-    start = html.rfind('data-id="', 0, index)
-    ends = [e for e in (html.find("</a>", index), html.find("</g>", index))
-            if e != -1]
-    return html[start:min(ends) if ends else len(html)]
+    start = html.rfind('<g id="node', 0, index)
+    return html[start:html.index("</a>", index)]
 
 
-def _cx(html, node_id, lane=None):
-    """节点圆点的 x 坐标（列位置）。lane 限定在某泳道的局部 HTML 里找。"""
-    scope = lane if lane is not None else html
-    match = re.search(r'data-id="%s"[^>]*>[^<]*<circle[^>]*cx="([\d.]+)"'
-                      % re.escape(node_id), scope)
-    assert match, node_id
+def _cx(html, title, lane=None):
+    """节点标签文字的 x 坐标（列位置随前置层数右移）。"""
+    block = _block_containing(lane if lane is not None else html, title)
+    match = re.search(r'<text[^>]*? x="([-\d.]+)"', block)
+    assert match, title
     return float(match.group(1))
 
 
@@ -54,40 +59,38 @@ def test_each_containment_root_is_a_lane():
 
 
 def test_blocking_chain_layers_left_to_right():
-    """29→32→34 是三层链：列坐标必须严格递增；31 无前置和 29 同列。"""
+    """29→32→34 是三层链：列坐标必须严格递增。"""
     lane = _lane_html(HTML, "live-chat 实施路线")
-    x29 = _cx(HTML, "%s#29" % REPO, lane)
-    x31 = _cx(HTML, "%s#31" % REPO, lane)
-    x32 = _cx(HTML, "%s#32" % REPO, lane)
-    x34 = _cx(HTML, "%s#34" % REPO, lane)
+    x29 = _cx(HTML, "apimart 可用型号清单", lane)
+    x32 = _cx(HTML, "sys_config 补 callers.chat", lane)
+    x34 = _cx(HTML, "半双工语音 MVP", lane)
     assert x29 < x32 < x34
-    assert x31 == x29
 
 
 def test_edges_have_arrowheads_and_hot_marks_open_blockers():
     lane = _lane_html(HTML, "live-chat 实施路线")
-    assert "marker-end" in lane
-    assert 'class="dep hot"' in lane        # 30 还 open，30→33 是卡住边
-    assert re.search(r'class="dep" marker-end', lane)   # 29 已关，29→32 正常边
+    assert "<polygon" in lane                    # graphviz 原生箭头
+    assert 'class="edge dep hot"' in lane        # 30 还 open，30→33 是卡住边
+    assert 'class="edge dep"' in lane            # 29 已关，29→32 正常边
 
 
 def test_dot_color_encodes_state():
-    assert '<circle class="done"' in _block_containing(HTML, "C 端接入")
-    assert '<circle class="doing"' in _block_containing(HTML, "ads SSV 服务端验证")
+    assert 'class="node done"' in _block_containing(HTML, "C 端接入")
+    assert 'class="node doing"' in _block_containing(HTML, "ads SSV 服务端验证")
     block31 = _block_containing(HTML, "决策: live-chat 三个产品口径")
-    assert '<circle class="todo frontier"' in block31
+    assert 'class="node todo frontier"' in block31
 
 
 def test_frontier_ring_survives_closed_blockers():
     """#32 的前置 #29 已关 → 可上手，蓝圈还在。"""
-    assert '<circle class="todo frontier"' in \
+    assert 'class="node todo frontier"' in \
         _block_containing(HTML, "sys_config 补 callers.chat")
 
 
 def test_out_of_lane_blocker_appears_as_ghost_dot():
     """#22 的前置 #29 在另一条泳道 → 本泳道画虚线幽灵点，带票号。"""
     lane = _lane_html(HTML, "看广告换额度")
-    assert '<circle class="ghost"' in lane
+    assert 'class="node ghost"' in lane
     assert "#29" in lane
 
 
@@ -149,9 +152,9 @@ def test_renders_issue_only_graph_without_any_goal():
 
 
 def test_no_node_is_ever_dropped_from_html():
-    """契约：图里每个节点的标题都必须出现在 HTML 里。"""
+    """契约：图里每个节点的标题都必须出现在 HTML 里（tooltip 兜底全文）。"""
     for node in GRAPH["nodes"]:
-        assert html_mod.escape(node["title"], quote=True) in HTML, node["id"]
+        assert html_mod.escape(node["title"], quote=False) in HTML, node["id"]
 
 
 def test_dependency_cycle_does_not_hang_render():

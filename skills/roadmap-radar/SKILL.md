@@ -65,4 +65,5 @@ python3 $SCRIPT --root /path/to/project --config /tmp/that.radar.json --out /tmp
 ## 前置
 
 - `gh` CLI 已登录（只有 GitHub source 需要）
-- Python 3，零第三方依赖
+- Python 3，零 pip 依赖
+- **graphviz**（`brew install graphviz`）—— DAG 布局引擎，构建期跑 `dot -Tsvg`，页面本身仍是零 JS 静态 SVG

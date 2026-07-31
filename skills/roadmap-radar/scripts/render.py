@@ -1,34 +1,32 @@
 """Node 图 -> 单文件 HTML。域无关：只认 Node 的字段，不认业务。
 
 主视图 = issue 先后依赖 DAG（native blocking）：
-每个 containment 根（map / 带子票的上游票）一条「泳道」，泳道内按
-longest-path 分层 —— 无前置的票在第 0 列，被 block 的票 = max(前置列)+1，
-箭头从左指右（先做的在左）。圆点 + 贝塞尔连线，Python 直出 SVG，零 JS。
+每个 containment 根（map / 带子票的上游票）一条「泳道」，泳道内的布局
+外包给 Graphviz（rankdir=LR：无前置的票在左，被 block 的票在其前置右边，
+箭头 = 先做左边才能做右边）。dot 在**构建期**跑，页面仍是零 JS 的静态 SVG。
 
-颜色语义（点）：绿=已关，橘=正在做（有认领），灰=未开始；
-frontier（前置全关 + 没人认领）在灰点外加蓝圈；
-被 open blocker 卡住用红色箭头表达 —— 卡住是边的事实，不占点的颜色。
-泳道外的前置票画成虚线幽灵点（跨泳道边不跨 SVG，就地给上下文）。
+颜色语义（盒）：绿=已关，橘=正在做（有认领），灰=未开始；
+frontier（前置全关 + 没人认领）加蓝色粗边框；
+被 open blocker 卡住用红色箭头表达 —— 卡住是边的事实，不占盒的颜色。
+泳道外的前置票画成虚线幽灵盒（跨泳道边不跨 SVG，就地给上下文）。
+所有颜色都由页面 CSS class 控制（dot 不烘颜色），暗色模式自动适配。
 """
 
 import html as html_mod
+import subprocess
 
 import model
 
-FS = 12.5          # 标签字号（px），布局宽度估算基于它
-ROW = 26           # 行高
-PAD = 16           # SVG 四周留白
-R = 5              # 圆点半径
-LABEL_PAD = 8      # 圆点到标签的间距
-GAP_MIN = 80       # 相邻两列的最小间距
+FS = 12.5          # 标签像素宽估算的字号基准
 CLIP_LABEL = 300   # 标签最大像素宽
+DOT_BIN = "dot"
 
 CSS = """
-:root { color-scheme: light dark; --fg:#111; --dim:#666; --line:#ddd; --edge:#b5b5b5;
-        --bar:#3b82f6; --ok:#16a34a; --doing:#f59e0b; --todo:#a3a8af;
+:root { color-scheme: light dark; --fg:#111; --dim:#666; --line:#ddd; --edge:#a8a8a8;
+        --bar:#3b82f6; --ok:#16a34a; --doing:#f59e0b; --todo:#8b9199;
         --warn:#dc2626; --card:#fff; --bg:#fafafa; }
 @media (prefers-color-scheme: dark) {
-  :root { --fg:#e7e7e7; --dim:#999; --line:#333; --edge:#555; --todo:#6c727a;
+  :root { --fg:#e7e7e7; --dim:#999; --line:#333; --edge:#666; --todo:#7a8087;
           --card:#1a1a1a; --bg:#111; }
 }
 * { box-sizing: border-box; }
@@ -41,10 +39,10 @@ header .meta { color:var(--dim); font-size:12px; margin-top:4px; }
 a { color:inherit; }
 
 #legend { color:var(--dim); font-size:12px; margin-bottom:14px; }
-#legend svg { vertical-align:-2px; margin:0 3px 0 12px; }
+#legend svg { vertical-align:-3px; margin:0 3px 0 12px; }
 
 .lane { background:var(--card); border:1px solid var(--line); border-radius:10px;
-        padding:10px 16px 4px; margin-bottom:14px; overflow-x:auto; }
+        padding:10px 16px 8px; margin-bottom:14px; overflow-x:auto; }
 .lane-head { font-size:14.5px; }
 .lane-head b { font-weight:600; }
 .lane-head .cnt { color:var(--dim); font-size:12px; margin-left:8px;
@@ -53,22 +51,22 @@ a { color:inherit; }
 .tag { display:inline-block; font-size:10.5px; padding:0 5px; border-radius:9px;
        border:1px solid var(--line); color:var(--dim); margin-left:6px; }
 
-svg.dag { display:block; }
-svg.dag text { font-size:12.5px; fill:var(--fg);
-               paint-order:stroke; stroke:var(--card); stroke-width:3px;
-               stroke-linejoin:round; }
-svg.dag text.strike { fill:var(--dim); text-decoration:line-through; }
-svg.dag text.ghosttx { fill:var(--dim); font-size:11.5px; }
-svg.dag path.dep { fill:none; stroke:var(--edge); stroke-width:1.4; }
-svg.dag path.dep.hot { stroke:var(--warn); }
-svg.dag .arwfill { fill:var(--edge); }
-svg.dag .arwfill-hot { fill:var(--warn); }
-svg.dag circle.done { fill:var(--ok); stroke:var(--ok); stroke-width:1.6; }
-svg.dag circle.doing { fill:var(--doing); stroke:var(--doing); stroke-width:1.6; }
-svg.dag circle.todo { fill:var(--todo); stroke:var(--todo); stroke-width:1.6; }
-svg.dag circle.frontier { stroke:var(--bar); stroke-width:2.4; }
-svg.dag circle.ghost { fill:var(--card); stroke:var(--dim); stroke-width:1.4;
-                       stroke-dasharray:2.5 2.5; }
+/* ---- graphviz SVG：几何来自 dot，颜色全在这里 ---- */
+svg.dag { display:block; margin-top:4px; }
+svg.dag text { fill:var(--fg); }
+svg.dag .node path { fill:var(--card); stroke:var(--todo); stroke-width:1.3; }
+svg.dag .node.todo path { fill:var(--todo); fill-opacity:.13; }
+svg.dag .node.doing path { fill:var(--doing); fill-opacity:.18;
+                                 stroke:var(--doing); }
+svg.dag .node.done path { fill:var(--ok); fill-opacity:.15; stroke:var(--ok); }
+svg.dag .node.done text { fill:var(--dim); text-decoration:line-through; }
+svg.dag .node.frontier path { stroke:var(--bar); stroke-width:2.2; }
+svg.dag .node.ghost path { fill:none; stroke:var(--dim); stroke-dasharray:3 3; }
+svg.dag .node.ghost text { fill:var(--dim); }
+svg.dag .edge path { fill:none; stroke:var(--edge); stroke-width:1.3; }
+svg.dag .edge polygon { fill:var(--edge); stroke:var(--edge); }
+svg.dag .edge.hot path { stroke:var(--warn); }
+svg.dag .edge.hot polygon { fill:var(--warn); stroke:var(--warn); }
 
 #goals { color:var(--dim); font-size:12px; margin-top:10px; }
 #doctor { margin-top:26px; border:1px solid var(--warn); border-radius:10px;
@@ -78,20 +76,20 @@ table.dangling { border-collapse:collapse; font-size:12px; }
 table.dangling td { padding:1px 10px 1px 0; }
 """
 
-_LEGEND_DOT = ('<svg width="14" height="14"><circle cx="7" cy="7" r="5" '
-               'style="%s"/></svg>')
+_SWATCH = ('<svg width="18" height="14"><rect x="1" y="1" width="16" height="12"'
+           ' rx="3" style="%s"/></svg>')
 LEGEND = (
     '<div id="legend">图例：'
-    + _LEGEND_DOT % "fill:var(--ok);stroke:var(--ok)" + ' 已完成'
-    + _LEGEND_DOT % "fill:var(--doing);stroke:var(--doing)" + ' 正在做（有认领）'
-    + _LEGEND_DOT % "fill:var(--todo);stroke:var(--todo)" + ' 未开始'
-    + _LEGEND_DOT % ("fill:var(--todo);stroke:var(--bar);stroke-width:2.4")
-    + ' frontier（前置全关，可上手）'
+    + _SWATCH % "fill:var(--ok);fill-opacity:.15;stroke:var(--ok)" + ' 已完成'
+    + _SWATCH % "fill:var(--doing);fill-opacity:.18;stroke:var(--doing)"
+    + ' 正在做（有认领）'
+    + _SWATCH % "fill:var(--todo);fill-opacity:.13;stroke:var(--todo)" + ' 未开始'
+    + _SWATCH % ("fill:var(--todo);fill-opacity:.13;stroke:var(--bar);"
+                 "stroke-width:2.2") + ' frontier（前置全关，可上手）'
     + '<svg width="30" height="14"><path d="M2 7 H22" style="stroke:var(--warn);'
       'stroke-width:1.6"/><path d="M22 3 L28 7 L22 11 Z" '
       'style="fill:var(--warn)"/></svg> 被未完成的前置卡住'
-    + _LEGEND_DOT % ("fill:var(--card);stroke:var(--dim);stroke-dasharray:2.5 2.5")
-    + ' 泳道外的前置票'
+    + _SWATCH % "fill:none;stroke:var(--dim);stroke-dasharray:3 3" + ' 泳道外的前置票'
     + '</div>')
 
 
@@ -99,8 +97,13 @@ def esc(value):
     return html_mod.escape(str(value if value is not None else ""), quote=True)
 
 
+def _dq(value):
+    """DOT 双引号字符串转义。"""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _text_w(text, size=FS):
-    """无字体度量环境下的宽度估算：CJK 记全宽，其他记 0.6 宽。"""
+    """CJK 记全宽、其他记 0.6 宽的像素宽度估算（只用于截断，不做布局）。"""
     width = 0.0
     for ch in text:
         width += size if ord(ch) >= 0x2E80 else size * 0.6
@@ -150,10 +153,10 @@ def render(graph, generated_at=None):
     parts.append("</header>")
     parts.append(LEGEND)
 
-    for index, lane in enumerate(lanes):
-        parts.append(_lane_section(lane, nodes, by_id, kids, "l%d" % index))
+    for lane in lanes:
+        parts.append(_lane_section(lane, by_id, kids))
     if strays:
-        parts.append(_stray_section(strays, by_id, "stray"))
+        parts.append(_stray_section(strays, by_id))
     if goals:
         parts.append('<div id="goals">goal 标签（不参与布局）：%s</div>'
                      % " · ".join(esc(g["title"]) for g in goals))
@@ -177,10 +180,9 @@ def _descendants(root, kids):
     return out
 
 
-def _lane_section(root, nodes, by_id, kids, uid):
+def _lane_section(root, by_id, kids):
     members = _descendants(root, kids)
     done = sum(1 for m in members if _is_done(m))
-    head = _link(root)
     chips = ""
     parent = by_id.get(root["parent"] or "")
     if parent is not None and parent["kind"] == model.KIND_GOAL:
@@ -188,155 +190,101 @@ def _lane_section(root, nodes, by_id, kids, uid):
     out = ['<section class="lane">',
            '<div class="lane-head" title="%s"><b>%s</b>'
            '<span class="cnt">%d/%d</span>%s</div>'
-           % (esc(_tooltip(root)), head, done, len(members), chips)]
+           % (esc(_tooltip(root)), _link(root), done, len(members), chips)]
     summary = (root["meta"] or {}).get("summary")
     if summary:
         out.append('<div class="lane-head"><div class="sum">%s</div></div>'
                    % esc(summary))
-    out.append(_dag_svg(members, by_id, uid))
+    out.append(_dag_svg(members, by_id))
     out.append("</section>")
     return "".join(out)
 
 
-def _stray_section(strays, by_id, uid):
+def _stray_section(strays, by_id):
     return ('<section class="lane">'
             '<div class="lane-head"><b>散票（不在任何地图 / 上游票下）</b>'
             '<span class="cnt">%d</span></div>%s</section>'
-            % (len(strays), _dag_svg(strays, by_id, uid)))
+            % (len(strays), _dag_svg(strays, by_id)))
 
 
-# ---------------- DAG 布局 + SVG ----------------
+# ---------------- DOT 生成 + graphviz 渲染 ----------------
 
-def _dag_svg(members, by_id, uid):
-    """成员 + 泳道外幽灵前置票 → 分层 DAG SVG。"""
+def _dag_svg(members, by_id):
+    return _dot_to_svg(_to_dot(members, by_id))
+
+
+def _to_dot(members, by_id):
+    """成员 + 泳道外幽灵前置票 → DOT。布局交给 graphviz，颜色只打 class。"""
     ids = {m["id"] for m in members}
     ghosts = {}
     for m in members:
         for b in (m["meta"] or {}).get("blocked_by") or []:
             if b not in ids and b not in ghosts:
                 ghosts[b] = by_id.get(b) or model.node(b, model.KIND_LEAF, b)
-    pop = {m["id"]: m for m in members}
-    pop.update(ghosts)
 
-    def blockers_of(nid):
-        node = pop.get(nid)
-        if node is None or nid in ghosts:      # 幽灵只当源头，不再往上追
-            return []
-        return [b for b in (node["meta"] or {}).get("blocked_by") or []
-                if b in pop]
+    out = ["digraph radar {",
+           '  rankdir=LR; bgcolor="transparent";',
+           '  pack=true; packmode="array_c1";',
+           '  graph [nodesep=0.1, ranksep=0.6, margin=0.05];',
+           '  node [shape=box, style=rounded, fontsize=11.5, height=0.32,'
+           ' margin="0.14,0.07", fontname="Helvetica,PingFang SC"];',
+           '  edge [arrowsize=0.7];']
 
-    layer = {}
+    for m in members:
+        out.append('  "%s" [label="%s", class="%s", href="%s",'
+                   ' tooltip="%s"];'
+                   % (_dq(m["id"]), _dq(_clip(m["title"])), _node_class(m),
+                      _dq(m["url"] or "#"), _dq(_tooltip(m))))
+    for gid, ghost in ghosts.items():
+        out.append('  "%s" [label="%s", class="ghost", href="%s",'
+                   ' tooltip="%s"];'
+                   % (_dq(gid), _dq(_ghost_label(ghost)),
+                      _dq(ghost["url"] or "#"), _dq(_tooltip(ghost))))
 
-    def resolve(nid, trail):
-        if nid in layer:
-            return layer[nid]
-        if nid in trail:                        # 依赖成环：断开，当源头
-            return 0
-        blockers = blockers_of(nid)
-        value = 0 if not blockers else 1 + max(
-            resolve(b, trail | {nid}) for b in blockers)
-        layer[nid] = value
-        return value
-
-    for nid in pop:
-        resolve(nid, set())
-
-    # 行：逐列从左到右，尽量贴前置的行（链条走直线），冲突就找空行
-    max_layer = max(layer.values()) if layer else 0
-    rows = {}
-    used = {}
-    for col in range(0, max_layer + 1):
-        col_ids = [nid for nid in pop if layer[nid] == col]
-        col_ids.sort(key=lambda nid: (
-            sum(rows[b] for b in blockers_of(nid) if b in rows)
-            / max(1, len([b for b in blockers_of(nid) if b in rows]))
-            if any(b in rows for b in blockers_of(nid)) else 1e9))
-        taken = used.setdefault(col, set())
-        free = 0
-        for nid in col_ids:
-            ref = [rows[b] for b in blockers_of(nid) if b in rows]
-            want = round(sum(ref) / len(ref)) if ref else None
-            if want is None or want in taken:
-                while free in taken:
-                    free += 1
-                want = free
-            taken.add(want)
-            rows[nid] = want
-
-    labels = {nid: _label_of(pop[nid], nid in ghosts) for nid in pop}
-    col_x = {0: PAD + R}
-    for col in range(1, max_layer + 1):
-        widths = [_text_w(labels[nid]) for nid in pop if layer[nid] == col - 1]
-        col_x[col] = col_x[col - 1] + max(GAP_MIN,
-                                          (max(widths) if widths else 0)
-                                          + LABEL_PAD + 34)
-    width = PAD + max(col_x[layer[nid]] + R + LABEL_PAD + _text_w(labels[nid])
-                      for nid in pop)
-    height = (max(rows.values()) + 1) * ROW + PAD * 2 if rows else ROW
-
-    def xy(nid):
-        return col_x[layer[nid]], PAD + ROW / 2 + rows[nid] * ROW
-
-    parts = ['<svg class="dag" width="%d" height="%d" '
-             'xmlns="http://www.w3.org/2000/svg">' % (round(width), round(height)),
-             '<defs>'
-             '<marker id="arw-%s" viewBox="0 0 10 10" refX="9" refY="5" '
-             'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
-             '<path d="M0 0 L10 5 L0 10 Z" class="arwfill"/></marker>'
-             '<marker id="arwh-%s" viewBox="0 0 10 10" refX="9" refY="5" '
-             'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
-             '<path d="M0 0 L10 5 L0 10 Z" class="arwfill-hot"/></marker>'
-             '</defs>' % (uid, uid)]
-
-    for nid in pop:                              # 先画边再画点
-        for b in blockers_of(nid):
-            x0, y0 = xy(b)
-            x1, y1 = xy(nid)
-            hot = not _is_done(pop[b])
-            # 边从「标签末尾」画到下一列圆点（不从圆点画起），
-            # 否则同行链的线正好穿过标签文字，看起来像划线
-            x0e = x0 + R + LABEL_PAD + _text_w(labels[b]) + 4
-            mx = (x0e + x1) / 2
-            parts.append(
-                '<path class="dep%s" marker-end="url(#%s-%s)" '
-                'd="M%.1f %.1f C%.1f %.1f %.1f %.1f %.1f %.1f"/>'
-                % (" hot" if hot else "", "arwh" if hot else "arw", uid,
-                   x0e, y0, mx, y0, mx, y1, x1 - R - 3, y1))
-    for nid in pop:
-        parts.append(_node_svg(pop[nid], nid in ghosts, labels[nid], xy(nid)))
-    parts.append("</svg>")
-    return "".join(parts)
+    known = ids | set(ghosts)
+    for m in members:
+        for b in (m["meta"] or {}).get("blocked_by") or []:
+            if b not in known:
+                continue
+            blocker = by_id.get(b) or ghosts.get(b)
+            hot = blocker is not None and not _is_done(blocker)
+            out.append('  "%s" -> "%s" [class="dep%s"];'
+                       % (_dq(b), _dq(m["id"]), " hot" if hot else ""))
+    out.append("}")
+    return "\n".join(out)
 
 
-def _label_of(node, is_ghost):
+def _node_class(node):
+    if _is_done(node):
+        cls = "done"
+    elif any(b.startswith("claimed:") for b in node["badges"]):
+        cls = "doing"
+    else:
+        cls = "todo"
+    if "frontier" in node["badges"]:
+        cls += " frontier"
+    return cls
+
+
+def _ghost_label(node):
     title = node["title"]
     number = (node["meta"] or {}).get("number")
-    if is_ghost and number:
+    if number:
         title = "#%s %s" % (number, title)
     return _clip(title)
 
 
-def _node_svg(node, is_ghost, label, pos):
-    x, y = pos
-    if is_ghost:
-        cls = "ghost"
-        text_cls = ' class="ghosttx"'
-    else:
-        done = _is_done(node)
-        doing = any(b.startswith("claimed:") for b in node["badges"])
-        cls = "done" if done else ("doing" if doing else "todo")
-        if "frontier" in node["badges"]:
-            cls += " frontier"
-        text_cls = ' class="strike"' if done else ""
-    body = ('<circle class="%s" cx="%.1f" cy="%.1f" r="%.1f"/>'
-            '<text x="%.1f" y="%.1f" text-anchor="start"%s>%s</text>'
-            '<title>%s</title>'
-            % (cls, x, y, R, x + R + LABEL_PAD, y + 4, text_cls, esc(label),
-               esc(_tooltip(node))))
-    if node["url"]:
-        return '<a class="n" data-id="%s" href="%s">%s</a>' \
-            % (esc(node["id"]), esc(node["url"]), body)
-    return '<g class="n" data-id="%s">%s</g>' % (esc(node["id"]), body)
+def _dot_to_svg(dot_text):
+    """dot -Tsvg，剥掉 XML 头只留 <svg>，挂上 class="dag"。"""
+    try:
+        proc = subprocess.run([DOT_BIN, "-Tsvg"], input=dot_text,
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        raise SystemExit("需要 graphviz 做 DAG 布局：brew install graphviz")
+    if proc.returncode != 0:
+        raise RuntimeError("dot 渲染失败：%s" % proc.stderr.strip()[:400])
+    svg = proc.stdout[proc.stdout.index("<svg"):]
+    return svg.replace("<svg ", '<svg class="dag" ', 1)
 
 
 def _link(node):
