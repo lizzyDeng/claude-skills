@@ -8,7 +8,7 @@ sys.path.insert(0, str(BASE))
 
 import model  # noqa: E402
 from sources import wayfinder  # noqa: E402
-from test_github_issues import FakeCtx  # noqa: E402
+from test_github_issues import FakeCtx, dep  # noqa: E402
 
 REPO = "hyoteam/aifriends"
 
@@ -25,7 +25,7 @@ def test_preset_finds_maps_without_group_from_config():
 
 
 def test_preset_turns_dependencies_on():
-    ctx = FakeCtx(deps={13: 1})
+    ctx = FakeCtx(deps={13: [dep(16, "open")]})
     nodes = {n["id"]: n for n in collect(ctx=ctx)}
     assert "blocked" in nodes["gh:%s#13" % REPO]["badges"]
 

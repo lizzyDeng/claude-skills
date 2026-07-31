@@ -1,0 +1,59 @@
+{
+ "data": {
+  "repository": {
+   "issues": {
+    "pageInfo": {
+     "hasNextPage": false,
+     "endCursor": null
+    },
+    "nodes": [
+     {
+      "number": 12,
+      "subIssues": {
+       "nodes": [
+        {
+         "number": 13,
+         "repository": {
+          "nameWithOwner": "hyoteam/aifriends"
+         }
+        },
+        {
+         "number": 25,
+         "repository": {
+          "nameWithOwner": "hyoteam/aifriends"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 13,
+      "subIssues": {
+       "nodes": [
+        {
+         "number": 30,
+         "repository": {
+          "nameWithOwner": "hyoteam/aifriends"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 14,
+      "subIssues": {
+       "nodes": [
+        {
+         "number": 77,
+         "repository": {
+          "nameWithOwner": "other/repo"
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ }
+}

@@ -117,7 +117,8 @@ def _read_json(path, config):
             parent=NORTH_STAR_ID if banner else None,
             meta={"source": "forge",
                   "target_metric": objective.get("target_metric"),
-                  "description": objective.get("description")},
+                  "description": objective.get("description"),
+                  "summary": objective.get("description")},
         ))
 
     for feature in features:
