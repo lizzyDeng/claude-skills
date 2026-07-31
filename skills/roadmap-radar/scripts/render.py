@@ -64,6 +64,14 @@ svg.dag .edge path { fill:none; stroke:var(--edge); stroke-width:1.3; }
 svg.dag .edge polygon { fill:var(--edge); stroke:var(--edge); }
 svg.dag .edge.hot path { stroke:var(--warn); }
 svg.dag .edge.hot polygon { fill:var(--warn); stroke:var(--warn); }
+svg.dag .edge.flow path { stroke:var(--line); }
+svg.dag .edge.flow polygon { fill:var(--line); stroke:var(--line); }
+svg.dag .node.anchor ellipse { fill:var(--card); stroke:var(--dim);
+                               stroke-width:1.3; }
+svg.dag .node.anchor text { fill:var(--dim); }
+svg.dag .node.anchor.ok ellipse { fill:var(--ok); fill-opacity:.15;
+                                  stroke:var(--ok); }
+svg.dag .node.anchor.ok text { fill:var(--ok); }
 
 #goals { color:var(--dim); font-size:12px; margin-top:10px; }
 #doctor { margin-top:26px; border:1px solid var(--warn); border-radius:10px;
@@ -201,17 +209,22 @@ def _stray_section(strays, by_id):
     return ('<section class="lane">'
             '<div class="lane-head"><b>散票（不在任何地图 / 上游票下）</b>'
             '<span class="cnt">%d</span></div>%s</section>'
-            % (len(strays), _dag_svg(strays, by_id)))
+            % (len(strays), _dag_svg(strays, by_id, anchors=False)))
 
 
 # ---------------- DOT 生成 + graphviz 渲染 ----------------
 
-def _dag_svg(members, by_id):
-    return _dot_to_svg(_to_dot(members, by_id))
+def _dag_svg(members, by_id, anchors=True):
+    return _dot_to_svg(_to_dot(members, by_id, anchors))
 
 
-def _to_dot(members, by_id):
-    """成员 + 泳道外幽灵前置票 → DOT。布局交给 graphviz，颜色只打 class。"""
+def _to_dot(members, by_id, anchors=True):
+    """成员 + 泳道外幽灵前置票 → DOT。布局交给 graphviz，颜色只打 class。
+
+    anchors=True 时合成「开始 ▸ … ▸ 完成」两个锚点：开始连所有无前置的
+    节点、所有末端节点汇入完成 —— 一条泳道于是有唯一的入口和出口，
+    完成节点带 done/total，全完成时变绿。散票区不加锚（本来就零散）。
+    """
     ids = {m["id"] for m in members}
     ghosts = {}
     for m in members:
@@ -239,6 +252,8 @@ def _to_dot(members, by_id):
                       _dq(ghost["url"] or "#"), _dq(_tooltip(ghost))))
 
     known = ids | set(ghosts)
+    has_in = set()
+    has_out = set()
     for m in members:
         for b in (m["meta"] or {}).get("blocked_by") or []:
             if b not in known:
@@ -247,6 +262,27 @@ def _to_dot(members, by_id):
             hot = blocker is not None and not _is_done(blocker)
             out.append('  "%s" -> "%s" [class="dep%s"];'
                        % (_dq(b), _dq(m["id"]), " hot" if hot else ""))
+            has_in.add(m["id"])
+            has_out.add(b)
+
+    if anchors and members:
+        done_n = sum(1 for m in members if _is_done(m))
+        all_done = done_n == len(members)
+        out.append('  "__start" [label="开始", shape=circle, class="anchor",'
+                   ' fontsize=10, margin=0, tooltip="起点：从无前置的票开始"];')
+        out.append('  "__end" [label="完成\\n%d/%d", shape=doublecircle,'
+                   ' class="anchor%s", fontsize=10, margin=0,'
+                   ' tooltip="泳道完成度 %d/%d"];'
+                   % (done_n, len(members), " ok" if all_done else "",
+                      done_n, len(members)))
+        for nid in list(ids | set(ghosts)):
+            if nid not in has_in:      # 无前置：开始从这里发出（幽灵也串上）
+                out.append('  "__start" -> "%s" [class="flow", arrowsize=0.6];'
+                           % _dq(nid))
+        for m in members:
+            if m["id"] not in has_out:   # 末端：没人依赖它 → 汇入完成
+                out.append('  "%s" -> "__end" [class="flow", arrowsize=0.6];'
+                           % _dq(m["id"]))
     out.append("}")
     return "\n".join(out)
 

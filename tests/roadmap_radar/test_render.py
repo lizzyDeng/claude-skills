@@ -15,7 +15,8 @@ def _plain(html):
     """归一 graphviz 输出：- 会转成 &#45;，混排文本拆成多个 <text> run。"""
     html = re.sub(r"</text>\s*<text[^>]*>", "", html)
     return (html.replace("&#45;", "-").replace("&#10;", "\n")
-                .replace("&quot;", '"').replace("&#39;", "'"))
+                .replace("&quot;", '"').replace("&#39;", "'")
+                .replace("&gt;", ">"))
 
 
 GRAPH = json.loads((FIX / "graph.json").read_text(encoding="utf-8"))
@@ -92,6 +93,45 @@ def test_out_of_lane_blocker_appears_as_ghost_dot():
     lane = _lane_html(HTML, "看广告换额度")
     assert 'class="node ghost"' in lane
     assert "#29" in lane
+
+
+def test_lane_has_start_and_end_anchors():
+    """每条泳道有唯一入口/出口：开始 → 无前置的票 … 末端票 → 完成。"""
+    lane = _lane_html(HTML, "live-chat 实施路线")
+    assert "开始" in lane
+    assert "完成1/6" in lane            # #29 已关，其余 5 张 open（多行 label 归一后）
+    assert "__start->" in lane          # 开始有出边
+    assert "->__end" in lane            # 完成有入边
+
+
+def test_end_anchor_green_only_when_all_done():
+    graph = {"nodes": [
+        {"id": "gh:r#1", "kind": "group", "title": "M", "url": None,
+         "parent": None, "progress": 1.0, "state": "closed", "badges": [],
+         "meta": {}},
+        {"id": "gh:r#2", "kind": "leaf", "title": "T", "url": None,
+         "parent": "gh:r#1", "progress": 1.0, "state": "closed",
+         "badges": [], "meta": {}},
+    ], "doctor": {}}
+    out = _plain(render.render(graph))
+    assert 'class="node anchor ok"' in out
+    assert "完成1/1" in out
+    lane = _lane_html(HTML, "live-chat 实施路线")     # 没做完的泳道不绿
+    assert 'class="node anchor ok"' not in lane
+
+
+def test_isolated_ticket_is_wired_through_start_and_end():
+    """#25 没有任何依赖边：必须被 开始→#25→完成 串进主流，不悬空。"""
+    lane = _lane_html(HTML, "看广告换额度")
+    nid = "%s#25" % REPO
+    assert "__start->%s" % nid in lane
+    assert "%s->__end" % nid in lane
+
+
+def test_stray_section_has_no_anchors():
+    lane = _lane_html(HTML, "散票")
+    assert "__start" not in lane
+    assert "__end" not in lane
 
 
 def test_strays_land_in_stray_lane_not_dropped():
