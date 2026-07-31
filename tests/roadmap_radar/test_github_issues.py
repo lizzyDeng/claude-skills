@@ -130,6 +130,29 @@ def test_milestone_goal_source():
     assert nodes["gh:%s#1" % REPO]["parent"] == "goal:Q3 变现"
 
 
+def test_summary_is_first_content_line_skipping_markdown_noise():
+    body = ("<!-- template -->\n## 目标\n![img](x.png)\n\n"
+            "- **让宿主 App** 能[接入](u) SDK\n第二行不要")
+    assert github_issues.summary_of(body) == "让宿主 App 能接入 SDK"
+
+
+def test_summary_truncates_long_lines():
+    out = github_issues.summary_of("x" * 300)
+    assert len(out) == github_issues.SUMMARY_MAX
+    assert out.endswith("…")
+
+
+def test_summary_of_empty_body_is_none():
+    assert github_issues.summary_of("") is None
+    assert github_issues.summary_of(None) is None
+
+
+def test_collect_puts_summary_into_meta():
+    nodes = {n["id"]: n for n in collect()}
+    assert nodes["gh:%s#12" % REPO]["meta"]["summary"] == "4 个借鉴点全部定型"
+    assert nodes["gh:%s#13" % REPO]["meta"]["summary"] == "分层阈值怎么定"
+
+
 def test_unknown_goal_from_form_raises():
     try:
         collect(goal_from="magic:xyz")

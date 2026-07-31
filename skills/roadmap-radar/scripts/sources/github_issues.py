@@ -11,6 +11,32 @@ import model
 ISSUE_FIELDS = "number,title,state,labels,assignees,url,body,milestone"
 DEFAULT_LIMIT = 300
 
+SUMMARY_MAX = 120
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# 整行都是结构噪音：标题、图片、代码围栏、表格行、分隔线
+_NOISE_LINE_RE = re.compile(r"^(#{1,6}\s|!\[|```|\||-{3,}\s*$)")
+_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MARK_RE = re.compile(r"[*_`~]")
+
+
+def summary_of(body):
+    """issue 正文 -> 一句话简介：第一个有内容的行，去 markdown 记号。
+
+    没有可用行返回 None（渲染层不显示，而不是显示空串）。
+    """
+    text = _HTML_COMMENT_RE.sub("", body or "")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or _NOISE_LINE_RE.match(line):
+            continue
+        line = re.sub(r"^[-*>]\s+", "", line)
+        line = _LINK_RE.sub(r"\1", line)
+        line = _MARK_RE.sub("", line).strip()
+        if line:
+            return line if len(line) <= SUMMARY_MAX else line[:SUMMARY_MAX - 1] + "…"
+    return None
+
 
 def collect(config, ctx):
     repo = config["repo"]
@@ -54,6 +80,7 @@ def collect(config, ctx):
             badges=["claimed:%s" % a for a in assignees],
             meta={"source": "github-issues", "repo": repo,
                   "number": issue["number"], "body": issue.get("body") or "",
+                  "summary": summary_of(issue.get("body")),
                   "labels": [label["name"] for label in issue.get("labels", [])]},
         )
         nodes.append(node)

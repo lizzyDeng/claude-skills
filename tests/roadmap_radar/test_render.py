@@ -87,12 +87,57 @@ def test_renders_without_north_star_root():
 
 
 def _block_containing(html, needle):
-    """取包含 needle 的那个 <details>/<li> 块，用于局部断言。"""
+    """取包含 needle 的那个节点盒（到下一个节点盒为止），用于局部断言。"""
     index = html.index(needle)
-    start = max(html.rfind("<details", 0, index), html.rfind("<li", 0, index))
-    end = index + html[index:].find("</details>") if "</details>" in html[index:] \
-        else len(html)
-    return html[start:end]
+    start = html.rfind('<div class="node', 0, index)
+    nxt = html.find('<div class="node', index)
+    return html[start:nxt if nxt != -1 else len(html)]
+
+
+# --- 拓扑树结构与一句话简介 ---
+
+def test_goal_renders_as_topology_tree():
+    """每个 goal 一张树，不再是纯文字罗列。"""
+    assert 'class="goal-sec"' in HTML
+    assert 'class="tree"' in HTML
+
+
+def test_children_nest_in_ul_after_parent_node_box():
+    """map 的子票必须嵌在 map 节点盒后面的 <ul> 里（拓扑连线的锚）。"""
+    map_i = HTML.index("issues/14")             # 「看广告换额度」map 节点
+    ul_i = HTML.index("<ul>", map_i)
+    child_i = HTML.index("issues/22", map_i)    # 它的子票
+    assert ul_i < child_i
+
+
+def test_node_summary_one_liner_is_rendered():
+    graph = {"nodes": [
+        {"id": "goal:g", "kind": "goal", "title": "G", "url": None, "parent": None,
+         "progress": 0.5, "state": None, "badges": [],
+         "meta": {"summary": "让用户愿意回来"}},
+        {"id": "gh:r#1", "kind": "leaf", "title": "T", "url": None,
+         "parent": "goal:g", "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"summary": "接入 SSV 回调"}},
+    ], "doctor": {}}
+    out = render.render(graph)
+    assert '<div class="sum">让用户愿意回来</div>' in out
+    assert '<div class="sum">接入 SSV 回调</div>' in out
+
+
+def test_map_sections_collapse_to_counts_not_bullet_dump():
+    """决策/迷雾不再逐条罗列，只显示计数，全文进 tooltip。"""
+    graph = {"nodes": [
+        {"id": "goal:g", "kind": "goal", "title": "G", "url": None, "parent": None,
+         "progress": 0.0, "state": None, "badges": [], "meta": {}},
+        {"id": "gh:r#2", "kind": "group", "title": "M", "url": None,
+         "parent": "goal:g", "progress": 0.0, "state": "open", "badges": [],
+         "meta": {"decisions": ["拆两轨", "手填为准"], "fog": ["阈值未定"]}},
+    ], "doctor": {}}
+    out = render.render(graph)
+    assert "决策 2" in out
+    assert "迷雾 1" in out
+    assert "拆两轨" in out          # 全文还在（tooltip），不是丢了
+    assert '<div class="sections">' not in out
 
 
 # --- 未挂载节点不得被丢弃（真数据回归：hyoteam 上 27/94 个节点曾静默消失） ---
