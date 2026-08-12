@@ -1,0 +1,358 @@
+/* ============================================================
+   DAYFLOW-STYLE POSTER KIT
+   手绘感中文说明长图 · 可复用样式表
+   ------------------------------------------------------------
+   四个技术点：
+   1. 抖动边框  —— feTurbulence + feDisplacementMap 只作用在 ::before
+                    伪元素上，文字保持锐利（关键）
+   2. 双墨色纪律 —— 全图只有「深棕墨」+「橙重音」两种笔，米底打底
+   3. 特色标题字 —— 得意黑 Smiley Sans（本地 woff2），正文走系统 PingFang
+   4. 手绘装饰   —— 波浪下划线 / 折线图 / 涂鸦图标全部是内联 SVG
+   ============================================================ */
+
+@font-face {
+  font-family: 'Smiley Sans';
+  src: url('./fonts/SmileySans-Oblique.ttf.woff2') format('woff2');
+  font-weight: 400;
+  font-display: block;
+}
+
+:root {
+  /* ── 纸与墨 ───────────────────────────────── */
+  --paper:        #FCF3E8;   /* 暖米底 */
+  --paper-warm:   #F9E7D4;   /* 高亮块底 */
+  --paper-sink:   #F5DFC8;   /* 更深一档，用于强调条 */
+  --ink:          #33241C;   /* 主墨（深棕黑，不是纯黑）*/
+  --ink-soft:     #6B5648;   /* 次级文字 */
+  --accent:       #EF7326;   /* 橙重音 —— 全图唯一亮色 */
+  --accent-deep:  #D9542B;   /* 否定/警示 */
+  --leaf:         #6E8B4A;   /* 肯定/推荐 */
+
+  /* ── 尺度 ─────────────────────────────────── */
+  --page-w:       1024px;
+  --pad:          72px;
+  --stroke:       2px;
+  --radius:       16px;
+
+  --font-display: 'Smiley Sans', 'PingFang SC', sans-serif;
+  --font-body:    'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --font-latin:   'Poppins', 'Avenir Next', sans-serif;
+}
+
+/* ============================================================
+   页面骨架
+   ============================================================ */
+
+body {
+  margin: 0;
+  background: #E8DCCB;
+  font-family: var(--font-body);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+.poster {
+  width: var(--page-w);
+  margin: 0 auto;
+  padding: var(--pad) var(--pad) calc(var(--pad) * 0.8);
+  box-sizing: border-box;
+  background: var(--paper);
+  /* 纸纹：极淡的噪点，让大面积米底不死板 */
+  background-image:
+    radial-gradient(circle at 20% 12%, rgba(239,115,38,.045), transparent 45%),
+    radial-gradient(circle at 85% 78%, rgba(239,115,38,.035), transparent 40%);
+  position: relative;
+  z-index: 0;              /* 兜住 .sketch::before 的 z-index:-1 */
+  overflow: hidden;
+}
+
+/* 藏起 SVG filter 定义容器 */
+.defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+
+/* ============================================================
+   1 · 抖动手绘边框（核心 trick）
+   ------------------------------------------------------------
+   边框画在 ::before 上、只给 ::before 上 filter。
+   若把 filter 加在元素本身，里面的中文会跟着一起抖 → 糊。
+   .sk-1 / .sk-2 / .sk-3 只是换 seed，避免所有框抖成同一个样子。
+   ============================================================ */
+
+.sketch { position: relative; z-index: 0; }
+/* 🔴 z-index:-1 而不是 0：::before 是绝对定位盒，同层时会盖住普通文本节点
+   （只有元素子节点能靠 position:relative 抬起来，裸文本抬不了）。
+   沉到 -1 靠 .poster 的 stacking context 兜住，不会穿到纸底之下。 */
+.sketch::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: var(--stroke) solid var(--ink);
+  border-radius: var(--radius);
+  filter: url(#wob-1);
+  pointer-events: none;
+  z-index: -1;
+}
+.sketch.sk-2::before { filter: url(#wob-2); }
+.sketch.sk-3::before { filter: url(#wob-3); }
+
+/* 填色变体：底色也画在 ::before 上，跟着一起抖 */
+.sketch.fill-warm::before  { background: var(--paper-warm); }
+.sketch.fill-sink::before  { background: var(--paper-sink); }
+.sketch.fill-paper::before { background: var(--paper); }
+
+/* 细线变体 / 虚线变体 */
+.sketch.hair::before   { border-width: 1.5px; }
+.sketch.dashed::before { border-style: dashed; border-width: 2px; }
+
+/* 无框、只有抖动底色 */
+.sketch.bare::before { border-color: transparent; }
+
+/* ============================================================
+   2 · 品牌行 & 大标题
+   ============================================================ */
+
+.brand {
+  font-family: var(--font-latin);
+  font-weight: 600;
+  font-size: 26px;
+  letter-spacing: .06em;
+  color: var(--ink);
+  margin-bottom: 26px;
+}
+.brand em {
+  font-family: var(--font-display);
+  font-style: normal;
+  color: var(--accent);
+  font-size: 24px;
+  margin-left: 2px;
+}
+
+.headline {
+  font-family: var(--font-display);
+  font-size: 78px;
+  line-height: 1.22;
+  letter-spacing: .01em;
+  margin: 0 0 22px;
+  /* 得意黑只有 Oblique 一款，回正一点让它更像海报手写标题 */
+  transform: skewX(4deg);
+  transform-origin: left bottom;
+}
+.headline .hot { color: var(--accent); }
+
+.headline.sm { font-size: 56px; }
+
+.subline {
+  font-size: 21px;
+  line-height: 1.85;
+  color: var(--ink-soft);
+  margin: 0;
+}
+
+/* 手绘波浪下划线：压在关键词下面 */
+.mark {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 8' preserveAspectRatio='none'%3E%3Cpath d='M0,5 C15,1.5 25,7 40,4 C55,1 70,7 85,3.2 C92,1.5 96,4.5 100,3' stroke='%23EF7326' stroke-width='2.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0 100%;
+  background-size: 100% .42em;
+  padding-bottom: .18em;
+}
+
+/* 粗橙短横：标题下的那一笔 */
+.rule {
+  width: 132px; height: 11px;
+  margin: 4px 0 30px;
+  background: var(--accent);
+  border-radius: 6px;
+  filter: url(#wob-2);
+}
+
+/* ============================================================
+   3 · 对话气泡群（右上角装饰）
+   ============================================================ */
+
+.bubbles {
+  position: relative;
+  min-height: 300px;
+}
+.bubble {
+  display: inline-block;
+  padding: 13px 20px;
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.3;
+  color: var(--ink);
+  position: absolute;
+  white-space: nowrap;
+}
+.bubble::before {
+  content: '';
+  position: absolute; inset: 0;
+  border: 2px solid var(--ink);
+  border-radius: 22px;
+  filter: url(#wob-1);
+  z-index: 0;
+}
+.bubble.warm::before { background: var(--paper-warm); }
+.bubble.b2::before   { filter: url(#wob-2); }
+.bubble.b3::before   { filter: url(#wob-3); }
+.bubble span { position: relative; z-index: 1; }
+
+/* 气泡小尾巴 */
+.bubble.tail::after {
+  content: '';
+  position: absolute;
+  left: 28px; bottom: -13px;
+  width: 26px; height: 20px;
+  background: var(--paper);
+  border-right: 2px solid var(--ink);
+  border-bottom: 2px solid var(--ink);
+  border-bottom-right-radius: 3px;
+  transform: skewX(-26deg) rotate(4deg);
+  filter: url(#wob-2);
+  z-index: 1;
+}
+.bubble.warm.tail::after { background: var(--paper-warm); }
+
+/* ============================================================
+   4 · 编号步骤
+   ============================================================ */
+
+.step {
+  display: grid;
+  grid-template-columns: 236px 1fr;
+  gap: 28px;
+  margin-bottom: 40px;
+  align-items: start;
+}
+
+.step-head { padding-top: 4px; }
+
+.step-no {
+  display: inline-flex;
+  align-items: center; justify-content: center;
+  width: 40px; height: 40px;
+  font-family: var(--font-latin);
+  font-weight: 600; font-size: 21px;
+  color: var(--accent);
+  position: relative;
+  margin-right: 12px;
+  vertical-align: -9px;
+}
+.step-no::before {
+  content: '';
+  position: absolute; inset: 0;
+  border: 2.4px solid var(--accent);
+  border-radius: 50%;
+  filter: url(#wob-3);
+}
+.step-no span { position: relative; }
+
+.step-title {
+  font-family: var(--font-display);
+  font-size: 33px;
+  line-height: 1.35;
+  display: inline;
+}
+.step-desc {
+  margin: 14px 0 0;
+  font-size: 17.5px;
+  line-height: 1.95;
+  color: var(--ink-soft);
+}
+.step-body { padding: 24px 26px; }
+
+/* 行内英文术语 */
+.tt {
+  font-family: var(--font-latin);
+  font-size: .93em;
+  color: var(--accent);
+  letter-spacing: .01em;
+}
+.tt.ink { color: var(--ink); }
+
+/* ============================================================
+   5 · 卡片栅格（适合 / 不适合 那种四联卡）
+   ============================================================ */
+
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+
+.tile { padding: 22px 20px 24px; }
+.tile h4 {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 400;
+}
+.tile p {
+  margin: 0;
+  font-size: 15.5px;
+  line-height: 1.85;
+  color: var(--ink-soft);
+}
+.tile .icon { font-size: 34px; line-height: 1; margin-bottom: 14px; display: block; }
+.tile.good h4 { color: var(--leaf); }
+.tile.bad  h4 { color: var(--accent-deep); }
+
+/* 分栏标题 */
+.sec-label {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--font-display);
+  font-size: 30px;
+  margin: 46px 0 20px;
+}
+.sec-label .badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 2.4px solid currentColor;
+  font-size: 19px;
+  filter: url(#wob-1);
+}
+.sec-label.good { color: var(--leaf); }
+.sec-label.bad  { color: var(--accent-deep); }
+.sec-label small {
+  font-size: 17px; color: var(--ink-soft);
+  font-family: var(--font-body);
+}
+
+/* ============================================================
+   6 · 底部 callout 条
+   ============================================================ */
+
+.callout {
+  display: flex; align-items: center; gap: 16px;
+  padding: 20px 30px;
+  margin-top: 18px;
+  font-family: var(--font-display);
+  font-size: 27px;
+}
+.callout .glyph { color: var(--accent); font-size: 30px; line-height: 1; }
+
+.note {
+  padding: 22px 28px;
+  font-size: 16px;
+  line-height: 2;
+  color: var(--ink-soft);
+}
+.note b {
+  color: var(--ink);
+  font-weight: 400;
+  font-family: var(--font-latin);
+  font-size: 15px;
+}
+
+/* ============================================================
+   7 · 手绘图表容器
+   ============================================================ */
+
+.chart { padding: 30px 28px 22px; }
+.chart svg { display: block; width: 100%; height: auto; }
+.chart-cap {
+  margin: 10px 0 0;
+  font-size: 15px; color: var(--ink-soft); text-align: center;
+}
+
+.hr-dash {
+  height: 0; margin: 44px 0;
+  border-top: 2px dashed rgba(51,36,28,.28);
+  filter: url(#wob-2);
+}

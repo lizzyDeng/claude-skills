@@ -96,6 +96,7 @@ Phase 1: Brainstorm (9 步)
   1.5c Codex Review     [CC:auto | Codex:done] .fastship-codex-review.md PASS/FAIL
                         FAIL → 按缺陷层回退(F7：需求层 p0_requirements_missing→1.3r / 方案层→1.4) → 重走至 1.5c
   1.6  用户确认         [CC:done  | Codex:done] done --user-confirmed
+                        🔴 递方案前必须先出「方案摘要图」（见下）
 
 Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
   2.0  执行计划         [/goal 自主驱动] dynamic workflow：读 skeleton.json 拓扑扇出（≥2 不相交组 parallel，同 worktree 只编辑不 commit），每 subagent 只收 briefs/<id>.md → implement→review pipeline
@@ -109,6 +110,26 @@ Phase 2+3: /goal 自主执行（Plan 确认后自动触发）
   3.5  Loop Record      [/goal 自主决策: fail→auto continue, 3次后暂停]
   3.6  KNOWLEDGE 闭环   [/goal + hook auto-detect]
 ```
+
+## 步骤 1.6 · 方案摘要图（递方案给用户前必做）
+
+1.4 产出的 plan tree / skeleton 是**给 agent 消费**的：颗粒细、含实现细节、几百行。
+用户要拍板的不是它，而是「问题 / 根因 / 怎么做 / 怎么算做完 / 这次不做什么」。
+所以 1.6 之前必须再出一个**给人消费**的出口：
+
+```bash
+KIT=~/.claude/skills/plan-poster/kit
+mkdir -p .claude/plan-posters
+cp "$KIT"/skeleton.html .claude/plan-posters/<session-id>.html
+#  ← 按 plan 填内容（骨架里 ※ 是占位符，漏改会在图上显眼留着）
+python3 "$KIT"/render.py .claude/plan-posters/<session-id>.html \
+                        .claude/plan-posters/<session-id>.png --scale 2
+```
+
+用 SendUserFile 把 PNG 发给用户，再执行 `done --user-confirmed`。
+
+🔴 图上的**验收标准必须与 1.4 锁定的 AC 逐字一致**——图是 plan 的投影，不是二次创作。
+两边不一致时以 plan 为准并回头修图。完整规则见 `plan-poster` skill。
 
 ## /goal 自主执行（Phase 2+3）
 
@@ -221,6 +242,7 @@ Phase 3 旅程失败、或 `setup_commands` 起的服务行为异常时，**先�
 ## 核心红线
 
 - Plan 必须走 writing-plans skill（orchestrator 验证 plan 文件签名，手写 plan 被拒）
+- 步骤 1.6 递方案给用户前必须走 plan-poster skill 出「方案摘要图」（plan tree 给 agent 消费，摘要图给人消费，两个出口缺一不可；图上 AC 须与 1.4 锁定的逐字一致）
 - 1A 需求拷打 (1.3r，仅 feature)：多角色法庭（产品/运营/数据/财务，缺席须显式 abstain 到场）→ 书记员机械合成 → grill。引擎硬验**合成纪律**：additive 并集不减（书记员只搬运、不改写/不凭空造/不冒名来源）、exclusive fork 全 resolved、每 P0 有 source + ≥1 可观察 AC（`{id, assertion}`，AC id 全局唯一含 P1）、concern 必带 evidence_ref。verdict 派生自结构，自报 PASS 无效。
 - 1B 技术方案 (1.4)：须为【每条 1A P0/P1 AC】显式映射 ≥1 task + ≥1 E2E（plan 内嵌 `ac_mapping` JSON 契约）；dangling/重复 ac_id/空 task|e2e/未全覆盖 = 当场 FAIL（不等 codex）。bugfix 无 1A，只验 writing-plans 签名。被 config/toggle 门控的 AC 若声明 `differential`，必须写全 `{flag,on_state,off_state}` + 非空 `required_surfaces`（cross-端覆盖契约，§6.4）。
 - Grill 必须走 grill-me skill（orchestrator 验证 grill 摘要文件 ≥300B + 结构）；若 1B 声明了 open 技术 fork，grill 摘要须含 `fork_resolutions` 逐条回写非空 resolution（从**可信 plan** 复核 open fork 集，漏裁/空裁/裁非 open fork 即 FAIL）

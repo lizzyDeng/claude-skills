@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>her 记忆拓扑 · Dayflow 风格说明图</title>
+<link rel="stylesheet" href="./dayflow.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════
+     抖动滤镜定义 —— 整个画风的地基。三个 seed 换着用。
+     baseFrequency 越小 = 抖动波长越长（越像慢手画）
+     scale 越大 = 抖得越狠，2~4 之间最像人手
+     ══════════════════════════════════════════════════════════ -->
+<svg class="defs">
+  <filter id="wob-1" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.022" numOctaves="3" seed="7" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="6" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <filter id="wob-2" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.030" numOctaves="3" seed="23" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="5" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <filter id="wob-3" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.016" numOctaves="2" seed="41" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="7" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
+
+<div class="poster">
+
+  <!-- ─────────── 头部：标题 + 气泡群 ─────────── -->
+  <div style="display:grid;grid-template-columns:1fr 420px;gap:20px;align-items:start;">
+    <div>
+      <div class="brand">AIFRIEND<em>·her</em></div>
+      <h1 class="headline">
+        她不是<br>
+        <span class="hot">记不住</span>，<br>
+        是换了个<br>
+        <span class="hot">记法</span>。
+      </h1>
+      <div class="rule"></div>
+      <p class="subline">
+        窗口只是短期缓冲，<br>
+        长程记忆走的是一张会遗忘、<br>
+        也会被重新想起的图。
+      </p>
+    </div>
+
+    <div class="bubbles">
+      <div class="bubble tail"        style="top:6px;   left:96px;  transform:rotate(-1.2deg);"><span>那家店你还记得吗</span></div>
+      <div class="bubble warm b2"     style="top:78px;  left:2px;   transform:rotate(1.4deg);"><span>我上次说过的</span></div>
+      <div class="bubble b3"          style="top:146px; left:132px; transform:rotate(-.8deg);"><span>你不是不吃香菜吗</span></div>
+      <div class="bubble warm"        style="top:212px; left:14px;  transform:rotate(1.1deg);"><span>我们第一次见面</span></div>
+      <div class="bubble b2 tail"     style="top:280px; left:150px; transform:rotate(-1.5deg);"><span>记得我生日吗</span></div>
+      <div class="bubble b3"          style="top:352px; left:38px;  transform:rotate(.9deg);"><span>你说过会等我</span></div>
+      <div style="position:absolute;top:344px;left:322px;color:var(--accent);font-size:40px;line-height:1;">♡</div>
+    </div>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <!-- ─────────── 对比：两代做法 ─────────── -->
+  <div class="grid-2">
+    <div class="sketch dashed tile">
+      <span class="icon">
+        <svg width="46" height="34" viewBox="0 0 46 34" fill="none" stroke="#6B5648" stroke-width="2" stroke-linecap="round">
+          <rect x="2" y="3" width="42" height="28" rx="5" filter="url(#wob-2)"/>
+          <path d="M9 12h28M9 19h20M9 26h24" filter="url(#wob-1)"/>
+        </svg>
+      </span>
+      <h4>窗口 capsule</h4>
+      <p>把一段旧对话压成<b>一段扁平摘要</b>。<br>
+         折叠那一刻认为重要的才留下 —— 之后再想起别的，<br>没了。</p>
+    </div>
+
+    <div class="sketch fill-warm tile">
+      <span class="icon">
+        <svg width="52" height="40" viewBox="0 0 52 40" fill="none" stroke="#EF7326" stroke-width="2.2" stroke-linecap="round">
+          <g filter="url(#wob-3)">
+            <circle cx="10" cy="12" r="5.5"/><circle cx="27" cy="5"  r="4"/>
+            <circle cx="42" cy="16" r="5"/>  <circle cx="19" cy="31" r="4.5"/>
+            <circle cx="38" cy="33" r="3.5"/>
+            <path d="M15 13.5 24 7M31 8l8 5M23 27l-9-9M35 30l4-9M23.5 30h11"/>
+          </g>
+        </svg>
+      </span>
+      <h4 style="color:var(--accent)">持久记忆图<span style="font-size:14.5px;color:var(--ink-soft);font-family:var(--font-body);margin-left:14px;">← her 走这条</span></h4>
+      <p>信息不是被裁掉，是被<span class="mark">提升出窗口</span>：<br>
+         变成带权重的节点、彼此连边、按<b>当轮 query</b> 重新召回。</p>
+    </div>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <h2 class="headline sm" style="margin-bottom:8px;">一条记忆的<span class="hot">一生</span></h2>
+  <div class="rule" style="width:96px;height:9px;margin-bottom:34px;"></div>
+
+  <!-- ─────────── 四步 ─────────── -->
+  <div class="step">
+    <div class="step-head">
+      <span class="step-no"><span>1</span></span>
+      <span class="step-title">抽取</span>
+      <p class="step-desc">对话对 → 记忆节点，<br>带上 type / importance / emotion。</p>
+    </div>
+    <div class="sketch fill-paper step-body">
+      <p style="margin:0 0 12px;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">
+        闲置一段时间后，后台 sweep 把这一轮聊过的东西<b>提炼成条目</b>，而不是原样堆着。
+      </p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <span class="sketch hair fill-warm" style="padding:8px 15px;font-size:15.5px;">☑ 不吃香菜</span>
+        <span class="sketch hair fill-warm sk-2" style="padding:8px 15px;font-size:15.5px;">☑ 上周换了工作</span>
+        <span class="sketch hair fill-warm sk-3" style="padding:8px 15px;font-size:15.5px;">☑ 容易受情绪影响</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-head">
+      <span class="step-no"><span>2</span></span>
+      <span class="step-title">连边</span>
+      <p class="step-desc">相似度过阈值就自动挂边，<br>重复的信息会被稀释降权。</p>
+    </div>
+    <div class="sketch fill-paper sk-2 step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">
+        新记忆落地时找最像的几条挂上<b>弱边</b> —— 于是「香菜」和「那次吵架的晚饭」之间，
+        有了一条<span class="mark">别人看不见的线</span>。
+      </p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-head">
+      <span class="step-no"><span>3</span></span>
+      <span class="step-title">遗忘</span>
+      <p class="step-desc">不是删除，是变淡。<br>越稳的记忆淡得越慢。</p>
+    </div>
+    <div class="sketch fill-paper sk-3 step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">
+        每条记忆有自己的半衰期。没被想起的会慢慢沉底 —— 但只要<b>被召回一次</b>，
+        计时就从头开始。
+      </p>
+    </div>
+  </div>
+
+  <div class="step" style="margin-bottom:26px;">
+    <div class="step-head">
+      <span class="step-no"><span>4</span></span>
+      <span class="step-title">召回</span>
+      <p class="step-desc">按这一轮你说的话去捞，<br>不是按折叠时的猜测。</p>
+    </div>
+    <div class="sketch fill-warm step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">
+        向量粗筛 → 按<b>相似 / 新近 / 情绪 / 重要度</b>重排 → 顺着边多走一跳 →
+        锚点记忆无条件带上。
+      </p>
+    </div>
+  </div>
+
+  <!-- ─────────── 手绘图表：遗忘 + 召回重置 ─────────── -->
+  <div class="sketch hair chart sk-2">
+    <svg viewBox="0 0 900 300">
+      <g stroke="#33241C" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".45">
+        <path d="M60 268 H870" stroke-dasharray="7 9" filter="url(#wob-1)"/>
+        <path d="M60 30 H870"  stroke-dasharray="7 9" filter="url(#wob-1)"/>
+      </g>
+
+      <!-- 衰减段 A -->
+      <path d="M60 34 C110 62, 150 92, 200 118 C250 144, 300 164, 360 182
+               C410 196, 450 204, 470 208"
+            stroke="#EF7326" stroke-width="4.5" fill="none"
+            stroke-linecap="round" filter="url(#wob-3)"/>
+      <!-- 被召回：跳回顶 -->
+      <path d="M470 208 L474 40" stroke="#EF7326" stroke-width="4.5"
+            stroke-linecap="round" filter="url(#wob-2)"/>
+      <!-- 衰减段 B -->
+      <path d="M474 40 C524 70, 566 102, 616 128 C666 154, 716 176, 776 194
+               C826 208, 856 214, 870 217"
+            stroke="#EF7326" stroke-width="4.5" fill="none"
+            stroke-linecap="round" filter="url(#wob-3)"/>
+
+      <circle cx="470" cy="208" r="7" fill="#FCF3E8" stroke="#EF7326" stroke-width="4"/>
+      <circle cx="474" cy="40"  r="7" fill="#EF7326"/>
+
+      <text x="24"  y="36"  font-family="PingFang SC" font-size="18" fill="#6B5648">强</text>
+      <text x="24"  y="274" font-family="PingFang SC" font-size="18" fill="#6B5648">弱</text>
+      <text x="150" y="256" font-family="PingFang SC" font-size="19" fill="#6B5648">没被想起 → 慢慢沉底</text>
+      <text x="520" y="34"  font-family="PingFang SC" font-size="19" fill="#EF7326">被召回一次 → 计时归零</text>
+    </svg>
+    <p class="chart-cap">同一条记忆的强度曲线：遗忘是连续的，召回是一次跳变。</p>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <!-- ─────────── 适合 / 不适合 ─────────── -->
+  <div class="sec-label good"><span class="badge">✓</span> 这套的长处 <small>（拿手的）</small></div>
+  <div class="grid-4">
+    <div class="sketch hair tile good"><h4>问什么捞什么</h4><p>召回按当轮语义走，不受折叠时的判断限制。</p></div>
+    <div class="sketch hair sk-2 tile good"><h4>越久越有味</h4><p>关系脉络、老细节能跨很长时间被重新点亮。</p></div>
+    <div class="sketch hair sk-3 tile good"><h4>会自然淡忘</h4><p>不重要的自己沉底，不用人工清理。</p></div>
+    <div class="sketch hair tile good"><h4>联想式命中</h4><p>顺着边多走一跳，捞回你没直接提的那件事。</p></div>
+  </div>
+
+  <div class="sec-label bad"><span class="badge">✕</span> 要小心的地方 <small>（代价）</small></div>
+  <div class="grid-4">
+    <div class="sketch hair fill-warm tile bad"><h4>原文会缺</h4><p>召回面回的是记忆条目，不是逐字原话。</p></div>
+    <div class="sketch hair fill-warm sk-2 tile bad"><h4>抽取即瓶颈</h4><p>没被提炼出来的细节，后面谁也捞不回来。</p></div>
+    <div class="sketch hair fill-warm sk-3 tile bad"><h4>多一层成本</h4><p>抽取、向量、召回都是额外调用。</p></div>
+    <div class="sketch hair fill-warm tile bad"><h4>调参面更大</h4><p>阈值、半衰期、重排权重，每个都能调歪。</p></div>
+  </div>
+
+  <!-- ─────────── 底部 callout ─────────── -->
+  <div class="sketch fill-sink callout" style="margin-top:40px;">
+    <span class="glyph">✦</span>
+    <span>摘要回答的是「当时我以为重要的」，<br>图回答的是「<span class="mark">这一轮你问的</span>」。</span>
+  </div>
+
+  <div class="sketch dashed note" style="margin-top:16px;">
+    <b>名词小贴士</b><br>
+    · 节点：一条被提炼出来的记忆，带类型 / 重要度 / 情绪分<br>
+    · 边：两条记忆之间的关联，召回时可以顺着多走一跳<br>
+    · 锚点：无条件带上的关键记忆，不参与淡忘竞争
+  </div>
+
+</div>
+</body>
+</html>
