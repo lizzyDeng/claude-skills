@@ -61,6 +61,11 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 
 - 对需求的理解（一段话）+ 推荐方案与理由（💡 建议 / 📝 理由）+ 步骤清单 + 影响面
   + **验收标准**——用户确认的是「方案 + 验收」的整体，验收标准确认后即锁定。
+- 🔴 **同时产出「方案摘要图」**：调用 `plan-poster` skill，把上面这份方案渲成一张手绘感
+  长图（`.claude/plan-posters/<task-slug>.png`），用 SendUserFile 发给用户。
+  plan 叶的产出是给 agent 消费的，**这张图是给人消费的**，两个出口缺一不可；
+  图上的验收标准必须与 plan 里锁定的**逐字一致**（图是投影，不是二次创作）。
+  图的路径写进 ledger。
 - **涉及前端 UI 的需求加一档**：必须给出具体 UI 方案——改哪些页面/组件、交互流程、
   布局与视觉处理（文字描述或 ASCII 草图）；有多个合理做法时列 2-3 个选项让用户挑。
   UI 方案必须含 **loading / error（带重试入口）/ empty** 三个非 success 态的处理。
@@ -100,6 +105,7 @@ description: "Model-tiering orchestration: a cheap main-loop model (Fable) condu
 | barrier 纪律 | 每个 barrier 是否有站得住的理由；该 pipeline 的地方没滥用 barrier |
 | 扇出轴 | 拆分维度是否合理（按文件/按表/按维度…），有没有更优轴 |
 | 暂停纪律 | `需求` 类是否在 1.5 真正暂停等确认；UI 需求是否给了具体 UI 方案 |
+| 摘要图 | `需求` 类是否产出方案摘要图；图上验收标准与 plan 是否逐字一致 |
 | 计划纪律 | 动代码任务是否真派了 Opus plan 叶 + grill 叶（而非主循环闭门自产方案） |
 | 验收闭环 | 验收标准是否执行前锁定；Step 4 是否附真实命令输出（bugfix：红 → 绿） |
 | 鲁棒性 | 清单是否逐项覆盖（N/A 有理由）；implement 叶是否带清单；验收含非 happy path |
@@ -149,6 +155,7 @@ LLM 写方案天然只写 happy path——所以把非 happy path 做成必填�
 
 ## 方案确认（仅需求类）
 <提给用户的方案要点 + 用户确认/修正原文>
+- 方案摘要图：<.claude/plan-posters/<slug>.png>
 
 ## Workflow 脚本
 <最终脚本原文>

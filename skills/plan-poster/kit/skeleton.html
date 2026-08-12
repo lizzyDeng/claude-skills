@@ -1,0 +1,157 @@
+<!doctype html>
+<!-- ══════════════════════════════════════════════════════════════
+     方案摘要图 · 骨架模板
+     用法：整份复制 → 只改标 ※ 的文字 → python3 render.py <this> out.png
+     🔴 不要改 filter 定义、不要改 class 名、不要加新颜色
+     ══════════════════════════════════════════════════════════════ -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>※需求名 · 方案摘要</title>
+<link rel="stylesheet" href="./dayflow.css">
+</head>
+<body>
+
+<!-- 抖动滤镜定义 —— 原样保留，勿改 -->
+<svg class="defs">
+  <filter id="wob-1" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.022" numOctaves="3" seed="7" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="6" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <filter id="wob-2" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.030" numOctaves="3" seed="23" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="5" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <filter id="wob-3" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.016" numOctaves="2" seed="41" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="7" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
+
+<div class="poster">
+
+  <!-- ①  要解决什么 ─────────────────────────────────────────
+       大标题写「问题」，不写方案名。读者 3 秒要知道疼在哪。 -->
+  <div style="display:grid;grid-template-columns:1fr 400px;gap:20px;align-items:start;">
+    <div>
+      <div class="brand">※项目名<em>·#123</em></div>
+      <h1 class="headline">
+        ※一句话<br>
+        <span class="hot">说清问题</span>，<br>
+        ※第三行。
+      </h1>
+      <div class="rule"></div>
+      <p class="subline">
+        ※副标题两三行：<br>
+        当前什么状况、为什么现在要动。
+      </p>
+    </div>
+    <!-- 装饰气泡：放用户原话 / 报错 / 症状。4~6 条，别写方案 -->
+    <div class="bubbles">
+      <div class="bubble tail"    style="top:6px;  left:80px; transform:rotate(-1.2deg);"><span>※症状一</span></div>
+      <div class="bubble warm b2" style="top:78px; left:0;    transform:rotate(1.4deg);"><span>※用户原话</span></div>
+      <div class="bubble b3"      style="top:150px;left:110px;transform:rotate(-.8deg);"><span>※报错片段</span></div>
+      <div class="bubble warm"    style="top:222px;left:14px; transform:rotate(1.1deg);"><span>※症状四</span></div>
+    </div>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <!-- ②  判断 ───────────────────────────────────────────────
+       根因是什么 / 为什么选这个方案。有对照时用两栏，否则删掉右边一块。 -->
+  <div class="grid-2">
+    <div class="sketch dashed tile">
+      <h4>※看起来像的原因</h4>
+      <p>※为什么这个判断不对 —— 一句话说清它只是症状。</p>
+    </div>
+    <div class="sketch fill-warm tile">
+      <h4 style="color:var(--accent)">※真正的根因</h4>
+      <p>※证据在哪：<b>file.rs:123</b>。<span class="mark">关键结论</span>。</p>
+    </div>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <!-- ③  怎么做 ─────────────────────────────────────────────
+       ≤5 步。每步左边一句话标题 + 一句说明，右边一块具体内容。 -->
+  <h2 class="headline sm" style="margin-bottom:8px;">怎么<span class="hot">做</span></h2>
+  <div class="rule" style="width:96px;height:9px;margin-bottom:34px;"></div>
+
+  <div class="step">
+    <div class="step-head">
+      <span class="step-no"><span>1</span></span>
+      <span class="step-title">※步骤名</span>
+      <p class="step-desc">※一句话说明<br>这步在干什么。</p>
+    </div>
+    <div class="sketch fill-paper step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">
+        ※具体改什么，落到 <b>file:line</b> 或模块名。
+      </p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-head">
+      <span class="step-no"><span>2</span></span>
+      <span class="step-title">※步骤名</span>
+      <p class="step-desc">※一句话说明。</p>
+    </div>
+    <div class="sketch fill-paper sk-2 step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">※内容。</p>
+    </div>
+  </div>
+
+  <div class="step" style="margin-bottom:26px;">
+    <div class="step-head">
+      <span class="step-no"><span>3</span></span>
+      <span class="step-title">※步骤名</span>
+      <p class="step-desc">※一句话说明。</p>
+    </div>
+    <div class="sketch fill-paper sk-3 step-body">
+      <p style="margin:0;font-size:16.5px;line-height:1.9;color:var(--ink-soft)">※内容。</p>
+    </div>
+  </div>
+
+  <div class="hr-dash"></div>
+
+  <!-- ④  验收标准 ───────────────────────────────────────────
+       🔴 必填，且必须是可执行命令 / 可观察行为。这是全图最该被看见的一块。 -->
+  <div class="sec-label good"><span class="badge">✓</span> 怎么算做完 <small>（验收标准 · 执行前锁定）</small></div>
+  <div class="grid-2">
+    <div class="sketch hair tile good">
+      <h4>※验收一</h4>
+      <p><b>※cargo test xxx</b><br>※期望看到什么输出。</p>
+    </div>
+    <div class="sketch hair sk-2 tile good">
+      <h4>※验收二（非 happy path）</h4>
+      <p>※失败注入 / 超时 / 非法输入下的期望行为。</p>
+    </div>
+  </div>
+
+  <!-- ⑤  边界 ───────────────────────────────────────────────
+       这次不做什么 + 已知风险。ADHD 读者最容易漏的就是这块，务必留。 -->
+  <div class="sec-label bad"><span class="badge">✕</span> 这次不做 <small>（边界与风险）</small></div>
+  <div class="grid-4">
+    <div class="sketch hair fill-warm tile bad"><h4>※不做一</h4><p>※为什么押后。</p></div>
+    <div class="sketch hair fill-warm sk-2 tile bad"><h4>※不做二</h4><p>※理由。</p></div>
+    <div class="sketch hair fill-warm sk-3 tile bad"><h4>※风险一</h4><p>※踩到会怎样。</p></div>
+    <div class="sketch hair fill-warm tile bad"><h4>※风险二</h4><p>※踩到会怎样。</p></div>
+  </div>
+
+  <!-- ⑥  一句话总结 ─────────────────────────────────────────── -->
+  <div class="sketch fill-sink callout" style="margin-top:40px;">
+    <span class="glyph">✦</span>
+    <span>※一句话把方案的取舍说清，<br>让人<span class="mark">看完这行就能点头或否掉</span>。</span>
+  </div>
+
+  <!-- ⑦  出处（可选但建议保留：让图能追回原始 plan） -->
+  <div class="sketch dashed note" style="margin-top:16px;">
+    <b>出处</b><br>
+    · plan：<b>※.claude/.fastship-plan.md</b><br>
+    · 影响面：<b>※src/a.rs · src/b.rs</b><br>
+    · 生成时间：※YYYY-MM-DD
+  </div>
+
+</div>
+</body>
+</html>
