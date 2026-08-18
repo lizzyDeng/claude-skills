@@ -122,11 +122,18 @@ KIT=~/.claude/skills/plan-poster/kit
 mkdir -p .claude/plan-posters
 cp "$KIT"/skeleton.html .claude/plan-posters/<session-id>.html
 #  ← 按 plan 填内容（骨架里 ※ 是占位符，漏改会在图上显眼留着）
-python3 "$KIT"/render.py .claude/plan-posters/<session-id>.html \
-                        .claude/plan-posters/<session-id>.png --scale 2
+python3 "$KIT"/bundle.py .claude/plan-posters/<session-id>.html   # 原地变自包含单文件
 ```
 
-用 SendUserFile 把 PNG 发给用户，再执行 `done --user-confirmed`。
+用 `SendUserFile(files:["…<session-id>.html"], display:"render")` 把 **HTML** 发给用户，
+再执行 `done --user-confirmed`。
+
+🔴 **`bundle.py` 这步不能省**：海报靠 `<link href="./dayflow.css">` 找样式、css 又靠
+`url('./fonts/…')` 找得意黑。不 bundle 就发，这两跳全断——样式没了、标题回落系统黑体，
+**而页面照样打得开**，没有报错也没有 404。静默失败，你不会知道用户看到的是残图。
+（实测：bundle 后丢空目录与资源齐全基准 **0.0000% 像素差异**；裸 html 是 **100%**。）
+
+需要 PNG（发微信 / 小红书 / 存档）时再补：`python3 "$KIT"/render.py <html> <png> --scale 2`。
 
 🔴 图上的**验收标准必须与 1.4 锁定的 AC 逐字一致**——图是 plan 的投影，不是二次创作。
 两边不一致时以 plan 为准并回头修图。完整规则见 `plan-poster` skill。
