@@ -1,6 +1,6 @@
 ---
 name: plan-poster
-description: "把一份方案/计划渲染成手绘感中文摘要长图（HTML + SVG 抖动滤镜 + Chrome 无头截图），供人一眼看懂并拍板。触发词：方案摘要图、出成长图、画成海报、plan poster、摘要图。🔴 /fastship 步骤 1.6 与 /conductor 步骤 1.5 递方案给用户时必须调用本 skill。"
+description: "把一份方案/计划渲染成手绘感中文摘要长图，产出**自包含单文件 HTML**（内联 CSS + base64 内嵌字体 + SVG 抖动滤镜），供人一眼看懂并拍板。触发词：方案摘要图、出成长图、画成海报、plan poster、摘要图。🔴 /fastship 步骤 1.6 与 /conductor 步骤 1.5 递方案给用户时必须调用本 skill。"
 ---
 
 # /plan-poster — 方案摘要图
@@ -12,7 +12,7 @@ plan tree 是给 agent 消费的；**这张图是给人消费的**。同一份�
 | 场景 | 用不用 |
 |---|---|
 | `/fastship` 步骤 **1.6 用户确认** | 🔴 必须 |
-| `/conductor` 步骤 **1.5 方案确认**（`需求` 类） | 🔴 必须 |
+| `/conductor` 步骤 **1.5 方案确认**（`需求` + `bugfix`，gate PASS 之后） | 🔴 必须 |
 | 用户说「出成长图 / 画成海报 / 给我张摘要图」 | 必须 |
 | 纯 bugfix 且改动 < 20 行 | 可跳过，正文写清即可 |
 | 说明某个机制怎么运作（非方案） | 可用，换掉第 ③④⑤ 段即可 |
@@ -24,16 +24,31 @@ KIT=~/.claude/skills/plan-poster/kit
 mkdir -p .claude/plan-posters
 cp "$KIT"/skeleton.html .claude/plan-posters/<slug>.html
 #  ← 编辑 <slug>.html，把所有 ※ 换成真内容
-python3 "$KIT"/render.py .claude/plan-posters/<slug>.html \
-                        .claude/plan-posters/<slug>.png --scale 2
+python3 "$KIT"/bundle.py .claude/plan-posters/<slug>.html      # 原地变自包含
 ```
 
 1. **抄骨架 + 改文字**：`※` 是单色占位标记，漏改一处会在图上显眼地留着（故意的）
-2. **渲染**：`render.py` 会自动把 `dayflow.css` 和 `fonts/` 补到 html 旁边，不用手动拷
-3. **给用户看**：`SendUserFile`（`display:"render"`）发 PNG，再 `open <slug>.png`
+2. **打包自包含**：`bundle.py` 把 `dayflow.css` 内联进 `<style>`、把得意黑 woff2 转成
+   base64 data URI 塞进 css。产出**单文件约 1.5 MB**。**幂等**——文字改完再跑一次即可，
+   不会重复内联、不会膨胀。
+3. **给用户看**：`SendUserFile(files:["<slug>.html"], display:"render")`
+
+🔴 **为什么必须 bundle（这一步不能省）**：海报靠 `<link href="./dayflow.css">` 找样式，
+css 又靠 `url('./fonts/…')` 找得意黑。**单发一个 html 给别人、或丢进 artifact，这两跳全断**——
+样式没了、标题回落系统黑体，画风就没了，**但页面照样能打开**，所以这个失败是静默的。
+
+实测（三方对照，`--scale 1` 逐像素比）：
+
+| 变体 | 与「资源齐全」基准的像素差异 | 内容高度 |
+|---|---|---|
+| **bundle 后**丢进空目录 | **0.0000%**（完全一致） | 3248 |
+| 裸 html 丢进空目录 | **100%**（布局塌掉） | 2856 |
 
 参考成品：`kit/example-poster.html`（组件用了一遍）。
-产出目录建议加进 `.gitignore` —— PNG 是可重新生成的产物，不进版本库。
+产出目录建议加进 `.gitignore` —— html 是可重新生成的产物，不进版本库。
+
+**编辑期预览**：想在浏览器里边改边看，先跑一次 `bundle.py` 就行（自包含之后直接
+`open <slug>.html`）；或者把 `dayflow.css` 与 `fonts/` 拷到 html 旁边。
 
 ## 内容规则（比样式重要）
 
@@ -83,9 +98,17 @@ python3 "$KIT"/render.py .claude/plan-posters/<slug>.html \
 
 ## 坑
 
-- Chrome 新版无头**不支持整页截图**，只能开高窗口再裁 —— `render.py` 干的就是这个。
-- `render.py` 取**最后一行**的颜色当空白色来裁，不能取左上角：海报满宽时两侧没有桌面色。
-- `--scale 2` 出 2x 图，发微信/小红书才不糊；正文预览用 `--scale 1` 更快。
-- 字体是本地 woff2（得意黑 Smiley Sans，OFL）。`dayflow.css` 按相对路径找 `./fonts/`，
-  **复制 css 时必须连 `fonts/` 一起复制**，否则标题回落成系统黑体，画风就没了。
-- 正文用系统 `PingFang SC`，别为正文去拉中文字库（20MB 起，且下载常超时）。
+- 🔴 **资源缺失是静默失败**：少了 `dayflow.css` 或 `fonts/`，页面照样打得开，只是样式没了、
+  标题回落系统黑体。**没有报错、没有 404 提示**，所以别靠"能打开"判断成功——靠 `bundle.py`。
+- 1.5 MB 里 **1.4 MB 是字体**（得意黑 Smiley Sans，OFL，本地 woff2 转 base64）。
+  正文用系统 `PingFang SC`，别为正文去拉中文字库（20MB 起，且下载常超时）。
+- 🔴 `bundle.py` 只替换 `url(<路径>)`，**不碰 `url(#wob-1)`** ——那是同文档 SVG filter 引用，
+  当成资源路径替换掉的话满页抖动滤镜全废。改 bundle.py 时别把这个负向匹配 `(?!#)` 弄丢。
+- `bundle.py` **幂等**：认 `<style id="poster-inline-css">` 标记，重跑先摘旧的再重新内联，
+  不会滚雪球。改完文字直接重跑，不必从 skeleton 重来。
+- **测「自包含」必须挪到空目录测**。留在原地测永远是绿的——资源就在旁边。
+  而且别用 `render.py` 截图来测：它的 `ensure_assets()` 会**自动把 css/fonts 拷过去**，
+  当场把对照组修好（本 skill 改版时真踩过：三个变体截出来尺寸一模一样才发现）。
+  直接调 Chrome 截图。
+- 需要 PNG 时（发微信 / 小红书 / 存档），`kit/render.py` 还在：
+  `python3 render.py <slug>.html <slug>.png --scale 2`。不是主流程，按需用。
