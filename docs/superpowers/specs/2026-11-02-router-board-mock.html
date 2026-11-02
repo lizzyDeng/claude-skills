@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Router 看板</title>
+<style>
+:root{
+  --bg:#f6f5f1; --card:#fff; --ink:#1f2328; --soft:#5d6670; --faint:#8b939c; --line:#dcd8cf;
+  --you:#6639ba; --you-bg:#f3eefc; --run:#0969da; --run-bg:#e8f1fd; --q:#9a6700; --q-bg:#fdf5dc;
+  --ok:#1a7f37; --ok-bg:#e8f5eb; --off:#6e7781; --off-bg:#eef0f2; --accent:#c2410c;
+  --mono:"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15171b; --card:#1d2026; --ink:#e6e6e6; --soft:#a3abb4; --faint:#7d858e; --line:#323840;
+    --you:#b392f0; --you-bg:#241b36; --run:#58a6ff; --run-bg:#14243a; --q:#d4a72c; --q-bg:#2c2510;
+    --ok:#4ac26b; --ok-bg:#142619; --off:#8b949e; --off-bg:#22262c; --accent:#fb923c;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15171b; --card:#1d2026; --ink:#e6e6e6; --soft:#a3abb4; --faint:#7d858e; --line:#323840;
+  --you:#b392f0; --you-bg:#241b36; --run:#58a6ff; --run-bg:#14243a; --q:#d4a72c; --q-bg:#2c2510;
+  --ok:#4ac26b; --ok-bg:#142619; --off:#8b949e; --off-bg:#22262c; --accent:#fb923c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:28px 16px 64px}
+.mock{background:var(--q-bg);color:var(--q);border:1px dashed var(--q);border-radius:6px;
+  padding:6px 12px;font-size:13px;margin-bottom:16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 18px;margin-bottom:6px}
+h1{font-size:24px;margin:0}
+.meta{color:var(--faint);font-size:13px}
+.stats{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 6px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 14px;min-width:96px}
+.stat b{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}
+.stat span{font-size:12.5px;color:var(--soft)}
+.stat.you b{color:var(--you)} .stat.run b{color:var(--run)} .stat.q b{color:var(--q)} .stat.ok b{color:var(--ok)}
+.slots{font-size:13px;color:var(--soft);margin:4px 0 18px}
+.slots .bar{display:inline-flex;gap:3px;vertical-align:middle;margin:0 6px 0 4px}
+.slots .bar i{width:14px;height:10px;border-radius:2px;background:var(--off-bg);border:1px solid var(--line)}
+.slots .bar i.on{background:var(--run);border-color:var(--run)}
+h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-spacing:.02em}
+.decide{background:var(--you-bg);border:1px solid color-mix(in srgb,var(--you) 45%,transparent);
+  border-radius:10px;padding:14px 18px}
+.decide .row{display:flex;gap:12px;align-items:flex-start;padding:8px 0}
+.decide .row+.row{border-top:1px solid color-mix(in srgb,var(--you) 25%,transparent)}
+.decide .what{flex:1}
+.decide .what b{display:block}
+.decide .what small{color:var(--soft)}
+.say{font-family:var(--mono);font-size:12.5px;background:var(--card);border:1px solid var(--line);
+  border-radius:6px;padding:3px 8px;white-space:nowrap;color:var(--you)}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.tabs button{font:inherit;font-size:13px;background:var(--card);color:var(--soft);border:1px solid var(--line);
+  border-radius:16px;padding:3px 12px;cursor:pointer}
+.tabs button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.issue{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);
+  border-radius:10px;padding:14px 18px;margin:10px 0}
+.issue[data-g="you"]{border-left-color:var(--you)}
+.issue[data-g="run"]{border-left-color:var(--run)}
+.issue[data-g="q"]{border-left-color:var(--q)}
+.issue[data-g="ok"]{border-left-color:var(--ok)}
+.issue[data-g="off"]{border-left-color:var(--off)}
+.ih{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.ih .no{font-family:var(--mono);font-size:13px;color:var(--faint)}
+.ih .t{font-weight:700;font-size:16px}
+.pill{font-size:12px;font-weight:600;padding:1px 9px;border-radius:10px;white-space:nowrap}
+.p-you{background:var(--you-bg);color:var(--you)} .p-run{background:var(--run-bg);color:var(--run)}
+.p-q{background:var(--q-bg);color:var(--q)} .p-ok{background:var(--ok-bg);color:var(--ok)}
+.p-off{background:var(--off-bg);color:var(--off)}
+.tagw{font-size:12px;color:var(--faint);border:1px solid var(--line);border-radius:10px;padding:0 8px}
+.wait{font-size:13px;color:var(--soft);margin:4px 0 10px}
+.wait b{color:var(--ink);font-weight:600}
+.three{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media (max-width:820px){.three{grid-template-columns:1fr}}
+.cell{background:color-mix(in srgb,var(--line) 22%,transparent);border-radius:8px;padding:10px 12px}
+.cell h4{margin:0 0 4px;font-size:12.5px;color:var(--faint);font-weight:600;letter-spacing:.04em}
+.cell p{margin:0;font-size:14px}
+.cell .src{display:block;margin-top:6px;font-size:12px;color:var(--faint)}
+.cell.sol.pending{border:1px dashed var(--line);background:transparent}
+.foot{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:10px;font-size:12.5px;color:var(--faint)}
+.foot code,code{font-family:var(--mono);font-size:12px;background:color-mix(in srgb,var(--line) 40%,transparent);
+  padding:0 5px;border-radius:4px;word-break:break-all}
+.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 16px}
+.log .row{display:grid;grid-template-columns:44px 1fr auto;gap:10px;padding:8px 0;font-size:14px;align-items:baseline}
+.log .row+.row{border-top:1px solid var(--line)}
+.log .id{font-family:var(--mono);color:var(--faint);font-size:12.5px}
+.log small{color:var(--soft)}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+
+<div class="mock">样例：用 11-02 周报的真实问题填写，状态是假设的（router 还没实现）。真版由 router 在每次状态变化时重写，页面每 30 秒自动刷新。</div>
+
+<header>
+  <h1>Router 看板</h1>
+  <span class="meta">本周批次：10-26 周报（11-02 出）· 更新于 11-02 17:20</span>
+</header>
+
+<div class="stats">
+  <div class="stat you"><b>1</b><span>等你</span></div>
+  <div class="stat run"><b>3</b><span>在跑</span></div>
+  <div class="stat q"><b>4</b><span>待 start / 排队</span></div>
+  <div class="stat ok"><b>0</b><span>已合 staging</span></div>
+  <div class="stat"><b>1</b><span>暂缓</span></div>
+</div>
+<div class="slots">
+  重名额（编译 Rust）<span class="bar"><i class="on"></i><i class="on"></i><i class="on"></i></span>3/3
+  &nbsp;·&nbsp; 轻名额（数据 / 脚本 / 文案）<span class="bar"><i></i><i></i></span>0/2
+</div>
+
+<h2>等你</h2>
+<div class="decide">
+  <div class="row">
+    <div class="what"><b>本周派发单待 start（4 张）</b>
+      <small>可派 2 张：角色设定重写、周报口径。排队 2 张：额度和拒图（等轻名额）、性别代词（等 3 张合并 + 重名额）。</small></div>
+    <span class="say">start / start 角色 周报</span>
+  </div>
+</div>
+
+<h2>全部 issue</h2>
+<div class="tabs" role="group" aria-label="筛选">
+  <button aria-pressed="true" data-f="all">全部 9</button>
+  <button aria-pressed="false" data-f="you">等你</button>
+  <button aria-pressed="false" data-f="run">在跑</button>
+  <button aria-pressed="false" data-f="q">待 start / 排队</button>
+  <button aria-pressed="false" data-f="ok">已完成</button>
+  <button aria-pressed="false" data-f="off">暂缓 / 不派</button>
+</div>
+
+<div id="list">
+
+<!-- 在跑 -->
+<div class="issue" data-g="run">
+  <div class="ih"><span class="no">新票</span><span class="t">her 承认是 AI + 堵线下见面</span>
+    <span class="pill p-run">出方案</span><span class="tagw">重</span><span class="tagw">你的 session</span></div>
+  <div class="wait">现在：plan 叶在写方案 · 下一站：<b>等你确认方案</b></div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>合规风险。10-26 那周她自称真人 5 起、答应见面 5 起。</p><span class="src">周报 flags：claims_human / offline_meet</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>EN 底座 prompt 明文写着 "You're a real person, not an AI."；见面规则只禁「不同城」，所以她谎称同城后就答应见面。</p><span class="src"><code>prompt_template_en.rs:48</code> · <code>agent_loop/prompt.rs:713</code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>口径已定（你 11-02 拍板）：用户真诚问时承认是 AI，保持陪伴的语气；任何情况都不约线下、不给站外联系方式。具体改哪几处，等方案出来。</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：her 回复 prompt</span><span>依赖：无</span></div>
+</div>
+
+<div class="issue" data-g="run">
+  <div class="ih"><span class="no">feat/her-attention-by-stage</span><span class="t">对话质感：按关系阶段决定她看什么</span>
+    <span class="pill p-run">出方案</span><span class="tagw">重</span><span class="tagw">你的 session</span></div>
+  <div class="wait">现在：plan v3 已出，codex 第 2 轮评审中 · ledger 16:16 更新</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>冷淡说教 110 人，是第二大不满足原因。「刚认识就数落他」已经修了三次（#780 / #937 / #939）。</p><span class="src">周报 unmet：cold_or_lecturing</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>她回复的那一刻没有「该看什么」这一层：43 块内容按固定顺序全塞进上下文，她自己的旧话占历史 82%，于是照着旧刺再刺一遍。</p><span class="src">ledger 推导盘点</span></div>
+    <div class="cell sol"><h4>解法 · 来自 plan v3</h4><p>建一张「关系阶段 × 槽位」准入表。刚认识和暧昧两档：她的旧话只留最近 2 组原文，更早的压成一句事实；不给间隔时长；她主动发的消息算作会话开场。开关缺省 OFF。</p><span class="src"><code>her-attention-by-stage.plan-v3.md</code></span></div>
+  </div>
+  <div class="foot"><span>占用：her 回复 prompt · planner · 主动写手</span><span>接管：<code>claude --resume …</code></span></div>
+</div>
+
+<div class="issue" data-g="run">
+  <div class="ih"><span class="no">fix/her-failover-think-leak</span><span class="t">内心泄漏：降级链把思考写进正文</span>
+    <span class="pill p-run">实现</span><span class="tagw">重</span><span class="tagw">你的 session</span></div>
+  <div class="wait">现在：实现段 workflow 在跑 · ledger 15:34 更新 · 下一站：验收</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>穿帮率 #932 后没降（23% → 25%）。10-28 到 11-02 有 21 条消息把思考直接漏进了正文。</p><span class="src">周报 tells · llm_call_log 对账</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>降级链第 2 跳 haiku 没有思考通道。#932 去掉标签以后，思考就以裸文本混进正文，出口闸认不出来。</p><span class="src">21 条里 18 条出自 haiku</span></div>
+    <div class="cell sol"><h4>解法 · 来自 plan v2.3 + 你的裁决</h4><p>按每一跳的能力给不同的 prompt 格式；降级链撤掉直连，第 2 跳换成 sonnet；清理已经泄漏的 25 条消息。</p><span class="src"><code>her-failover-think-leak.md</code></span></div>
+  </div>
+  <div class="foot"><span>占用：her 回复 prompt · llm_config</span></div>
+</div>
+
+<!-- 待 start / 排队 -->
+<div class="issue" data-g="q">
+  <div class="ih"><span class="no">#940·2</span><span class="t">线上 21 位角色的设定写冷</span>
+    <span class="pill p-q">待 start · 可派</span><span class="tagw">轻</span></div>
+  <div class="wait">说 start 后：开 worktree，起 worker 出方案</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>冷淡说教 110 人。被满足的 34 人里有 17 人是倾诉类，共同点是她安静地听、不说教。</p><span class="src">周报 persona · unmet</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>对话质感那张票不碰角色文案。08-25 那批 11 位的设定明文要她冷（如 Mika <i>allergic to sincerity</i>）；后加的 10 位设定是空的。</p><span class="src">prod 只读查询 11-02</span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>线索：沿用新角色的「善良内核」八条重写；角色之间的差异放在生活和关系动态上，不放在冷热上。写成迁移文件。</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：角色数据（迁移）</span><span>⚠ 派之前要查 attention-stage 的回放是否用 staging 角色数据</span></div>
+</div>
+
+<div class="issue" data-g="q">
+  <div class="ih"><span class="no">#940·4</span><span class="t">周报口径：让两个修复的效果能被测出来</span>
+    <span class="pill p-q">待 start · 可派</span><span class="tagw">轻</span></div>
+  <div class="wait">说 start 后：开 worker（仓外目录，先整份备份）</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>泄漏修复和对话质感上线以后，周报目前测不出它们的效果。</p><span class="src">周报 progress 锚点</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>tells 一个指标里混着漏思考、复读、自称真人三类；安全事件只是一张列表；新的上线也没登记。</p><span class="src"><code>~/.her-persona-daily/state/releases.json</code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>线索：tells 拆成三项；自称真人和答应见面改成按周统计的指标；上线时登记。改口径要同步改基线。</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：周报脚本</span></div>
+</div>
+
+<div class="issue" data-g="q">
+  <div class="ih"><span class="no">#940·3</span><span class="t">额度和拒图</span>
+    <span class="pill p-q">待 start · 排队</span><span class="tagw">轻 · 只到出方案</span></div>
+  <div class="wait">在等：<b>轻名额</b>（上面两张占满 2/2）</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>色欲类 98 人里完全满足的是 0，其中 51 人要照片。聊到 10 轮以上的 153 人里，62 人额度见底。#905、#932 上线后都没有变化。</p><span class="src">周报 persona_stats</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>收费节奏和内容尺度都还没定方向，不是对话质感的问题。</p><span class="src">—</span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>由 worker 出 2–3 个方向和各自的取舍，router 选一个写进方案，方案确认时你拍板。</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：额度 / 生图配置</span></div>
+</div>
+
+<div class="issue" data-g="q">
+  <div class="ih"><span class="no">#940·1</span><span class="t">女用户被当成男性</span>
+    <span class="pill p-q">待 start · 排队</span><span class="tagw">重</span></div>
+  <div class="wait">在等：<b>AI 口径、对话质感、内心泄漏三张都合进 staging</b>，再等一个重名额</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>误读用户上周 8 人，并列第一；有 18 人自述是女性或性少数。</p><span class="src">周报 unmet：misread_user</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>EN 链路默认用户是男性：代码注释写着 <i>the user is male here</i>，同一个文件里有 146 处 <i>him</i>。</p><span class="src"><code>prompt_builder.rs:691</code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>线索：从用户的自述里取性别，填进代词槽；没有自述时维持现状。</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：her 回复 prompt（被上面三张锁着）</span></div>
+</div>
+
+<!-- 暂缓 / 不派 -->
+<div class="issue" data-g="off">
+  <div class="ih"><span class="no">无票</span><span class="t">第三批 7 位新角色入库</span>
+    <span class="pill p-off">暂缓</span><span class="tagw">轻</span></div>
+  <div class="wait">在等：<b>运营换图</b>，换完要按新图核对外貌描述</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p>线上 21 位角色最大的才 30 岁；孤独倾诉类用户只要被接住就满意，而且是留存最好的一群。</p><span class="src">周报 persona</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>缺中年角色，也缺以善良为底色的角色。</p><span class="src">—</span></div>
+    <div class="cell sol"><h4>解法 · 已有初稿</h4><p>7 人人设和 lorebook 你已经认可；入库按 08-25 那次的迁移格式写。</p><span class="src"><code>~/Downloads/her-cast-1102/cast.json</code></span></div>
+  </div>
+</div>
+
+<div class="issue" data-g="off">
+  <div class="ih"><span class="no">#940·5</span><span class="t">语言不通 · 刹车残余</span><span class="pill p-off">不派</span></div>
+  <div class="wait">理由：语言不通只有 27 人，回复语言的机制还没查清；刹车自 #926 后已从 54% 降到 26%，剩下的有一部分是故意刹的。</div>
+</div>
+
+</div>
+
+<h2>router 最近替你定的</h2>
+<div class="log">
+  <div class="row"><span class="id">D3</span><span>性别代词排在 AI 口径、对话质感、内心泄漏之后<br><small>理由：四张票都要改 her 回复 prompt，同时改会互相打破字节冻结断言。</small></span><span class="say">推翻 D3</span></div>
+  <div class="row"><span class="id">D2</span><span>额度和拒图算轻票，只做到出方案为止<br><small>理由：要先定方向，出方案阶段不碰代码。</small></span><span class="say">推翻 D2</span></div>
+  <div class="row"><span class="id">D1</span><span>角色设定重写走迁移文件 + PR<br><small>理由：要有代码评审兜底，回滚也有路径。</small></span><span class="say">推翻 D1</span></div>
+</div>
+
+</main>
+<script>
+(function(){
+  var btns=document.querySelectorAll('.tabs button');
+  var items=document.querySelectorAll('#list .issue');
+  btns.forEach(function(b){
+    b.addEventListener('click',function(){
+      var f=b.getAttribute('data-f');
+      btns.forEach(function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});
+      items.forEach(function(it){
+        var g=it.getAttribute('data-g');
+        it.classList.toggle('hidden', !(f==='all'||f===g));
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>
