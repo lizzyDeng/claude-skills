@@ -27,6 +27,18 @@ elif args[0] == "api" and "--jq" in args: print("9" + args[1].rsplit("/", 1)[-1]
 '''
 
 
+def git_project(tmp_path, root):
+    """root = 一个 clone，origin 是本地裸仓，带 staging 分支（dispatch 要 fetch + worktree add）。"""
+    g = lambda *a, cwd=None: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+    origin = tmp_path / "origin.git"
+    g("init", "-q", "--bare", "-b", "staging", str(origin))
+    g("clone", "-q", str(origin), str(root))
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        g("config", k, v, cwd=root)
+    (root / ".gitignore").write_text(".claude/\n")
+    g("add", ".gitignore", cwd=root); g("commit", "-qm", "init", cwd=root); g("push", "-q", "origin", "HEAD:staging", cwd=root)
+
+
 def wait_until(cond, timeout=10):
     end = time.time() + timeout
     while time.time() < end:
@@ -38,7 +50,9 @@ def wait_until(cond, timeout=10):
 
 @pytest.fixture
 def proj(tmp_path, monkeypatch):
-    root = tmp_path / "proj"; home = root / ".claude" / "router"; home.mkdir(parents=True)
+    root = tmp_path / "proj"; home = root / ".claude" / "router"
+    git_project(tmp_path, root)
+    home.mkdir(parents=True)
     runs = tmp_path / "daily" / "runs"; (runs / "2026-10-26").mkdir(parents=True)
     (tmp_path / "daily" / "state").mkdir()
     bin_ = tmp_path / "bin"; bin_.mkdir()
@@ -97,6 +111,7 @@ def test_draft_creates_tickets_without_touching_github(proj):
     assert [(q["kind"], q["summary"]) for q in s["queue"]] == [("start", "派发单已备好（2 张）")]
     assert proj.gh() == [] and proj.claude() == []
     assert "DRY RUN" in out["notify"]
+    assert "派发单已备好（2 张）" in (proj.home / "board.html").read_text()
 
 
 def test_draft_same_batch_twice_refuses_without_replace(proj):
@@ -111,12 +126,17 @@ def test_start_subset_creates_issues_and_queues_only_selected(proj):
     proj.out("draft", "--from", str(FIX / "triage.json"))
     out = proj.out("start", "T1")
     s = proj.state()
-    assert out["started"] == ["T1"] and s["tickets"]["T1"]["status"] == "queued" and s["tickets"]["T1"]["start_ok"]
+    assert out["started"] == ["T1"] and s["tickets"]["T1"]["start_ok"]
     assert s["tickets"]["T2"]["status"] == "draft" and s["batch"]["started"] is True
     creates = [c for c in proj.gh() if c[:2] == ["issue", "create"]]
     assert [c[c.index("--title") + 1] for c in creates] == ["her 周报问题", s["tickets"]["T1"]["title"]]
     assert s["tickets"]["T1"]["issue"] == 102
     assert [q["kind"] for q in s["queue"]] == ["start"]        # 还有没 start 的票，派发单留着
+    assert out["dispatched"] == ["T1"] and s["tickets"]["T1"]["status"] == "kickoff"
+    assert (proj.root / ".claude/worktrees/router-T1").is_dir()
+    wait_until(lambda: proj.claude())
+    brief = proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    assert "worker.md" in brief and "#102" in brief
 
 
 def test_start_all_links_dependencies_and_clears_start_item(proj):
@@ -139,7 +159,7 @@ def test_start_blocks_when_issue_body_leaks_uid(proj):
     out = json.loads(r.stdout)
     assert r.returncode == 1 and out["blocked"] == [{"ticket": "T2", "hits": ["5eed0001"]}]
     s = proj.state()
-    assert s["tickets"]["T2"]["status"] == "draft" and s["tickets"]["T1"]["status"] == "queued"
+    assert s["tickets"]["T2"]["status"] == "draft" and s["tickets"]["T1"]["status"] == "kickoff"
     assert not any("5eed0001" in json.dumps(c) for c in proj.gh())
 
 
@@ -291,3 +311,29 @@ def test_corrupt_state_refuses_to_run(proj):
     r = proj.run("status", check=False)
     assert r.returncode == 1 and "解析失败" in json.loads(r.stdout)["error"]
     assert (proj.home / "state.json").read_text() == "{broken"
+
+
+def test_watch_exits_when_there_is_something_for_router(proj):
+    seed(proj, T1=("executing", ["a"], {"worker": {"pid": 999999, "session_id": "s", "worktree": str(proj.tmp),
+                                                   "started_at": "2026-11-02T00:00:00Z"}}))
+    out = proj.out("watch", "--interval", "1")
+    assert out["woke"] == ["new_queue"] and proj.state()["tickets"]["T1"]["status"] == "stuck"
+    assert proj.out("tick")["new_queue"] == []
+
+
+def test_start_surfaces_dispatch_errors(proj):
+    proj.out("draft", "--from", str(FIX / "triage.json"))
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=proj.root, check=True)
+    r = proj.run("start", "T1", check=False)            # fetch 失败 → 开不了 worktree，要报出来
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and out["started"] == ["T1"] and out["errors"][0]["error"].startswith("dispatch T1")
+    assert proj.state()["tickets"]["T1"]["status"] == "queued"
+
+
+def test_submit_card_on_overtime_stops_live_worker(proj, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    p = subprocess.Popen([sys.executable, str(FAKE)], start_new_session=True)
+    seed(proj, T1=("kickoff", ["a"], {"worker": {"pid": p.pid, "session_id": "s"}}))
+    card = proj.tmp / "c.md"; card.write_text("**3. 方案方向**\n半张卡\n")
+    proj.out("submit-card", "T1", "--card", str(card), "--overtime")
+    assert p.wait(timeout=10) is not None                 # 超时交卡：后台 worker 先停，等你确认后再续跑

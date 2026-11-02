@@ -3,12 +3,14 @@
 写一律走「临时文件 + os.replace」：router 随时可能被压缩或崩溃，半截文件比没有文件更糟。
 读到坏文件就拒绝启动并留备份——用空状态覆盖等于把全部在跑的票丢掉。
 """
+import fcntl
 import json
 import os
 import re
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -74,6 +76,18 @@ def _atomic_write(path: Path, text: str) -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+@contextmanager
+def locked(home: Path):
+    """<home>/.lock 上的排他锁：后台 tick 与前台命令不会互相覆盖 state.json。不可嵌套。"""
+    Path(home).mkdir(parents=True, exist_ok=True)
+    with open(Path(home) / ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def load_state(path: Path) -> dict:

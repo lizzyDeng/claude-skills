@@ -57,6 +57,12 @@ class FakeCtx:
     def env(self, key):
         return self.envs.get(key)
 
+    posted = None
+
+    def post_json(self, url, payload, timeout=30):
+        self.posted = (self.posted or []) + [(url, payload)]
+        return {"code": 0}
+
     def calls_with(self, *words):
         return [c for c in self.calls if all(w in c for w in words)]
 

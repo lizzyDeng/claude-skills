@@ -8,7 +8,6 @@
 改状态的子命令都在 <状态目录>/.lock 上加排他锁：后台 watch 的 tick 和前台命令不会互相覆盖。
 """
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -59,15 +58,8 @@ class Env:
     def now(self) -> str:
         return self.ctx.now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    @contextmanager
     def locked(self):
-        self.home.mkdir(parents=True, exist_ok=True)
-        with open(self.home / ".lock", "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        return store.locked(self.home)
 
     @contextmanager
     def state(self):
@@ -103,12 +95,14 @@ def notify(env, text) -> str:
     return nt.send(Path(os.path.expanduser(env.cfg.get("lark_config", ""))), text, env.ctx)
 
 
-def dispatch(env, st) -> list:
+def dispatch(env, st):
+    """→ (派出去的票, 派发时的错误)。"""
     try:
         import tick
     except ImportError:
-        return []
-    return tick.dispatch(env.ctx, env.root, env.cfg, st)
+        return [], []
+    run = tick.Run(env.ctx, env.root, env.cfg, st)
+    return tick.dispatch(env.ctx, env.root, env.cfg, st, run=run), run.res["errors"]
 
 
 def _csv(s):
@@ -275,7 +269,8 @@ def cmd_start(a, env):
                    for t in st["tickets"].values()):
             st["queue"] = [q for q in st["queue"] if q["kind"] != "start"]
         store.save_state(env.state_path, st)
-        dispatched = dispatch(env, st)
+        dispatched, dispatch_errors = dispatch(env, st)
+        errors += [{"ticket": None, "error": e} for e in dispatch_errors]
         store.save_state(env.state_path, st)
         render_board(env, st)
     res = {"ok": not blocked and not errors, "started": started, "dispatched": dispatched,
@@ -323,6 +318,8 @@ def cmd_submit_card(a, env):
                      "version": version, "submitted_at": env.now()}
         t["solution"] = {"kind": "card", "text": _card_direction(card.read_text(encoding="utf-8")),
                          "source": f"方向卡 v{version}（待你确认）"}
+        if env.ctx.pid_alive(t["worker"].get("pid")):
+            launcher.stop_now(t["worker"]["pid"])      # 超时交卡：worker 还在写，先停，确认后续跑
         t["worker"]["pid"] = None
         t["worker"]["kickoff_rounds"] = a.rounds
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")

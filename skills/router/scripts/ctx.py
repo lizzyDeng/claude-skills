@@ -1,6 +1,8 @@
 """全部 IO 出口：子进程、时钟、进程存活、环境变量。测试用 tests/router/conftest.py 的 FakeCtx 替换。"""
+import json
 import os
 import subprocess
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +45,11 @@ class Ctx:
 
     def now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+    def post_json(self, url, payload, timeout=30) -> dict:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read() or b"{}")
 
     def env(self, key):
         return os.environ.get(key)
