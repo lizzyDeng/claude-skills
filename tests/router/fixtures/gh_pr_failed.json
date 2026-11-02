@@ -1,0 +1,22 @@
+{
+ "state": "OPEN",
+ "mergedAt": null,
+ "mergeCommit": null,
+ "headRefOid": "abc123",
+ "statusCheckRollup": [
+  {
+   "__typename": "CheckRun",
+   "name": "rust",
+   "status": "COMPLETED",
+   "conclusion": "FAILURE"
+  },
+  {
+   "__typename": "CheckRun",
+   "name": "lint",
+   "status": "COMPLETED",
+   "conclusion": "SUCCESS"
+  }
+ ],
+ "baseRefName": "staging",
+ "mergeable": "MERGEABLE"
+}

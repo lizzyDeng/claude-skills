@@ -23,4 +23,5 @@
 - `/forge-setup` — 在当前项目一键安装 /forge 所需的 hooks、Gate 脚本和 skill 定义
 - `/roadmap-radar` — goal 拓扑与进度可视化：forge roadmap + wayfinder issue 合成一张自包含 HTML（含 frontier 和未归位体检）
 - `/conductor` — 分档编排：便宜主模型指挥 dynamic workflow，推理重的叶子路由到 Opus
+- `/router` — 一个 session 管全部待办：周报分诊出派发单，用户说 start 才派 headless worker，收方向卡和决定、按代码面订阅转交事件、CI 绿后合 staging、本地看板
 - `/plan-poster` — 把方案渲成手绘感中文摘要长图供人拍板（/fastship 1.6 与 /conductor 1.5 强制调用）

@@ -1,0 +1,13 @@
+{
+  "her-reply-prompt": {
+    "weight": "heavy",
+    "globs": [
+      "crates/persona-engine/src/prompt_builder.rs",
+      "crates/persona-engine/src/prompt_template_en.rs",
+      "crates/persona-engine/src/agent_loop/prompt.rs",
+      "services/api-server/src/services/her_chat/**"
+    ]
+  },
+  "weekly-report": {"weight": "light", "globs": ["~/.her-persona-daily/**"]},
+  "llm-config": {"weight": "light", "globs": ["services/api-server/migrations/*llm_config*"]}
+}

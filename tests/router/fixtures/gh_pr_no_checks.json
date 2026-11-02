@@ -1,0 +1,9 @@
+{
+ "state": "OPEN",
+ "mergedAt": null,
+ "mergeCommit": null,
+ "headRefOid": "abc123",
+ "statusCheckRollup": [],
+ "baseRefName": "staging",
+ "mergeable": "MERGEABLE"
+}
