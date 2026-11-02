@@ -67,3 +67,32 @@ class FakeCtx:
 @pytest.fixture
 def fake():
     return FakeCtx()
+
+
+@pytest.fixture
+def table():
+    import surfaces
+    return surfaces.load_surfaces(FIX / "surfaces.json")
+
+
+def make_state(external=None, **tickets):
+    """tickets: T1=(status, surfaces) 或 (status, surfaces, {其它字段})；external: path → surfaces 列表或完整 dict。"""
+    import store
+    s = store.empty_state()
+    for tid, spec in tickets.items():
+        status, surf, *rest = spec
+        t = store._ticket_defaults()
+        t.update(id=tid, title=tid, status=status, surfaces=list(surf))
+        for k, v in (rest[0] if rest else {}).items():
+            t[k] = {**t[k], **v} if isinstance(t.get(k), dict) and isinstance(v, dict) else v
+        s["tickets"][tid] = t
+        s["seq"]["ticket"] = max(s["seq"]["ticket"], int(tid[1:]))
+    for path, ext in (external or {}).items():
+        s["external"][path] = ext if isinstance(ext, dict) else {
+            "surfaces": list(ext), "weight": "light", "active": True, "locking": True}
+    return s
+
+
+@pytest.fixture
+def state_with():
+    return make_state
