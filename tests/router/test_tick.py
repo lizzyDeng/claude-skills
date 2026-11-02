@@ -274,3 +274,11 @@ def test_notify_signature_matches_weekly(fake, tmp_path):
     assert payload["sign"] == base64.b64encode(hmac.new(key, b"", hashlib.sha256).digest()).decode()
     assert payload["msg_type"] == "text" and payload["content"] == {"text": "hi"}
     assert notify.send(tmp_path / "missing.json", "hi", fake).startswith("DRY RUN")
+
+
+def test_heavy_blocked_when_free_disk_too_low(proj):
+    proj.cfg["disk_min_free_gb"] = 10 ** 9                 # 任何盘都不够 → 只派轻票
+    proj.put(T1=("queued", ["her-reply-prompt"], {"weight": "heavy", "start_ok": True}),
+             T2=("queued", ["weekly-report"], {"start_ok": True}))
+    assert proj.run()["dispatched"] == ["T2"]
+    assert "剩余" in proj.state()["tickets"]["T1"]["waiting_for"]

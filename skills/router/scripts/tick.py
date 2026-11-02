@@ -7,6 +7,7 @@
 整轮持 <home>/.lock。每一步单独 try：一步出错不拖垮后面几步，错误进返回值。
 """
 import os
+import shutil
 import string
 import time
 import traceback
@@ -255,17 +256,28 @@ class Run:
                 self.res["errors"].append(f"step5 下游留言 {o['id']}：{e}")
 
     # ---- 6 ----
-    def _disk_gb(self):
+    def disk_block(self):
+        """派重票前的磁盘闸 → 拦住的原因（空串 = 不拦）。
+        两种口径：配置了共享 CARGO_TARGET_DIR 就看它的体积；再看项目所在卷的剩余空间
+        （aifriends 每个 worktree 自带 target/，一张重票 8–32G，合并删 worktree 时一起清掉）。"""
+        reasons = []
         d = self.cfg.get("cargo_target_dir") or self.ctx.env("CARGO_TARGET_DIR")
-        if not d:
-            return None
-        cache = self.state.get("disk") or {}
-        if cache.get("dir") == d and self.ctx.now().timestamp() - _ts(cache.get("at")) < 30 * 60:
-            return cache["gb"]
-        out = self.ctx.run(["du", "-sk", d]).stdout.split()
-        gb = int(out[0]) / 1024 / 1024 if out and out[0].isdigit() else None
-        self.state["disk"] = {"dir": d, "gb": gb, "at": self.now}
-        return gb
+        if d:
+            cache = self.state.get("disk") or {}
+            if cache.get("dir") == d and self.ctx.now().timestamp() - _ts(cache.get("at")) < 30 * 60:
+                gb = cache["gb"]
+            else:
+                out = self.ctx.run(["du", "-sk", d]).stdout.split()
+                gb = int(out[0]) / 1024 / 1024 if out and out[0].isdigit() else None
+                self.state["disk"] = {"dir": d, "gb": gb, "at": self.now}
+            if gb is not None and gb > self.cfg.get("disk_limit_gb", 150):
+                reasons.append(f"CARGO_TARGET_DIR {gb:.0f}G 超过 {self.cfg.get('disk_limit_gb', 150)}G")
+        need = self.cfg.get("disk_min_free_gb")
+        if need:
+            free = shutil.disk_usage(self.root if self.root.exists() else self.home).free / 1024 ** 3
+            if free < need:
+                reasons.append(f"磁盘剩余 {free:.0f}G 低于 {need}G")
+        return "；".join(reasons)
 
     def step6_dispatch(self):
         self.res["dispatched"] = dispatch(self.ctx, self.root, self.cfg, self.state, run=self)
@@ -301,7 +313,7 @@ def _brief(run, tid):
         card_path=str(run.home / "cards" / f"{tid}.md"), kickoff_budget=run.cfg.get("kickoff_budget_min", 30))
 
 
-def _explain_waits(run, picked, heavy_blocked, gb):
+def _explain_waits(run, picked, disk):
     st = run.state
     locks = surfaces.held_locks(st)
     for tid in picked:
@@ -317,8 +329,8 @@ def _explain_waits(run, picked, heavy_blocked, gb):
         elif held:
             s, h = held[0]
             t["waiting_for"] = f"等代码面 {s}（{('外部 session ' + Path(h[4:]).name) if h.startswith('ext:') else h} 持有）"
-        elif t["weight"] == "heavy" and heavy_blocked:
-            t["waiting_for"] = f"磁盘：CARGO_TARGET_DIR {gb:.0f}G 超过 {run.cfg.get('disk_limit_gb')}G，先清再派重票"
+        elif t["weight"] == "heavy" and disk:
+            t["waiting_for"] = f"磁盘：{disk}，先清再派重票"
         else:
             t["waiting_for"] = "等重名额" if t["weight"] == "heavy" else "等轻名额"
 
@@ -328,8 +340,8 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
     run = run or Run(ctx, root, cfg, state)
     heavy_cand = any(t["status"] == store.QUEUED and t["start_ok"] and t["weight"] == "heavy"
                      for t in state["tickets"].values())
-    gb = run._disk_gb() if heavy_cand else None
-    heavy_blocked = gb is not None and gb > cfg.get("disk_limit_gb", 150)
+    disk = run.disk_block() if heavy_cand else ""
+    heavy_blocked = bool(disk)
     picked, done = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), heavy_blocked), []
     for tid in picked:
         t = state["tickets"][tid]
@@ -344,7 +356,7 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
         t["kickoff_at"] = run.now
         store.set_status(state, tid, store.KICKOFF, run.now, f"写方向卡（{cfg.get('kickoff_budget_min', 30)} 分钟内）")
         done.append(tid)
-    _explain_waits(run, done, heavy_blocked, gb or 0)
+    _explain_waits(run, done, disk)
     return done
 
 
