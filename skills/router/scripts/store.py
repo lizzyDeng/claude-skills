@@ -56,7 +56,7 @@ def _ticket_defaults():
             "solution": {"kind": "clue", "text": "", "source": ""},
             "surfaces": [], "tags": [], "blocked_by": [], "waiting_for": "", "review_flag": False,
             "worker": {"session_id": None, "pid": None, "worktree": None, "branch": None,
-                       "log": None, "started_at": None, "kickoff_rounds": 0},
+                       "log": None, "started_at": None, "kickoff_rounds": 0, "runs": 0},
             "pr": None, "stops": 0, "fail_streak": {"step": "", "count": 0}, "history": []}
 
 

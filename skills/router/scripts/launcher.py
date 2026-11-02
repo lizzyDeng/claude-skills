@@ -8,6 +8,7 @@ spike（docs/superpowers/reports/2026-11-02-router-headless-spike.md）定下的
 import json
 import os
 import signal
+import uuid
 from pathlib import Path
 
 
@@ -73,3 +74,18 @@ def stop_now(pid: int) -> None:
 
 def remove_worktree(ctx, repo, wt) -> None:
     _git(ctx, repo, "worktree", "remove", "--force", str(wt))
+
+
+def run_worker(ctx, home: Path, cfg: dict, state: dict, tid: str, prompt: str, resume: bool, at: str) -> int:
+    """起（或续跑）一张票的 worker，并把 pid / 日志 / 次数记回 ticket。每次运行一个新日志文件，
+    这样上一次的结果对象不会被误读成这一次的。"""
+    w = state["tickets"][tid]["worker"]
+    w["session_id"] = w.get("session_id") or str(uuid.uuid4())
+    w["runs"] = w.get("runs", 0) + 1
+    log = Path(home) / "logs" / f"{tid}-{w['runs']}.log"
+    env = {"ROUTER_TICKET": tid, "ROUTER_HOME": str(home),
+           "ROUTER_CLI": str(Path(__file__).resolve().with_name("router.py"))}
+    w["pid"] = spawn(ctx, Path(w["worktree"]), claude_cmd(cfg["worker"], prompt, w["session_id"], resume), log, env)
+    w.update(log=str(log), started_at=at)
+    w.pop("exit", None)
+    return w["pid"]
