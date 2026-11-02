@@ -6,7 +6,13 @@ router 只登记、只转交信息，不给它们下指令（spec §10）。
   locking = 活动在 lock_hours 小时内 → 持锁（等用户回答的 session 不该丢锁；
             squash 合并后留下的陈旧 worktree 也不该永久占锁）
 判活不看 lsof（memory：lsof 空 ≠ 死）。
+
+代码面 = 三部分的并集：
+  - 已提交：分支自分叉点起改过、且至今仍与 base 不同的文件（squash 合进 base 后自动不再占锁）
+  - 未提交改动
+  - 计划要改：近期 conductor ledger / plan 里写到的文件路径（还在出方案、没动代码的 session 也要先占上）
 """
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +40,17 @@ def _status_files(out: str):
         yield path.split(" -> ")[-1].strip('"')
 
 
+_PATH = re.compile(r"[\w.~/-]*/[\w.-]+\.(?:rs|ts|tsx|js|py|sql|json|toml|sh)\b")
+
+
+def _planned_files(ledgers, since_ts):
+    files = set()
+    for p in ledgers:
+        if p.stat().st_mtime >= since_ts:
+            files |= set(_PATH.findall(p.read_text(encoding="utf-8", errors="replace")))
+    return files
+
+
 def _iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
 
@@ -51,7 +68,9 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
             continue                                  # 主仓 checkout / 已失效的 worktree
         if branch.startswith("router/") or branch in router_branches:
             continue
-        files = set(ctx.run(["git", "-C", path, "diff", "--name-only", f"{base_ref}...HEAD"]).stdout.split())
+        since_fork = set(ctx.run(["git", "-C", path, "diff", "--name-only", f"{base_ref}...HEAD"]).stdout.split())
+        still_differs = set(ctx.run(["git", "-C", path, "diff", "--name-only", base_ref, "HEAD"]).stdout.split())
+        files = since_fork & still_differs
         dirty = set(_status_files(ctx.run(["git", "-C", path, "status", "--porcelain"]).stdout))
         files |= dirty
         dirty_ts = max([Path(path, f).stat().st_mtime for f in dirty if Path(path, f).is_file()] or [0])
@@ -61,7 +80,8 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
         commit = ctx.run(["git", "-C", path, "log", "-1", "--format=%ct", f"{base_ref}..HEAD"]).stdout.strip()
         commit_ts = int(commit) if commit.isdigit() else None
         last = max([t for t in (ledger_ts, commit_ts, dirty_ts) if t] or [0])
-        surfs = surf_mod.surfaces_for_files(sorted(files), table)
+        planned = surf_mod.surfaces_for_files(sorted(_planned_files(ledgers, now - lock_hours * 3600)), table)
+        surfs = surf_mod.surfaces_for_files(sorted(files), table) | planned
         found[path] = {
             "branch": branch,
             "ledger": str(ledgers[-1]) if ledgers else None,
@@ -70,6 +90,7 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
             "active": bool(last) and now - last <= stale_min * 60,
             "locking": bool(last) and now - last <= lock_hours * 3600,
             "surfaces": sorted(surfs),
+            "planned_surfaces": sorted(planned),
             "weight": surf_mod.weight_for(surfs, table),
         }
     return found

@@ -22,6 +22,8 @@ def repo(tmp_path, fake):
     fake.script(["git", "-C", str(main), "worktree", "list", "--porcelain"], porcelain)
     fake.script(["git", "-C", str(a), "diff", "--name-only", f"{BASE}...HEAD"],
                 "services/api-server/src/services/her_chat/turn.rs\n")
+    fake.script(["git", "-C", str(a), "diff", "--name-only", BASE, "HEAD"],      # 仍与 staging 不同
+                "services/api-server/src/services/her_chat/turn.rs\nREADME.md\n")
     fake.script(["git", "-C", str(a), "status", "--porcelain"], " M crates/persona-engine/src/prompt_builder.rs\n?? notes.txt\n")
     fake.script(["git", "-C", str(b), "status", "--porcelain"], "R  old.py -> services/api-server/migrations/20261102_llm_config_x.sql\n")
     return tmp_path, main, a, b, r
@@ -88,3 +90,23 @@ def test_uncommitted_file_mtime_counts_as_activity(fake, repo, table):
     os.utime(f / "prompt_builder.rs", (t, t))
     out = scan(fake, main, BASE, table, set(), 45)
     assert out[str(a)]["active"] is True and out[str(a)]["ledger"] is None
+
+
+def test_planned_surfaces_from_ledger_text(fake, repo, table):
+    tmp, main, a, b, r = repo
+    f = _ledger(b, 10, fake)
+    f.write_text("plan v3：改 `crates/persona-engine/src/prompt_builder.rs:691` 和 services/api-server/src/services/her_chat/turn.rs")
+    os.utime(f, (fake.now().timestamp() - 600,) * 2)
+    out = scan(fake, main, BASE, table, set(), 45)
+    assert out[str(b)]["planned_surfaces"] == ["her-reply-prompt"]
+    assert out[str(b)]["surfaces"] == ["her-reply-prompt", "llm-config"] and out[str(b)]["weight"] == "heavy"
+
+
+def test_squash_merged_files_do_not_lock(fake, repo, table):
+    tmp, main, a, b, r = repo
+    _ledger(a, 10, fake)
+    # 分支改过 turn.rs，但它和 staging 现在一模一样（已 squash 合入）
+    fake.script(["git", "-C", str(a), "diff", "--name-only", BASE, "HEAD"], "crates/persona-engine/src/prompt_builder.rs\n")
+    fake.script(["git", "-C", str(a), "status", "--porcelain"], "")
+    out = scan(fake, main, BASE, table, set(), 45)
+    assert out[str(a)]["surfaces"] == []
