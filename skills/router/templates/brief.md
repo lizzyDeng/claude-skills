@@ -27,6 +27,9 @@ $clue
 - 不直接问用户；要决定就 emit decision 后退出。
 - 花钱（真 LLM 批量、生图、其它外部付费）要先 emit decision（--tags spend，写清调用数和金额）后退出。你自己的 Claude 用量不算花钱。
 
+## 收尾
+$finish
+
 ## 环境
 - 分支：router/$ticket；PR 的 base 分支：$base_branch
 - ROUTER_TICKET=$ticket，ROUTER_HOME=$router_home

@@ -49,7 +49,8 @@ elif args[:2] == ["pr", "view"]:
     pr = args[2]
     print(json.dumps({"state": "MERGED" if merged(pr) else "OPEN", "mergedAt": None,
                       "mergeCommit": {"oid": "feedface" + pr} if merged(pr) else None,
-                      "headRefOid": "head" + pr, "statusCheckRollup": [run]}))
+                      "headRefOid": "head" + pr, "baseRefName": "staging", "mergeable": "MERGEABLE",
+                      "statusCheckRollup": [run], "title": "t", "body": "验收输出"}))
 '''
 
 

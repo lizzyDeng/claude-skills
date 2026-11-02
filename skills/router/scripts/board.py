@@ -33,7 +33,7 @@ def _e(x) -> str:
 def _say(q) -> str:
     t, qid = q.get("ticket") or "", q["id"]
     return {"start": "start / start T1 T3",
-            "card": f"{t} 同意 / {t} 改：…",
+            "card": f"{t} 同意 / {t} 改：… / {t} 驳回：…",
             "spend": f"放行 {qid} / 不放行 {qid}",
             "prod": "上 prod",
             "handson": f"{t} 走查过了",

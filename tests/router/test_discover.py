@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -110,3 +111,15 @@ def test_squash_merged_files_do_not_lock(fake, repo, table):
     fake.script(["git", "-C", str(a), "status", "--porcelain"], "")
     out = scan(fake, main, BASE, table, set(), 45)
     assert out[str(a)]["surfaces"] == []
+
+
+def test_branch_merged_by_pr_head_releases_locks(fake, repo, table):  # 分诊发现：合完的 session 还占锁
+    tmp, main, a, b, r = repo
+    _ledger(a, 10, fake)
+    fake.script(["git", "-C", str(a), "rev-parse", "HEAD"], "5e846ee08019\n")
+    fake.script(["git", "-C", str(a), "status", "--porcelain"], "?? .claude/conductor/runs/x.md\n")   # 只有 ledger 没提交
+    fake.script(["gh", "pr", "list"], json.dumps([{"number": 941, "headRefOid": "5e846ee08019"}]))
+    out = scan(fake, main, BASE, table, set(), 45, repo_slug="o/r")
+    assert out[str(a)]["merged_pr"] == 941 and out[str(a)]["surfaces"] == [] and out[str(a)]["locking"] is False
+    fake.script(["git", "-C", str(a), "status", "--porcelain"], " M crates/persona-engine/src/prompt_builder.rs\n")
+    assert scan(fake, main, BASE, table, set(), 45, repo_slug="o/r")[str(a)]["locking"] is True   # 合完又在改 → 照样占锁

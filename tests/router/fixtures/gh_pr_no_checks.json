@@ -3,5 +3,7 @@
  "mergedAt": null,
  "mergeCommit": null,
  "headRefOid": "abc123",
- "statusCheckRollup": []
+ "statusCheckRollup": [],
+ "baseRefName": "staging",
+ "mergeable": "MERGEABLE"
 }

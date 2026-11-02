@@ -45,6 +45,13 @@ class FakeCtx:
     def pid_alive(self, pid):
         return pid in self.alive
 
+    starts = None
+
+    def proc_start(self, pid):
+        if pid not in self.alive:
+            return None
+        return (self.starts or {}).get(pid, f"start-{pid}")
+
     def kill(self, pid):
         self.alive.discard(pid)
 

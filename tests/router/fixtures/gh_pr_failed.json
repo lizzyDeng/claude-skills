@@ -16,5 +16,7 @@
    "status": "COMPLETED",
    "conclusion": "SUCCESS"
   }
- ]
+ ],
+ "baseRefName": "staging",
+ "mergeable": "MERGEABLE"
 }

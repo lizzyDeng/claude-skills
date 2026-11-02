@@ -151,7 +151,7 @@ def _pr_fake(proj, merged_after_merge=True):
 
 
 def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
-    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41,
+    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41, "card_confirmed": True,
                                                      "solution": {"kind": "card", "text": "底座改为承认是 AI", "source": "v1"},
                                                      "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}),
              T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
@@ -168,7 +168,7 @@ def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
 
 
 def test_ci_failure_resumes_once_then_stuck(proj):
-    proj.put(T1=("verifying", ["a"], {"pr": 41, "worker": {"session_id": "sid", "worktree": "/wt/x", "runs": 1}}))
+    proj.put(T1=("verifying", ["a"], {"pr": 41, "card_confirmed": True, "worker": {"session_id": "sid", "worktree": "/wt/x", "runs": 1}}))
     proj.ctx.script(["gh", "pr", "view"], (FIX / "gh_pr_failed.json").read_text())
     proj.run()
     t = proj.state()["tickets"]["T1"]
@@ -282,3 +282,150 @@ def test_heavy_blocked_when_free_disk_too_low(proj):
              T2=("queued", ["weekly-report"], {"start_ok": True}))
     assert proj.run()["dispatched"] == ["T2"]
     assert "剩余" in proj.state()["tickets"]["T1"]["waiting_for"]
+
+
+# ---- 终审修复 ----------------------------------------------------------------
+
+def test_pr_opened_before_card_confirmed_is_not_merged(proj):        # C2
+    proj.put(T1=running("kickoff", ["a"], log=log_with(proj, "T1", "{}")))
+    events.emit_progress(proj.home, "T1", "card_ready", "2026-11-02T10:01:00Z")
+    events.emit_progress(proj.home, "T1", "pr_opened", "2026-11-02T10:02:00Z")
+    proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "paused" and [q["kind"] for q in proj.state()["queue"]] == ["direction"]
+    s = proj.state(); store.set_status(s, "T1", store.VERIFYING, T0); s["tickets"]["T1"]["pr"] = 41
+    store.save_state(proj.home / "state.json", s)
+    _pr_fake(proj)
+    proj.run()
+    assert not proj.ctx.calls_with("pr", "merge") and proj.state()["tickets"]["T1"]["status"] == "verifying"
+
+
+def _verifying(proj, fx, **kw):
+    proj.put(T1=("verifying", ["a"], {"pr": 41, "card_confirmed": True,
+                                      "worker": {"session_id": "sid", "worktree": "/wt/x", "runs": 1}, **kw}))
+    proj.ctx.script(["gh", "pr", "view"], (FIX / fx).read_text())
+
+
+def test_pr_against_wrong_base_is_queued_not_merged(proj):            # C1
+    _verifying(proj, "gh_pr_wrong_base.json")
+    proj.run(); proj.run()
+    assert not proj.ctx.calls_with("pr", "merge")
+    assert [q["kind"] for q in proj.state()["queue"]] == ["stuck"] and "main" in proj.state()["queue"][0]["summary"]
+
+
+def test_closed_pr_queues_and_clears(proj):                           # I1
+    _verifying(proj, "gh_pr_closed.json")
+    proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "stuck" and t["pr"] is None and "关闭" in proj.state()["queue"][0]["summary"]
+
+
+def test_conflicting_pr_resumes_worker_to_rebase(proj):               # I1
+    _verifying(proj, "gh_pr_conflict.json")
+    proj.run()
+    assert proj.state()["tickets"]["T1"]["status"] == "executing" and "rebase" in proj.ctx.spawned[0]["cmd"][2]
+
+
+def test_merge_failure_twice_queues(proj):                            # I1
+    _verifying(proj, "gh_pr_green.json")
+    proj.ctx.script(["gh", "pr", "merge"], "", returncode=1, stderr="Base branch was modified")
+    proj.run(); assert proj.state()["queue"] == []
+    proj.run(); assert [q["kind"] for q in proj.state()["queue"]] == ["stuck"]
+
+
+def test_merge_waits_for_live_worker(proj):                           # I6
+    _verifying(proj, "gh_pr_green.json", )
+    s = proj.state(); s["tickets"]["T1"]["worker"]["pid"] = 123; store.save_state(proj.home / "state.json", s)
+    proj.ctx.alive.add(123)
+    proj.run()
+    assert not proj.ctx.calls_with("pr", "merge")
+
+
+def test_pr_with_leak_is_not_merged(proj, tmp_path):                  # C4 合并前扫 PR
+    (tmp_path / "u").mkdir(); (tmp_path / "u" / "users.json").write_text(json.dumps({"5eed0001": {}}))
+    proj.cfg["leak_guard_globs"] = [str(tmp_path / "u" / "*.json")]
+    _verifying(proj, "gh_pr_green.json")
+    proj.ctx.script(["gh", "pr", "diff"], "+ // 来自用户 5eed0001 的反馈\n")
+    proj.run()
+    assert not proj.ctx.calls_with("pr", "merge") and "uid" in proj.state()["queue"][0]["summary"]
+
+
+def test_conflict_reported_once_even_after_answer(proj):              # I2
+    ext = proj.tmp / "ext"; ext.mkdir()
+    proj.put(T1=("executing", ["her-reply-prompt"], {"worker": {"pid": 123, "started_at": T0}}))
+    proj.ctx.alive.add(123)
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "list", "--porcelain"],
+                    f"worktree {proj.root}\nbranch refs/heads/main\n\nworktree {ext}\nbranch refs/heads/feat/x\n")
+    proj.ctx.script(["git", "-C", str(ext), "status", "--porcelain"], " M crates/persona-engine/src/prompt_builder.rs\n")
+    (ext / "crates/persona-engine/src").mkdir(parents=True); (ext / "crates/persona-engine/src/prompt_builder.rs").write_text("x")
+    assert len(proj.run()["new_queue"]) == 1
+    s = proj.state(); s["queue"] = []; store.save_state(proj.home / "state.json", s)     # 用户答完
+    assert proj.run()["new_queue"] == []
+
+
+def test_dispatch_is_saved_before_a_crash_later_in_the_tick(proj, monkeypatch):   # I4
+    proj.put(T1=("queued", ["weekly-report"], {"start_ok": True}))
+    monkeypatch.setattr(tick.board, "write", lambda *a: (_ for _ in ()).throw(SystemExit("killed")))
+    with pytest.raises(SystemExit): proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "kickoff" and t["worker"]["pid"]
+
+
+def test_pending_card_resurfaces_on_first_tick(proj):                 # I5
+    proj.put(T1=("kickoff", ["a"], {"card_ready_at": T0, "worker": {"pid": None, "runs": 1}}))
+    assert tick.run(proj.ctx, proj.root, proj.cfg)["cards_for_review"] == []
+    assert tick.run(proj.ctx, proj.root, proj.cfg, resurface=True)["cards_for_review"] == ["T1"]
+
+
+def test_slow_path_events_persist_until_ack(proj):                    # I5
+    proj.put(T1=running("executing", ["a"])); proj.ctx.alive.add(123)
+    events.emit(proj.home, "T1", "finding", "新问题", "x", at="2026-11-02T10:01:00Z")
+    assert len(proj.run()["slow_path_events"]) == 1
+    assert proj.run()["slow_path_events"] == []
+    assert [e["summary"] for e in tick.run(proj.ctx, proj.root, proj.cfg, resurface=True)["slow_path_events"]] == ["新问题"]
+    s = proj.state(); assert len(s["slow_path"]) == 1
+
+
+def test_offrepo_impl_done_settles_with_handson(proj):                # I8
+    proj.put(T1=running("executing", ["weekly-report"], log=log_with(proj, "T1", "{}"), card_confirmed=True),
+             T2=("queued", ["weekly-report"], {"start_ok": True, "blocked_by": ["T1"]}))
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    s = proj.state()
+    assert s["tickets"]["T1"]["status"] == "merged_staging" and res["dispatched"] == ["T2"]
+    q = [q for q in s["queue"] if q["kind"] == "handson"][0]
+    assert "仓外" in q["summary"] and "backups" in q["summary"]
+
+
+def test_offrepo_ticket_brief_says_backup_not_pr(proj):
+    proj.put(T1=("queued", ["weekly-report"], {"start_ok": True}))
+    proj.run()
+    brief = proj.ctx.spawned[0]["cmd"][proj.ctx.spawned[0]["cmd"].index("-p") + 1]
+    assert "仓外" in brief and "backups/T1" in brief and "impl_done" in brief
+
+
+def test_pause_does_not_swallow_pr_opened(proj):
+    proj.put(T1=running("executing", ["a"], log=log_with(proj, "T1", "{}"), pause_requested=True, card_confirmed=True))
+    events.emit_progress(proj.home, "T1", "pr_opened", "2026-11-02T10:01:00Z")
+    proj.run()
+    assert proj.state()["tickets"]["T1"]["status"] == "verifying"
+
+
+def test_one_bad_pr_does_not_block_others(proj):
+    proj.put(T1=("verifying", ["a"], {"pr": 41, "card_confirmed": True, "worker": {}}),
+             T2=("verifying", ["b"], {"pr": 42, "card_confirmed": True, "worker": {}}))
+    green = (FIX / "gh_pr_green.json").read_text()
+    proj.ctx.script(["gh", "pr", "view", "41"], "", returncode=1, stderr="not found")
+    proj.ctx.script(["gh", "pr", "view", "42"], green)
+    res = proj.run()
+    assert ["gh", "pr", "merge", "42", "--squash", "--match-head-commit", "abc123", "-R", "o/r"] in proj.ctx.calls
+    assert any("T1" in e for e in res["errors"])
+
+
+def test_pid_reuse_counts_as_dead(proj):                              # I9
+    proj.put(T1=running("executing", ["a"], log=log_with(proj, "T1", "")))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["pid_start"] = "Sun Nov  1 09:00:00 2026"
+    store.save_state(proj.home / "state.json", s)
+    proj.ctx.alive.add(123)                                     # pid 123 活着，但启动时间对不上
+    proj.run()
+    assert proj.state()["tickets"]["T1"]["status"] == "stuck"

@@ -26,8 +26,13 @@ import surfaces  # noqa: E402
 from ctx import Ctx  # noqa: E402
 
 RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
+# 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
+ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
+               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
+    "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
+              "然后 progress card_ready 退出。不要开始实现。",
     "spend": "这是花钱放行的回答：照原话执行；没放行就换不花钱的做法，做不到就再 emit decision 停下。",
     "direction": "照原话继续当前阶段。",
     "stuck": "router 发现你上次没留下结果就退出了。先看 git status / git log 和你的笔记，确认做到哪，再照原话继续。",
@@ -126,13 +131,29 @@ def _resume_prompt(kind, text, inbox):
     return "\n".join(parts)
 
 
-def _resume(env, st, tid, kind, text, status):
+def _check_surfaces(env, names):
+    unknown = [n for n in names if n not in env.table]
+    if unknown:
+        raise Fail(f"未知代码面 {unknown}；只能用 surfaces.json 里的：{sorted(env.table)}")
+
+
+def _resume(env, st, tid, kind, text, status, force_restart=False):
+    """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
+    force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。"""
     t = st["tickets"][tid]
+    if t["status"] == store.TAKEOVER:
+        raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
+    if launcher.worker_alive(env.ctx, t["worker"]):
+        if not force_restart:
+            events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+            return "delivered"
+        launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
     launcher.run_worker(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), True, env.now())
     store.set_status(st, tid, status, env.now())
+    return "resumed"
 
 
 def _append_local(path: Path, line: str) -> None:
@@ -171,6 +192,8 @@ def cmd_draft(a, env):
             if st["tickets"][tid]["status"] in (store.DRAFT, store.HOLD, store.SKIP):
                 del st["tickets"][tid]
         st["queue"] = [q for q in st["queue"] if q["kind"] != "start"]
+        for item in tri["tickets"]:
+            _check_surfaces(env, item.get("surfaces", []))
         by_title, created = {}, []
         for item in tri["tickets"]:
             surf = list(item.get("surfaces", []))
@@ -207,6 +230,7 @@ def cmd_draft(a, env):
 
 def cmd_add(a, env):
     surf = _csv(a.surfaces)
+    _check_surfaces(env, surf)
     with env.state() as st:
         tid = store.new_ticket(
             st, title=a.title, origin="user", batch="user", priority=a.priority,
@@ -289,22 +313,29 @@ def cmd_answer(a, env):
             raise Fail(f"决定单里没有 {a.qid}")
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(a.text.splitlines())}")
-        resumed, hint = None, ""
+        resumed, delivered, hint = None, None, ""
         t = st["tickets"].get(q["ticket"]) if q["ticket"] else None
-        if t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
-            if q["kind"] == "card":
+        if t and t["status"] == store.TAKEOVER:
+            hint = f"{t['id']} 在你接管中，回答已存档；还给 router 后再续跑"
+        elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
+            kind = q["kind"]
+            if kind == "card" and a.reject:
+                kind = "reject"
+                t["card_confirmed"] = False
+                t["solution"]["source"] = re.sub(r"（.*?）$", "（被驳回）", t["solution"]["source"])
+            elif kind == "card":
                 t["card_confirmed"] = True
                 t["solution"]["source"] = t["solution"]["source"].replace("待你确认", "已确认")
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
-            _resume(env, st, t["id"], q["kind"], a.text, status)
-            resumed = t["id"]
+            how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"))
+            resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
         elif q["kind"] == "start":
             hint = "派发单要用 start 子命令"
         elif q["kind"] == "handson":
             hint = "走查完用 walkthrough-done"
         elif q["kind"] == "prod":
             hint = "按 aifriends 发版流程上 prod，发完用 released"
-    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "hint": hint}
+    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint}
 
 
 def cmd_submit_card(a, env):
@@ -313,13 +344,15 @@ def cmd_submit_card(a, env):
         raise Fail(f"方向卡不存在：{card}")
     with env.state() as st:
         t = env.ticket(st, a.ticket)
+        if t["status"] != store.KICKOFF:
+            raise Fail(f"{a.ticket} 状态是 {t['status']}，只有出方向卡阶段（kickoff）的票能交卡")
+        st["queue"] = [q for q in st["queue"] if not (q["kind"] == "card" and q["ticket"] == a.ticket)]   # 旧版本作废
         version = t.get("card", {}).get("version", 0) + 1
         t["card"] = {"path": str(card), "rounds": a.rounds, "codex": a.codex, "overtime": a.overtime,
                      "version": version, "submitted_at": env.now()}
         t["solution"] = {"kind": "card", "text": _card_direction(card.read_text(encoding="utf-8")),
                          "source": f"方向卡 v{version}（待你确认）"}
-        if env.ctx.pid_alive(t["worker"].get("pid")):
-            launcher.stop_now(t["worker"]["pid"])      # 超时交卡：worker 还在写，先停，确认后续跑
+        launcher.stop_worker(env.ctx, t["worker"])      # 超时交卡：worker 还在写，先停，确认后续跑
         t["worker"]["pid"] = None
         t["worker"]["kickoff_rounds"] = a.rounds
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
@@ -353,12 +386,17 @@ def cmd_revoke(a, env):
 def cmd_tell(a, env):
     with env.state() as st:
         t = env.ticket(st, a.ticket)
-        events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": a.text})
+        if t["status"] == store.TAKEOVER and a.resume:
+            raise Fail(f"{a.ticket} 在你接管中：先「还给 router」（handback）再续跑")
+        alive = launcher.worker_alive(env.ctx, t["worker"])
+        if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
+            events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": a.text})
         resumed = None
-        if a.resume and not env.ctx.pid_alive(t["worker"].get("pid")):
-            _resume(env, st, a.ticket, "direction", a.text,
-                    t["status"] if t["status"] in store.RUNNING else store.KICKOFF)
+        if a.resume and _resume(env, st, a.ticket, "direction", a.text,
+                                t["status"] if t["status"] in store.RUNNING else store.KICKOFF) == "resumed":
             resumed = a.ticket
+        elif not a.resume:
+            pass
     return {"ok": True, "resumed": resumed}
 
 
@@ -374,8 +412,7 @@ def cmd_pause(a, env):
 def cmd_stop(a, env):
     with env.state() as st:
         t = env.ticket(st, a.ticket)
-        if t["worker"].get("pid"):
-            launcher.stop_now(t["worker"]["pid"])
+        launcher.stop_worker(env.ctx, t["worker"])
         t["worker"]["pid"] = None
         store.set_status(st, a.ticket, store.PAUSED, env.now(), "你让它立刻停")
     return {"ok": True}
@@ -387,8 +424,7 @@ def cmd_takeover(a, env):
         w = t["worker"]
         if not w.get("session_id"):
             raise Fail(f"{a.ticket} 还没有 worker session")
-        if w.get("pid"):
-            launcher.stop_now(w["pid"])                 # 同一个 session 不能两边同时写
+        launcher.stop_worker(env.ctx, w)                # 同一个 session 不能两边同时写
         w["pid"] = None
         if t["status"] != store.TAKEOVER:
             t["takeover_from"] = t["status"]
@@ -403,12 +439,36 @@ def cmd_handback(a, env):
         if t["status"] != store.TAKEOVER:
             raise Fail(f"{a.ticket} 不在接管中")
         prev = t.pop("takeover_from", store.PAUSED)
+        store.set_status(st, a.ticket, prev, env.now())       # 先解除接管，_resume 才肯续跑
         if prev in store.RUNNING:
             _resume(env, st, a.ticket, "direction",
                     "用户接管结束，交还给 router。先看 git log / git status 了解用户做了什么，再按当前阶段继续。", prev)
         else:
             store.set_status(st, a.ticket, prev, env.now())
     return {"ok": True, "status": prev}
+
+
+def cmd_surfaces(a, env):
+    """方向卡出来后按实际更新代码面，或越界时给票分配锁（spec §4.4、§8）。同时记一条决定。"""
+    names = _csv(a.set)
+    _check_surfaces(env, names)
+    with env.state() as st:
+        t = env.ticket(st, a.ticket)
+        held = {s: h for s, h in surfaces.conflicts(st, a.ticket, set(names)).items()}
+        if held and not a.force:
+            raise Fail(f"这些代码面被别人锁着：{held}；等它们放锁，或确认后加 --force", held=held)
+        old = t["surfaces"]
+        t["surfaces"], t["weight"] = names, surfaces.weight_for(set(names), env.table)
+        did = store.append_decision(env.decisions, st, a.ticket, f"代码面 {old} → {names}", a.why,
+                                    "router.py surfaces", env.now())
+    return {"ok": True, "surfaces": names, "weight": t["weight"], "decision": did}
+
+
+def cmd_ack_slow(a, env):
+    with env.state() as st:
+        n = len(st.get("slow_path", []))
+        st["slow_path"] = []
+    return {"ok": True, "cleared": n}
 
 
 def cmd_prioritize(a, env):
@@ -528,18 +588,11 @@ def cmd_status(a, env):
 
 
 def cmd_discover(a, env):
-    ctx = env.ctx
+    import tick
     with env.state() as st:
-        ext = discover.scan(ctx, env.root, f"origin/{env.cfg.get('base_branch', 'staging')}", env.table,
-                            set(), env.cfg.get("stale_min", 45), env.cfg.get("external_lock_hours", 24))
-        st["external"] = ext
-        new = []
-        seen = {q["summary"] for q in st["queue"] if q["kind"] == "conflict"}
-        for wt, surf, tid in discover.conflicts_with_router(st, ext):
-            summary = f"外部 session {Path(wt).name} 改了 {tid} 锁着的代码面 {surf}"
-            if summary not in seen:
-                new.append(store.push_queue(st, tid, "conflict", summary, _blocks(st, tid), env.now()))
-    return {"ok": True, "external": ext, "new_queue": new}
+        run = tick.Run(env.ctx, env.root, env.cfg, st)
+        run.step1_external()                          # 与巡检第 1 步同一套逻辑（含冲突只报一次）
+    return {"ok": True, "external": st["external"], "new_queue": run.res["new_queue"]}
 
 
 # ---- 入口 -------------------------------------------------------------------
@@ -563,6 +616,7 @@ def build_parser():
     s.add_argument("tickets", nargs="*")
     s = sub.add_parser("answer", help="回答决定单上的一项，原话转给 worker")
     s.add_argument("qid"); s.add_argument("text")
+    s.add_argument("--reject", action="store_true", help="驳回方向卡：worker 回第 1 段重写")
     s = sub.add_parser("submit-card", help="方向卡进决定单")
     s.add_argument("ticket"); s.add_argument("--card", required=True)
     s.add_argument("--rounds", type=int, default=0); s.add_argument("--codex")
@@ -577,6 +631,10 @@ def build_parser():
     for name, h in (("pause", "先停：做完当前这一步"), ("stop", "立刻停"), ("takeover", "我接管"),
                     ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了")):
         sub.add_parser(name, help=h).add_argument("ticket")
+    s = sub.add_parser("surfaces", help="更新票的代码面 / 越界时分配锁（记一条决定）")
+    s.add_argument("ticket"); s.add_argument("--set", required=True); s.add_argument("--why", required=True)
+    s.add_argument("--force", action="store_true")
+    sub.add_parser("ack-slow", help="慢路径事件处理完了：清掉存档")
     s = sub.add_parser("prioritize", help="调整优先级（越小越先）")
     s.add_argument("ticket"); s.add_argument("n", type=int)
     s = sub.add_parser("emit", help="worker 往上抛事件")
@@ -614,6 +672,8 @@ def main(argv=None):
         import tick
         fn = getattr(tick, "cmd_" + args.cmd)
     try:
+        if os.environ.get("ROUTER_TICKET") and args.cmd in ROUTER_ONLY:
+            raise Fail(f"{args.cmd} 只能由用户 / router session 跑，worker 不许调用", code=2)
         env = Env(Path(args.root), Ctx())
         res = fn(args, env)
     except Fail as e:

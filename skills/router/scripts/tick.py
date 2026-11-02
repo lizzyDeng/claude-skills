@@ -82,57 +82,79 @@ class Run:
     # ---- 1 ----
     def step1_external(self):
         ext = discover.scan(self.ctx, self.root, f"origin/{self.cfg.get('base_branch', 'staging')}", self.table,
-                            set(), self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24))
+                            set(), self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24),
+                            self.cfg.get("repo"))
         self.state["external"] = ext
-        seen = {q["summary"] for q in self.state["queue"] if q["kind"] == "conflict"}
-        for wt, surf, tid in discover.conflicts_with_router(self.state, ext):
-            summary = f"外部 session {Path(wt).name} 改了 {tid} 锁着的代码面 {surf}"
-            if summary not in seen:
-                self.queue(tid, "conflict", summary)
+        # 同一个冲突只报一次：答完之后外部 session 仍持有那块代码，也不再每分钟叫用户（反目标 5）
+        current = {f"{wt}|{surf}|{tid}": (wt, surf, tid) for wt, surf, tid in discover.conflicts_with_router(self.state, ext)}
+        reported = set(self.state.get("conflicts_reported", []))
+        for key in sorted(set(current) - reported):
+            wt, surf, tid = current[key]
+            self.queue(tid, "conflict", f"外部 session {Path(wt).name} 改了 {tid} 锁着的代码面 {surf}")
+        self.state["conflicts_reported"] = sorted(current)    # 冲突消失后再出现，会再报
 
     # ---- 2 ----
     def step2_exits(self):
         for tid, t in list(self.state["tickets"].items()):
             w = t["worker"]
-            if t["status"] not in store.RUNNING or not w.get("pid") or self.ctx.pid_alive(w["pid"]):
+            if t["status"] not in store.RUNNING or not w.get("pid") or launcher.worker_alive(self.ctx, w):
                 continue
-            mine = [e for e in events.read_all(self.home, tid)
-                    if e.get("ts", "") >= (w.get("started_at") or "") and (e.get("type") == "progress" or e.get("stop"))]
-            result = launcher.read_result(w["log"]) if w.get("log") else None
-            w["exit"] = {"at": self.now, "result": result is not None,
-                         "is_error": bool(result and result.get("is_error"))}
-            w["pid"] = None
-            if t.pop("pause_requested", False):
-                store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
-                continue
-            last = mine[-1] if mine else None
-            if last and last.get("stop"):
-                t["stops"] += 1
-                kind = "spend" if "spend" in last.get("affects", {}).get("tags", []) else STOP_KIND[last["type"]]
-                prefix = {"assumption_broken": "核心假设被推翻：", "overreach": "要越界："}.get(last["type"], "")
-                qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}")
-                store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
-            elif last and last.get("phase") == "card_ready" and t["status"] == store.KICKOFF:
-                t["card_ready_at"] = self.now
-                t["waiting_for"] = "router 方向审中"
-                self.res["cards_for_review"].append(tid)
-            elif last and last.get("phase") == "pr_opened":
-                store.set_status(self.state, tid, store.VERIFYING, self.now, "等 CI")
-                t["verifying_at"] = self.now
-            elif result and result.get("is_error"):
-                fs = t["fail_streak"]
-                if fs.get("step") == t["status"] and fs.get("count", 0) >= 1:
-                    fs["count"] += 1
-                    self._stuck(tid, f"{tid} 同一步连续失败 {fs['count']} 次：{str(result.get('result'))[:120]}")
-                else:
-                    t["fail_streak"] = {"step": t["status"], "count": 1}
-                    self.resume(tid, "【router】你上一次运行报错退出了："
-                                     f"{str(result.get('result'))[:300]}\n先读 inbox，确认做到哪，再从中断处继续。",
-                                t["status"])
-            elif result:
-                self._stuck(tid, f"{tid} 退出了但没报进度（违反 worker.md）")
+            try:
+                self._handle_exit(tid, t)
+            except Exception as e:  # 一张票出错不挡其它票
+                self.res["errors"].append(f"step2 {tid}：{e!r}")
+
+    def _offrepo(self, t) -> bool:
+        """票的代码面全在仓外（~/… 或仓外绝对路径）：没有 PR 可开，走「备份 → 改 → diff → 你核对」。"""
+        globs = [g for s in t["surfaces"] for g in self.table.get(s, {}).get("globs", [])]
+        root = str(self.root)
+        return bool(globs) and all(g.startswith("~") or (g.startswith("/") and not g.startswith(root)) for g in globs)
+
+    def _handle_exit(self, tid, t):
+        w = t["worker"]
+        mine = [e for e in events.read_all(self.home, tid)
+                if e.get("ts", "") >= (w.get("started_at") or "") and (e.get("type") == "progress" or e.get("stop"))]
+        result = launcher.read_result(w["log"]) if w.get("log") else None
+        w["exit"] = {"at": self.now, "result": result is not None, "is_error": bool(result and result.get("is_error"))}
+        w["pid"] = None
+        pause = t.pop("pause_requested", False)
+        last = mine[-1] if mine else None
+        phase = last.get("phase") if last else None
+        if last and last.get("stop"):
+            t["stops"] += 1
+            kind = "spend" if "spend" in last.get("affects", {}).get("tags", []) else STOP_KIND[last["type"]]
+            prefix = {"assumption_broken": "核心假设被推翻：", "overreach": "要越界："}.get(last["type"], "")
+            qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}")
+            store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
+        elif phase == "card_ready" and t["status"] == store.KICKOFF:
+            t["card_ready_at"] = self.now
+            t["waiting_for"] = "router 方向审中"
+            self.res["cards_for_review"].append(tid)
+        elif phase == "pr_opened" and not t.get("card_confirmed"):
+            # 🔴 方向卡没经用户确认就开了 PR：不进验收，更不会被合（方案确认归用户）
+            qid = self.queue(tid, "direction", f"{tid}：方向卡还没确认就开了 PR，不会合；先确认或驳回方向卡")
+            store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
+        elif phase == "pr_opened":
+            store.set_status(self.state, tid, store.VERIFYING, self.now, "等 CI")
+            t["verifying_at"] = self.now
+        elif phase == "impl_done" and t.get("card_confirmed") and self._offrepo(t):
+            self._settle(tid, t, sha=None)
+        elif pause:
+            store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
+        elif result and result.get("is_error"):
+            fs = t["fail_streak"]
+            if fs.get("step") == t["status"] and fs.get("count", 0) >= 1:
+                fs["count"] += 1
+                self._stuck(tid, f"{tid} 同一步连续失败 {fs['count']} 次：{str(result.get('result'))[:120]}")
             else:
-                self._stuck(tid, f"{tid} 没留下结果就退出了（被杀 / 睡眠 / OOM？）")
+                t["fail_streak"] = {"step": t["status"], "count": 1}
+                self.resume(tid, "【router】你上一次运行报错退出了："
+                                 f"{str(result.get('result'))[:300]}\n先读 inbox，确认做到哪，再从中断处继续。",
+                            t["status"])
+        elif result:
+            self._stuck(tid, f"{tid} 退出了但没报进度（违反 worker.md）")
+        else:
+            self._stuck(tid, f"{tid} 没留下结果就退出了（被杀 / 睡眠 / OOM？）")
 
     def _stuck(self, tid, summary):
         qid = self.queue(tid, "stuck", summary)
@@ -158,6 +180,8 @@ class Run:
                     events.mark_review(self.state, hits)
                 if not fast:
                     self.res["slow_path_events"].append(ev)
+                    self.state.setdefault("slow_path", []).append(ev)   # 存盘，router 处理完 ack-slow 才删
+        self.state["slow_path"] = self.state.get("slow_path", [])[-50:]
 
     def _external_inbox(self, wt, ev):
         p = Path(wt) / ".claude" / "router-inbox.md"
@@ -198,45 +222,108 @@ class Run:
     # ---- 5 ----
     def step5_merge(self):
         repo, base = self.cfg["repo"], self.cfg.get("base_branch", "staging")
-        uids = github.load_guard_uids(self.cfg.get("leak_guard_globs", []))
+        try:
+            guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
+        except github.GuardEmpty as e:          # 闸失效就一张都不合（fail-closed）
+            self.res["errors"].append(f"step5 防泄漏闸：{e}")
+            return
         for tid, t in list(self.state["tickets"].items()):
             if t["status"] != store.VERIFYING:
                 continue
-            pr = t.get("pr") or github.pr_for_branch(self.ctx, repo, t["worker"].get("branch") or f"router/{tid}")
-            if not pr:
-                continue
-            t["pr"] = pr
-            st = github.pr_status(self.ctx, repo, pr)
-            if st["checks"] == "failure" and not st["merged"]:
-                fs = t["fail_streak"]
-                if fs.get("step") == "ci" and fs.get("count", 0) >= 1:
-                    fs["count"] += 1
-                    self._stuck(tid, f"{tid} PR #{pr} CI 连续红 {fs['count']} 次")
-                else:
-                    t["fail_streak"] = {"step": "ci", "count": 1}
-                    self.resume(tid, f"【router】PR #{pr} 的 CI 红了。先 `gh pr checks {pr}` 看是哪项；"
-                                     "「Platform release contract」偶发失败可以先 `gh run rerun --failed`。修好推上去，"
-                                     "再 `progress pr_opened` 后退出。", store.EXECUTING)
-                continue
-            if st["checks"] == "none" and not st["merged"]:
-                since = _ts(t.get("verifying_at") or self.now)
-                if self.ctx.now().timestamp() - since > 30 * 60 and t.get("no_ci_reported") != pr:
-                    t["no_ci_reported"] = pr
-                    self.queue(tid, "stuck", f"{tid} PR #{pr} 30 分钟了还没有任何 CI 检查")
-                continue
-            if not github.merge_if_green(self.ctx, repo, pr):
-                continue
-            sha = github.pr_status(self.ctx, repo, pr)["merge_sha"] or "?"
-            t["merge_sha"] = sha
-            t["fail_streak"] = {"step": "", "count": 0}
-            store.set_status(self.state, tid, store.MERGED, self.now, "等你 staging 走查")
-            self._notify_downstream(tid, t, sha, base, uids)
-            if t["worker"].get("worktree"):
-                try:
-                    launcher.remove_worktree(self.ctx, self.root, t["worker"]["worktree"])
-                except RuntimeError as e:
-                    self.res["errors"].append(f"step5 删 worktree：{e}")
-            self.queue(tid, "handson", f"staging 走查 {tid}：{t['title']}")
+            try:
+                self._verify(tid, t, repo, base, guard)
+            except Exception as e:  # 一个 PR 出错（被删、gh 抖动）不挡其它票
+                self.res["errors"].append(f"step5 {tid}：{e!r}")
+
+    def _once(self, t, key, value, tid, kind, summary):
+        if t.get(key) != value:
+            t[key] = value
+            self.queue(tid, kind, summary)
+
+    def _retry_or_stuck(self, tid, t, step, summary, prompt):
+        fs = t["fail_streak"]
+        if fs.get("step") == step and fs.get("count", 0) >= 1:
+            fs["count"] += 1
+            self._stuck(tid, f"{summary}（连续 {fs['count']} 次）")
+        else:
+            t["fail_streak"] = {"step": step, "count": 1}
+            self.resume(tid, prompt, store.EXECUTING)
+
+    def _verify(self, tid, t, repo, base, guard):
+        if launcher.worker_alive(self.ctx, t["worker"]):
+            return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）：等它退出
+        if not t.get("card_confirmed"):
+            self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
+                       f"{tid}：方向卡没经你确认，PR 不合")
+            return
+        pr = t.get("pr") or github.pr_for_branch(self.ctx, repo, t["worker"].get("branch") or f"router/{tid}")
+        if not pr:
+            if self.ctx.now().timestamp() - _ts(t.get("verifying_at") or self.now) > 30 * 60:
+                self._once(t, "no_pr_reported", t.get("verifying_at"), tid, "stuck", f"{tid} 报了 pr_opened，但找不到它的 PR")
+            return
+        t["pr"] = pr
+        st = github.pr_status(self.ctx, repo, pr)
+        if st["base"] != base:
+            # 🔴 合进 main = 上 prod，归用户。base 不对一律不合
+            self._once(t, "wrong_base_reported", pr, tid, "stuck",
+                       f"{tid} PR #{pr} 的 base 是 {st['base']}，不是 {base}：不合（gh pr edit {pr} --base {base}）")
+            return
+        if st["merged"]:
+            return self._settle(tid, t, st["merge_sha"] or "?")
+        if st["state"] == "CLOSED":
+            t["pr"] = None
+            return self._stuck(tid, f"{tid} PR #{pr} 被关闭了（没合）")
+        if st["checks"] == "failure":
+            return self._retry_or_stuck(tid, t, "ci", f"{tid} PR #{pr} CI 红",
+                                        f"【router】PR #{pr} 的 CI 红了。先 `gh pr checks {pr}` 看是哪项；"
+                                        "「Platform release contract」偶发失败可以先 `gh run rerun --failed`。修好推上去，"
+                                        "再 `progress pr_opened` 后退出。")
+        if st["mergeable"] == "CONFLICTING":
+            return self._retry_or_stuck(tid, t, "conflict", f"{tid} PR #{pr} 和 {base} 有冲突",
+                                        f"【router】PR #{pr} 和最新 {base} 冲突。rebase 到 origin/{base}、解决冲突、"
+                                        "重跑验收，推上去（--force-with-lease 只推你自己的 router 分支），再 `progress pr_opened` 后退出。")
+        if st["checks"] == "none":
+            if self.ctx.now().timestamp() - _ts(t.get("verifying_at") or self.now) > 30 * 60:
+                self._once(t, "no_ci_reported", pr, tid, "stuck", f"{tid} PR #{pr} 30 分钟了还没有任何 CI 检查")
+            return
+        if st["checks"] != "success":
+            return
+        hits = github.leak_hits(github.pr_text(self.ctx, repo, pr), guard)
+        if hits:
+            return self._once(t, "leak_reported", st["head"], tid, "stuck",
+                              f"{tid} PR #{pr} 含用户 uid 或原话（{len(hits)} 处），不合；要改掉并重写这条分支的历史")
+        if not github.merge_if_green(self.ctx, repo, pr, base):
+            fs = t["fail_streak"]
+            t["fail_streak"] = {"step": "merge", "count": fs.get("count", 0) + 1 if fs.get("step") == "merge" else 1}
+            if t["fail_streak"]["count"] >= 2:
+                self._stuck(tid, f"{tid} PR #{pr} 合并失败 {t['fail_streak']['count']} 次")
+            return
+        self._settle(tid, t, github.pr_status(self.ctx, repo, pr)["merge_sha"] or "?")
+
+    def _settle(self, tid, t, sha):
+        """一张票完成：仓内 = 合进 base；仓外 = 改完待你核对。放锁、通知下游、删 worktree、进「待你动手」。"""
+        base = self.cfg.get("base_branch", "staging")
+        t["merge_sha"] = sha
+        t["fail_streak"] = {"step": "", "count": 0}
+        offrepo = sha is None
+        store.set_status(self.state, tid, store.MERGED, self.now, "等你核对仓外改动" if offrepo else f"等你 {base} 走查")
+        try:
+            guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
+        except github.GuardEmpty as e:
+            guard = None
+            self.res["errors"].append(f"下游留言跳过（防泄漏闸失效）：{e}")
+        if guard is not None:
+            self._notify_downstream(tid, t, sha or "仓外改动，无 commit", base, guard)
+        if t["worker"].get("worktree"):
+            try:
+                launcher.remove_worktree(self.ctx, self.root, t["worker"]["worktree"])
+            except RuntimeError as e:
+                self.res["errors"].append(f"删 worktree {tid}：{e}")
+        if offrepo:
+            self.queue(tid, "handson", f"核对 {tid} 的仓外改动：diff {self.home}/cards/{tid}.diff · "
+                                       f"备份 {self.home}/backups/{tid}/（不满意说「{tid} 回滚」）")
+        else:
+            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
 
     def _notify_downstream(self, tid, t, sha, base, uids):
         for o in self.state["tickets"].values():
@@ -247,7 +334,7 @@ class Run:
             if not (dep or shared):
                 continue
             why = "依赖已解锁" if dep else f"共享代码面 {'、'.join(sorted(shared))} 已释放"
-            body = (f"上游 {tid}{' #' + str(t['issue']) if t.get('issue') else ''}「{t['title']}」已合进 {base}，SHA `{sha[:12]}`。\n"
+            body = (f"上游 {tid}{' #' + str(t['issue']) if t.get('issue') else ''}「{t['title']}」已完成（合进 {base}），SHA `{sha[:12]}`。\n"
                     f"- 合了什么：{(t.get('solution') or {}).get('text', '')[:300]}\n"
                     f"- 对本票的影响：{why}；开工 / 继续前先基于最新 {base}。\n\n由 /router 自动留言。")
             try:
@@ -310,7 +397,13 @@ def _brief(run, tid):
         surfaces="、".join(t["surfaces"]) or "（未声明）", tags="、".join(t.get("tags", [])) or "（无）",
         blocked_by="、".join(t["blocked_by"]) or "无", base_branch=run.cfg.get("base_branch", "staging"),
         router_home=str(run.home), router_cli=str(Path(__file__).resolve().with_name("router.py")),
-        card_path=str(run.home / "cards" / f"{tid}.md"), kickoff_budget=run.cfg.get("kickoff_budget_min", 30))
+        card_path=str(run.home / "cards" / f"{tid}.md"), kickoff_budget=run.cfg.get("kickoff_budget_min", 30),
+        finish=(f"这张票只改仓外目录（{'、'.join(t['surfaces'])}），不推分支、不开 PR：开改前把要动的文件整份备份到 "
+                f"{run.home}/backups/{tid}/（cp -a，保留目录结构）；改完把 `diff -ru <备份> <现状>` 写到 "
+                f"{run.home}/cards/{tid}.diff，跑验收，然后 progress impl_done 退出。")
+        if run._offrepo(t) else
+        (f"改完照 worker.md 第 3 段：推 router/{tid}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
+         "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"))
 
 
 def _explain_waits(run, picked, disk):
@@ -355,12 +448,23 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
         launcher.run_worker(ctx, run.home, cfg, state, tid, _brief(run, tid), False, run.now)
         t["kickoff_at"] = run.now
         store.set_status(state, tid, store.KICKOFF, run.now, f"写方向卡（{cfg.get('kickoff_budget_min', 30)} 分钟内）")
+        store.save_state(run.home / "state.json", state)     # 起了进程就落盘：这轮后面崩了也不会丢 worker
         done.append(tid)
     _explain_waits(run, done, disk)
     return done
 
 
-def run(ctx, root, cfg) -> dict:
+def _resurface(r):
+    """router 被压缩 / 重启后，上一次 watch 交出去、还没处理完的东西再交一次（只在 watch 第一轮和 tick 子命令做）。"""
+    for tid, t in r.state["tickets"].items():
+        if (t["status"] == store.KICKOFF and t.get("card_ready_at") and not launcher.worker_alive(r.ctx, t["worker"])
+                and tid not in r.res["cards_for_review"]):
+            r.res["cards_for_review"].append(tid)
+    pending = [e for e in r.state.get("slow_path", []) if e not in r.res["slow_path_events"]]
+    r.res["slow_path_events"] = pending + r.res["slow_path_events"]
+
+
+def run(ctx, root, cfg, resurface=False) -> dict:
     home = home_for(root)
     with store.locked(home):
         state = store.load_state(home / "state.json")
@@ -371,6 +475,8 @@ def run(ctx, root, cfg) -> dict:
                 step()
             except Exception as e:  # 一步出错不拖垮整轮；错误交给 router
                 r.res["errors"].append(f"{step.__name__}：{e!r}\n{traceback.format_exc(limit=3)}")
+        if resurface:
+            _resurface(r)
         store.save_state(home / "state.json", state)
     return r.res
 
@@ -385,13 +491,14 @@ def add_subcommands(sub):
 
 
 def cmd_tick(a, env):
-    return {"ok": True, **run(env.ctx, env.root, env.cfg)}
+    return {"ok": True, **run(env.ctx, env.root, env.cfg, resurface=True)}
 
 
 def cmd_watch(a, env):
-    started, err_streak = time.time(), 0
+    started, err_streak, first = time.time(), 0, True
     while True:
-        res = run(env.ctx, env.root, env.cfg)
+        res = run(env.ctx, env.root, env.cfg, resurface=first)
+        first = False
         err_streak = err_streak + 1 if res["errors"] else 0
         if any(res.get(k) for k in WAKE_KEYS) or err_streak >= 3:
             return {"ok": True, "woke": [k for k in WAKE_KEYS if res.get(k)] + (["errors"] if err_streak >= 3 else []), **res}

@@ -337,3 +337,91 @@ def test_submit_card_on_overtime_stops_live_worker(proj, monkeypatch):
     card = proj.tmp / "c.md"; card.write_text("**3. 方案方向**\n半张卡\n")
     proj.out("submit-card", "T1", "--card", str(card), "--overtime")
     assert p.wait(timeout=10) is not None                 # 超时交卡：后台 worker 先停，等你确认后再续跑
+
+
+# ---- 终审修复 ----------------------------------------------------------------
+
+def _queue(proj, s, *items):
+    s["queue"] = [{"id": q, "ticket": t, "kind": k, "summary": "x", "blocks": 0, "created_at": "t"} for q, t, k in items]
+    s["seq"]["queue"] = len(items)
+    (proj.home / "state.json").write_text(json.dumps(s))
+
+
+def test_resume_with_live_worker_only_delivers_inbox(proj, monkeypatch):   # C3
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    p = subprocess.Popen([sys.executable, str(FAKE)], start_new_session=True)
+    s = seed(proj, T1=("executing", ["a"], {"worker": {"pid": p.pid, "session_id": "s", "worktree": str(proj.tmp)}}))
+    _queue(proj, s, ("Q1", "T1", "conflict"))
+    out = proj.out("answer", "Q1", "按 T1 来")
+    assert out["resumed"] is None and out["delivered"] == "T1"
+    assert proj.state()["tickets"]["T1"]["worker"]["pid"] == p.pid and p.poll() is None
+    assert "按 T1 来" in (proj.home / "inbox" / "T1.jsonl").read_text()
+    p.kill()
+
+
+def test_answer_stuck_stops_live_worker_then_resumes(proj, monkeypatch):    # C3
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    p = subprocess.Popen([sys.executable, str(FAKE)], start_new_session=True)
+    s = seed(proj, T1=("executing", ["a"], {"card_confirmed": True, "worker": {"pid": p.pid, "session_id": "s", "worktree": str(proj.tmp)}}))
+    _queue(proj, s, ("Q1", "T1", "stuck"))
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "0")
+    out = proj.out("answer", "Q1", "续跑")
+    assert out["resumed"] == "T1" and p.wait(timeout=10) is not None
+    assert proj.state()["tickets"]["T1"]["worker"]["pid"] != p.pid
+
+
+def test_answer_reject_keeps_kickoff_and_asks_rewrite(proj):              # I3
+    s = seed(proj, T1=("await_card", ["a"], {"solution": {"kind": "card", "text": "t", "source": "方向卡 v1（待你确认）"},
+                                             "worker": {"session_id": "s", "worktree": str(proj.tmp)}}))
+    _queue(proj, s, ("Q1", "T1", "card"))
+    out = proj.out("answer", "Q1", "根因找错了，重新查", "--reject")
+    t = proj.state()["tickets"]["T1"]
+    assert out["resumed"] == "T1" and t["status"] == "kickoff" and not t.get("card_confirmed")
+    assert t["solution"]["source"] == "方向卡 v1（被驳回）"
+    wait_until(lambda: proj.claude())
+    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    assert "驳回" in prompt and "card_ready" in prompt and "已确认" not in prompt
+
+
+def test_takeover_blocks_resume(proj):                                    # I6
+    s = seed(proj, T1=("takeover", ["a"], {"takeover_from": "executing", "worker": {"session_id": "s", "worktree": str(proj.tmp)}}))
+    _queue(proj, s, ("Q1", "T1", "direction"))
+    r = proj.run("tell", "T1", "x", "--resume", check=False)
+    assert r.returncode == 1 and "接管" in json.loads(r.stdout)["error"]
+    out = proj.out("answer", "Q1", "y")
+    assert out["resumed"] is None and proj.state()["tickets"]["T1"]["status"] == "takeover"
+    assert proj.claude() == []
+
+
+def test_unknown_surface_names_rejected(proj):                            # I7
+    r = proj.run("add", "--title", "x", "--surfaces", "her-reply-promt", check=False)
+    assert r.returncode == 1 and "her-reply-promt" in json.loads(r.stdout)["error"]
+    tri = json.loads((FIX / "triage.json").read_text()); tri["tickets"][0]["surfaces"] = ["nope"]
+    (proj.tmp / "t.json").write_text(json.dumps(tri, ensure_ascii=False))
+    assert proj.run("draft", "--from", str(proj.tmp / "t.json"), check=False).returncode == 1
+
+
+def test_surfaces_command_updates_and_logs_decision(proj):                # I7
+    seed(proj, T1=("paused", ["weekly-report"]))
+    out = proj.out("surfaces", "T1", "--set", "weekly-report,her-reply-prompt", "--why", "越界：要改底座")
+    t = proj.state()["tickets"]["T1"]
+    assert t["surfaces"] == ["weekly-report", "her-reply-prompt"] and t["weight"] == "heavy" and out["decision"] == "D1"
+    assert "越界：要改底座" in (proj.home / "decisions.md").read_text()
+
+
+def test_worker_env_cannot_run_router_only_commands(proj):
+    seed(proj, T1=("draft", ["a"]))
+    env = {"ROUTER_TICKET": "T1", "ROUTER_HOME": str(proj.home)}
+    for args in (("start", "T1"), ("answer", "Q1", "放行"), ("decide", "--ticket", "T1", "--decision", "d", "--why", "w", "--basis", "b")):
+        r = proj.run(*args, env=env, check=False)
+        assert r.returncode == 2 and "worker" in json.loads(r.stdout)["error"]
+
+
+def test_submit_card_replaces_older_card_item_and_requires_kickoff(proj):
+    s = seed(proj, T1=("kickoff", ["a"]), T2=("executing", ["b"]))
+    _queue(proj, s, ("Q1", "T1", "card"))
+    card = proj.tmp / "c.md"; card.write_text("x")
+    proj.out("submit-card", "T1", "--card", str(card))
+    assert [q["kind"] for q in proj.state()["queue"] if q["ticket"] == "T1"] == ["card"]
+    assert proj.state()["queue"][0]["id"] != "Q1"
+    assert proj.run("submit-card", "T2", "--card", str(card), check=False).returncode == 1

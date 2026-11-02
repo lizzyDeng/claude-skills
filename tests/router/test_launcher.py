@@ -71,6 +71,7 @@ def test_create_and_remove_worktree_commands(fake, tmp_path):
     wt, branch = create_worktree(fake, tmp_path, "staging", ".claude/worktrees", "T3")
     assert branch == "router/T3" and wt == tmp_path / ".claude/worktrees" / "router-T3"
     assert fake.calls == [["git", "-C", str(tmp_path), "fetch", "origin", "staging"],
+                          ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/router/T3"],
                           ["git", "-C", str(tmp_path), "worktree", "add", "-b", "router/T3", str(wt), "origin/staging"]]
     remove_worktree(fake, tmp_path, wt)
     assert fake.last_call() == ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt)]
@@ -81,3 +82,20 @@ def test_create_worktree_failure_raises(fake, tmp_path):
     fake.script(["git", "-C", str(tmp_path), "worktree", "add"], "", returncode=128, stderr="already exists")
     with pytest.raises(RuntimeError, match="already exists"):
         create_worktree(fake, tmp_path, "staging", ".claude/worktrees", "T3")
+
+
+def test_create_worktree_reuses_existing(fake, tmp_path):             # I4：上次派到一半崩了，再派要能接上
+    wt = tmp_path / ".claude/worktrees" / "router-T3"; wt.mkdir(parents=True)
+    assert create_worktree(fake, tmp_path, "staging", ".claude/worktrees", "T3") == (wt, "router/T3")
+    assert not fake.calls_with("worktree", "add")
+    fake2 = type(fake)().script(["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/router/T4"], "abc\n")
+    wt4, _ = create_worktree(fake2, tmp_path, "staging", ".claude/worktrees", "T4")
+    assert ["git", "-C", str(tmp_path), "worktree", "add", str(wt4), "router/T4"] in fake2.calls
+
+
+def test_worker_alive_checks_process_identity(fake):                  # I9：pid 被复用不能当成 worker 还活着
+    from launcher import worker_alive
+    fake.alive.add(55)
+    assert worker_alive(fake, {"pid": 55, "pid_start": fake.proc_start(55)}) is True
+    assert worker_alive(fake, {"pid": 55, "pid_start": "Mon Nov  2 01:00:00 2026"}) is False
+    assert worker_alive(fake, {"pid": 55}) is True and worker_alive(fake, {"pid": None}) is False

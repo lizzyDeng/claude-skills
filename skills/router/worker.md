@@ -48,13 +48,18 @@
 - 对别人有用的事实、超出本票范围的新问题：`python3 $ROUTER_CLI emit finding "<事实>" --evidence "<出处>" [--tickets T…]`。
 - 摘要最多 3 行。
 
-## 第 3 段：验收 → PR
+## 第 3 段：验收 → PR（仓外票见本段末尾）
 
 1. 逐条跑方向卡第 6 项的验收标准，**贴真实命令输出**（写进 PR 描述，去掉用户原话和 uid）。
 2. 写过 staging 数据的：在同一个 run 里回滚，并在验收里贴出回滚前后的对比。
 3. 推分支：`git push -u origin router/$ROUTER_TICKET`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
-4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。
-5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了你会被叫醒修。
+4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。
+5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的 `router/<T>` 分支）。
+
+**仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。
+1. 动手前把要改的文件整份备份到 `$ROUTER_HOME/backups/$ROUTER_TICKET/`（`cp -a`，保留目录结构）。
+2. 改完把 `diff -ru <备份> <现状>` 写到 `$ROUTER_HOME/cards/$ROUTER_TICKET.diff`，跑验收，贴真实输出。
+3. `python3 $ROUTER_CLI progress impl_done`，然后**退出**。router 会放锁并请用户核对；不满意就用备份恢复。
 
 ## 禁止
 

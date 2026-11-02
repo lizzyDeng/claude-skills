@@ -11,8 +11,12 @@ router 只登记、只转交信息，不给它们下指令（spec §10）。
   - 已提交：分支自分叉点起改过、且至今仍与 base 不同的文件（squash 合进 base 后自动不再占锁）
   - 未提交改动
   - 计划要改：近期 conductor ledger / plan 里写到的文件路径（还在出方案、没动代码的 session 也要先占上）
+分支 tip == 某个已合并 PR 的 head（squash 后判已合的唯一可靠办法），且没有 .claude/ 以外的未提交改动
+⇒ 这个 session 的活已经合进去了：不占锁、不占重票名额。
 """
+import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,12 +55,33 @@ def _planned_files(ledgers, since_ts):
     return files
 
 
+_MERGED = {}                     # (branch, head) → (查询时间, PR 号或 None)；合过的结果不会变，没合的 10 分钟后重查
+
+
+def _merged_pr(ctx, repo_slug, path, branch):
+    head = ctx.run(["git", "-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    if not head or not branch:
+        return None
+    hit = _MERGED.get((branch, head))
+    if hit and (hit[1] or time.time() - hit[0] < 600):
+        return hit[1]
+    r = ctx.run(["gh", "pr", "list", "-R", repo_slug, "--head", branch, "--state", "merged",
+                 "--json", "number,headRefOid", "--limit", "5"])
+    try:
+        prs = json.loads(r.stdout or "[]") if r.returncode == 0 else []
+    except ValueError:
+        prs = []
+    num = next((p["number"] for p in prs if p.get("headRefOid", "").startswith(head) or head.startswith(p.get("headRefOid") or "-")), None)
+    _MERGED[(branch, head)] = (time.time(), num)
+    return num
+
+
 def _iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
 
 
 def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min: int,
-         lock_hours: int = 24) -> dict:
+         lock_hours: int = 24, repo_slug: str = None) -> dict:
     out = ctx.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"]).stdout
     blocks = list(_worktrees(out))
     now = ctx.now().timestamp()
@@ -82,13 +107,18 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
         last = max([t for t in (ledger_ts, commit_ts, dirty_ts) if t] or [0])
         planned = surf_mod.surfaces_for_files(sorted(_planned_files(ledgers, now - lock_hours * 3600)), table)
         surfs = surf_mod.surfaces_for_files(sorted(files), table) | planned
+        merged_pr = _merged_pr(ctx, repo_slug, path, branch) if repo_slug else None
+        real_dirty = [f for f in dirty if not f.startswith(".claude/")]
+        if merged_pr and not real_dirty:
+            surfs, planned = set(), set()
         found[path] = {
             "branch": branch,
             "ledger": str(ledgers[-1]) if ledgers else None,
             "ledger_mtime": _iso(ledger_ts),
             "last_activity": _iso(last),
             "active": bool(last) and now - last <= stale_min * 60,
-            "locking": bool(last) and now - last <= lock_hours * 3600,
+            "locking": bool(last) and now - last <= lock_hours * 3600 and bool(surfs),
+            "merged_pr": merged_pr,
             "surfaces": sorted(surfs),
             "planned_surfaces": sorted(planned),
             "weight": surf_mod.weight_for(surfs, table),

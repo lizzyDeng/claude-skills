@@ -43,6 +43,14 @@ class Ctx:
             return True
         return True
 
+    def proc_start(self, pid):
+        """进程启动时间（ps lstart）。pid 被复用时它会变：用来确认还是不是我们起的那个 worker。"""
+        if not pid:
+            return None
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        return r.stdout.strip() or None
+
     def now(self) -> datetime:
         return datetime.now(timezone.utc)
 
