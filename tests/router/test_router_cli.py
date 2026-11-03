@@ -1361,3 +1361,17 @@ def test_review_canary_refuses_when_sibling_is_covered_by_another_list(rv, monke
     assert out["ok"] is False and c["reason"] == "boundary" and "只靠拒读 HOME" in out["error"], out
     assert not [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]]   # 探不到那一层就不跑 exec
     assert not (rv.tmp / ".router-canary-probe").exists() and _tmp_probes() == []
+
+
+def test_review_canary_records_failure_when_probe_dir_cannot_be_created(rv, monkeypatch):   # F2：建不了探针 ⇒ fail-closed 且记一笔
+    import ctx as real_ctx
+    import review
+    import router
+    monkeypatch.setattr(review, "TMP_PARENT", str(rv.tmp / "no-such-dir" / "deeper"))   # 例：沙箱里 /tmp 不可写
+    with pytest.raises(review.Refused) as e:
+        review.canary(router.Env(rv.root, real_ctx.Ctx()))
+    assert e.value.reason == "boundary"
+    c = json.loads((rv.home / "review" / "canary.json").read_text())
+    assert c["ok"] is False and c["reason"] == "boundary"                 # review-pack 下次报 canary_stale，补跑
+    assert not (rv.tmp / ".router-canary-probe").exists()                 # 已建的 HOME 同级探针照样删掉
+    assert not [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]]

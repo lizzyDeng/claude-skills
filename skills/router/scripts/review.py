@@ -44,6 +44,7 @@ SENSITIVE_HOME = ("~/.claude/projects", "~/.codex/sessions")
 OS_DENIED = "Operation not permitted"                 # 只认 OS 原文：模型自己写得出「denied / Permission denied」
 SIBLING = ".router-canary-probe"                      # 金丝雀在 HOME 下临时建的同级目录（没列进任何名单）
 TMP_PROBE = "router-canary-probe-"                     # 金丝雀在 /tmp 下临时建的目录前缀（HOME 之外、没列进任何名单）
+TMP_PARENT = "/tmp"                                    # 它的父目录（realpath 后是默认拒绝的根之一）
 # HOME 之外、默认拒绝的公共目录：临时目录（后台任务输出、查询结果）、其他用户、外接卷。不存在的跳过。
 OUTSIDE_HOME = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders", "/Users", "/Volumes")
 GLOB_CHARS = set("*?[")
@@ -408,15 +409,18 @@ def _canary_exec(env, cdir, codex, tbin, version) -> dict:
     (cdir / "pack" / "readme.txt").write_text(tok["pack"] + "\n")
     (cdir / "deny" / "notes.txt").write_text(tok["deny"] + "\n")
     sib = Path(_real("~")) / SIBLING
-    tmp_root = _real("/tmp")
+    tmp_root = _real(TMP_PARENT)
     tdir = Path(tmp_root) / f"{TMP_PROBE}{uuid.uuid4().hex[:12]}"
     shutil.rmtree(sib, ignore_errors=True)
     out = cdir / "exec.out"
     try:
-        sib.mkdir()
-        (sib / "probe.txt").write_text(tok["sibling"] + "\n")
-        tdir.mkdir(mode=0o700)
-        (tdir / "probe.txt").write_text(tok["tmp"] + "\n")
+        try:
+            sib.mkdir()
+            (sib / "probe.txt").write_text(tok["sibling"] + "\n")
+            tdir.mkdir(mode=0o700)
+            (tdir / "probe.txt").write_text(tok["tmp"] + "\n")
+        except OSError as e:                    # 建不了探针（例：沙箱里 /tmp 不可写）：fail-closed，照样记一笔
+            raise Refused(f"建不了金丝雀探针：{e}", "boundary")
         deny, read = boundary(env, cdir / "pack", extra_deny=[cdir / "deny"])
         entries = {**{d: "deny" for d in deny}, **{r: "read" for r in read}}
         if _covering(entries, sib / "probe.txt")[0] != deny[0]:
