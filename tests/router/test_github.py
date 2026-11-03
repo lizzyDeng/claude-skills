@@ -149,3 +149,95 @@ def test_guard_collects_nested_uid_values_and_quotes(tmp_path):        # C4
 def test_guard_fails_closed_when_globs_match_nothing(tmp_path):
     with pytest.raises(GuardEmpty): load_guard([str(tmp_path / "nope" / "*.json")])
     assert load_guard([]).uids == set()
+
+
+# ---- plan v4：R1 改指判定、R6 逐目标幂等留言 / 关 issue -------------------------
+import github  # noqa: E402
+
+
+def _timeline(*nodes):
+    """gh api graphql 的完整响应（不带 --jq）。"""
+    return json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": list(nodes)}}}}})
+
+
+AUTO = {"__typename": "AutomaticBaseChangeSucceededEvent", "oldBase": "staging", "newBase": "main",
+        "createdAt": "2026-11-02T13:20:00Z"}
+HUMAN = {"__typename": "BaseRefChangedEvent", "previousRefName": "staging", "currentRefName": "main",
+         "createdAt": "2026-11-02T13:30:00Z", "actor": {"login": "someone"}}
+
+
+def test_auto_retargeted_reads_latest_base_change_event():
+    gql = lambda out, rc=0: FakeCtx().script(["gh", "api", "graphql"], out, returncode=rc)
+    f = gql(_timeline(HUMAN, AUTO))                                   # 最近一条是 GitHub 自动改指
+    assert github.auto_retargeted(f, R, 41, "staging") is True
+    assert f.calls_with("graphql") and f.timeout_of("graphql") is not None
+    assert github.auto_retargeted(gql(_timeline(AUTO, HUMAN)), R, 41, "staging") is False   # 之后人手改过
+    assert github.auto_retargeted(gql(_timeline()), R, 41, "staging") is False             # 没有改指事件
+    other = {**AUTO, "oldBase": "develop"}
+    assert github.auto_retargeted(gql(_timeline(other)), R, 41, "staging") is False         # 不是从我们的 base 改走的
+    assert github.auto_retargeted(gql("", rc=1), R, 41, "staging") is None                 # GhError
+    assert github.auto_retargeted(gql("{not json"), R, 41, "staging") is None              # 坏 JSON
+
+
+def test_auto_retargeted_pr_is_moved_back_with_pr_edit():
+    f = FakeCtx()
+    github.retarget_pr(f, R, 41, "staging")
+    assert f.last_call() == ["gh", "pr", "edit", "41", "-R", "o/r", "--base", "staging"]
+    with pytest.raises(github.GhError):
+        github.retarget_pr(FakeCtx().script(["gh", "pr", "edit"], "", returncode=1, stderr="x"), R, 41, "staging")
+
+
+def _view(state="OPEN", *bodies):
+    return json.dumps({"state": state, "comments": [{"body": b} for b in bodies]})
+
+
+MARK = "<!-- router:downstream:T1->T3 -->"
+LEGACY = r"上游 T1(?: #\d+)?「"
+OLD_BODY = ("上游 T1 #944「周报口径」已完成（合进 staging），SHA `仓外改动，无 commit`。\n- 合了什么：x\n"
+            "- 对本票的影响：共享代码面 weekly-report 已释放；开工 / 继续前先基于最新 staging。\n\n由 /router 自动留言。")
+
+
+def test_comment_once_recognizes_marker_and_legacy_signature():
+    def run(view_out, body="上游 T1「周报口径」已完成（仓外改动，不经 PR）", guard=()):
+        f = FakeCtx().script(["gh", "issue", "view", "946"], view_out)
+        return f, github.comment_once(f, R, 946, body, guard, MARK, legacy=LEGACY)
+    f, res = run(_view("OPEN", "无关评论", f"早先的留言\n\n{MARK}"))          # marker 命中 ⇒ 跳过
+    assert "already" in str(res) and not f.calls_with("issue", "comment")
+    assert ["gh", "issue", "view", "946", "-R", "o/r", "--json", "state,comments"] == f.calls[0]
+    f, res = run(_view("OPEN", OLD_BODY))                                     # 旧格式签名 ⇒ 跳过
+    assert "already" in str(res) and not f.calls_with("issue", "comment")
+    f, res = run(_view("OPEN", OLD_BODY.replace("上游 T1 #944", "上游 T10 #950")))   # T10 不是 T1
+    assert "commented" in str(res)
+    c = f.calls_with("issue", "comment")[0]
+    assert c[:5] == ["gh", "issue", "comment", "946", "-R"] and c[c.index("--body") + 1].endswith(MARK)
+    f, res = run(_view("OPEN", "> " + OLD_BODY))                              # 旧格式出现在引用块里：不算
+    assert "commented" in str(res)
+    f, res = run(_view("OPEN", "上游 T1 #944「周报口径」随手写的，不是 router 的留言"))   # 没有签名尾巴：不算
+    assert "commented" in str(res)
+    with pytest.raises(LeakBlocked):                                          # 被防泄漏闸挡 ⇒ 不调 comment
+        f = FakeCtx().script(["gh", "issue", "view", "946"], _view("OPEN"))
+        try:
+            github.comment_once(f, R, 946, "影响 5eed0001", {"5eed0001"}, MARK, legacy=LEGACY)
+        finally:
+            assert not f.calls_with("issue", "comment")
+
+
+def test_close_issue_comments_once_by_marker_and_guards_body():
+    mark = "<!-- router:closeout:T1 -->"
+    body = "仓外改动已由你核对（2026-11-03），本票完成。由 /router 关闭。"
+    f = FakeCtx().script(["gh", "issue", "view", "944"], _view("OPEN"))
+    github.close_issue(f, R, 944, body, (), mark)
+    assert f.calls_with("issue", "comment") and f.calls_with("issue", "close")
+    assert f.calls.index(f.calls_with("issue", "comment")[0]) < f.calls.index(f.calls_with("issue", "close")[0])
+    assert ["gh", "issue", "close", "944", "-R", "o/r", "--reason", "completed"] in f.calls
+    assert not any("--comment" in c for c in f.calls_with("issue", "close"))    # 不用 close --comment（内部是两次调用）
+    f = FakeCtx().script(["gh", "issue", "view", "944"], _view("OPEN", f"{body}\n\n{mark}"))   # 上次留言成功、关失败
+    github.close_issue(f, R, 944, body, (), mark)
+    assert not f.calls_with("issue", "comment") and f.calls_with("issue", "close")
+    f = FakeCtx().script(["gh", "issue", "view", "944"], _view("CLOSED", f"{body}\n\n{mark}"))  # 已经关了
+    github.close_issue(f, R, 944, body, (), mark)
+    assert not f.calls_with("issue", "comment") and not f.calls_with("issue", "close")
+    f = FakeCtx().script(["gh", "issue", "view", "944"], _view("OPEN"))
+    with pytest.raises(LeakBlocked):
+        github.close_issue(f, R, 944, "影响 5eed0001", {"5eed0001"}, mark)
+    assert not f.calls_with("issue", "comment") and not f.calls_with("issue", "close")
