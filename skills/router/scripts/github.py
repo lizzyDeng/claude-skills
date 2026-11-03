@@ -105,8 +105,11 @@ def load_guard(globs) -> Guard:
     return g
 
 
-def _gh(ctx, args) -> str:
-    r = ctx.run(["gh", *args])
+GH_S = 120                     # gh / graphql 弱网上界：超时 rc=124 → GhError
+
+
+def _gh(ctx, args, timeout=GH_S) -> str:
+    r = ctx.run(["gh", *args], timeout=timeout)
     if r.returncode != 0:
         raise GhError(f"gh {' '.join(args[:3])} 失败：{(r.stderr or r.stdout).strip()[:300]}")
     return r.stdout
@@ -254,3 +257,70 @@ def merge_if_green(ctx, repo, pr, base=None) -> bool:
 def comment(ctx, repo, issue, body, uids=()) -> None:
     _guard(body, uids)
     _gh(ctx, ["issue", "comment", str(issue), "-R", repo, "--body", body])
+
+
+# ---- R1：被 GitHub 自动改指的 PR ----------------------------------------------
+
+_TIMELINE_Q = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
+pullRequest(number:$number){timelineItems(last:20,itemTypes:[AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT,BASE_REF_CHANGED_EVENT]){
+nodes{__typename ... on AutomaticBaseChangeSucceededEvent{oldBase newBase createdAt}
+... on BaseRefChangedEvent{previousRefName currentRefName createdAt actor{login}}}}}}}"""
+
+
+def last_base_change(ctx, repo, pr):
+    """PR 时间线里最近一次改 base 的事件（GitHub 自动 / 人手）；没有 → {}；查不了 → None。"""
+    owner, _, name = repo.partition("/")
+    try:
+        out = _gh(ctx, ["api", "graphql", "-f", f"query={_TIMELINE_Q}", "-F", f"owner={owner}",
+                        "-F", f"name={name}", "-F", f"number={int(pr)}"])
+        nodes = json.loads(out)["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+    except (GhError, ValueError, KeyError, TypeError):
+        return None
+    nodes = [n for n in nodes or [] if isinstance(n, dict)]
+    return nodes[-1] if nodes else {}
+
+
+def is_auto_retarget(ev, base) -> bool:
+    return bool(ev) and ev.get("__typename") == "AutomaticBaseChangeSucceededEvent" and ev.get("oldBase") == base
+
+
+def auto_retargeted(ctx, repo, pr, base):
+    """最近一次改 base 是 GitHub 自动把它从 <base> 改走的（base 分支被删）→ True；
+    最近一次是人手改的、或从没改过 → False（人手改过的不碰）；查不了 → None（走原来的 stuck，绝不合）。"""
+    ev = last_base_change(ctx, repo, pr)
+    return None if ev is None else is_auto_retarget(ev, base)
+
+
+def retarget_pr(ctx, repo, pr, base) -> None:
+    _gh(ctx, ["pr", "edit", str(pr), "-R", repo, "--base", base])
+
+
+# ---- R6：逐目标幂等留言 / 关 issue ---------------------------------------------
+
+AUTO_SIGNATURE = "由 /router 自动留言"
+
+
+def comment_once(ctx, repo, n, body, guard, marker, legacy=None) -> dict:
+    """先查后做：issue 上已有带 marker 的评论（或旧格式的 router 留言）就不再留。投递语义「至少一次」，
+    靠 marker 去重做到「恰好一次」。→ {"result": "commented"|"already", "state": issue 状态}。
+    legacy：旧格式正文的正则，用 re.match 锚定评论开头，并要求带 router 签名（引用块、人手写的都不算）。"""
+    view = json.loads(_gh(ctx, ["issue", "view", str(n), "-R", repo, "--json", "state,comments"]) or "{}")
+    bodies = [c.get("body") or "" for c in view.get("comments") or [] if isinstance(c, dict)]
+    state = view.get("state")
+    if any(marker in b for b in bodies) or (
+            legacy and any(re.match(legacy, b) and AUTO_SIGNATURE in b for b in bodies)):
+        return {"result": "already", "state": state}
+    text = f"{body}\n\n{marker}"
+    _guard(text, guard)
+    _gh(ctx, ["issue", "comment", str(n), "-R", repo, "--body", text])
+    return {"result": "commented", "state": state}
+
+
+def close_issue(ctx, repo, n, body, guard, marker) -> dict:
+    """留一条收尾评论（marker 去重）再关。不用 `issue close --comment`：它在 gh 内部也是先留言再关的两次调用，
+    关失败时下次会重复留言。已关的不再关。→ {"comment": …, "closed": "closed"|"already"}"""
+    c = comment_once(ctx, repo, n, body, guard, marker)
+    if (c.get("state") or "").upper() == "CLOSED":
+        return {"comment": c["result"], "closed": "already"}
+    _gh(ctx, ["issue", "close", str(n), "-R", repo, "--reason", "completed"])
+    return {"comment": c["result"], "closed": "closed"}
