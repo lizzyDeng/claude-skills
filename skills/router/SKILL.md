@@ -44,7 +44,11 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 
 1. 并行做两件事：
    - 派一个 **Opus** Agent，prompt = `templates/direction_review.md` + 派单（票的 why / problem / 线索）+ 卡全文。输出 `{"pass": bool, "challenges": [...]}`。
-   - 后台跑 codex 一轮（只审一轮）：`timeout 330 codex exec -s read-only "<同一份材料>" < /dev/null > <home>/cards/<T>.codex.md 2>&1`。
+   - codex 一轮（只审一轮）：先 `router.py review-pack <T> [--round <n>]`，**不要自己拼 codex 命令**。读边界（默认拒绝整个 HOME，只放行审查目录和 codex 运行时）和三道预检只在 review-pack 里；仓外票只拷卡上引用的干净代码进 pack，数据目录、含 uid 的文件一律不拷。
+     - `ok: true` ⇒ 用 Bash 后台跑它给的 `codex_cmd`（`bash <home>/review/<T>/codex.sh`，输出在 `cards/<T>.codex[-rN].md`）。
+     - `reason: canary_stale`（codex 升级了，或这个版本从没验过）⇒ 先 `router.py review-canary`（一次真 codex exec，算 codex 订阅的常规审查用量），再重试一次 review-pack。
+     - 仍然 `ok: false`（boundary / canary_failed / canary_inconclusive / leak / guard …）⇒ 本轮不跑 codex，`router.py decide --ticket <T> --decision "codex 跳过：<reason>" --why "<error 原文>" --basis "review-pack 输出"`，只用 Opus 审。
+     - review-canary 报 `canary_leak`（金丝雀读出了被拒路径的假数据）⇒ 另外**告诉用户**「codex 读边界失效」：这是安全事件，人要知道；之后 review-pack 会一直报 canary_failed、跳过 codex，直到用户查过 codex 版本和配置。
 2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume`，worker 改卡后会再次 `progress card_ready`，回到这里。
 3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime]`。codex 与 Opus 有分歧：由你裁决，在卡末尾追加 `## router 裁决` 一段写明，再交。
 4. 超时（`waiting_for` 里有「超时」）照样交，加 `--overtime`，卡上注明哪部分没完成、为什么。

@@ -28,7 +28,8 @@ from ctx import Ctx  # noqa: E402
 RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
-               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow"}
+               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow",
+               "review-pack", "review-canary"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -659,6 +660,24 @@ def cmd_status(a, env):
     return None
 
 
+def _review_call(fn, *args):
+    import review
+    try:
+        return {"ok": True, **fn(review, *args)}
+    except review.Refused as e:
+        raise Fail(str(e), reason=e.reason, **e.extra)
+
+
+def cmd_review_pack(a, env):
+    """方向审的 codex 材料 + 读边界 + 三道预检 → <home>/review/<T>/codex.sh。不过 ⇒ ok:false 带 reason，不给命令。"""
+    return _review_call(lambda r: r.pack(env, a.ticket, a.round))
+
+
+def cmd_review_canary(a, env):
+    """真 codex exec 金丝雀（一次 codex 订阅的常规审查用量）：只在 codex 升级、或从没跑过时需要。"""
+    return _review_call(lambda r: r.canary(env))
+
+
 def cmd_discover(a, env):
     import tick
     with env.state() as st:
@@ -724,6 +743,9 @@ def build_parser():
     s = sub.add_parser("status", help="看板文字版")
     s.add_argument("--json", action="store_true")
     sub.add_parser("discover", help="扫外部 worktree，登记它们锁着的代码面")
+    s = sub.add_parser("review-pack", help="方向审：拼 codex 材料、设读边界、预检，生成 codex.sh")
+    s.add_argument("ticket"); s.add_argument("--round", type=int, default=1)
+    sub.add_parser("review-canary", help="用真 codex exec 验读边界（按 codex 版本记 canary.json）")
     extend_parser(sub)
     return p
 

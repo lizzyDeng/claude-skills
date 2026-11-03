@@ -34,6 +34,16 @@ RECEIPT_GRACE_S = 60
 AUTO_FIX_WHY = "用户 11-02 长期授权：base 被删时从 main 重建、改回被 GitHub 自动改指的 router PR、记一条 decide"
 
 
+def is_offrepo_glob(g, root) -> bool:
+    return g.startswith("~") or (g.startswith("/") and not g.startswith(str(root)))
+
+
+def is_offrepo(t, table, root) -> bool:
+    """票的代码面全在仓外（~/… 或仓外绝对路径）：没有 PR 可开，走「备份 → 改 → diff → 你核对」。"""
+    globs = [g for s in t["surfaces"] for g in table.get(s, {}).get("globs", [])]
+    return bool(globs) and all(is_offrepo_glob(g, root) for g in globs)
+
+
 def home_for(root: Path) -> Path:
     return Path(os.environ.get("ROUTER_HOME") or Path(root) / ".claude" / "router")
 
@@ -245,10 +255,7 @@ class Run:
                 self.res["errors"].append(f"step2 {tid}：{e!r}")
 
     def _offrepo(self, t) -> bool:
-        """票的代码面全在仓外（~/… 或仓外绝对路径）：没有 PR 可开，走「备份 → 改 → diff → 你核对」。"""
-        globs = [g for s in t["surfaces"] for g in self.table.get(s, {}).get("globs", [])]
-        root = str(self.root)
-        return bool(globs) and all(g.startswith("~") or (g.startswith("/") and not g.startswith(root)) for g in globs)
+        return is_offrepo(t, self.table, self.root)
 
     def _handle_exit(self, tid, t):
         w = t["worker"]
