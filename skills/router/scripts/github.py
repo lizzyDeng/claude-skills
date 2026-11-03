@@ -271,8 +271,8 @@ def last_base_change(ctx, repo, pr):
     """PR 时间线里最近一次改 base 的事件（GitHub 自动 / 人手）；没有 → {}；查不了 → None。"""
     owner, _, name = repo.partition("/")
     try:
-        out = _gh(ctx, ["api", "graphql", "-f", f"query={_TIMELINE_Q}", "-F", f"owner={owner}",
-                        "-F", f"name={name}", "-F", f"number={int(pr)}"])
+        out = _gh(ctx, ["api", "graphql", "-f", f"query={_TIMELINE_Q}", "-f", f"owner={owner}",
+                        "-f", f"name={name}", "-F", f"number={int(pr)}"])
         nodes = json.loads(out)["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
     except (GhError, ValueError, KeyError, TypeError):
         return None

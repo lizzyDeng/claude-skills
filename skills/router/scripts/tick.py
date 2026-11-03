@@ -27,6 +27,9 @@ import surfaces
 SKILL_DIR = Path(__file__).resolve().parent.parent
 WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review")
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
+# 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
+# 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。
+RECEIPT_GRACE_S = 60
 # router 自己做、只记一条 decide 的两件事（重建 base、改回被自动改指的 PR）共用的授权说明
 AUTO_FIX_WHY = "用户 11-02 长期授权：base 被删时从 main 重建、改回被 GitHub 自动改指的 router PR、记一条 decide"
 
@@ -609,7 +612,8 @@ class Run:
         """逐张处理 dispatch.phase == "spawning" 的票，证据只认启动回执（不扫 ps、不靠 argv）：
         回执在：活（pid + 启动时间对得上）⇒ 认领；死 ⇒ 认领后走退出处理；判活失败 ⇒ 保留意图，不派不杀。
         回执读不了 ⇒ 保留意图，不派不杀。回执不在：有日志 / transcript ⇒ 起过，认领后走退出处理；
-        什么痕迹都没有 ⇒ 从没起过，清掉意图，这张票重新可派（sid 没用过，复用）。"""
+        意图还新（< RECEIPT_GRACE_S）⇒ 可能还在起，保留意图；
+        什么痕迹都没有且意图已旧 ⇒ 从没起过，清掉意图，这张票重新可派（sid 没用过，复用）。"""
         for tid, t in list(self.state["tickets"].items()):
             it = t.get("dispatch")
             if not isinstance(it, dict) or it.get("phase") != "spawning":
@@ -637,6 +641,8 @@ class Run:
         if self._has_trace(it):
             self._adopt(tid, t, it, None, None)
             return self._handle_exit(tid, t)
+        if self.ctx.now().timestamp() - _ts(it.get("at")) < RECEIPT_GRACE_S:
+            return self._unverified(tid, it, "启动回执还没出现，可能还在起")
         t.pop("dispatch", None)                            # 进程从没起过：重新可派
 
     def _has_trace(self, it) -> bool:
