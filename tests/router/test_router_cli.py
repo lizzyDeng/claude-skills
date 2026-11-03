@@ -813,14 +813,19 @@ def test_closeout_keeps_branch_with_unpushed_commits(proj, monkeypatch):
 #   SHIM_VERSION  --version 的输出                 SHIM_SANDBOX=leak  sandbox 预检读到了内容（边界没生效）
 #   SHIM_EXEC     answer（默认，回审查结论）| emulate（按策略执行 cat）| ignore_home（假装拒读 HOME 及罩住 HOME 的根都不存在）
 #                 | leak_all | silent | pack_only | model_words | recite（只真跑 pack 那条，其余被拒的「输出」是模型照抄的）
+#                 | codemode（同 emulate，但 --json 只报第一条 command_execution——真 0.144.4 走 code-mode exec 工具时就这样）
 #   SHIM_PROBE    逐个探针改行为，逗号分隔 <探针>=<行为>；探针 pack/deny/sibling/tmp，行为 skip（不执行）
-#                 | leak（读出内容）| nofile（报 No such file）| rc0（报 Operation not permitted 但 exit 0）
+#                 | leak（读出内容）| leak_quiet（读出内容，但模型不在回话里复述）| nofile（报 No such file）
+#                 | rc0（报 Operation not permitted 但 exit 0）| echo（用 echo 打出一句像 OS 报错的话）
 #                 | relative（命令里写相对 -C 目录的路径，真跑样例里模型就写了 `cat readme.txt`）
+#   SHIM_NO_ROLLOUT  不写 rollout（codex 自己的会话记录）
 #   SHIM_PROMPT_DROP  debug prompt-input 的拒读段少列最后一条（预检 1 完整性）
 #   SHIM_RC       exec 的退出码（默认 0；124 = 超时）
 #   CODEX_LOG     每次调用记一行 {"argv", "cwd", "stdin"}
 # exec 带 --json 时照 codex-cli 0.144.4 的 JSONL 事件输出：command_execution（command / aggregated_output /
-# exit_code）与 agent_message（text）；不带就输出纯文本。
+# exit_code）与 agent_message（text）；不带就输出纯文本。每条真执行的命令另记进 rollout
+# （$CODEX_HOME 或 ~/.codex 下 sessions/<年>/<月>/<日>/rollout-…-<thread_id>.jsonl，照 0.144.4 的 code-mode
+# 形状：custom_tool_call exec 的 JS 里调 tools.exec_command，custom_tool_call_output 里是输出、没有退出码）。
 CODEX_SHIM = r'''#!/usr/bin/env python3
 import json, os, re, sys
 args = sys.argv[1:]
@@ -883,10 +888,11 @@ if args[:1] == ["exec"]:
         if "/.router-canary-probe/" in p: return "sibling"
         return "other"
     as_json = "--json" in args
-    events, said = [], []
+    tid = "01a19fe1-0000-7000-8000-00000000c0de"
+    events, said, rollout = [], [], [{"type": "session_meta", "payload": {"id": tid}}]
     def emit(o):
         events.append(o)
-    emit({"type": "thread.started", "thread_id": "shim"}); emit({"type": "turn.started"})
+    emit({"type": "thread.started", "thread_id": tid}); emit({"type": "turn.started"})
     for i, p in enumerate(re.findall(r"cat\s+['\"`]?([^\s'\"`]+)", stdin)):
         inside = real(p).startswith(cdir.rstrip("/") + "/")
         how = per.get(kind(p), "")
@@ -894,10 +900,11 @@ if args[:1] == ["exec"]:
             if mode == "recite" and not inside:
                 said.append(f"cat: {p}: Operation not permitted")
             continue
-        allowed = mode in ("leak_all", "pack_only", "model_words", "recite") or how == "leak" or mode_of(fs, p) != "deny"
+        allowed = (mode in ("leak_all", "pack_only", "model_words", "recite") or how in ("leak", "leak_quiet")
+                   or mode_of(fs, p) != "deny")
         if how == "nofile":
             out, rc = f"cat: {p}: No such file or directory\n", 1
-        elif how == "rc0":
+        elif how in ("rc0", "echo"):
             out, rc = f"cat: {p}: Operation not permitted\n", 0
         elif allowed:
             try:
@@ -909,10 +916,30 @@ if args[:1] == ["exec"]:
         shown = os.path.relpath(p, cdir) if how == "relative" else p
         if how == "relative":
             out = out.replace(p, shown)
-        emit({"type": "item.completed", "item": {"id": f"item_{i}", "type": "command_execution",
-              "command": f"/bin/zsh -lc 'cat {shown}'", "aggregated_output": out, "exit_code": rc,
-              "status": "completed" if rc == 0 else "failed"}})
-        said.append(out.rstrip("\n"))
+        cmd = f"echo 'cat: {shown}: Operation not permitted'" if how == "echo" else f"cat {shown}"
+        if not (mode == "codemode" and any(e.get("item", {}).get("type") == "command_execution" for e in events)):
+            emit({"type": "item.completed", "item": {"id": f"item_{i}", "type": "command_execution",
+                  "command": f"/bin/zsh -lc {json.dumps(cmd) if how == 'echo' else repr(cmd)}",
+                  "aggregated_output": out, "exit_code": rc, "status": "completed" if rc == 0 else "failed"}})
+        key = '"cmd"' if i % 2 == 0 else "cmd"                  # 真样例两种写法都有：{"cmd":…} 和 {cmd:…}
+        rollout.append({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "exec", "call_id": f"call_{i}",
+            "input": f"const r = await tools.exec_command({{{key}:{json.dumps(cmd)},yield_time_ms:10000}});\ntext(r.output);"}})
+        rollout.append({"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": f"call_{i}",
+            "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                       {"type": "input_text", "text": out}]}})
+        if how != "leak_quiet":
+            said.append(out.rstrip("\n"))
+    sess = os.path.join(os.environ.get("CODEX_HOME") or real("~/.codex"), "sessions", "2026", "11", "03")
+    rpath = os.path.join(sess, f"rollout-2026-11-03T13-28-48-{tid}.jsonl")
+    if os.environ.get("SHIM_NO_ROLLOUT"):
+        if os.path.exists(rpath):
+            os.remove(rpath)                                    # 同一测试里上一次调用留下的也不算
+    else:
+        os.makedirs(sess, exist_ok=True)
+        with open(rpath, "w") as f:
+            f.write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in rollout))
     if mode == "model_words":
         said.append("这个路径被策略 denied / Permission denied，我不去读它。")
     emit({"type": "item.completed", "item": {"id": "item_last", "type": "agent_message", "text": "\n".join(said)}})
@@ -956,7 +983,8 @@ def rv(proj, monkeypatch):
     monkeypatch.setenv("HOME", str(t))
     (t / "bin" / "codex").write_text(CODEX_SHIM); (t / "bin" / "codex").chmod(0o755)
     monkeypatch.setenv("CODEX_LOG", str(t / "codex.log"))
-    for k in ("SHIM_VERSION", "SHIM_SANDBOX", "SHIM_EXEC", "SHIM_PROBE", "SHIM_PROMPT_DROP", "SHIM_RC"):
+    for k in ("SHIM_VERSION", "SHIM_SANDBOX", "SHIM_EXEC", "SHIM_PROBE", "SHIM_PROMPT_DROP", "SHIM_RC",
+              "SHIM_NO_ROLLOUT", "CODEX_HOME"):
         monkeypatch.delenv(k, raising=False)
     daily = t / "daily"
     (daily / "runs" / "2026-10-26" / "users.json").write_text(
@@ -1309,6 +1337,69 @@ def test_review_canary_requires_every_probe_judged_by_its_own_command(rv, monkey
 def test_review_canary_any_fake_token_anywhere_is_a_leak(rv, monkeypatch, probe, leaked):          # F9
     out, c = _canary(rv, monkeypatch, probe=probe)
     assert out["ok"] is False and c["reason"] == "canary_leak" and c["leaked"] == [leaked], c
+
+
+# A6.2 真跑（codex-cli 0.144.4，两次）：四条 cat 都真执行了、三条被拒的都是 OS 原文报错，但模型走 code-mode 的
+# exec 工具，--json 只报了第一条 command_execution ⇒ 判据拿不到证据、判「拿不准」。真执行记录在 codex 自己写的
+# rollout 里（harness 写的，模型改不了）：判据要连它一起认，rollout 里出现假令牌同样算泄漏。
+def test_review_canary_judges_codemode_calls_from_rollout_when_json_events_are_partial(rv, monkeypatch):
+    out, c = _canary(rv, monkeypatch, "codemode")
+    assert out["ok"] is True and c["ok"] is True, c
+    assert c["rollout"].endswith("-01a19fe1-0000-7000-8000-00000000c0de.jsonl"), c
+    out, c = _canary(rv, monkeypatch, "codemode", probe="pack=relative")   # 相对路径照样算正对照
+    assert out["ok"] is True, c
+    out, c = _canary(rv, monkeypatch, "recite")                            # rollout 里只有 pack 那条：照样拿不准
+    assert out["ok"] is False and c["reason"] == "canary_inconclusive", c
+
+
+@pytest.mark.parametrize("probe", ["deny=skip", "sibling=skip", "tmp=skip", "deny=nofile", "tmp=echo", "sibling=echo"])
+def test_review_canary_rollout_evidence_needs_the_exact_cat_and_os_text(rv, monkeypatch, probe):
+    out, c = _canary(rv, monkeypatch, "codemode", probe=probe)             # rollout 没退出码：命令必须就是 `cat <路径>`
+    assert out["ok"] is False and c["reason"] == "canary_inconclusive", (probe, c)
+
+
+def test_review_canary_without_rollout_falls_back_to_json_events_only(rv, monkeypatch):
+    monkeypatch.setenv("SHIM_NO_ROLLOUT", "1")
+    out, c = _canary(rv, monkeypatch, "codemode")
+    assert out["ok"] is False and c["reason"] == "canary_inconclusive" and c["rollout"] is None, c
+    out, c = _canary(rv, monkeypatch)                                       # --json 事件齐全：不靠 rollout 也过
+    assert out["ok"] is True, c
+
+
+@pytest.mark.parametrize("probe,leaked", [("deny=leak_quiet", "deny"), ("tmp=leak_quiet", "tmp")])
+def test_review_canary_fake_token_in_rollout_is_a_leak(rv, monkeypatch, probe, leaked):
+    out, c = _canary(rv, monkeypatch, "codemode", probe=probe)             # 读出来了、模型没复述：只有 rollout 里有令牌
+    assert out["ok"] is False and c["reason"] == "canary_leak" and c["leaked"] == [leaked], c
+
+
+def test_rollout_commands_only_trusts_calls_it_can_attribute():
+    import review
+    line = lambda p: json.dumps({"type": "response_item", "payload": p})
+    two = 'await tools.exec_command({cmd:"cat a"}); await tools.exec_command({cmd:"cat b"});'   # 一段输出两条命令：分不清
+    text = "\n".join([
+        line({"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": two}),
+        line({"type": "custom_tool_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "A\nB\n"}]}),
+        line({"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": json.dumps({"cmd": "cat x"})}),
+        line({"type": "function_call_output", "call_id": "c2", "output": "cat: x: Operation not permitted\n"}),
+        line({"type": "custom_tool_call", "name": "exec", "call_id": "c3", "input": 'tools.exec_command({"cmd":"cat y"})'}),
+        "not json",                                                                                # 没有输出的调用不算
+    ])
+    assert review._rollout_commands(text) == [
+        {"command": "cat x", "aggregated_output": "cat: x: Operation not permitted\n", "exit_code": None}]
+
+
+def test_thread_id_rejects_glob_characters():
+    import review
+    ev = lambda t: json.dumps({"type": "thread.started", "thread_id": t})
+    assert review._thread_id("noise\n" + ev("01a19fe1-0000-7000-8000-00000000c0de")) == "01a19fe1-0000-7000-8000-00000000c0de"
+    assert review._thread_id(ev("*")) is None and review._thread_id(ev("../x")) is None   # 不许拿去拼 glob 捞别的会话
+    assert review._thread_id("") is None
+
+
+def test_review_canary_honours_codex_home(rv, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(rv.tmp / "alt-codex-home"))
+    out, c = _canary(rv, monkeypatch, "codemode")
+    assert out["ok"] is True and c["rollout"].startswith(str(rv.tmp / "alt-codex-home")), c
 
 
 @pytest.mark.parametrize("base", ["main", "master", "trunk"])

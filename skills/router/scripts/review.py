@@ -13,9 +13,12 @@
 能不能信这个边界，看「版本绑定的金丝雀」：review-canary 用真 codex exec、和 codex.sh 同一个命令形状（另加 --json），
 让模型 cat 四个文件：pack 里的正对照、显式拒读目录里的假数据、一个没列进任何名单的 HOME 同级目录里的假数据、
 一个 HOME 之外 /tmp 下没列进任何名单的目录里的假数据。
-判据只认 --json 里真实执行的 command_execution 事件（模型自己写的话不算，RV M-6）：正对照那条命令 exit 0 且输出有
-PACK 令牌；三个被拒探针各有自己的那条命令 exit≠0 且输出是 OS 原文「<路径>: Operation not permitted」；任何假数据令牌
-出现在输出的任何地方 = canary_leak。只有全部满足、且 codex 正常退出才算过，结果按 codex 版本记进
+判据只认真实执行记录（模型自己写的话不算，RV M-6）：--json 里的 command_execution 事件，加上 codex 自己写的
+rollout（$CODEX_HOME 或 ~/.codex 下 sessions/…/rollout-…-<thread_id>.jsonl）里的工具调用和输出——0.144.4 走 code-mode
+exec 工具时 --json 只报第一条命令（A6.2 真跑两次实测），rollout 是 harness 写的、模型改不了。每条记录的命令必须就是
+`cat <路径>`：正对照输出有 PACK 令牌（事件里 exit 0）；三个被拒探针输出是 OS 原文「<路径>: Operation not permitted」
+（事件里 exit≠0；rollout 没退出码，靠「命令就是 cat」保证这句是 cat 打的）。同一条命令两边都有时以带退出码的事件为准。
+任何假数据令牌出现在 exec.out 或 rollout 的任何地方 = canary_leak。只有全部满足、且 codex 正常退出才算过，结果按 codex 版本记进
 <home>/review/canary.json。review-pack 每次都查：版本对不上（codex 自动升级了）⇒ canary_stale，要先补跑金丝雀。
 
 所有失败一律 fail-closed：不生成 codex.sh，调用方（SKILL §4）本轮不跑 codex，只用 Opus 方向审。
@@ -442,8 +445,12 @@ def _canary_exec(env, cdir, codex, tbin, version) -> dict:
         shutil.rmtree(sib, ignore_errors=True)
         shutil.rmtree(tdir, ignore_errors=True)
     text = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
-    leaked = [k for k in DENIED_PROBES if tok[k] in text]          # 任何地方：命令输出、模型的话、非 JSON 行
+    rollout = _rollout_path(_thread_id(text))
+    rtext = rollout.read_text(encoding="utf-8", errors="replace") if rollout else ""
+    leaked = [k for k in DENIED_PROBES if tok[k] in text or tok[k] in rtext]   # 任何地方：命令输出、模型的话、rollout
     cmds = _commands(text)
+    seen = {tuple(_argv(c.get("command"))) for c in cmds}
+    cmds += [c for c in _rollout_commands(rtext) if tuple(_argv(c["command"])) not in seen]   # 有退出码的事件优先
     cwd = _real(cdir / "pack")
     checks = {"pack": _read_ok(cmds, files["pack"], cwd, tok["pack"]),
               **{k: _denied(cmds, files[k], cwd) for k in DENIED_PROBES}}
@@ -454,7 +461,7 @@ def _canary_exec(env, cdir, codex, tbin, version) -> dict:
     else:
         ok, reason = False, "canary_inconclusive"                 # 含超时（rc=124）：不当成功，也不当定论（F11）
     rec = {"codex_version": version, "ok": ok, "reason": reason, "at": env.now(), "rc": r.returncode,
-           "leaked": leaked, "checks": checks, "out": str(out)}
+           "leaked": leaked, "checks": checks, "out": str(out), "rollout": str(rollout) if rollout else None}
     _write_canary(env, rec)
     if not ok:
         missing = [k for k, v in checks.items() if not v]
@@ -482,6 +489,80 @@ def _commands(text) -> list:
     return out
 
 
+def _thread_id(text):
+    """--json 第一条 thread.started 的 thread_id（拿来找 rollout；只收安全字符，防 glob 注入）。"""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") == "thread.started":
+                tid = str(ev.get("thread_id") or "")
+                return tid if re.fullmatch(r"[A-Za-z0-9-]{1,64}", tid) else None
+    return None
+
+
+def _rollout_path(tid):
+    """codex 自己写的会话记录：$CODEX_HOME（默认 ~/.codex）/sessions/<年>/<月>/<日>/rollout-…-<thread_id>.jsonl。"""
+    if not tid:
+        return None
+    root = Path(os.environ.get("CODEX_HOME") or _real("~/.codex")) / "sessions"
+    hits = sorted(root.glob(f"*/*/*/rollout-*-{tid}.jsonl"))
+    return hits[0] if hits else None
+
+
+EXEC_CMD = re.compile(r'exec_command\(\s*\{\s*"?cmd"?\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
+def _rollout_commands(text) -> list:
+    """rollout → 真执行过的命令（与 _commands 同形状，exit_code=None：code-mode 输出里没有退出码）。
+    认两种调用：custom_tool_call exec（JS 里恰好一次 tools.exec_command，多次就分不清哪段输出是谁的，不认）和
+    function_call exec_command / shell。输出按 call_id 对上 *_output。"""
+    calls, outs = {}, {}
+    for line in text.splitlines():
+        try:
+            p = json.loads(line).get("payload") or {}
+        except (ValueError, AttributeError):
+            continue
+        kind, cid = p.get("type"), p.get("call_id")
+        if kind == "custom_tool_call" and p.get("name") == "exec":
+            found = EXEC_CMD.findall(str(p.get("input") or ""))
+            if len(found) == 1 and str(p.get("input")).count("exec_command(") == 1:
+                try:
+                    calls[cid] = json.loads(found[0])
+                except ValueError:
+                    pass
+        elif kind == "function_call" and p.get("name") in ("exec_command", "shell", "shell_command"):
+            try:
+                a = json.loads(p.get("arguments") or "{}")
+            except ValueError:
+                continue
+            c = a.get("cmd") or a.get("command")
+            calls[cid] = shlex.join(c) if isinstance(c, list) else c
+        elif kind in ("custom_tool_call_output", "function_call_output"):
+            o = p.get("output")
+            if isinstance(o, list):
+                o = "".join(str(x.get("text") or "") for x in o if isinstance(x, dict))
+            elif isinstance(o, dict):
+                o = str(o.get("output") or o.get("content") or "")
+            outs[cid] = str(o or "")
+    return [{"command": c, "aggregated_output": outs[cid], "exit_code": None}
+            for cid, c in calls.items() if isinstance(c, str) and cid in outs]
+
+
+def _argv(cmd) -> list:
+    """命令 → argv；剥掉 codex 套的 `/bin/zsh -lc '<命令>'`。解析不了 = []（不认）。"""
+    try:
+        argv = shlex.split(str(cmd or ""))
+        if len(argv) == 3 and os.path.basename(argv[0]) in ("sh", "bash", "zsh") and argv[1] in ("-c", "-lc"):
+            argv = shlex.split(argv[2])
+    except ValueError:
+        return []
+    return argv
+
+
 def _forms(path, cwd) -> list:
     """命令里这个文件可能的写法：绝对路径、相对 -C 目录的路径、~/ 形式（模型常按 cwd 缩写，真跑样例里就是 `cat readme.txt`）。"""
     forms = [path, os.path.relpath(path, cwd)]
@@ -491,17 +572,31 @@ def _forms(path, cwd) -> list:
     return list(dict.fromkeys(forms))
 
 
+def _cat_form(c, path, cwd):
+    """这条命令就是 `cat <这个文件>`（argv 精确相等）⇒ 返回命令里的写法；否则 None。"""
+    argv = _argv(c.get("command"))
+    return next((f for f in _forms(path, cwd) if argv == ["cat", f]), None)
+
+
+def _rc(c):
+    """事件里的退出码；rollout 记录没有退出码 = None。bool 不算数字。"""
+    rc = c.get("exit_code")
+    return rc if isinstance(rc, int) and not isinstance(rc, bool) else None
+
+
 def _read_ok(cmds, path, cwd, token) -> bool:
-    """正对照：有一条命令提到这个文件、exit 0、输出里有这一次新造的令牌（模型写不出没读过的 uuid）。"""
-    return any(c.get("exit_code") == 0 and token in str(c.get("aggregated_output") or "")
-               and any(f in str(c.get("command") or "") for f in _forms(path, cwd)) for c in cmds)
+    """正对照：有一条命令就是 `cat <这个文件>`、没报非 0、输出里有这一次新造的令牌（模型写不出没读过的 uuid）。"""
+    return any(_cat_form(c, path, cwd) and token in str(c.get("aggregated_output") or "")
+               and (_rc(c) == 0 or (_rc(c) is None and c.get("exit_code") is None)) for c in cmds)
 
 
 def _denied(cmds, path, cwd) -> bool:
-    """被拒探针：有一条命令提到这个文件、exit≠0、输出是 OS 原文「<命令里的写法>: Operation not permitted」。"""
+    """被拒探针：有一条命令就是 `cat <这个文件>`、输出是 OS 原文「<命令里的写法>: Operation not permitted」，
+    且事件里的退出码≠0（rollout 记录没有退出码：靠「命令就是 cat」保证这句话是 cat 自己打的，不是 echo 出来的）。"""
     for c in cmds:
-        rc, cmd, outp = c.get("exit_code"), str(c.get("command") or ""), str(c.get("aggregated_output") or "")
-        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
-            if any(f in cmd and f"{f}: {OS_DENIED}" in outp for f in _forms(path, cwd)):
+        f = _cat_form(c, path, cwd)
+        if f and f"{f}: {OS_DENIED}" in str(c.get("aggregated_output") or ""):
+            rc = _rc(c)
+            if (rc is not None and rc != 0) or (rc is None and c.get("exit_code") is None):
                 return True
     return False
