@@ -12,14 +12,15 @@ CSS = ':root{\n  --bg:#f6f5f1; --card:#fff; --ink:#1f2328; --soft:#5d6670; --fai
 JS = "(function(){\n  var btns=document.querySelectorAll('.tabs button');\n  var items=document.querySelectorAll('#list .issue');\n  btns.forEach(function(b){\n    b.addEventListener('click',function(){\n      var f=b.getAttribute('data-f');\n      btns.forEach(function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});\n      items.forEach(function(it){\n        var g=it.getAttribute('data-g');\n        it.classList.toggle('hidden', !(f==='all'||f===g));\n      });\n    });\n  });\n})();\n"
 
 
-GROUP = {store.AWAIT_CARD: "you", store.STUCK: "you", store.TAKEOVER: "you",
+GROUP = {store.AWAIT_CARD: "you", store.STUCK: "you", store.TAKEOVER: "you", store.AWAIT_CHECK: "you",
          store.KICKOFF: "run", store.EXECUTING: "run", store.VERIFYING: "run",
          store.DRAFT: "q", store.QUEUED: "q",
          store.MERGED: "ok", store.AWAIT_PROD: "ok", store.DONE: "ok",
          store.PAUSED: "off", store.HOLD: "off", store.SKIP: "off"}
 GROUP_ORDER = {"you": 0, "run": 1, "q": 2, "ok": 3, "off": 4}
 PILL = {store.DRAFT: "待 start", store.QUEUED: "排队", store.KICKOFF: "出方向卡", store.AWAIT_CARD: "等你确认方向卡",
-        store.EXECUTING: "执行", store.VERIFYING: "验收", store.MERGED: "已合 staging", store.AWAIT_PROD: "等上 prod",
+        store.EXECUTING: "执行", store.VERIFYING: "验收", store.MERGED: "已合 staging",
+        store.AWAIT_CHECK: "仓外已改 · 待你核对", store.AWAIT_PROD: "等上 prod",
         store.DONE: "完成", store.PAUSED: "暂停", store.TAKEOVER: "你接管", store.STUCK: "卡住",
         store.HOLD: "暂缓", store.SKIP: "不派"}
 KIND = {"start": "派发单", "card": "方向卡", "spend": "花钱放行", "prod": "上 prod", "handson": "待你动手",
@@ -30,8 +31,15 @@ def _e(x) -> str:
     return html.escape(str(x if x is not None else ""))
 
 
+# 带 topic 的项：用户回的话按 topic 定（router.cmd_answer 按 topic 分派）
+SAY_TOPIC = {"base": "{qid} 好了", "retarget": "{qid} 改好了", "dispatch": "{qid} 重派",
+             "offrepo": "{t} 核对过了 / {t} 不满意：…"}
+
+
 def _say(q) -> str:
     t, qid = q.get("ticket") or "", q["id"]
+    if q.get("topic") in SAY_TOPIC:
+        return SAY_TOPIC[q["topic"]].format(t=t, qid=qid)
     return {"start": "start / start T1 T3",
             "card": f"{t} 同意 / {t} 改：… / {t} 驳回：…",
             "spend": f"放行 {qid} / 不放行 {qid}",
@@ -68,10 +76,14 @@ def _ticket_card(t, evs) -> str:
            [f"依赖 {b}" for b in t["blocked_by"]]
     foot.append(f'<span>订阅：{_e(" · ".join(subs) or "无")}</span>')
     w = t.get("worker", {})
-    if w.get("session_id"):
-        foot.append(f'<span>接管：<code>{_e("cd " + str(w.get("worktree")) + " && claude --resume " + w["session_id"])}</code></span>')
+    if w.get("session_id") and w.get("worktree") and t["status"] not in (store.DONE, store.AWAIT_PROD):
+        foot.append(f'<span>接管：<code>{_e("cd " + str(w["worktree"]) + " && claude --resume " + w["session_id"])}</code></span>')
     if t.get("pr"):
         foot.append(f'<span>PR #{_e(t["pr"])}</span>')
+    df = t.get("dispatch_fail") or {}
+    if df:
+        foot.append(f'<span>派发失败 {_e(df.get("count", 1))} 次（阶段 {_e(df.get("phase"))}）：{_e(str(df.get("error", ""))[:120])}</span>')
+    foot += _closeout_spans(t.get("closeout"))
     tl = "".join(f'<li><span class="ts">{_e(_hhmm(e.get("ts", "")))}</span>[{_e(e.get("phase") or e.get("type"))}] '
                  f'{_e(e.get("summary", ""))}</li>' for e in evs[-5:])
     return f"""<div class="issue" data-g="{g}">
@@ -86,6 +98,39 @@ def _ticket_card(t, evs) -> str:
   <div class="foot">{"".join(foot)}</div>
   {"<ul class='tl'>" + tl + "</ul>" if tl else ""}
 </div>"""
+
+
+def _closeout_spans(co) -> list:
+    """仓外票收尾逐目标显示：没做完的（下一轮 tick 重试）、有意保留的（要你处理）、最近一次出错。"""
+    if not isinstance(co, dict):
+        return []
+    o, out = store.closeout_open(co), []
+    names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
+    todo = [f"下游 {oid}" for oid in o["downstream"]] + [names[c] for c in o["cols"]]
+    if todo:
+        out.append(f'<span>收尾未完成：{_e("、".join(todo))}</span>')
+    kept = [f"{ {'worktree': 'worktree', 'branch': '分支'}[c]}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
+            if str(co.get(c, "")).startswith("kept")]
+    if kept:
+        out.append(f'<span>保留：{_e("、".join(kept))}</span>')
+    err = co.get("error") or {}
+    if err.get("msg") and todo:
+        out.append(f'<span>收尾出错（{_e(_hhmm(err.get("at", "")))}）：{_e(err["msg"][:200])}</span>')
+    return out
+
+
+def _banners(state) -> str:
+    """顶部横幅：不在任何一张票上、但挡住全局的问题（Lark 发不出去、远端 base 有问题）。"""
+    out = []
+    ne = state.get("notify_error") or {}
+    if ne:
+        out.append(f'Lark 推送失败 {_e(ne.get("count", 1))} 次（{_e(_hhmm(ne.get("at", "")))}）：{_e(str(ne.get("error", ""))[:200])}'
+                   "；决定单照常记着，下一轮巡检重试")
+    bp = state.get("base_problem") or {}
+    if bp:
+        who = f"等你回答 {bp['qid']}" if bp.get("qid") else "你已回答，下一轮巡检重验"
+        out.append(f'远端 base 有问题（{_e(bp.get("kind", ""))}）：{_e(who)}；这期间一张票都不派')
+    return "".join(f'<div class="mock">{b}</div>' for b in out)
 
 
 def _external_card(path, e) -> str:
@@ -151,10 +196,10 @@ def render(state, decisions, events, now, slots=None) -> str:
   <div class="stat you"><b>{len(queue)}</b><span>等你</span></div>
   <div class="stat run"><b>{count(store.RUNNING) + len(active_ext)}</b><span>在跑</span></div>
   <div class="stat q"><b>{count({store.DRAFT, store.QUEUED})}</b><span>待 start / 排队</span></div>
-  <div class="stat ok"><b>{count(store.SETTLED)}</b><span>已合 staging</span></div>
+  <div class="stat ok"><b>{count(store.SETTLED)}</b><span>已合 / 已改完</span></div>
   <div class="stat"><b>{count({store.HOLD, store.SKIP, store.PAUSED})}</b><span>暂缓</span></div>
 </div>
-<div class="slots">
+{_banners(state)}<div class="slots">
   重名额（编译 Rust）<span class="bar">{bar(used["heavy"], slots.get("heavy", 3))}</span>{used["heavy"]}/{slots.get("heavy", 3)}
   &nbsp;·&nbsp; 轻名额（数据 / 脚本 / 文案）<span class="bar">{bar(used["light"], slots.get("light", 2))}</span>{used["light"]}/{slots.get("light", 2)}
 </div>

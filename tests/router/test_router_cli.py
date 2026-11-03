@@ -666,7 +666,13 @@ def test_answer_and_tell_resume_keep_waiting_for(proj):
 
 # ---- R6：仓外票核对 → 完成 → tick 逐目标收尾（⑪⑫） -----------------------------------
 
+def _live_guard(proj):
+    """防泄漏闸要有文件可读（闸失效 = GitHub 各栏 fail-closed）：放一份合成的 users.json。"""
+    (proj.runs / "2026-10-26" / "users.json").write_text(json.dumps({"5eed0001": {}}))
+
+
 def _offrepo_await_check(proj, wt, **extra):
+    _live_guard(proj)
     s = seed(proj, T1=("await_check", ["weekly-report"], {
                  "issue": 944, "title": "周报口径", "card_confirmed": True, "merge_sha": None,
                  "worker": {"session_id": "sid-t1-closeout", "worktree": str(wt) if wt else None,
@@ -719,6 +725,7 @@ OLD_DOWNSTREAM = ("上游 T1 #944「周报口径」已完成（合进 staging）
 
 
 def _legacy_field_ticket(proj):
+    _live_guard(proj)
     git("branch", "router/T1", "origin/staging", cwd=proj.root)
     seed(proj, T1=("merged_staging", ["weekly-report"], {
              "merge_sha": None, "issue": 944, "title": "周报口径", "card_confirmed": True,

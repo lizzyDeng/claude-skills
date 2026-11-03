@@ -361,6 +361,10 @@ class Run:
 
     # ---- 5 ----
     def step5_merge(self):
+        try:                                     # 5a 收尾放在加载合并闸之前：合并闸失效不该挡住本地清理
+            self.step5a_closeout()
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"step5a 收尾：{e!r}")
         repo, base = self.cfg["repo"], self.cfg.get("base_branch", "staging")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
@@ -471,29 +475,147 @@ class Run:
                    f"{tid} PR #{pr} 的 base 是 {st['base']}，不是 {base}：不合（gh pr edit {pr} --base {base}）")
 
     def _settle(self, tid, t, sha):
-        """一张票完成：仓内 = 合进 base；仓外 = 改完待你核对。放锁、通知下游、删 worktree、进「待你动手」。"""
+        """一张票改完。
+        仓内（sha = 合并 commit）：合进 base ⇒ 放锁、通知下游、删 worktree（成功才清指针）、进「待你动手」走查。
+        仓外（sha=None）：仓外没有 staging 隔离层，改完就是真身 ⇒ 待你核对（AWAIT_CHECK）：继续持锁、不解依赖、
+        不通知下游、不删 worktree（不满意时续跑要用它当 cwd）。核对后的收尾在 step5a_closeout。"""
         base = self.cfg.get("base_branch", "staging")
         t["merge_sha"] = sha
         t["fail_streak"] = {"step": "", "count": 0}
-        offrepo = sha is None
-        store.set_status(self.state, tid, store.MERGED, self.now, "等你核对仓外改动" if offrepo else f"等你 {base} 走查")
+        if sha is None:
+            store.set_status(self.state, tid, store.AWAIT_CHECK, self.now, "等你核对仓外改动")
+            self.queue(tid, "handson", f"核对 {tid} 的仓外改动：diff {self.home}/cards/{tid}.diff · "
+                                       f"备份 {self.home}/backups/{tid}/（满意说「{tid} 核对过了」；"
+                                       f"不满意说「{tid} 不满意：…」）", topic="offrepo")
+            return
+        store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
         except github.GuardEmpty as e:
             guard = None
             self.res["errors"].append(f"下游留言跳过（防泄漏闸失效）：{e}")
         if guard is not None:
-            self._notify_downstream(tid, t, sha or "仓外改动，无 commit", base, guard)
-        if t["worker"].get("worktree"):
+            self._notify_downstream(tid, t, sha, base, guard)
+        w = t["worker"]
+        if w.get("worktree"):
             try:
-                launcher.remove_worktree(self.ctx, self.root, t["worker"]["worktree"])
+                launcher.remove_worktree(self.ctx, self.root, w["worktree"])
             except RuntimeError as e:
-                self.res["errors"].append(f"删 worktree {tid}：{e}")
-        if offrepo:
-            self.queue(tid, "handson", f"核对 {tid} 的仓外改动：diff {self.home}/cards/{tid}.diff · "
-                                       f"备份 {self.home}/backups/{tid}/（不满意说「{tid} 回滚」）")
-        else:
-            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+                self.res["errors"].append(f"删 worktree {tid}：{e}")      # 删失败：保留指针，接管命令仍可用
+            else:
+                w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
+        self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+
+    # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
+    def step5a_closeout(self):
+        """DONE 且 closeout 还有 pending 的票，逐栏、逐目标先查后做（投递「至少一次」，靠 marker 去重成「恰好一次」）：
+        1 本地：worktree 干净才删、分支没有未推送提交才删；done 就清指针，kept 留指针并写明原因，error 下一轮重试。
+        2 GitHub：单独加载防泄漏闸；闸失效 ⇒ GitHub 各栏全部保持 pending（fail-closed），本地照做。
+          下游逐张留言（marker / 旧格式签名命中就不再留），再关本票 issue（已关不再关）。
+        一个目标失败只记在它自己身上，继续下一个；错误第 1 次进 errors，之后同样的失败不再刷屏。"""
+        todo = [(tid, t) for tid, t in self.state["tickets"].items()
+                if t["status"] == store.DONE and store.closeout_pending(t.get("closeout"))]
+        if not todo:
+            return
+        guard, guard_err = None, ""
+        if any(self._gh_open(t["closeout"]) for _, t in todo):
+            try:
+                guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
+            except github.GuardEmpty as e:
+                guard_err = f"收尾暂停：防泄漏闸失效（{e}）"
+        for tid, t in todo:
+            try:
+                self._closeout_one(tid, t, guard, guard_err)
+            except Exception as e:  # noqa: BLE001 — 一张票的收尾出错不挡别的票
+                self._closeout_note(tid, t, [f"{e!r}"], False)
+
+    @staticmethod
+    def _gh_open(co) -> bool:
+        o = store.closeout_open(co)
+        return bool(o["downstream"]) or "issue" in o["cols"]
+
+    def _closeout_one(self, tid, t, guard, guard_err):
+        co, w = t["closeout"], t["worker"]
+        errs, progressed = [], False
+        if co.get("worktree") == "pending" or co.get("branch") == "pending":
+            r = launcher.cleanup_ticket_checkout(self.ctx, self.root, w.get("worktree"), w.get("branch"))
+            for col in ("worktree", "branch"):
+                if co.get(col) != "pending":
+                    continue
+                v = r.get(col) or "error: 没有结果"
+                if v.startswith("error"):
+                    errs.append(f"{'worktree' if col == 'worktree' else '分支'}：{v[len('error: '):]}")
+                    continue
+                co[col] = v
+                progressed = True
+                if v == "done":
+                    w[col] = None             # 清了才清指针：看板不再给失效的接管命令
+        if self._gh_open(co):
+            if guard is None:
+                errs.append(guard_err or "收尾暂停：防泄漏闸失效")
+            else:
+                progressed |= self._closeout_github(tid, t, co, guard, errs)
+        self._closeout_note(tid, t, errs, progressed)
+
+    def _closeout_github(self, tid, t, co, guard, errs) -> bool:
+        repo, progressed = self.cfg["repo"], False
+        for oid, d in (co.get("downstream") or {}).items():
+            if not isinstance(d, dict) or d.get("state") != "pending":
+                continue
+            try:
+                github.comment_once(self.ctx, repo, d["issue"], self._downstream_body(tid, t, oid), guard,
+                                    f"<!-- router:downstream:{tid}->{oid} -->", legacy=github.legacy_downstream_re(tid))
+            except (github.GhError, github.LeakBlocked, ValueError, KeyError) as e:
+                d["error"] = str(e)[:200]
+                errs.append(f"下游 {oid} #{d.get('issue')}：{e}")
+                continue
+            d["state"] = "done"
+            d.pop("error", None)
+            progressed = True
+        if co.get("issue") == "pending":
+            try:
+                github.close_issue(self.ctx, repo, t["issue"], self._closeout_body(tid, t), guard,
+                                   f"<!-- router:closeout:{tid} -->")
+            except (github.GhError, github.LeakBlocked, ValueError) as e:
+                errs.append(f"关 issue #{t.get('issue')}：{e}")
+            else:
+                co["issue"] = "done"
+                progressed = True
+        return progressed
+
+    def _closeout_note(self, tid, t, errs, progressed):
+        """closeout.error = {at, msg, n}：n == 1 才进 errors；有一栏前进了就从 1 重新数（新的失败要让 router 看见）。"""
+        co = t["closeout"]
+        if not errs:
+            co.pop("error", None)
+            if not store.closeout_pending(co):
+                t["waiting_for"] = ""
+            return
+        prev = co.get("error") or {}
+        n = 1 if progressed or not prev else prev.get("n", 0) + 1
+        msg = "；".join(errs)[:400]
+        co["error"] = {"at": self.now, "msg": msg, "n": n}
+        if n == 1:
+            self.res["errors"].append(f"收尾 {tid}：{msg}")
+
+    def _done_date(self, t) -> str:
+        at = next((h["at"] for h in reversed(t.get("history", [])) if h.get("status") == store.DONE), self.now)
+        return str(at)[:10]
+
+    def _closeout_body(self, tid, t) -> str:
+        surf = "、".join(t.get("surfaces", [])) or "未声明"
+        return (f"仓外改动已由用户核对（{self._done_date(t)}），本票完成。改动在本机（代码面：{surf}），"
+                f"不经 PR / staging。由 /router 关闭。")
+
+    def _downstream_body(self, tid, t, oid) -> str:
+        o = self.state["tickets"].get(oid) or {}
+        shared = set(o.get("surfaces", [])) & set(t.get("surfaces", []))
+        why = ("依赖已解锁" if tid in o.get("blocked_by", []) else
+               f"共享代码面 {'、'.join(sorted(shared))} 已释放" if shared else "上游已完成")
+        issue = f" #{t['issue']}" if t.get("issue") else ""
+        return (f"上游 {tid}{issue}「{t['title']}」已完成（仓外改动，不经 PR；用户已核对）。\n"
+                f"- 改了什么：{(t.get('solution') or {}).get('text', '')[:300]}\n"
+                f"- 对本票的影响：{why}；开工 / 继续前先看本机最新的仓外文件。\n\n由 /router 自动留言。")
 
     def _notify_downstream(self, tid, t, sha, base, uids):
         for o in self.state["tickets"].values():

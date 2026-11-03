@@ -37,6 +37,9 @@ KIND_HINT = {
     "direction": "照原话继续当前阶段。",
     "stuck": "router 发现你上次没留下结果就退出了。先看 git status / git log 和你的笔记，确认做到哪，再照原话继续。",
     "conflict": "照原话处理代码面冲突后继续。",
+    "offrepo_reject": "用户核对你的仓外改动后不满意（原话见上）。先读 inbox；按原话改，或用 "
+                      "$ROUTER_HOME/backups/$ROUTER_TICKET/ 恢复后重做；改完重写 cards/$ROUTER_TICKET.diff、跑验收，"
+                      "再 progress impl_done 退出。",
 }
 
 
@@ -320,10 +323,10 @@ def cmd_answer(a, env):
             raise Fail(f"决定单里没有 {a.qid}")
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(a.text.splitlines())}")
-        resumed, delivered, hint = None, None, ""
+        resumed, delivered, hint, extra = None, None, "", {}
         t = st["tickets"].get(q["ticket"]) if q["ticket"] else None
         topic = q.get("topic")
-        # 判定顺序：topic（base / retarget / dispatch）→ 接管中 → 走查 → 续跑 worker
+        # 判定顺序：topic（base / retarget / dispatch）→ 接管中 → 续跑 worker → 待你动手（走查 / 核对）
         if topic == "base":
             bp = st.get("base_problem")
             if bp and bp.get("qid") == q["id"]:
@@ -355,13 +358,26 @@ def cmd_answer(a, env):
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
             how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"))
             resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
+        elif t and q["kind"] == "handson":
+            if a.reject:
+                if t["status"] == store.MERGED:
+                    raise Fail(f"{t['id']} 是仓内票、已合 staging，没有驳回通道：不满意请 add 一张跟进票")
+                if t["status"] != store.AWAIT_CHECK:
+                    raise Fail(f"{t['id']} 状态是 {t['status']}，不在等你核对")
+                wt = t["worker"].get("worktree")
+                if not wt or not Path(wt).is_dir():
+                    raise Fail(f"{t['id']} 的 worktree 已不在，不能续跑：不满意请 add 一张跟进票")
+                how = _resume(env, st, t["id"], "offrepo_reject", a.text, store.EXECUTING)
+                resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
+            else:
+                extra = _checked(env, st, t)
+                hint = extra.pop("hint", "")
         elif q["kind"] == "start":
             hint = "派发单要用 start 子命令"
-        elif q["kind"] == "handson":
-            hint = "走查完用 walkthrough-done"
         elif q["kind"] == "prod":
             hint = "按 aifriends 发版流程上 prod，发完用 released"
-    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint}
+    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint,
+            **extra}
 
 
 def cmd_submit_card(a, env):
@@ -537,14 +553,44 @@ def cmd_inbox(a, env):
     return {"ok": True, "messages": msgs}
 
 
+def _closeout_targets(st, tid) -> dict:
+    """核对完那一刻的下游快照：没 settle、没 skip、有 issue，且依赖本票或共享代码面的票。
+    迁移来的旧票同样现算，不预设「已通知」：tick 留言前先查 marker / 旧格式签名，已留过的不重复。"""
+    t = st["tickets"][tid]
+    mine = set(t.get("surfaces", []))
+    return {o["id"]: {"issue": o["issue"], "state": "pending"} for o in st["tickets"].values()
+            if o["id"] != tid and o.get("issue") and o["status"] not in store.SETTLED | {store.SKIP}
+            and (tid in o.get("blocked_by", []) or mine & set(o.get("surfaces", [])))}
+
+
+def _checked(env, st, t) -> dict:
+    """用户说「T 走查过了 / T 核对过了」（walkthrough-done，或回答 handson 项）：
+    仓内已合 staging → 等上 prod；仓外待核对 → 完成，收尾（下游留言、关 issue、清 worktree / 分支）交给下一轮 tick。
+    只改本地状态，不碰网络。重复说一次是幂等的。"""
+    tid, status = t["id"], t["status"]
+    drop_handson = lambda: [q for q in st["queue"] if not (q["kind"] == "handson" and q["ticket"] == tid)]
+    if status == store.MERGED:
+        store.set_status(st, tid, store.AWAIT_PROD, env.now(), "等上 prod")
+        st["queue"] = drop_handson()
+        return {"status": store.AWAIT_PROD}
+    if status == store.AWAIT_CHECK:
+        t["closeout"] = {"downstream": _closeout_targets(st, tid), "issue": "pending" if t.get("issue") else "n/a",
+                         "worktree": "pending", "branch": "pending"}
+        store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：下游留言、关 issue、清 worktree）")
+        st["queue"] = drop_handson()
+        return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾在下一轮巡检完成"}
+    if status == store.DONE and store.closeout_pending(t.get("closeout")):
+        return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾还没做完，下一轮巡检继续"}
+    if status in (store.DONE, store.AWAIT_PROD):
+        st["queue"] = drop_handson()
+        return {"status": status, "already": True}
+    raise Fail(f"{tid} 还没合进 staging，也不在等你核对（{status}）")
+
+
 def cmd_walkthrough_done(a, env):
     with env.state() as st:
-        t = env.ticket(st, a.ticket)
-        if t["status"] != store.MERGED:
-            raise Fail(f"{a.ticket} 还没合进 staging（{t['status']}）")
-        store.set_status(st, a.ticket, store.AWAIT_PROD, env.now(), "等上 prod")
-        st["queue"] = [q for q in st["queue"] if not (q["kind"] == "handson" and q["ticket"] == a.ticket)]
-    return {"ok": True}
+        res = _checked(env, st, env.ticket(st, a.ticket))
+    return {"ok": True, **res}
 
 
 def _prod_item(env, st):
@@ -655,7 +701,7 @@ def build_parser():
     s = sub.add_parser("tell", help="写进 worker 收件箱")
     s.add_argument("ticket"); s.add_argument("text"); s.add_argument("--resume", action="store_true")
     for name, h in (("pause", "先停：做完当前这一步"), ("stop", "立刻停"), ("takeover", "我接管"),
-                    ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了")):
+                    ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了 / 仓外改动核对过了")):
         sub.add_parser(name, help=h).add_argument("ticket")
     s = sub.add_parser("surfaces", help="更新票的代码面 / 越界时分配锁（记一条决定）")
     s.add_argument("ticket"); s.add_argument("--set", required=True); s.add_argument("--why", required=True)

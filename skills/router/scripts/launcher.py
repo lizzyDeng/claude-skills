@@ -171,27 +171,30 @@ def _registered_worktrees(ctx, repo) -> set:
 
 
 def cleanup_ticket_checkout(ctx, repo, wt, branch) -> dict:
-    """票完成后清本地：worktree 干净才删，分支没有未推送的提交才删。每栏 "done" 或 "kept: 原因"；
-    幂等（已删的算 done）。调用方据此清空 / 保留 worker.worktree / worker.branch 指针。"""
+    """票完成后清本地：worktree 干净才删，分支没有未推送的提交才删。幂等（已删的算 done）。
+    每栏三种结果：
+      "done"            —— 删了，或本来就没有；调用方清空 worker.worktree / worker.branch 指针
+      "kept: 原因"      —— 有意保留（未提交改动 / 未推送提交 / worktree 保留），要人处理，不再重试；指针保留
+      "error: 原因"     —— git 命令失败（锁、权限、瞬态），下一轮重试；指针保留"""
     res = {}
     p = Path(wt) if wt else None
     if p and p.exists():
         st = ctx.run(["git", "-C", str(p), "status", "--porcelain"])
         if st.returncode != 0:
-            res["worktree"] = f"kept: git status 失败：{_err(st)}"
+            res["worktree"] = f"error: git status 失败：{_err(st)}"
         elif (st.stdout or "").strip():
             res["worktree"] = "kept: 有未提交改动"
         else:
             r = ctx.run(["git", "-C", str(repo), "worktree", "remove", str(p)])
-            res["worktree"] = "done" if r.returncode == 0 else f"kept: git worktree remove 失败：{_err(r)}"
+            res["worktree"] = "done" if r.returncode == 0 else f"error: git worktree remove 失败：{_err(r)}"
     else:
         if p and str(p) in _registered_worktrees(ctx, repo):          # 路径没了、git 还登记着
             r = ctx.run(["git", "-C", str(repo), "worktree", "prune"])
-            res["worktree"] = "done" if r.returncode == 0 else f"kept: git worktree prune 失败：{_err(r)}"
+            res["worktree"] = "done" if r.returncode == 0 else f"error: git worktree prune 失败：{_err(r)}"
         else:
             res["worktree"] = "done"
     if res["worktree"] != "done":
-        res["branch"] = "kept: worktree 保留"
+        res["branch"] = "kept: worktree 保留" if res["worktree"].startswith("kept") else "error: worktree 还没清"
         return res
     if not branch:
         res["branch"] = "done"
@@ -203,12 +206,12 @@ def cleanup_ticket_checkout(ctx, repo, wt, branch) -> dict:
     r = ctx.run(["git", "-C", str(repo), "rev-list", "--count", branch, "--not", "--remotes"])
     n = (r.stdout or "").strip()
     if r.returncode != 0 or not n.isdigit():
-        res["branch"] = f"kept: 数不出未推送提交：{_err(r)}"
+        res["branch"] = f"error: 数不出未推送提交：{_err(r)}"
     elif int(n) > 0:
         res["branch"] = f"kept: {n} 个未推送提交"
     else:
         d = ctx.run(["git", "-C", str(repo), "branch", "-D", branch])
-        res["branch"] = "done" if d.returncode == 0 else f"kept: git branch -D 失败：{_err(d)}"
+        res["branch"] = "done" if d.returncode == 0 else f"error: git branch -D 失败：{_err(d)}"
     return res
 
 

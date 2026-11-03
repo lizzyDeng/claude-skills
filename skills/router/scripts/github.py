@@ -316,6 +316,11 @@ def comment_once(ctx, repo, n, body, guard, marker, legacy=None) -> dict:
     return {"result": "commented", "state": state}
 
 
+def legacy_downstream_re(tid) -> str:
+    """修复前 _notify_downstream 的正文开头「上游 T1 #944「…」：T1 不会命中 T10（后面必须是 " #" 或「）。"""
+    return rf"上游 {re.escape(tid)}(?: #\d+)?「"
+
+
 def close_issue(ctx, repo, n, body, guard, marker) -> dict:
     """留一条收尾评论（marker 去重）再关。不用 `issue close --comment`：它在 gh 内部也是先留言再关的两次调用，
     关失败时下次会重复留言。已关的不再关。→ {"comment": …, "closed": "closed"|"already"}"""

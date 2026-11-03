@@ -173,6 +173,24 @@ def push_queue(state, ticket, kind, summary, at, topic=None) -> str:
     return qid
 
 
+# ---- 仓外票收尾（R6）：closeout = {"downstream": {票号: {"issue", "state"}}, "issue", "worktree", "branch"} ----
+# 每栏 "pending"（下一轮 tick 做）| "done" | "n/a"（没有 issue）| "kept: 原因"（有意保留，要人处理）
+CLOSEOUT_COLS = ("issue", "worktree", "branch")
+
+
+def closeout_open(co) -> dict:
+    """还没做完的栏 → {"downstream": [票号…], "cols": [栏名…]}；kept 不算没做完（要人处理，不再重试）。"""
+    if not isinstance(co, dict):
+        return {"downstream": [], "cols": []}
+    down = [oid for oid, d in (co.get("downstream") or {}).items() if isinstance(d, dict) and d.get("state") == "pending"]
+    return {"downstream": down, "cols": [c for c in CLOSEOUT_COLS if co.get(c) == "pending"]}
+
+
+def closeout_pending(co) -> bool:
+    o = closeout_open(co)
+    return bool(o["downstream"] or o["cols"])
+
+
 def in_queue(state, qid) -> bool:
     return bool(qid) and any(q["id"] == qid for q in state["queue"])
 
