@@ -638,6 +638,24 @@ def _summary(st):
     return counts, used, store.queue_view(st)       # 「几张 / 挡几张」读时现算（R3）
 
 
+def _closeout_line(co) -> str:
+    """仓外票收尾进度（status 文字版）：没做完的、有意保留的、最近一次出错。"""
+    o = store.closeout_open(co)
+    names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
+    parts = []
+    todo = [f"下游 {x}" for x in o["downstream"]] + [names[c] for c in o["cols"]]
+    if todo:
+        parts.append("收尾未完成：" + "、".join(todo))
+    kept = [f"{c}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
+            if isinstance(co, dict) and str(co.get(c, "")).startswith("kept")]
+    if kept:
+        parts.append("保留：" + "、".join(kept))
+    err = (co or {}).get("error") if isinstance(co, dict) else None
+    if todo and err:
+        parts.append(f"出错：{str(err.get('msg', ''))[:120]}")
+    return "".join(f" · {x}" for x in parts)
+
+
 def cmd_status(a, env):
     with env.locked():
         st = store.load_state(env.state_path)
@@ -655,7 +673,7 @@ def cmd_status(a, env):
         t = st["tickets"][tid]
         issue = f" #{t['issue']}" if t["issue"] else ""
         wait = f" · 等：{t['waiting_for']}" if t["waiting_for"] else ""
-        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}")
+        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}")
     print("\n".join(lines))
     return None
 

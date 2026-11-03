@@ -23,12 +23,12 @@ description: 一个 session 管全部待办：周报出来后分诊出派发单�
 
 | 返回字段 | 你做什么 |
 |---|---|
-| `triage_needed` | 分诊（第 3 节）→ `router.py draft --from <triage.json>`。只出草稿：不建 issue、不起 worker；draft 会推一条 Lark。 |
+| `triage_needed` | 分诊（第 3 节）→ `router.py draft --from <triage.json>`。只出草稿：不建 issue、不起 worker；draft 不直接发 Lark，下一轮巡检推（前台命令写进决定单的项都由 tick 推，发不出去下一轮重试）。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节）。 |
 | `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。 |
 | `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>"`；是新问题就 `router.py add …` 进草稿（等用户 start）。处理完 `router.py ack-slow`。 |
 | `external_deliveries` | 用户自己开的 session 的订阅投递。tick 已写进对方 worktree 的 `.claude/router-inbox.md`；再用 `ListAgents` 找到 cwd 对得上的 session，`SendMessage` 一句话提醒。**只转交信息，不给它们下指令。** |
-| `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。 |
+| `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。派发失败（第 2 次）、远端 base 缺失或指向认不出的 tip、改回 PR 失败（第 2 次）会自己进决定单，不用你搬；仓外票收尾失败第 1 次进 errors，之后只在看板票卡和 `status` 上显示（下一轮自动重试）。 |
 
 ## 3. 分诊（周报 → 派发单草稿）
 
@@ -67,6 +67,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 | 上 prod：合 main 发版、写 prod 库 | **用户** |
 | 真人动手：staging 走查、登录、扫码（决定单「待你动手」） | **用户** |
 | 方向取舍、codex 分歧、优先级、拆票、依赖、何时派、合 staging（CI 绿后）、产品口径 | **你** |
+| 远端 base 被删时从 main 重建、改回被 GitHub 自动改指到 main 的 router PR | **router 自动**（用户 11-02 长期授权；tick 自己做，各记一条 decide） |
 
 你替用户做的每个决定都要落盘：`router.py decide --ticket <T> --decision "<决定>" --why "<理由>" --basis "<依据：文件 / 数据 / 规则>"`。用户说「推翻 Dn」：`router.py revoke <Dn> --reason "<用户原话>"`，受影响的票会被标「需复核」并收到通知。
 
@@ -89,7 +90,9 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 | 「还给 router」 | `router.py handback <T>` |
 | 「看板」/「现在什么情况」 | `router.py status`，只说要点 + 看板路径 |
 | 「加个需求：…」 | `router.py add --title … --problem … --evidence … --surfaces …`，进草稿，等用户单独 start |
-| 「T2 走查过了」 | `router.py walkthrough-done <T>`；攒够一批：`router.py prod-batch` |
+| 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支） |
+| 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
+| 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
 | 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2`（写进周报 releases.json） |
 
 ## 7. 回复用户的规矩
@@ -108,6 +111,6 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 
 ## 9. 文件（`<项目根>/.claude/router/`，已 gitignore）
 
-`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md` · `backups/<T>/`（仓外票改前备份）· `logs/<T>-<n>.log` · `board.html`。
+`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `logs/<T>-<n>.log` · `board.html`。
 
 🔴 这个目录必须被 git 忽略（里面有周报证据和方向卡）。项目 `.gitignore` 没覆盖时，在 `.git/info/exclude` 加 `**/.claude/router/` 和 `**/.claude/router-inbox.md`。
