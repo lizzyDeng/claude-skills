@@ -1362,3 +1362,28 @@ def test_tick_refuses_to_merge_when_base_branch_is_main(proj):                  
     assert not proj.ctx.calls_with("pr", "merge") and not _pushes(proj)
     assert any("base_branch" in e for e in res["errors"])
     assert proj.state()["tickets"]["T1"]["status"] == "verifying"
+
+
+def test_foreign_tip_waiting_for_answer_backs_off_without_new_items(proj):              # F12（RV M-11）
+    proj.put(T1=_queued())
+    _foreign_tip_open(proj)                                              # Q1 在决定单里等你回答，远端仍是 Z
+    proj.ctx.script(["git", "-C", str(proj.root), "merge-base", "--is-ancestor", M, Z], "", returncode=1)
+    for _ in range(3):
+        res = proj.run()
+        st = proj.state()
+        assert res["new_queue"] == [] and [q["id"] for q in st["queue"]] == ["Q1"]   # 退避：不每轮新建一个 Qn
+        assert st["base_problem"]["qid"] == "Q1" and st["seq"]["queue"] == 1
+        assert res["dispatched"] == [] and not _wt_adds(proj)
+    assert "Q1" in st["tickets"]["T1"]["waiting_for"]
+
+
+def test_receipt_with_other_session_id_is_not_adopted(proj):                            # F12：回执 sid 校验
+    _, R = _intent(proj)
+    _write_receipt(R, "sid-someone-else", 10042, "start-10042")          # 回执是别的 session 的（旧的 / 串了）
+    proj.ctx.alive.add(10042)
+    res = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert proj.ctx.spawn_attempts == [] and t["status"] == "queued"     # 不认领、不重派、不杀
+    assert t["dispatch"]["phase"] == "spawning" and t["worker"].get("pid") is None
+    assert "session 对不上" in t["dispatch"]["unverified"] and len(_t1_errors(res)) == 1
+    assert 10042 in proj.ctx.alive

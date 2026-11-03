@@ -1345,3 +1345,19 @@ def test_canary_timeout_is_not_success_and_a_rerun_recovers(rv, monkeypatch):   
     (rv.home / "review" / "canary.json").write_text(json.dumps(          # 只有泄漏才长期判 canary_failed
         {"codex_version": "codex-cli 0.144.4", "ok": False, "reason": "canary_leak", "at": "2026-11-02T09:00:00Z"}))
     assert _pack_out(rv, check_ok=False)["reason"] == "canary_failed"
+
+
+def test_review_pack_preflight1_requires_every_deny_path_in_prompt(rv, monkeypatch):    # F12（RV M-11）：预检 1 完整性
+    _offrepo_card(rv)
+    monkeypatch.setenv("SHIM_PROMPT_DROP", "1")                          # codex 的拒读段里少了一条
+    out = _pack_out(rv, check_ok=False)
+    assert out["ok"] is False and out["reason"] == "boundary" and "预检 1" in out["error"], out
+    assert not (rv.home / "review" / "T1" / "codex.sh").exists()
+
+
+def test_review_canary_refuses_when_sibling_is_covered_by_another_list(rv, monkeypatch):   # F12：同级目录覆盖自检
+    _cfg(rv, leak_guard_globs=[f"{rv.daily}/runs/*/*.json"], codex_deny_read=["~/.router-canary-probe"])
+    out, c = _canary(rv, monkeypatch)
+    assert out["ok"] is False and c["reason"] == "boundary" and "只靠拒读 HOME" in out["error"], out
+    assert not [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]]   # 探不到那一层就不跑 exec
+    assert not (rv.tmp / ".router-canary-probe").exists() and _tmp_probes() == []
