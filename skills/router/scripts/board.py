@@ -111,7 +111,7 @@ def render(state, decisions, events, now, slots=None) -> str:
     active_ext = [e for e in state["external"].values() if e.get("active")]
     used["heavy"] += sum(1 for e in active_ext if e.get("weight") == "heavy")
     bar = lambda n, cap: "".join('<i class="on"></i>' if i < n else "<i></i>" for i in range(max(cap, n)))
-    queue = sorted(state["queue"], key=lambda q: (-q["blocks"], int(q["id"][1:])))
+    queue = store.queue_view(state)          # 「挡几张」读时现算（R3）
     rows = "".join(f'<div class="row"><div class="what"><b>{_e(q["summary"])}</b>'
                    f'<small>{_e(q["id"])} · {_e(KIND.get(q["kind"], q["kind"]))} · 挡 {_e(q["blocks"])} 张 · {_e(_hhmm(q["created_at"]))}</small></div>'
                    f'<span class="say">{_e(_say(q))}</span></div>' for q in queue) or \

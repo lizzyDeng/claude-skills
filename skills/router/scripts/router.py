@@ -114,14 +114,6 @@ def _csv(s):
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def _blocks(st, tid) -> int:
-    """这张票挡住了几张：依赖它的 + 排队等它代码面的。"""
-    t = st["tickets"][tid]
-    return sum(1 for o in st["tickets"].values() if o["id"] != tid and o["status"] not in store.SETTLED
-               and (tid in o["blocked_by"]
-                    or (o["status"] == store.QUEUED and set(o["surfaces"]) & set(t["surfaces"]))))
-
-
 def _resume_prompt(kind, text, inbox):
     parts = ["【router】你之前停下等的事有了回答。", "", "用户原话（逐字）：", text, ""]
     if inbox:
@@ -223,7 +215,7 @@ def cmd_draft(a, env):
                     unknown.append({"ticket": tid, "depends_on": dep})
         st["batch"] = {"id": batch, "started": False, "started_at": None}
         n = sum(1 for t in created if st["tickets"][t]["status"] == store.DRAFT)
-        qid = store.push_queue(st, None, "start", f"派发单已备好（{n} 张）", n, env.now())
+        qid = store.push_queue(st, None, "start", f"派发单已备好（{n} 张）", env.now())
     return {"ok": True, "batch": batch, "tickets": created, "queue": qid, "unknown_depends": unknown,
             "notify": notify(env, f"router：派发单已备好（{n} 张，批次 {batch}）")}
 
@@ -358,7 +350,7 @@ def cmd_submit_card(a, env):
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
                                f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
-                               _blocks(st, a.ticket), env.now())
+                               env.now())
     return {"ok": True, "queue": qid, "version": version}
 
 
@@ -525,7 +517,7 @@ def _prod_item(env, st):
     ready = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
                    key=lambda x: int(x[1:]))
     if ready:
-        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", len(ready), env.now()), ready
+        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready
     return None, []
 
 
@@ -561,8 +553,7 @@ def _summary(st):
         if t["status"] in store.RUNNING:
             used[t["weight"]] += 1
     used["heavy"] += sum(1 for e in st["external"].values() if e.get("active") and e.get("weight") == "heavy")
-    queue = sorted(st["queue"], key=lambda q: (-q["blocks"], int(q["id"][1:])))
-    return counts, used, queue
+    return counts, used, store.queue_view(st)       # 「几张 / 挡几张」读时现算（R3）
 
 
 def cmd_status(a, env):

@@ -41,12 +41,6 @@ def _ts(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() if s else 0
 
 
-def _blocks(state, tid):
-    t = state["tickets"][tid]
-    return sum(1 for o in state["tickets"].values() if o["id"] != tid and o["status"] not in store.SETTLED
-               and (tid in o["blocked_by"] or (o["status"] == store.QUEUED and set(o["surfaces"]) & set(t["surfaces"]))))
-
-
 class Run:
     def __init__(self, ctx, root, cfg, state):
         self.ctx, self.root, self.cfg, self.state = ctx, Path(root), cfg, state
@@ -57,8 +51,11 @@ class Run:
         self.res = {"triage_needed": None, "dispatched": [], "new_queue": [], "slow_path_events": [],
                     "external_deliveries": [], "cards_for_review": [], "notified": False, "errors": []}
 
-    def queue(self, tid, kind, summary):
-        qid = store.push_queue(self.state, tid, kind, summary, _blocks(self.state, tid) if tid else 0, self.now)
+    def queue(self, tid, kind, summary, topic=None):
+        """summary 里的「{qid}」换成这一项自己的编号（文案要写「回『Qn 好了』」）。"""
+        qid = store.push_queue(self.state, tid, kind, summary, self.now, topic=topic)
+        if "{qid}" in summary:
+            self.state["queue"][-1]["summary"] = summary.replace("{qid}", qid)
         self.res["new_queue"].append(qid)
         return qid
 
@@ -376,7 +373,7 @@ class Run:
                                  {tid: events.read_all(self.home, tid)[-5:] for tid in self.state["tickets"]},
                                  self.ctx.now(), self.cfg.get("slots")))
         if self.res["new_queue"]:
-            q = sorted(self.state["queue"], key=lambda x: (-x["blocks"], int(x["id"][1:])))
+            q = store.queue_view(self.state)
             text = f"router：等你 {len(q)} 件（{' '.join(x['id'] for x in q)}）"
             out = notify.send(Path(os.path.expanduser(self.cfg.get("lark_config", ""))), text, self.ctx)
             self.res["notified"] = out == "sent"
