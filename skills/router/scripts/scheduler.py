@@ -8,10 +8,11 @@ def _num(tid: str) -> int:
 
 
 def free_slots(state: dict, slots: dict) -> dict:
-    """各档剩余名额（可能为负）：在跑的票占名额，等用户回答的不占；用户自己开着、正在动的重 session 也算。"""
+    """各档剩余名额（可能为负）：在跑的票占名额，等用户回答的不占；带未核实意图的票按「可能在跑」占；
+    用户自己开着、正在动的重 session 也算。"""
     free = dict(slots)
     for t in state["tickets"].values():
-        if t["status"] in store.RUNNING:
+        if store.occupies_slot(t):
             free[t["weight"]] = free.get(t["weight"], 0) - 1
     for ext in state["external"].values():
         if ext.get("active") and ext.get("weight") == "heavy":

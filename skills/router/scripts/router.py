@@ -674,7 +674,7 @@ def _summary(st):
         counts[t["status"]] = counts.get(t["status"], 0) + 1
     used = {"heavy": 0, "light": 0}
     for t in st["tickets"].values():
-        if t["status"] in store.RUNNING:
+        if store.occupies_slot(t):
             used[t["weight"]] += 1
     used["heavy"] += sum(1 for e in st["external"].values() if e.get("active") and e.get("weight") == "heavy")
     return counts, used, store.queue_view(st)       # 「几张 / 挡几张」读时现算（R3）

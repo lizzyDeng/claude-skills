@@ -28,7 +28,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review")
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
 # 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
-# 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。
+# 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
 RECEIPT_GRACE_S = 60
 # router 自己做、只记一条 decide 的两件事（重建 base、改回被自动改指的 PR）共用的授权说明
 AUTO_FIX_WHY = "用户 11-02 长期授权：base 被删时从 main 重建、改回被 GitHub 自动改指的 router PR、记一条 decide"
@@ -431,6 +431,15 @@ class Run:
             t["fail_streak"] = {"step": step, "count": 1}
             self.resume(tid, prompt, store.EXECUTING)
 
+    def _base_blocks(self, t) -> bool:
+        """要合并、要叫 worker rebase / 修 CI 之前先看远端 base（每轮只查一次）：不对（认不出的 tip、被删待重建、
+        查不了）⇒ 什么都不做，waiting_for 写明原因（RV M-4：base 是认不出的 tip 时不往上合、不让 worker 基于它）。"""
+        b = self.ensure_base()
+        if b["ok"]:
+            return False
+        t["waiting_for"] = f"{b['wait'] or b['error'] or '远端 base 有问题'}：先不合、不叫 worker rebase / 修 CI"
+        return True
+
     def _verify(self, tid, t, repo, base, guard):
         if store.pending_intent(t):
             return                                # 续跑待核实：worker 可能在跑，等对账
@@ -454,6 +463,9 @@ class Run:
         if st["state"] == "CLOSED":
             t["pr"] = None
             return self._stuck(tid, f"{tid} PR #{pr} 被关闭了（没合）")
+        if st["checks"] in ("failure", "success") or st["mergeable"] == "CONFLICTING":
+            if self._base_blocks(t):
+                return
         if st["checks"] == "failure":
             return self._retry_or_stuck(tid, t, "ci", f"{tid} PR #{pr} CI 红",
                                         f"【router】PR #{pr} 的 CI 红了。先 `gh pr checks {pr}` 看是哪项；"
@@ -723,8 +735,10 @@ class Run:
         before = {k: w.get(k) for k in ("session_id", "runs")}
         log = launcher.prepare_run(w, self.home, tid)
         receipt = launcher.receipt_path(log)
+        # at = 意图落盘这一刻（起进程前一刻），不是这轮开始：建 worktree / fetch 弱网可能已经花掉几分钟，
+        # 回执宽限期从这里算才不会被吃掉（RV M-3）
         t["dispatch"] = {"phase": "spawning", "kind": "dispatch", "session_id": w["session_id"], "log": str(log),
-                         "receipt": str(receipt), "at": self.now}
+                         "receipt": str(receipt), "at": _iso(self.ctx.now())}
         try:
             store.save_state(self.home / "state.json", self.state)
         except Exception as e:  # noqa: BLE001 — 意图没落盘：一个进程都不起，撤回内存里的意图

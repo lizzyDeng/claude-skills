@@ -56,6 +56,16 @@ def pending_intent(t) -> bool:
     return isinstance(t, dict) and (t.get("dispatch") or {}).get("phase") == "spawning"
 
 
+def occupies_slot(t) -> bool:
+    """占名额：在跑，或带着未核实的意图（按「可能在跑」算，RV M-5）。"""
+    return t["status"] in RUNNING or pending_intent(t)
+
+
+def holds_lock(t) -> bool:
+    """持代码面锁：LOCKING 状态，或带着未核实的意图（RV M-5）。"""
+    return t["status"] in LOCKING or pending_intent(t)
+
+
 def empty_state():
     return {"version": 1,
             "batch": {"id": None, "started": False, "started_at": None},
@@ -225,7 +235,7 @@ def queue_blocks(state, q) -> int:
     blocked = {o["id"] for o in tickets.values()
                if o["id"] != tid and o["status"] not in SETTLED | {SKIP}
                and ((t["status"] not in SETTLED and tid in o.get("blocked_by", []))
-                    or (t["status"] in LOCKING and o["status"] == QUEUED and mine & set(o.get("surfaces", []))))}
+                    or (holds_lock(t) and o["status"] == QUEUED and mine & set(o.get("surfaces", []))))}
     return (1 if t["status"] not in (DONE, SKIP) else 0) + len(blocked)
 
 

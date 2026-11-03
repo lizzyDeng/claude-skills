@@ -130,7 +130,7 @@ def conflicts_with_router(state, external) -> list:
     """外部 session 动了 router 票锁着的代码面 → [(worktree, surface, 持锁票号)]。"""
     owners = {}
     for tid, t in state["tickets"].items():
-        if t["status"] in store.LOCKING:
+        if store.holds_lock(t):
             for s in t["surfaces"]:
                 owners.setdefault(s, tid)
     return [(p, s, owners[s]) for p, e in sorted(external.items()) if e.get("locking", True)

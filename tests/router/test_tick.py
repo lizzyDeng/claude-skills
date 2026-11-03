@@ -1261,3 +1261,95 @@ def test_ps_failure_is_unknown_not_dead(proj, monkeypatch, how):                
     assert proj.state()["queue"] == [] and proj.ctx.spawn_attempts == []  # 不判 stuck、不起新 worker
     assert 123 in proj.ctx.alive
     assert len(_t1_errors(r1)) == 1 and _t1_errors(r2) == []            # 错误只报一次
+
+
+def _slow_worktree_then_crash_after_spawn(proj, monkeypatch, minutes=5):
+    """建 worktree 花了 minutes 分钟（fetch 弱网）；起了进程之后的存盘全失败 ⇒ 盘上只留意图，没有回执。"""
+    proj.put(T1=_queued())
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "add"], lambda c: proj.ctx.advance(minutes) or ("", 0, ""))
+    real = store.save_state
+
+    def crash(path, state):
+        if state["tickets"]["T1"]["worker"].get("pid") == 10000:
+            raise OSError(28, "No space left on device")
+        real(path, state)
+    monkeypatch.setattr(store, "save_state", crash)
+    with contextlib.suppress(OSError):
+        proj.run()
+    monkeypatch.setattr(store, "save_state", real)
+    assert len(_t1_spawns(proj)) == 1
+    return proj.state()["tickets"]["T1"]["dispatch"]
+
+
+def test_receipt_grace_counts_from_intent_write_not_tick_start(proj, monkeypatch):    # F6（RV M-3）
+    it = _slow_worktree_then_crash_after_spawn(proj, monkeypatch)
+    written = proj.ctx.now()
+    proj.ctx.advance(0.5)                                                # 意图写下 30 秒后的下一轮：还在宽限期内
+    proj.run()
+    assert len(_t1_spawns(proj)) == 1                                    # 保留意图，不重派
+    t = proj.state()["tickets"]["T1"]
+    assert t["dispatch"]["phase"] == "spawning" and t["status"] == "queued"
+    assert "启动回执还没出现" in t["dispatch"]["unverified"]
+    assert it["at"] == tick._iso(written)                                # 起点 = 意图自己落盘那一刻（起进程前一刻）
+
+
+def test_receipt_grace_expired_without_trace_is_cleared_and_redispatched(proj, monkeypatch):   # F6
+    it = _slow_worktree_then_crash_after_spawn(proj, monkeypatch)
+    proj.ctx.advance(tick.RECEIPT_GRACE_S / 60 + 1)                      # 过了宽限期，没回执、没日志、没 transcript
+    proj.run()
+    sp = _t1_spawns(proj)
+    assert len(sp) == 2
+    cmd = sp[1]["cmd"]
+    assert cmd[cmd.index("--session-id") + 1] == it["session_id"]       # sid 没用过，复用
+    t = proj.state()["tickets"]["T1"]
+    assert "dispatch" not in t and t["status"] == "kickoff"
+
+
+def _foreign_tip_open(proj):
+    s = proj.state()
+    store.push_queue(s, None, "stuck", f"远端 staging 指向 {Z[:12]}，不是 {M[:12]}", "2026-11-02T09:00:00Z", topic="base")
+    s["base_problem"] = {"qid": "Q1", "kind": "foreign_tip", "expected_sha": M, "sha": Z, "at": "2026-11-02T09:00:00Z"}
+    store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(_ls(proj, "staging"), _present(Z)[0])
+
+
+@pytest.mark.parametrize("fx,what", [("gh_pr_green.json", "merge"), ("gh_pr_conflict.json", "rebase"),
+                                     ("gh_pr_failed.json", "fix-ci")])
+def test_foreign_tip_in_queue_blocks_step5_merge_and_rebase(proj, fx, what):           # F7（RV M-4）
+    _verifying(proj, fx)
+    _foreign_tip_open(proj)
+    proj.run()
+    assert not proj.ctx.calls_with("pr", "merge")                        # 认不出的 base 上不合
+    assert proj.ctx.spawn_attempts == []                                 # 也不叫 worker rebase / 修 CI
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "verifying" and "Q1" in t["waiting_for"] and "staging" in t["waiting_for"]
+    assert [q["id"] for q in proj.state()["queue"]] == ["Q1"]
+
+
+def _add_ticket(proj, tid, spec):
+    s = proj.state()
+    s["tickets"][tid] = make_state(**{tid: spec})["tickets"][tid]
+    store.save_state(proj.home / "state.json", s)
+
+
+def test_unverified_intent_holds_its_surface_lock(proj):                                 # F8（RV M-5）
+    _unverified_intent(proj)                                             # T1 带意图（weekly-report），可能在跑
+    _add_ticket(proj, "T2", ("queued", ["weekly-report"], {"start_ok": True}))
+    res = proj.run()
+    assert "T2" not in res["dispatched"] and len(_t1_spawns(proj, "T2")) == 0
+    t2 = proj.state()["tickets"]["T2"]
+    assert t2["status"] == "queued" and "weekly-report" in t2["waiting_for"] and "T1" in t2["waiting_for"]
+
+
+def test_unverified_intent_occupies_a_slot(proj):                                         # F8
+    proj.cfg["slots"] = {"heavy": 3, "light": 1}
+    _unverified_intent(proj)
+    _add_ticket(proj, "T2", ("queued", ["llm-config"], {"start_ok": True}))
+    res = proj.run()
+    assert "T2" not in res["dispatched"] and len(_t1_spawns(proj, "T2")) == 0
+    assert proj.state()["tickets"]["T2"]["waiting_for"] == "等轻名额"
+    import scheduler
+    import surfaces
+    s = proj.state()
+    assert scheduler.free_slots(s, {"heavy": 3, "light": 1})["light"] == 0
+    assert surfaces.held_locks(s).get("weekly-report") == "T1"

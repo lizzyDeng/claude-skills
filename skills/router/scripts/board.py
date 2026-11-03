@@ -151,7 +151,7 @@ def render(state, decisions, events, now, slots=None) -> str:
     count = lambda sts: sum(1 for t in tickets.values() if t["status"] in sts)
     used = {"heavy": 0, "light": 0}
     for t in tickets.values():
-        if t["status"] in store.RUNNING:
+        if store.occupies_slot(t):
             used[t["weight"]] += 1
     active_ext = [e for e in state["external"].values() if e.get("active")]
     used["heavy"] += sum(1 for e in active_ext if e.get("weight") == "heavy")
