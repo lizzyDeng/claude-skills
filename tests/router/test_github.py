@@ -242,3 +242,14 @@ def test_close_issue_comments_once_by_marker_and_guards_body():
     with pytest.raises(LeakBlocked):
         github.close_issue(f, R, 944, "影响 5eed0001", {"5eed0001"}, mark)
     assert not f.calls_with("issue", "comment") and not f.calls_with("issue", "close")
+
+
+# ---- FX：终审后修复轮 ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("base", ["main", "master", "prod"])
+def test_merge_never_targets_main_even_if_config_says_so(base):          # F10（RV M-7）
+    f = pr_fake("gh_pr_green.json")
+    assert merge_if_green(f, R, 9, base=base, main="prod") is False      # 配置写错成 main / master / 仓库默认分支
+    assert not f.calls_with("pr", "merge")
+    g = pr_fake("gh_pr_wrong_base.json")                                  # PR 本身指向 main：不传 base 也不合
+    assert merge_if_green(g, R, 9) is False and not g.calls_with("pr", "merge")

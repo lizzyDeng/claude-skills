@@ -234,9 +234,19 @@ def pr_text(ctx, repo, pr) -> str:
     return "\n".join([d.get("title") or "", d.get("body") or "", _gh(ctx, ["pr", "diff", str(pr), "-R", repo])])
 
 
-def merge_if_green(ctx, repo, pr, base=None) -> bool:
-    """🔴 base 不对（例如 worker 漏写 --base，PR 指向 main）绝不合：合进 main = 上 prod，归用户。"""
+PROTECTED_BASES = {"main", "master"}
+
+
+def merge_if_green(ctx, repo, pr, base=None, main=None) -> bool:
+    """🔴 base 不对（例如 worker 漏写 --base，PR 指向 main）绝不合：合进 main = 上 prod，归用户。
+    硬拦（RV M-7）：要合进的 base（传进来的，或 PR 自己的）是 main / master / 仓库默认分支 main ⇒ 一律不合，
+    配置写错也一样；传进来的 base 不对时连 gh 都不调。"""
+    guarded = PROTECTED_BASES | ({main} if main else set())
+    if base is not None and (not base or base in guarded):
+        return False
     st = pr_status(ctx, repo, pr)
+    if (st["base"] or "") in guarded:
+        return False
     if base and st["base"] != base:
         return False
     if st["merged"]:

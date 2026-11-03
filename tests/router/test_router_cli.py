@@ -815,6 +815,7 @@ def test_closeout_keeps_branch_with_unpushed_commits(proj, monkeypatch):
 #                 | leak_all | silent | pack_only | model_words | recite（只真跑 pack 那条，其余被拒的「输出」是模型照抄的）
 #   SHIM_PROBE    逐个探针改行为，逗号分隔 <探针>=<行为>；探针 pack/deny/sibling/tmp，行为 skip（不执行）
 #                 | leak（读出内容）| nofile（报 No such file）| rc0（报 Operation not permitted 但 exit 0）
+#                 | relative（命令里写相对 -C 目录的路径，真跑样例里模型就写了 `cat readme.txt`）
 #   SHIM_PROMPT_DROP  debug prompt-input 的拒读段少列最后一条（预检 1 完整性）
 #   SHIM_RC       exec 的退出码（默认 0；124 = 超时）
 #   CODEX_LOG     每次调用记一行 {"argv", "cwd", "stdin"}
@@ -905,8 +906,11 @@ if args[:1] == ["exec"]:
                 out, rc = f"cat: {p}: {e.strerror}\n", 1
         else:
             out, rc = f"cat: {p}: Operation not permitted\n", 1
+        shown = os.path.relpath(p, cdir) if how == "relative" else p
+        if how == "relative":
+            out = out.replace(p, shown)
         emit({"type": "item.completed", "item": {"id": f"item_{i}", "type": "command_execution",
-              "command": f"/bin/zsh -lc 'cat {p}'", "aggregated_output": out, "exit_code": rc,
+              "command": f"/bin/zsh -lc 'cat {shown}'", "aggregated_output": out, "exit_code": rc,
               "status": "completed" if rc == 0 else "failed"}})
         said.append(out.rstrip("\n"))
     if mode == "model_words":
@@ -1268,3 +1272,76 @@ def test_start_blocks_issue_body_with_user_quote(proj):                         
     assert any(h.startswith("原话：") for h in out["blocked"][0]["hits"])
     assert [c[c.index("--title") + 1] for c in _creates(proj)] == ["her 周报问题"]   # 只有地图票，T1 没建
     assert not any("violet kettle" in json.dumps(c) for c in proj.gh())
+
+
+def _canary(rv, monkeypatch, mode="emulate", probe=""):
+    monkeypatch.setenv("SHIM_EXEC", mode)
+    monkeypatch.setenv("SHIM_PROBE", probe)
+    out = json.loads(rv.run("review-canary", check=False).stdout)
+    c = json.loads((rv.home / "review" / "canary.json").read_text())
+    return out, c
+
+
+def test_review_canary_judges_real_command_events_not_model_text(rv, monkeypatch):      # F9（RV M-6）
+    out, c = _canary(rv, monkeypatch)
+    assert out["ok"] is True and c["ok"] is True, out
+    ex = [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]][-1]
+    assert "--json" in ex["argv"]                                       # 按真实执行事件判
+    prompt = ex["stdin"]
+    assert not re.search(r"预期|会报错|报错|error|denied", prompt, re.I), prompt   # 不引导模型「该看到什么」
+    text = (rv.home / "review" / "_canary" / "exec.out").read_text()
+    assert "notes.txt: Operation not permitted" in text                 # A6.2 的 grep 在 JSON 输出里照样成立
+    out, c = _canary(rv, monkeypatch, "recite")                          # 只真跑了 pack，其余是模型照抄的 OS 报错
+    assert out["ok"] is False and c["reason"] == "canary_inconclusive", c
+    out, c = _canary(rv, monkeypatch, probe="pack=relative")             # 模型按 cwd 写相对路径：照样算正对照
+    assert out["ok"] is True, c
+
+
+@pytest.mark.parametrize("probe", ["deny=skip", "sibling=skip", "tmp=skip", "pack=skip",
+                                   "deny=nofile", "sibling=nofile", "tmp=nofile",
+                                   "deny=rc0", "sibling=rc0", "tmp=rc0"])
+def test_review_canary_requires_every_probe_judged_by_its_own_command(rv, monkeypatch, probe):   # F9：删任一探针判据 ⇒ 红
+    out, c = _canary(rv, monkeypatch, probe=probe)
+    assert out["ok"] is False and c["ok"] is False and c["reason"] == "canary_inconclusive", (probe, c)
+
+
+@pytest.mark.parametrize("probe,leaked", [("deny=leak", "deny"), ("sibling=leak", "sibling"), ("tmp=leak", "tmp")])
+def test_review_canary_any_fake_token_anywhere_is_a_leak(rv, monkeypatch, probe, leaked):          # F9
+    out, c = _canary(rv, monkeypatch, probe=probe)
+    assert out["ok"] is False and c["reason"] == "canary_leak" and c["leaked"] == [leaked], c
+
+
+@pytest.mark.parametrize("base", ["main", "master", "trunk"])
+def test_start_refuses_when_base_branch_is_main(proj, base):                       # F10（RV M-7）
+    _cfg(proj, base_branch=base, main_branch="trunk")
+    git("push", "-q", "origin", f"HEAD:refs/heads/{base}", cwd=proj.root)          # 远端真有这个分支：只靠配置闸拦
+    proj.out("draft", "--from", str(FIX / "triage.json"))
+    r = proj.run("start", "T1", check=False)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and "base_branch" in out["error"], out
+    assert proj.gh() == [] and proj.state()["tickets"]["T1"]["status"] == "draft"
+
+
+@pytest.mark.parametrize("reason", ["canary_inconclusive", "boundary"])
+def test_review_pack_treats_inconclusive_canary_as_stale_not_failed(rv, reason):        # F11（RV M-8）
+    _offrepo_card(rv)
+    (rv.home / "review" / "canary.json").write_text(json.dumps(
+        {"codex_version": "codex-cli 0.144.4", "ok": False, "reason": reason, "at": "2026-11-02T09:00:00Z"}))
+    out = _pack_out(rv, check_ok=False)
+    assert out["ok"] is False and out["reason"] == "canary_stale", out          # 让 SKILL §4 重跑一次金丝雀
+    assert not (rv.home / "review" / "T1" / "codex.sh").exists()
+
+
+def test_canary_timeout_is_not_success_and_a_rerun_recovers(rv, monkeypatch):           # F11：一次超时不生效到 codex 升级
+    _offrepo_card(rv)
+    monkeypatch.setenv("SHIM_RC", "124")                                  # 输出齐了，但 codex 被 timeout 杀掉（rc=124）
+    out, c = _canary(rv, monkeypatch)
+    assert out["ok"] is False and c["reason"] == "canary_inconclusive" and c["rc"] == 124
+    assert _pack_out(rv, check_ok=False)["reason"] == "canary_stale"
+    monkeypatch.setenv("SHIM_RC", "0")
+    out, c = _canary(rv, monkeypatch)                                     # 补跑一次就恢复
+    assert out["ok"] is True
+    assert _pack_out(rv)["ok"] is True
+    (rv.home / "review" / "canary.json").write_text(json.dumps(          # 只有泄漏才长期判 canary_failed
+        {"codex_version": "codex-cli 0.144.4", "ok": False, "reason": "canary_leak", "at": "2026-11-02T09:00:00Z"}))
+    assert _pack_out(rv, check_ok=False)["reason"] == "canary_failed"

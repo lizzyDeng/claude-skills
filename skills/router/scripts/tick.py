@@ -56,6 +56,12 @@ def _ts(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() if s else 0
 
 
+def _empty_res() -> dict:
+    return {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
+            "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "notified": False,
+            "errors": []}
+
+
 class Run:
     def __init__(self, ctx, root, cfg, state):
         self.ctx, self.root, self.cfg, self.state = ctx, Path(root), cfg, state
@@ -63,9 +69,7 @@ class Run:
         sp = self.home / "surfaces.json"
         self.table = surfaces.load_surfaces(sp) if sp.exists() else {}
         self.now = _iso(ctx.now())
-        self.res = {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
-                    "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "notified": False,
-                    "errors": []}
+        self.res = _empty_res()
         self._base = None              # ensure_base 的结果：每个 Run 只查一次
         self.fail_errors = []          # _fail 写进 errors 的那几条（start 已按结构化 dispatch_failed 报，不再重复）
 
@@ -485,7 +489,7 @@ class Run:
         if hits:
             return self._once(t, "leak_reported", st["head"], tid, "stuck",
                               f"{tid} PR #{pr} 含用户 uid 或原话（{len(hits)} 处），不合；要改掉并重写这条分支的历史")
-        if not github.merge_if_green(self.ctx, repo, pr, base):
+        if not github.merge_if_green(self.ctx, repo, pr, base, main=self.cfg.get("main_branch", "main")):
             fs = t["fail_streak"]
             t["fail_streak"] = {"step": "merge", "count": fs.get("count", 0) + 1 if fs.get("step") == "merge" else 1}
             if t["fail_streak"]["count"] >= 2:
@@ -964,6 +968,9 @@ def _resurface(r):
 
 
 def run(ctx, root, cfg, resurface=False) -> dict:
+    bad = store.base_branch_problem(cfg)
+    if bad:                                      # 配置把 base 写成 main：一步都不走（不派、不合、不重建），只报错
+        return {**_empty_res(), "errors": [bad]}
     home = home_for(root)
     with store.locked(home):
         state = store.load_state(home / "state.json")

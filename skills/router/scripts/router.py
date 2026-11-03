@@ -277,6 +277,9 @@ def cmd_add(a, env):
 
 def cmd_start(a, env):
     import tick
+    bad = store.base_branch_problem(env.cfg)
+    if bad:                                           # 在任何 GitHub 写入、任何 git 操作之前
+        raise Fail(bad)
     repo = env.cfg["repo"]
     blocked, errors, warnings, started = [], [], [], []
     with env.locked():

@@ -1353,3 +1353,12 @@ def test_unverified_intent_occupies_a_slot(proj):                               
     s = proj.state()
     assert scheduler.free_slots(s, {"heavy": 3, "light": 1})["light"] == 0
     assert surfaces.held_locks(s).get("weekly-report") == "T1"
+
+
+def test_tick_refuses_to_merge_when_base_branch_is_main(proj):                           # F10（RV M-7）
+    proj.cfg["base_branch"] = "main"
+    _verifying(proj, "gh_pr_wrong_base.json")                             # PR 指向 main、CI 全绿
+    res = proj.run()
+    assert not proj.ctx.calls_with("pr", "merge") and not _pushes(proj)
+    assert any("base_branch" in e for e in res["errors"])
+    assert proj.state()["tickets"]["T1"]["status"] == "verifying"

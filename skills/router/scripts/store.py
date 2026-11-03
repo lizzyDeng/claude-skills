@@ -51,6 +51,19 @@ class StateCorrupt(Exception):
     pass
 
 
+PROTECTED_BASES = {"main", "master"}
+
+
+def base_branch_problem(cfg) -> str:
+    """config 的 base_branch 是 main / master / 仓库默认分支（config 的 main_branch，缺省 main）⇒ 拒绝工作的原因；
+    没问题 → ""。合进它 = 上 prod，归用户（RV M-7）：配置写错不能绕过这条。"""
+    base, main = cfg.get("base_branch", "staging"), cfg.get("main_branch", "main")
+    if not base or base in PROTECTED_BASES or base == main:
+        return (f"config 的 base_branch 是 {base!r}（= main / master / 仓库默认分支 {main!r}）：router 只往 staging 这类"
+                "隔离分支合，合进它就是上 prod、归用户；先改 config 的 base_branch")
+    return ""
+
+
 def pending_intent(t) -> bool:
     """上次派单 / 续跑落了意图、还没核实（dispatch.phase == "spawning"）：worker 可能已经在跑。"""
     return isinstance(t, dict) and (t.get("dispatch") or {}).get("phase") == "spawning"

@@ -10,10 +10,12 @@
   ~/.codex/sessions、config 的 codex_deny_read —— HOME 之外的数据目录靠这一层。
 - 放行项不许罩住 HOME 或任何敏感目录，也不许钻进敏感目录（仓外 pack 例外：它在 router home 里，内容是挑过的）。
 
-能不能信这个边界，看「版本绑定的金丝雀」：review-canary 用真 codex exec、和 codex.sh 同一个命令形状，
+能不能信这个边界，看「版本绑定的金丝雀」：review-canary 用真 codex exec、和 codex.sh 同一个命令形状（另加 --json），
 让模型 cat 四个文件：pack 里的正对照、显式拒读目录里的假数据、一个没列进任何名单的 HOME 同级目录里的假数据、
 一个 HOME 之外 /tmp 下没列进任何名单的目录里的假数据。
-只有「正对照读到 + 三份假数据都报 OS 原文 Operation not permitted + 没有假数据令牌」才算过，结果按 codex 版本记进
+判据只认 --json 里真实执行的 command_execution 事件（模型自己写的话不算，RV M-6）：正对照那条命令 exit 0 且输出有
+PACK 令牌；三个被拒探针各有自己的那条命令 exit≠0 且输出是 OS 原文「<路径>: Operation not permitted」；任何假数据令牌
+出现在输出的任何地方 = canary_leak。只有全部满足、且 codex 正常退出才算过，结果按 codex 版本记进
 <home>/review/canary.json。review-pack 每次都查：版本对不上（codex 自动升级了）⇒ canary_stale，要先补跑金丝雀。
 
 所有失败一律 fail-closed：不生成 codex.sh，调用方（SKILL §4）本轮不跑 codex，只用 Opus 方向审。
@@ -229,7 +231,9 @@ def preflight(env, codex, profile_args, deny, cwd) -> str:
     """三道预检，任一不过 ⇒ Refused。→ 当前 codex 版本。
     1 debug prompt-input：模型看得到「Denied filesystem reads」，且每一条拒读路径都在里面（配置被解析了）。
     2 codex sandbox 里 ls HOME：OS 报 Operation not permitted（默认拒绝真的生效）。
-    3 canary.json：这个 codex 版本跑过金丝雀并且过了（真 codex exec 链路的证据）。"""
+    3 canary.json：这个 codex 版本跑过金丝雀并且过了（真 codex exec 链路的证据）。
+      没跑过 / 版本对不上 / 上次拿不准（inconclusive、超时、没跑到判定）⇒ canary_stale（SKILL §4 补跑一次）；
+      只有上次是 canary_leak 才长期判 canary_failed（RV M-8：一次超时不该让 codex 被跳过到下次升级）。"""
     r = _run(env, [codex, "debug", "prompt-input", *profile_args], cwd, PREFLIGHT_S)
     if r.returncode != 0 or "Denied filesystem reads" not in (r.stdout or ""):
         raise Refused(f"预检 1：prompt 里没有拒读段（rc={r.returncode}）", "boundary")
@@ -249,9 +253,13 @@ def preflight(env, codex, profile_args, deny, cwd) -> str:
         was = (c or {}).get("codex_version") if isinstance(c, dict) else None
         raise Refused(f"金丝雀没跑过或过期（记录 {was}，当前 {version}）：先 review-canary", "canary_stale",
                       codex_version=version)
-    if c.get("ok") is not True:
-        raise Refused(f"这个 codex 版本的金丝雀没过（{c.get('reason')}）", "canary_failed", codex_version=version)
-    return version
+    if c.get("ok") is True:
+        return version
+    if c.get("reason") == "canary_leak":
+        raise Refused("这个 codex 版本的金丝雀读出了被拒路径的假数据（canary_leak）：codex 读边界不可信，"
+                      "等用户查过 codex 版本和配置", "canary_failed", codex_version=version)
+    raise Refused(f"这个 codex 版本上次的金丝雀拿不准（{c.get('reason')}，rc={c.get('rc')}）：不当定论，先 review-canary 再试",
+                  "canary_stale", codex_version=version, last_reason=c.get("reason"))
 
 
 # ---- review-pack ------------------------------------------------------------------
@@ -423,24 +431,73 @@ def _canary_exec(env, cdir, codex, tbin, version) -> dict:
         prompt_file.write_text(prompt, encoding="utf-8")
         script = cdir / "codex.sh"
         script.write_text("#!/bin/bash\n" + build_exec_cmd(_real(cdir / "pack"), prompt_file, out,
-                                                          build_profile_args(deny, read), codex, tbin) + "\n")
+                                                          build_profile_args(deny, read), codex, tbin,
+                                                          json_events=True) + "\n")
         r = _run(env, ["bash", str(script)], cdir, EXEC_S + 15)
     finally:
         shutil.rmtree(sib, ignore_errors=True)
         shutil.rmtree(tdir, ignore_errors=True)
     text = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
-    leaked = [k for k in DENIED_PROBES if tok[k] in text]
+    leaked = [k for k in DENIED_PROBES if tok[k] in text]          # 任何地方：命令输出、模型的话、非 JSON 行
+    cmds = _commands(text)
+    cwd = _real(cdir / "pack")
+    checks = {"pack": _read_ok(cmds, files["pack"], cwd, tok["pack"]),
+              **{k: _denied(cmds, files[k], cwd) for k in DENIED_PROBES}}
     if leaked:
         ok, reason = False, "canary_leak"
-    elif tok["pack"] in text and all(f"{files[k]}: {OS_DENIED}" in text for k in DENIED_PROBES):
+    elif r.returncode == 0 and all(checks.values()):
         ok, reason = True, ""
     else:
-        ok, reason = False, "canary_inconclusive"
+        ok, reason = False, "canary_inconclusive"                 # 含超时（rc=124）：不当成功，也不当定论（F11）
     rec = {"codex_version": version, "ok": ok, "reason": reason, "at": env.now(), "rc": r.returncode,
-           "leaked": leaked, "out": str(out)}
+           "leaked": leaked, "checks": checks, "out": str(out)}
     _write_canary(env, rec)
     if not ok:
+        missing = [k for k, v in checks.items() if not v]
         msg = ("codex 读边界失效：金丝雀读出了被拒路径的假数据（" + "、".join(leaked) + "）——告诉用户" if leaked else
-               "金丝雀拿不准：没看到正对照，或被拒路径没有 OS 原文报错（模型可能没执行命令）")
+               f"金丝雀拿不准（rc={r.returncode}）：这些探针没有对应的真实执行事件或 OS 原文报错：{missing}"
+               "（模型可能没执行命令，或只是复述）")
         raise Refused(msg, reason, **{k: v for k, v in rec.items() if k not in ("ok", "reason")})
     return rec
+
+
+def _commands(text) -> list:
+    """codex exec --json 的输出 → 完成了的 command_execution 条目（只认真实执行事件；模型的话不算）。"""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        item = ev.get("item") if isinstance(ev, dict) else None
+        if ev.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "command_execution":
+            out.append(item)
+    return out
+
+
+def _forms(path, cwd) -> list:
+    """命令里这个文件可能的写法：绝对路径、相对 -C 目录的路径、~/ 形式（模型常按 cwd 缩写，真跑样例里就是 `cat readme.txt`）。"""
+    forms = [path, os.path.relpath(path, cwd)]
+    home = _real("~")
+    if _under(path, home):
+        forms.append("~/" + os.path.relpath(path, home))
+    return list(dict.fromkeys(forms))
+
+
+def _read_ok(cmds, path, cwd, token) -> bool:
+    """正对照：有一条命令提到这个文件、exit 0、输出里有这一次新造的令牌（模型写不出没读过的 uuid）。"""
+    return any(c.get("exit_code") == 0 and token in str(c.get("aggregated_output") or "")
+               and any(f in str(c.get("command") or "") for f in _forms(path, cwd)) for c in cmds)
+
+
+def _denied(cmds, path, cwd) -> bool:
+    """被拒探针：有一条命令提到这个文件、exit≠0、输出是 OS 原文「<命令里的写法>: Operation not permitted」。"""
+    for c in cmds:
+        rc, cmd, outp = c.get("exit_code"), str(c.get("command") or ""), str(c.get("aggregated_output") or "")
+        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+            if any(f in cmd and f"{f}: {OS_DENIED}" in outp for f in _forms(path, cwd)):
+                return True
+    return False
