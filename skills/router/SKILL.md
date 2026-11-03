@@ -96,6 +96,8 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 | 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
 | 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2`（写进周报 releases.json） |
 
+`tell --resume` / 会唤醒 worker 的 `answer` / `stop` / `takeover` / `handback` / `submit-card` 报「派单待核实」（上次起 worker 没落完盘，后台可能已有一个在跑）或「查不到它的启动时间」（ps 失败）：不要重试、不要手动起 worker，等下一轮巡检对账后再执行同一条命令。
+
 ## 7. 回复用户的规矩
 
 - 每条 ≤ 100 字；决定单要列全，按「挡住了几张票」排序。
@@ -106,7 +108,7 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 
 - **prod 只读**：worker 只写 staging；写过 staging 数据的票必须在同一个 run 里回滚。`supercli db execute` 已在 worker 配置里禁用。
 - **用户 uid 和原话不进 GitHub**：建票和留言都过防泄漏闸（`leak_guard_globs`），命中就拒。worker 要证据，给本地路径。
-- **合 staging 只在 CI 检查非空且全部通过时**，由 tick 做；不许 `gh pr merge --auto`（staging 没有必需检查，`--auto` 会立刻合）。另外三道闸：方向卡没经用户确认不合；PR 的 base 不是 `base_branch`（例如漏写 `--base` 指向了 main）不合；PR 标题 / 正文 / diff 里有用户 uid 或原话不合。
+- **合 staging 只在 CI 检查非空且全部通过时**，由 tick 做；不许 `gh pr merge --auto`（staging 没有必需检查，`--auto` 会立刻合）。另外几道闸：方向卡没经用户确认不合；PR 的 base 不是 `base_branch`（例如漏写 `--base` 指向了 main）不合；PR 标题 / 正文 / diff 里有用户 uid 或原话不合；远端 `base_branch` 是认不出的 tip（决定单里的 base 项）时不合、也不叫 worker rebase。config 的 `base_branch` 写成 main / master / `main_branch` ⇒ start 和巡检一律拒绝工作（报错），先改 config。
 - 不给用户自己开的 session 下指令；只登记、只转交。
 - 你不改仓库代码、不自己定解法；派的是问题和证据。
 

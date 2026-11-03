@@ -39,6 +39,13 @@
       "why_text": "",
       "value": 0.12
     },
+    "m_gain": {
+      "v": "better",
+      "z": 2.7,
+      "why": [],
+      "why_text": "",
+      "value": 0.55
+    },
     "m_hz": {
       "v": "up_unconfirmed",
       "z": 2.6,
@@ -47,6 +54,15 @@
       ],
       "why_text": "口径变更，封顶未确认",
       "value": 0.44
+    },
+    "m_sag": {
+      "v": "down_unconfirmed",
+      "z": -2.3,
+      "why": [
+        "after_has:#9003"
+      ],
+      "why_text": "后窗含 #9003",
+      "value": 0.48
     },
     "m_trend": {
       "v": "no_release",

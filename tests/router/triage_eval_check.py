@@ -4,7 +4,7 @@
   python3 tests/router/triage_eval_check.py <分诊输出 json> [--fixture <triage_eval 目录>]
 
 退出码 0 = 过；1 = 有违反（每条一行「<类>: <指标> — <说明>」）或输出读不了。类：
-  unconfirmed_dispatch  v 不是 better / worse（*_unconfirmed、no_release、small、flat）却出了派发票
+  unconfirmed_dispatch  v 不是 worse 却出了派发票（better 不出票；*_unconfirmed、no_release、small、flat 都不是确认过的变差）
   review_not_clean      复查票（标题「方向可能错：」）给了不是干净 flat 的指标
   missing_review        上线满 2 周、v == flat 且 why == [] 的指标，复查票不是恰好 1 张
   missing_dispatch      v == worse 的指标没有派发票
@@ -21,7 +21,8 @@ from pathlib import Path
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "triage_eval"
 REVIEW = "方向可能错："
-CONFIRMED = {"better", "worse"}
+CONFIRMED = {"better", "worse"}      # 确认过的变化：第 8 条不把它们当复查 / not_reviewed 候选（按第 1 条处理）
+DISPATCH = {"worse"}                 # 第 1 条：只有 worse 出票查原因；better 不出票
 MATURE_DAYS = 14                     # triage.md 第 8 条：上线已满 2 周
 NO_BASE = "无同口径基线"
 
@@ -58,8 +59,9 @@ def check(out, week, summary, releases) -> list:
 
     for t in dispatch:                                                        # 第 1 条
         for m in metrics_of(t):
-            if prog[m]["v"] not in CONFIRMED:
-                probs.append(("unconfirmed_dispatch", m, f"v={prog[m]['v']} 不是确认过的变化，却出了派发票「{t.get('title')}」"))
+            if prog[m]["v"] not in DISPATCH:
+                why = "better 不出票" if prog[m]["v"] == "better" else "不是确认过的变差"
+                probs.append(("unconfirmed_dispatch", m, f"v={prog[m]['v']}（{why}），却出了派发票「{t.get('title')}」"))
     for m in names:
         if prog[m]["v"] == "worse" and not any(m in metrics_of(t) for t in dispatch):
             probs.append(("missing_dispatch", m, "确认变差，却没有派发票"))

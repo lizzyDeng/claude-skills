@@ -30,6 +30,7 @@ STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overrea
 # 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
 # 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
 RECEIPT_GRACE_S = 60
+BASE_BLOCK_TAIL = "：先不合、不叫 worker rebase / 修 CI"     # 第 5 步被远端 base 挡住时 waiting_for 的结尾
 # router 自己做、只记一条 decide 的两件事（重建 base、改回被自动改指的 PR）共用的授权说明
 AUTO_FIX_WHY = "用户 11-02 长期授权：base 被删时从 main 重建、改回被 GitHub 自动改指的 router PR、记一条 decide"
 
@@ -441,7 +442,7 @@ class Run:
         b = self.ensure_base()
         if b["ok"]:
             return False
-        t["waiting_for"] = f"{b['wait'] or b['error'] or '远端 base 有问题'}：先不合、不叫 worker rebase / 修 CI"
+        t["waiting_for"] = f"{b['wait'] or b['error'] or '远端 base 有问题'}{BASE_BLOCK_TAIL}"
         return True
 
     def _verify(self, tid, t, repo, base, guard):
@@ -449,6 +450,8 @@ class Run:
             return                                # 续跑待核实：worker 可能在跑，等对账
         if launcher.worker_liveness(self.ctx, t["worker"]) != "dead":
             return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）或认不出：等它退出
+        if str(t.get("waiting_for") or "").endswith(BASE_BLOCK_TAIL):
+            t["waiting_for"] = store.DEFAULT_WAIT[store.VERIFYING]   # 上一轮被 base 挡住的说明：这一轮重新判
         if not t.get("card_confirmed"):
             self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
                        f"{tid}：方向卡没经你确认，PR 不合")

@@ -299,3 +299,22 @@ def test_triage_eval_template_documents_not_reviewed_and_baseline_rule():       
     assert "not_reviewed" in text and "无同口径基线" in text
     rule = [b for b in _rules(text).values() if "prior_same_instrument" in b]
     assert rule and "baseline.instrument" in rule[0]
+
+
+def test_triage_eval_checker_flags_dispatch_for_better_and_down_unconfirmed(tmp_path):   # F13（RV I3-9）
+    week, summary, releases = _fixture()
+    prog = summary["progress"]
+    better = [m for m, p in prog.items() if p["v"] == "better"]
+    down = [m for m, p in prog.items() if p["v"] == "down_unconfirmed"]
+    assert better and down, "夹具要各有一个 better 和 down_unconfirmed 指标"
+    assert not (set(better) | set(down)) & {m for r in releases for m in r["metrics"]}   # 不碰 releases 里的判定
+    assert [m for m in down if abs(prog[m]["z"]) >= 2]                    # 被封顶的「显著下降」
+    rc, text = _check(tmp_path, _good())
+    assert rc == 0, text
+    for m in better + down:                                               # 规则 1：better 不出票，*_unconfirmed 不单独出票
+        bad = _good(); bad["tickets"].append(_ticket(f"{m} 变化", m))
+        rc, text = _check(tmp_path, bad)
+        assert rc == 1 and _flagged(text, "unconfirmed_dispatch", m), (m, text)
+        held = _good(); held["tickets"].append(_ticket(f"{m} 提醒", m, decision="hold"))  # 要提醒就 hold：不算违反
+        rc, text = _check(tmp_path, held)
+        assert rc == 0, (m, text)

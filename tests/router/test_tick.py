@@ -1387,3 +1387,19 @@ def test_receipt_with_other_session_id_is_not_adopted(proj):                    
     assert t["dispatch"]["phase"] == "spawning" and t["worker"].get("pid") is None
     assert "session 对不上" in t["dispatch"]["unverified"] and len(_t1_errors(res)) == 1
     assert 10042 in proj.ctx.alive
+
+
+def test_base_block_note_is_cleared_once_base_heals(proj):                               # F7：说明不残留
+    _verifying(proj, "gh_pr_green.json")
+    _foreign_tip_open(proj)
+    proj.run()
+    assert "先不合" in proj.state()["tickets"]["T1"]["waiting_for"]
+    s = proj.state()
+    s["queue"] = []
+    s["base_problem"]["qid"] = None                                      # 你回答了 Q1
+    store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(_ls(proj, "staging"), _present(M)[0])               # 远端改回了 M
+    proj.ctx.script(["gh", "pr", "view"], (FIX / "gh_pr_pending.json").read_text())   # CI 还在跑
+    proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "verifying" and t["waiting_for"] == "等 CI"

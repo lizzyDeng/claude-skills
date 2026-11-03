@@ -24,7 +24,7 @@ def _write_receipt(path: Path, sid: str) -> None:
     try:
         r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=10)
-        start = r.stdout.strip() or None
+        start = (r.stdout.strip() or None) if r.returncode == 0 else None   # rc≠0：不拿半截输出当启动时间
     except (OSError, subprocess.SubprocessError):
         start = None                           # 查不到启动时间：回执照写，router 对账时按「判活失败」处理
     body = json.dumps({"session_id": sid, "pid": pid, "pid_start": start,

@@ -230,3 +230,26 @@ def test_cleanup_keeps_branch_when_worktree_kept(tmp_path):
     (wt / "dirty.txt").write_text("x\n")
     res = launcher.cleanup_ticket_checkout(Ctx(), root, str(wt), "router/T1")
     assert res["branch"].startswith("kept") and _branch_exists(root, "router/T1")
+
+
+# ---- FX：终审后修复轮 ------------------------------------------------------------------------
+
+def test_receipt_wrapper_does_not_record_partial_ps_output_as_start_time(tmp_path, monkeypatch):   # F5 同类：ps rc≠0
+    import json
+    import exec_receipt
+    monkeypatch.setattr(exec_receipt.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 124, "Mon Nov  2 10:00:00 2026\n", "timeout"))
+    r = tmp_path / "T1-1.receipt.json"
+    exec_receipt._write_receipt(r, "sid-a")
+    rec = json.loads(r.read_text())
+    assert rec["session_id"] == "sid-a" and rec["pid_start"] is None    # 查不到 ⇒ None（对账按「认不出」处理），不记半截输出
+
+
+def test_worker_liveness_is_three_state(fake):                                       # F5（RV M-2）
+    fake.alive.add(55)
+    assert launcher.worker_liveness(fake, {"pid": 55, "pid_start": fake.proc_start(55)}) == "alive"
+    assert launcher.worker_liveness(fake, {"pid": 55, "pid_start": "Mon Nov  2 01:00:00 2026"}) == "dead"   # pid 被复用
+    assert launcher.worker_liveness(fake, {"pid": 56, "pid_start": "x"}) == "dead"
+    fake.starts = {55: None}                                                          # ps 失败 / 超时
+    assert launcher.worker_liveness(fake, {"pid": 55, "pid_start": "start-55"}) == "unknown"
+    assert launcher.worker_alive(fake, {"pid": 55, "pid_start": "start-55"}) is False
