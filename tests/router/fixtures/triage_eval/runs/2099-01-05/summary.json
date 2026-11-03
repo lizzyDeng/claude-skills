@@ -1,0 +1,166 @@
+{
+  "week": "2099-01-05",
+  "instrument": "syn-a",
+  "baseline": {
+    "instrument": "syn-b",
+    "week": "2098-12-08",
+    "metrics": {
+      "m_flat_clean": {
+        "value": 0.37
+      },
+      "m_steady": {
+        "value": 0.58
+      },
+      "m_flat_dirty": {
+        "value": 0.27
+      },
+      "m_worse": {
+        "value": 0.47
+      }
+    }
+  },
+  "prior_same_instrument": {
+    "instrument": "syn-a",
+    "week": "2098-12-22",
+    "metrics": {
+      "m_flat_clean": {
+        "value": 0.29
+      },
+      "m_flat_dirty": {
+        "value": 0.31
+      }
+    }
+  },
+  "progress": {
+    "m_worse": {
+      "v": "worse",
+      "z": -2.8,
+      "why": [],
+      "why_text": "",
+      "value": 0.12
+    },
+    "m_hz": {
+      "v": "up_unconfirmed",
+      "z": 2.6,
+      "why": [
+        "instrument"
+      ],
+      "why_text": "口径变更，封顶未确认",
+      "value": 0.44
+    },
+    "m_trend": {
+      "v": "no_release",
+      "z": 2.4,
+      "why": [
+        "no_release"
+      ],
+      "why_text": "无针对上线",
+      "value": 0.71
+    },
+    "m_small": {
+      "v": "small",
+      "z": 0.9,
+      "why": [
+        "window_short"
+      ],
+      "why_text": "窗口不足，证据不足",
+      "value": 0.83
+    },
+    "m_flat_dirty": {
+      "v": "flat",
+      "z": 0.3,
+      "why": [
+        "instrument",
+        "crossing:1"
+      ],
+      "why_text": "口径变更；敏感性翻转 1 次",
+      "value": 0.26
+    },
+    "m_flat_clean": {
+      "v": "flat",
+      "z": 0.1,
+      "why": [],
+      "why_text": "",
+      "value": 0.41
+    },
+    "m_steady": {
+      "v": "flat",
+      "z": -0.2,
+      "why": [],
+      "why_text": "",
+      "value": 0.64
+    },
+    "m_ex_inst": {
+      "v": "flat",
+      "z": 0.2,
+      "why": [
+        "instrument"
+      ],
+      "why_text": "口径变更",
+      "value": 0.15
+    },
+    "m_ex_miss": {
+      "v": "flat",
+      "z": -0.1,
+      "why": [
+        "instrument_missing"
+      ],
+      "why_text": "缺口径记录",
+      "value": 0.17
+    },
+    "m_ex_before": {
+      "v": "flat",
+      "z": 0.4,
+      "why": [
+        "before_has:#9001"
+      ],
+      "why_text": "前窗含 #9001",
+      "value": 0.19
+    },
+    "m_ex_after": {
+      "v": "flat",
+      "z": -0.3,
+      "why": [
+        "after_has:#9002"
+      ],
+      "why_text": "后窗含 #9002",
+      "value": 0.21
+    },
+    "m_ex_cross": {
+      "v": "flat",
+      "z": 0.5,
+      "why": [
+        "crossing:2"
+      ],
+      "why_text": "敏感性翻转 2 次",
+      "value": 0.23
+    },
+    "m_ex_window": {
+      "v": "flat",
+      "z": 0.0,
+      "why": [
+        "window_short"
+      ],
+      "why_text": "窗口不足 7 天",
+      "value": 0.33
+    },
+    "m_ex_erased": {
+      "v": "flat",
+      "z": 0.6,
+      "why": [
+        "evidence_erased"
+      ],
+      "why_text": "证据被清",
+      "value": 0.35
+    },
+    "m_ex_immature": {
+      "v": "flat",
+      "z": -0.4,
+      "why": [
+        "immature"
+      ],
+      "why_text": "样本未成熟",
+      "value": 0.39
+    }
+  }
+}
