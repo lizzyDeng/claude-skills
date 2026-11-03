@@ -1107,3 +1107,87 @@ def test_closeout_guard_empty_keeps_issue_pending_without_error_spam(proj):
     w = proj.state()["tickets"]["T1"]["worker"]
     assert w["worktree"] is None and w["branch"] is None
     assert _t1_errors(r1) and _t1_errors(r2) == []                                      # 只在第 1 轮报
+
+
+# ---- FX：终审后修复轮 ------------------------------------------------------------------------
+
+def _t1_spawns(p, tid="T1"):
+    return [x for x in p.ctx.spawn_attempts if x["env"].get("ROUTER_TICKET") == tid]
+
+
+def _enospc(path, state):
+    raise OSError(28, "No space left on device")
+
+
+def _error_exit(proj):
+    """T1 在执行中，pid 123 已报错退出 ⇒ 第 2 步要续跑它一次。"""
+    L = log_with(proj, "T1", '{"type":"result","is_error":true,"result":"boom"}')
+    proj.put(T1=running("executing", ["weekly-report"], pid=123, log=L))
+
+
+def test_resume_when_every_save_fails_then_recovers_spawns_once(proj, monkeypatch):     # F1（RV I-1）
+    _error_exit(proj)
+    real = store.save_state
+    monkeypatch.setattr(store, "save_state", _enospc)
+    with contextlib.suppress(OSError):
+        proj.run()
+    monkeypatch.setattr(store, "save_state", real)
+    proj.run()                                                           # watch 重启后的下一轮
+    assert len(_t1_spawns(proj)) == 1                                    # 该票总共只起 1 个 worker
+    t = proj.state()["tickets"]["T1"]
+    assert t["worker"]["pid"] == proj.ctx.spawned[0]["pid"] and "dispatch" not in t
+
+
+def test_resume_crash_after_spawn_is_adopted_by_receipt_not_respawned(proj, monkeypatch):   # F1
+    _error_exit(proj)
+    real = store.save_state
+
+    def crash(path, state):                                              # 意图落得了盘；起了进程之后的存盘全失败
+        if state["tickets"]["T1"]["worker"].get("pid") == 10000:
+            raise OSError(28, "No space left on device")
+        real(path, state)
+    monkeypatch.setattr(store, "save_state", crash)
+    with contextlib.suppress(OSError):
+        proj.run()
+    monkeypatch.setattr(store, "save_state", real)
+    assert len(_t1_spawns(proj)) == 1
+    disk = proj.state()["tickets"]["T1"]
+    it = disk["dispatch"]                                                # 盘上留着续跑意图（带回执路径）
+    assert it["phase"] == "spawning" and it["session_id"] == "sid" and it["receipt"]
+    _write_receipt(it["receipt"], "sid", 10000, proj.ctx.proc_start(10000))
+    proj.run()
+    assert len(_t1_spawns(proj)) == 1                                    # 按回执认领，不重起
+    t = proj.state()["tickets"]["T1"]
+    assert t["worker"]["pid"] == 10000 and t["status"] == "executing" and "dispatch" not in t
+
+
+def test_foreground_resume_crash_after_spawn_never_starts_second_worker(proj, monkeypatch):   # F1（router._resume）
+    import router
+    proj.put(T1=("paused", ["weekly-report"], {"card_confirmed": True,
+                                                "worker": {"session_id": "sid", "worktree": str(proj.root / "wt"),
+                                                           "branch": "router/T1", "runs": 1}}))
+    s = proj.state()
+    store.push_queue(s, "T1", "direction", "T1：要不要继续", T0)
+    store.save_state(proj.home / "state.json", s)
+    (proj.home / "config.json").write_text(json.dumps(proj.cfg))
+    real = store.save_state
+
+    def crash(path, state):
+        if state["tickets"]["T1"]["worker"].get("pid") == 10000:
+            raise OSError(28, "No space left on device")
+        real(path, state)
+    monkeypatch.setattr(store, "save_state", crash)
+    with pytest.raises(OSError):
+        router.cmd_answer(argparse.Namespace(qid="Q1", text="继续", reject=False), router.Env(proj.root, proj.ctx))
+    monkeypatch.setattr(store, "save_state", real)
+    assert len(_t1_spawns(proj)) == 1
+    with pytest.raises(router.Fail):                                     # 用户以为没生效、再答一次：不起第二个
+        router.cmd_answer(argparse.Namespace(qid="Q1", text="继续", reject=False), router.Env(proj.root, proj.ctx))
+    with pytest.raises(router.Fail):
+        router.cmd_tell(argparse.Namespace(ticket="T1", text="继续", resume=True), router.Env(proj.root, proj.ctx))
+    it = proj.state()["tickets"]["T1"]["dispatch"]
+    _write_receipt(it["receipt"], "sid", 10000, proj.ctx.proc_start(10000))
+    proj.run()
+    assert len(_t1_spawns(proj)) == 1
+    t = proj.state()["tickets"]["T1"]
+    assert t["worker"]["pid"] == 10000 and t["status"] == "executing" and "dispatch" not in t

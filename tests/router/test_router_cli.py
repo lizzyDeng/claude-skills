@@ -810,9 +810,15 @@ def test_closeout_keeps_branch_with_unpushed_commits(proj, monkeypatch):
 # 假 codex：按 argv 里的 `-c permissions.router_review.filesystem={"<路径>"="deny|read", …}` 模拟沙箱
 # （最长前缀生效；不在任何条目下 = :read-only 默认可读）。exec 读 stdin 里的 `cat <路径>` 照策略「执行」。
 #   SHIM_VERSION  --version 的输出                 SHIM_SANDBOX=leak  sandbox 预检读到了内容（边界没生效）
-#   SHIM_EXEC     answer（默认，回审查结论）| emulate（按策略执行 cat）| ignore_home（假装拒读 HOME 那条不存在）
-#                 | leak_all | silent | pack_only | model_words
+#   SHIM_EXEC     answer（默认，回审查结论）| emulate（按策略执行 cat）| ignore_home（假装拒读 HOME 及罩住 HOME 的根都不存在）
+#                 | leak_all | silent | pack_only | model_words | recite（只真跑 pack 那条，其余被拒的「输出」是模型照抄的）
+#   SHIM_PROBE    逐个探针改行为，逗号分隔 <探针>=<行为>；探针 pack/deny/sibling/tmp，行为 skip（不执行）
+#                 | leak（读出内容）| nofile（报 No such file）| rc0（报 Operation not permitted 但 exit 0）
+#   SHIM_PROMPT_DROP  debug prompt-input 的拒读段少列最后一条（预检 1 完整性）
+#   SHIM_RC       exec 的退出码（默认 0；124 = 超时）
 #   CODEX_LOG     每次调用记一行 {"argv", "cwd", "stdin"}
+# exec 带 --json 时照 codex-cli 0.144.4 的 JSONL 事件输出：command_execution（command / aggregated_output /
+# exit_code）与 agent_message（text）；不带就输出纯文本。
 CODEX_SHIM = r'''#!/usr/bin/env python3
 import json, os, re, sys
 args = sys.argv[1:]
@@ -844,9 +850,11 @@ if args[:1] == ["--version"]:
 if args[:2] == ["debug", "prompt-input"]:
     record()
     print("<permissions>\nThe active permission profile denies reading these paths. Denied filesystem reads:")
-    for k, m in profile().items():
-        if m == "deny":
-            print(f'- {k} escalatable="false"')
+    denied = [k for k, m in profile().items() if m == "deny"]
+    if os.environ.get("SHIM_PROMPT_DROP"):
+        denied = denied[:-1]
+    for k in denied:
+        print(f'- {k} escalatable="false"')
     sys.exit(0)
 if args[:1] == ["sandbox"]:
     record()
@@ -862,23 +870,54 @@ if args[:1] == ["exec"]:
         print(json.dumps({"pass": True, "challenges": []})); sys.exit(0)
     cdir = real(args[args.index("-C") + 1]) if "-C" in args else os.getcwd()
     fs = profile()
-    if mode == "ignore_home":
-        fs = {k: v for k, v in fs.items() if k != real("~")}
-    for p in re.findall(r"cat\s+['\"`]?([^\s'\"`]+)", stdin):
+    if mode == "ignore_home":                                   # 默认拒绝那一层没生效：HOME 和罩住 HOME 的根都不算
+        h = real("~")
+        fs = {k: v for k, v in fs.items() if not (h == k or h.startswith(k.rstrip("/") + "/"))}
+    per = dict(x.split("=", 1) for x in os.environ.get("SHIM_PROBE", "").split(",") if "=" in x)
+    def kind(p):
+        if "/_canary/pack/" in p: return "pack"
+        if "/_canary/deny/" in p: return "deny"
+        if "router-canary-probe-" in p: return "tmp"
+        if "/.router-canary-probe/" in p: return "sibling"
+        return "other"
+    as_json = "--json" in args
+    events, said = [], []
+    def emit(o):
+        events.append(o)
+    emit({"type": "thread.started", "thread_id": "shim"}); emit({"type": "turn.started"})
+    for i, p in enumerate(re.findall(r"cat\s+['\"`]?([^\s'\"`]+)", stdin)):
         inside = real(p).startswith(cdir.rstrip("/") + "/")
-        if mode == "silent" or (mode in ("pack_only", "model_words") and not inside):
+        how = per.get(kind(p), "")
+        if how == "skip" or mode == "silent" or (mode in ("pack_only", "model_words", "recite") and not inside):
+            if mode == "recite" and not inside:
+                said.append(f"cat: {p}: Operation not permitted")
             continue
-        allowed = mode in ("leak_all", "pack_only", "model_words") or mode_of(fs, p) != "deny"
-        if allowed:
+        allowed = mode in ("leak_all", "pack_only", "model_words", "recite") or how == "leak" or mode_of(fs, p) != "deny"
+        if how == "nofile":
+            out, rc = f"cat: {p}: No such file or directory\n", 1
+        elif how == "rc0":
+            out, rc = f"cat: {p}: Operation not permitted\n", 0
+        elif allowed:
             try:
-                print(open(p).read())
+                out, rc = open(p).read(), 0
             except OSError as e:
-                print(f"cat: {p}: {e.strerror}")
+                out, rc = f"cat: {p}: {e.strerror}\n", 1
         else:
-            print(f"cat: {p}: Operation not permitted")
+            out, rc = f"cat: {p}: Operation not permitted\n", 1
+        emit({"type": "item.completed", "item": {"id": f"item_{i}", "type": "command_execution",
+              "command": f"/bin/zsh -lc 'cat {p}'", "aggregated_output": out, "exit_code": rc,
+              "status": "completed" if rc == 0 else "failed"}})
+        said.append(out.rstrip("\n"))
     if mode == "model_words":
-        print("这个路径被策略 denied / Permission denied，我不去读它。")
-    sys.exit(0)
+        said.append("这个路径被策略 denied / Permission denied，我不去读它。")
+    emit({"type": "item.completed", "item": {"id": "item_last", "type": "agent_message", "text": "\n".join(said)}})
+    emit({"type": "turn.completed"})
+    if as_json:
+        for o in events:
+            print(json.dumps(o, ensure_ascii=False))
+    else:
+        print("\n".join(said))
+    sys.exit(int(os.environ.get("SHIM_RC", "0")))
 print("unknown", args, file=sys.stderr); sys.exit(2)
 '''
 
@@ -912,7 +951,7 @@ def rv(proj, monkeypatch):
     monkeypatch.setenv("HOME", str(t))
     (t / "bin" / "codex").write_text(CODEX_SHIM); (t / "bin" / "codex").chmod(0o755)
     monkeypatch.setenv("CODEX_LOG", str(t / "codex.log"))
-    for k in ("SHIM_VERSION", "SHIM_SANDBOX", "SHIM_EXEC"):
+    for k in ("SHIM_VERSION", "SHIM_SANDBOX", "SHIM_EXEC", "SHIM_PROBE", "SHIM_PROMPT_DROP", "SHIM_RC"):
         monkeypatch.delenv(k, raising=False)
     daily = t / "daily"
     (daily / "runs" / "2026-10-26" / "users.json").write_text(
@@ -1107,3 +1146,95 @@ def test_review_canary_probes_unlisted_sibling_dir_under_home(rv, monkeypatch, m
     assert out["ok"] is ok and c["ok"] is ok
     if not ok:                                                              # 同级目录的假数据被读出来 = 泄漏
         assert c["reason"] == "canary_leak"
+
+
+# ---- FX：终审后修复轮 ------------------------------------------------------------------------
+
+import shlex  # noqa: E402
+
+
+def _cs(argv):
+    """argv 里每个 -c 的值（按顺序）。"""
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "-c" and i + 1 < len(argv)]
+
+
+def _has_slice(argv, part):
+    n = len(part)
+    return any(argv[i:i + n] == part for i in range(len(argv) - n + 1))
+
+
+def _no_sandbox_flag(argv):
+    return not [a for a in argv if a in ("-s", "--sandbox") or a.startswith("--sandbox=")]
+
+
+def test_review_exec_has_no_sandbox_flag_and_uses_same_profile_args_as_preflight(rv, monkeypatch):   # F0
+    import review
+    argv = shlex.split(review.build_exec_cmd("/r", "/p", "/o", review.build_profile_args(["/d"], ["/r"])))
+    assert _no_sandbox_flag(argv), argv                    # 显式 -s 会让 codex 不用 default_permissions 选中的 profile
+    assert 'approval_policy="never"' in _cs(argv)
+    _offrepo_card(rv)
+    out = _pack_out(rv)
+    pa = out["profile_args"]
+    log = rv.codex_log()
+    pre1 = [x for x in log if x["argv"][:2] == ["debug", "prompt-input"]][-1]["argv"]
+    pre2 = [x for x in log if x["argv"][:1] == ["sandbox"]][-1]["argv"]
+    r = subprocess.run(["bash", out["script"]], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    ex = [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]][-1]["argv"]
+    assert _no_sandbox_flag(ex), ex
+    for a in (pre1, pre2, ex):
+        assert _has_slice(a, pa), a
+    assert _cs(ex) == _cs(pre1) == _cs(pre2) == _cs(pa)    # exec 的配置 = 两道预检测过的配置（同一份 profile_args）
+    monkeypatch.setenv("SHIM_EXEC", "emulate")
+    rv.run("review-canary", check=False)
+    log = rv.codex_log()
+    ex = [x for x in log if x["argv"][:1] == ["exec"]][-1]["argv"]
+    assert _no_sandbox_flag(ex) and 'approval_policy="never"' in _cs(ex), ex
+
+
+TMP_ROOT = os.path.realpath("/tmp")
+
+
+def _tmp_probes():
+    return sorted(Path(TMP_ROOT).glob("router-canary-probe-*"))
+
+
+def test_review_profile_denies_tmp_tmpdir_and_other_users(rv):                     # F2（RV I-2）
+    import tempfile
+    _offrepo_card(rv)
+    pol = fs_policy(_pack_out(rv)["profile_args"])
+    assert decide(pol, "/private/tmp/claude-501/bg-task/output.txt") == "deny"    # Claude Code 后台任务输出
+    assert decide(pol, "/tmp/x") == "deny"
+    tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    assert decide(pol, os.path.join(tmpdir, "x.txt")) == "deny"
+    for root in ("/var/folders", "/private/var/folders", "/Users", "/Volumes"):
+        if os.path.isdir(root):
+            assert decide(pol, os.path.join(root, "zz-other-user", "secret.txt")) == "deny", root
+    pack = rv.home / "review" / "T1" / "pack"
+    assert decide(pol, pack / "card.md") == "read"                                 # 放行项更具体：照样生效
+    assert decide(pol, rv.tmp / ".nvm" / "versions" / "node" / "v18" / "bin" / "rg") == "read"
+    if os.path.realpath(str(pack)).startswith("/private/var/folders/"):             # macOS：pack 就在 /var/folders 下
+        assert covering(pol, pack / "card.md")[0] == os.path.realpath(pack)
+
+
+def test_review_canary_probes_unlisted_dir_outside_home_under_tmp(rv, monkeypatch):   # F2
+    monkeypatch.setenv("SHIM_EXEC", "emulate")
+    before = _tmp_probes()
+    out = json.loads(rv.run("review-canary", check=False).stdout)
+    assert out["ok"] is True, out
+    rec = [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]][-1]
+    pol = fs_policy(rec["argv"])
+    probes = re.findall(r"cat\s+['\"`]?([^\s'\"`]+)", rec["stdin"])
+    outside = [p for p in probes if os.path.realpath(p).startswith(TMP_ROOT + "/router-canary-probe-")
+               and covering(pol, p) == (TMP_ROOT, "deny")]                         # 只被「拒读 /tmp」这一条罩住
+    assert len(outside) == 1, probes
+    assert _tmp_probes() == before                                                  # 每次建删，不留探针目录
+    monkeypatch.setenv("SHIM_PROBE", "tmp=leak")                                    # /tmp 下的假数据被读出来 = 泄漏
+    out = json.loads(rv.run("review-canary", check=False).stdout)
+    c = json.loads((rv.home / "review" / "canary.json").read_text())
+    assert out["ok"] is False and c["reason"] == "canary_leak" and "tmp" in c["leaked"]
+    monkeypatch.setenv("SHIM_PROBE", "tmp=skip")                                    # 没探 /tmp：不算过
+    out = json.loads(rv.run("review-canary", check=False).stdout)
+    c = json.loads((rv.home / "review" / "canary.json").read_text())
+    assert out["ok"] is False and c["ok"] is False and c["reason"] == "canary_inconclusive"
+    assert _tmp_probes() == before

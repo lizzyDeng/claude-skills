@@ -254,6 +254,48 @@ def spawn_run(ctx, home, cfg, state, tid, prompt, resume, at, log=None, receipt=
     return pid
 
 
+class IntentNotSaved(Exception):
+    """起进程之前，意图没落盘：一个进程都没起（worker 字段已还原）。"""
+
+
+def begin_intent(t: dict, home, tid, kind, at, **extra):
+    """纯内存：分配这一次运行（prepare_run）并写下意图 → (log, receipt, before)。
+    意图 = {phase: spawning, kind: dispatch | resume, session_id, log, receipt, at, …}：at 是写意图这一刻
+    （起进程前一刻），回执宽限期从它算起。"""
+    w = t["worker"]
+    before = {k: w.get(k) for k in ("session_id", "runs")}
+    log = prepare_run(w, home, tid)
+    receipt = receipt_path(log)
+    t["dispatch"] = {"phase": "spawning", "kind": kind, "session_id": w["session_id"], "log": str(log),
+                     "receipt": str(receipt), "at": at, **extra}
+    return log, receipt, before
+
+
+def abort_intent(t: dict, before: dict) -> None:
+    t.pop("dispatch", None)
+    t["worker"].update(before)
+
+
+def resume_with_intent(ctx, home, cfg, state, tid, prompt, status, waiting, at, save) -> int:
+    """续跑与派单同一个事务（R2 + H4，RV I-1）：意图（含启动回执路径、续跑后的状态）落盘 → 起进程（带回执）。
+    返回 pid 时意图已从内存撤掉，调用方要**立刻存盘**；那次存盘失败 ⇒ 盘上留着意图，下一轮按回执认领，不重起。
+    save() 失败 ⇒ 抛 IntentNotSaved，一个进程都不起；起进程失败 ⇒ 撤意图、还原 worker 字段后原样抛出。"""
+    t = state["tickets"][tid]
+    log, receipt, before = begin_intent(t, home, tid, "resume", at, status=status, waiting=waiting)
+    try:
+        save()
+    except Exception as e:  # noqa: BLE001
+        abort_intent(t, before)
+        raise IntentNotSaved(repr(e)) from e
+    try:
+        pid = spawn_run(ctx, home, cfg, state, tid, prompt, True, at, log=log, receipt=receipt)
+    except Exception:
+        abort_intent(t, before)
+        raise
+    t.pop("dispatch", None)
+    return pid
+
+
 def run_worker(ctx, home: Path, cfg: dict, state: dict, tid: str, prompt: str, resume: bool, at: str) -> int:
     """起（或续跑）一张票的 worker，并把 pid / 日志 / 次数记回 ticket。每次运行一个新日志文件，
     这样上一次的结果对象不会被误读成这一次的。"""

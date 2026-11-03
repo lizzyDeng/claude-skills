@@ -78,8 +78,23 @@ class Run:
         return qid
 
     def resume(self, tid, prompt, status):
-        launcher.run_worker(self.ctx, self.home, self.cfg, self.state, tid, prompt, True, self.now)
+        """续跑 = 与派单同一个事务（RV I-1）：意图（含启动回执路径）落盘 → 起进程 → 立刻存盘。
+        意图没落盘 ⇒ 一个进程都不起，进决定单（回答后续跑）；起不来 ⇒ 进决定单；
+        起了之后存盘失败 ⇒ 盘上留着续跑意图，下一轮按启动回执认领，不会再起第二个。"""
+        sp = self.home / "state.json"
+        try:
+            pid = launcher.resume_with_intent(self.ctx, self.home, self.cfg, self.state, tid, prompt, status, None,
+                                              _iso(self.ctx.now()), lambda: store.save_state(sp, self.state))
+        except launcher.IntentNotSaved as e:
+            return self._stuck(tid, f"{tid} 要续跑，但起进程前存盘失败（{str(e)[:120]}）：没起 worker；回答后续跑")
+        except Exception as e:  # noqa: BLE001 — 抛异常 ⇔ 子进程没起
+            return self._stuck(tid, f"{tid} 续跑起不来：{str(e)[:160]}")
         store.set_status(self.state, tid, status, self.now)
+        try:
+            store.save_state(sp, self.state)
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"续跑 {tid}：已起 worker（pid {pid}），但落盘失败：{e!r}；"
+                                      "盘上留着续跑意图，下一轮按启动回执认领，不会重起")
 
     # ---- base（R1）：远端 base 在不在、是不是从我们认得的 tip 来的 ------------------
     def ensure_base(self) -> dict:
@@ -245,8 +260,14 @@ class Run:
 
     # ---- 2 ----
     def step2_exits(self):
+        try:                                     # 先对账上次没落完盘的派单 / 续跑：之后各步看到的才是真状态
+            self.recover_dispatch_intents()
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"step2 对账：{e!r}")
         for tid, t in list(self.state["tickets"].items()):
             w = t["worker"]
+            if store.pending_intent(t):          # 还待核实：worker 可能在跑，不判退出
+                continue
             if t["status"] not in store.RUNNING or not w.get("pid") or launcher.worker_alive(self.ctx, w):
                 continue
             try:
@@ -401,6 +422,8 @@ class Run:
             self.resume(tid, prompt, store.EXECUTING)
 
     def _verify(self, tid, t, repo, base, guard):
+        if store.pending_intent(t):
+            return                                # 续跑待核实：worker 可能在跑，等对账
         if launcher.worker_alive(self.ctx, t["worker"]):
             return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）：等它退出
         if not t.get("card_confirmed"):
@@ -690,8 +713,8 @@ class Run:
         before = {k: w.get(k) for k in ("session_id", "runs")}
         log = launcher.prepare_run(w, self.home, tid)
         receipt = launcher.receipt_path(log)
-        t["dispatch"] = {"phase": "spawning", "session_id": w["session_id"], "log": str(log), "receipt": str(receipt),
-                         "at": self.now}
+        t["dispatch"] = {"phase": "spawning", "kind": "dispatch", "session_id": w["session_id"], "log": str(log),
+                         "receipt": str(receipt), "at": self.now}
         try:
             store.save_state(self.home / "state.json", self.state)
         except Exception as e:  # noqa: BLE001 — 意图没落盘：一个进程都不起，撤回内存里的意图
@@ -772,7 +795,10 @@ class Run:
             return self._handle_exit(tid, t)
         if self.ctx.now().timestamp() - _ts(it.get("at")) < RECEIPT_GRACE_S:
             return self._unverified(tid, it, "启动回执还没出现，可能还在起")
-        t.pop("dispatch", None)                            # 进程从没起过：重新可派
+        t.pop("dispatch", None)                            # 进程从没起过
+        if it.get("kind") == "resume":                     # 续跑没起来：要转给它的话还在，交给用户再续一次
+            self._stuck(tid, f"{tid} 续跑没起来（起进程前 router 中断：没有启动回执、日志或 transcript）；回答后续跑")
+        # 派单：重新可派（sid 没用过，复用）
 
     def _has_trace(self, it) -> bool:
         log = Path(it["log"]) if it.get("log") else None
@@ -786,10 +812,13 @@ class Run:
         w.update(session_id=it.get("session_id") or w.get("session_id"), pid=pid, pid_start=pid_start,
                  log=it.get("log"), started_at=it.get("at"))
         w.pop("exit", None)
-        t["kickoff_at"] = it.get("at")
-        if t["status"] == store.QUEUED:
-            store.set_status(self.state, tid, store.KICKOFF, self.now,
-                             f"写方向卡（{self.cfg.get('kickoff_budget_min', 30)} 分钟内）")
+        if it.get("kind") == "resume":                     # 续跑：补上没来得及落盘的状态
+            store.set_status(self.state, tid, it.get("status") or t["status"], self.now, it.get("waiting"))
+        else:
+            t["kickoff_at"] = it.get("at")
+            if t["status"] == store.QUEUED:
+                store.set_status(self.state, tid, store.KICKOFF, self.now,
+                                 f"写方向卡（{self.cfg.get('kickoff_budget_min', 30)} 分钟内）")
         t.pop("dispatch", None)
         t.pop("dispatch_fail", None)
 

@@ -51,6 +51,11 @@ class StateCorrupt(Exception):
     pass
 
 
+def pending_intent(t) -> bool:
+    """上次派单 / 续跑落了意图、还没核实（dispatch.phase == "spawning"）：worker 可能已经在跑。"""
+    return isinstance(t, dict) and (t.get("dispatch") or {}).get("phase") == "spawning"
+
+
 def empty_state():
     return {"version": 1,
             "batch": {"id": None, "started": False, "started_at": None},

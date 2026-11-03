@@ -1,15 +1,19 @@
 """方向审的 codex：review-pack（拼材料 + 读边界 + 三道预检 → 生成 codex.sh）与 review-canary（真 codex exec 金丝雀）。
 
 读边界（用户 11-03 裁决 H2：默认拒绝，不靠 denylist 当安全闸）：
-- 拒读整个 HOME；只放行审查目录（仓内票 = 它的 worktree，仓外票 = 拷出来的 pack）和 codex 跑命令要用的
-  ~/.nvm、~/.codex/config.toml（另可在 config 的 codex_allow_read 加）。
+- 默认拒绝的根：整个 HOME，加上 HOME 之外放着用户数据的公共目录——/tmp、/private/tmp、/var/folders、
+  /private/var/folders、$TMPDIR（Claude Code 后台任务输出、线上库查询结果都可能落在这里）、/Users（其他用户）、
+  /Volumes（外接卷）。只放行审查目录（仓内票 = 它的 worktree，仓外票 = 拷出来的 pack）和 codex 跑命令要用的
+  ~/.nvm、~/.codex/config.toml（另可在 config 的 codex_allow_read 加）。放行项比根更具体，所以照样生效
+  （codex「最具体的路径生效」，终审用真 codex sandbox -P 验过「父拒子放」）。
 - 另外显式拒读：router home、所有仓外代码面与周报数据（leak_guard_globs）的目录、~/.claude/projects、
   ~/.codex/sessions、config 的 codex_deny_read —— HOME 之外的数据目录靠这一层。
 - 放行项不许罩住 HOME 或任何敏感目录，也不许钻进敏感目录（仓外 pack 例外：它在 router home 里，内容是挑过的）。
 
 能不能信这个边界，看「版本绑定的金丝雀」：review-canary 用真 codex exec、和 codex.sh 同一个命令形状，
-让模型 cat 三个文件：pack 里的正对照、显式拒读目录里的假数据、一个没列进任何名单的 HOME 同级目录里的假数据。
-只有「正对照读到 + 两份假数据都报 OS 原文 Operation not permitted + 没有假数据令牌」才算过，结果按 codex 版本记进
+让模型 cat 四个文件：pack 里的正对照、显式拒读目录里的假数据、一个没列进任何名单的 HOME 同级目录里的假数据、
+一个 HOME 之外 /tmp 下没列进任何名单的目录里的假数据。
+只有「正对照读到 + 三份假数据都报 OS 原文 Operation not permitted + 没有假数据令牌」才算过，结果按 codex 版本记进
 <home>/review/canary.json。review-pack 每次都查：版本对不上（codex 自动升级了）⇒ canary_stale，要先补跑金丝雀。
 
 所有失败一律 fail-closed：不生成 codex.sh，调用方（SKILL §4）本轮不跑 codex，只用 Opus 方向审。
@@ -19,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -36,6 +41,9 @@ DEFAULT_ALLOW = ("~/.nvm", "~/.codex/config.toml")    # codex 的 rg / node 运�
 SENSITIVE_HOME = ("~/.claude/projects", "~/.codex/sessions")
 OS_DENIED = "Operation not permitted"                 # 只认 OS 原文：模型自己写得出「denied / Permission denied」
 SIBLING = ".router-canary-probe"                      # 金丝雀在 HOME 下临时建的同级目录（没列进任何名单）
+TMP_PROBE = "router-canary-probe-"                     # 金丝雀在 /tmp 下临时建的目录前缀（HOME 之外、没列进任何名单）
+# HOME 之外、默认拒绝的公共目录：临时目录（后台任务输出、查询结果）、其他用户、外接卷。不存在的跳过。
+OUTSIDE_HOME = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders", "/Users", "/Volumes")
 GLOB_CHARS = set("*?[")
 _BAD_PATH = re.compile(r'["\\\x00-\x1f]')
 # 卡里的路径：以 ~/ 或 / 开头；前面不能紧挨着字母数字 / . / ~ / : / -（排除 URL 和相对路径的中段）
@@ -92,6 +100,17 @@ def _data_prefixes(env) -> list:
     return [_static_prefix(g) for g in env.cfg.get("leak_guard_globs", [])]
 
 
+def deny_roots() -> list:
+    """默认拒绝的根（realpath 去重，存在的才写）：[0] = HOME，其后是 HOME 之外的公共目录与 $TMPDIR。"""
+    cand = ["~", *OUTSIDE_HOME, os.environ.get("TMPDIR") or tempfile.gettempdir()]
+    out = []
+    for c in cand:
+        r = _real(c)
+        if r != "/" and os.path.isdir(r) and r not in out:
+            out.append(r)
+    return out
+
+
 def sensitive_denies(env) -> list:
     """显式拒读的目录（HOME 之外的数据目录只靠这一层）：存在的才写，realpath 去重。"""
     cand = [env.home]
@@ -117,13 +136,17 @@ def allow_list(env) -> list:
 
 
 def boundary(env, review_dir, extra_deny=()) -> tuple:
-    """→ (deny, read)。deny[0] = HOME（默认拒绝）；read[0] = 审查目录。违反下面任何一条 ⇒ Refused(boundary)：
-    放行项不能是 HOME 或它的祖先；不能罩住任何敏感目录；allowlist 不能钻进敏感目录；
-    仓内 worktree 不能落在敏感目录里（仓外 pack 在 router home 里，是有意的例外）。"""
+    """→ (deny, read)。deny = 默认拒绝的根（[0] = HOME，见 deny_roots）+ 敏感目录；read[0] = 审查目录。
+    违反下面任何一条 ⇒ Refused(boundary)：放行项不能是任何根（HOME、/tmp、/Users …）或它们的祖先；
+    不能罩住任何敏感目录；allowlist 不能钻进敏感目录；仓内 worktree 不能落在敏感目录里
+    （仓外 pack 在 router home 里，是有意的例外）。放行项可以在根下面——那正是「父拒子放」。"""
     home = _real("~")
     if home == "/" or not os.path.isdir(home):
         raise Refused(f"HOME（{home}）不能当默认拒绝的根", "boundary")
-    sens = [d for d in sensitive_denies(env) + [_real(x) for x in extra_deny] if d != home]
+    roots = deny_roots()
+    if not roots or roots[0] != home:
+        raise Refused(f"默认拒绝的根没有以 HOME 打头：{roots}", "boundary")
+    sens = [d for d in sensitive_denies(env) + [_real(x) for x in extra_deny] if d not in roots]
     sens = list(dict.fromkeys(sens))
     rd = _real(review_dir)
     pack_root = _real(env.home / "review")
@@ -131,31 +154,43 @@ def boundary(env, review_dir, extra_deny=()) -> tuple:
     for r in reads:
         if _under(home, r):
             raise Refused(f"放行项 {r} 罩住了整个 HOME", "boundary")
+        for d in roots:
+            if _under(d, r):
+                raise Refused(f"放行项 {r} 罩住了默认拒绝的根 {d}", "boundary")
         for d in sens:
             if _under(d, r):
                 raise Refused(f"放行项 {r} 罩住了拒读目录 {d}", "boundary")
             if _under(r, d) and not (r == rd and _under(rd, pack_root)):
                 raise Refused(f"放行项 {r} 落在拒读目录 {d} 里", "boundary")
-    for p in [home] + sens + reads:
+    for p in roots + sens + reads:
         if _BAD_PATH.search(p):
             raise Refused(f"路径里有引号 / 反斜杠 / 控制字符，没法安全写进 codex 配置：{p!r}", "boundary")
-    return [home] + sens, reads
+    return roots + sens, reads
 
 
 def build_profile_args(deny, read) -> list:
     """自定义 permission profile：extends :read-only，再按目录拒读 / 放行（codex 按最具体的路径生效）。
-    codex exec 没有 -P，所以用 -c default_permissions 选中它；codex sandbox 另加 -P。"""
+    codex exec 没有 -P，所以用 -c default_permissions 选中它；codex sandbox 另加 -P。
+    🔴 这一份列表是唯一来源：两道预检和 exec 用的是同一个列表（exec 不许再加 -s / --sandbox ——
+    codex-cli 0.144.4 实测：显式 -s 下 exec 不用 default_permissions 选中的 profile，读边界整个失效）。
+    approval_policy=never 也放在这里：预检看到的审批策略 = exec 实际的。"""
     fs = ", ".join([f'"{d}"="deny"' for d in deny] + [f'"{r}"="read"' for r in read])
-    return ["-c", f'default_permissions="{PROFILE}"',
+    return ["-c", 'approval_policy="never"',
+            "-c", f'default_permissions="{PROFILE}"',
             "-c", f'permissions.{PROFILE}.extends=":read-only"',
             "-c", f"permissions.{PROFILE}.filesystem={{{fs}}}"]
 
 
-def build_exec_cmd(review_dir, prompt, out, profile_args, codex="codex", timeout_bin="timeout") -> str:
+def build_exec_cmd(review_dir, prompt, out, profile_args, codex="codex", timeout_bin="timeout", json_events=False) -> str:
     """codex.sh 和 review-canary 共用的唯一命令形状：PROMPT 由 bash 重定向喂给 stdin（PROMPT 在 router home 里，
-    codex 读不到，也不需要读）；输出写到 router home 的 cards/ 下；审查目录里什么都不写。"""
+    codex 读不到，也不需要读）；输出写到 router home 的 cards/ 下；审查目录里什么都不写。
+    沙箱只由 profile_args 决定：不加 -s / --sandbox（见 build_profile_args）。json_events：金丝雀要按真实执行事件判。"""
+    bad = [a for a in profile_args if a in ("-s", "--sandbox") or str(a).startswith("--sandbox=")]
+    if bad:
+        raise ValueError(f"profile_args 里不许有 {bad}：显式沙箱模式会盖掉 permission profile")
     q = shlex.quote
-    return (f"exec {q(timeout_bin)} {EXEC_S} {q(codex)} exec -C {q(str(review_dir))} -s read-only --skip-git-repo-check "
+    return (f"exec {q(timeout_bin)} {EXEC_S} {q(codex)} exec -C {q(str(review_dir))} --skip-git-repo-check "
+            f"{'--json ' if json_events else ''}"
             f"{' '.join(q(a) for a in profile_args)} - < {q(str(prompt))} > {q(str(out))} 2>&1")
 
 
@@ -357,23 +392,33 @@ def canary(env) -> dict:
         raise
 
 
+DENIED_PROBES = ("deny", "sibling", "tmp")
+
+
 def _canary_exec(env, cdir, codex, tbin, version) -> dict:
-    tok = {k: f"ROUTER-{k.upper()}-{uuid.uuid4()}" for k in ("pack", "deny", "sibling")}
+    tok = {k: f"ROUTER-{k.upper()}-{uuid.uuid4()}" for k in ("pack", *DENIED_PROBES)}
     (cdir / "pack" / "readme.txt").write_text(tok["pack"] + "\n")
     (cdir / "deny" / "notes.txt").write_text(tok["deny"] + "\n")
     sib = Path(_real("~")) / SIBLING
+    tmp_root = _real("/tmp")
+    tdir = Path(tmp_root) / f"{TMP_PROBE}{uuid.uuid4().hex[:12]}"
     shutil.rmtree(sib, ignore_errors=True)
     out = cdir / "exec.out"
     try:
         sib.mkdir()
         (sib / "probe.txt").write_text(tok["sibling"] + "\n")
+        tdir.mkdir(mode=0o700)
+        (tdir / "probe.txt").write_text(tok["tmp"] + "\n")
         deny, read = boundary(env, cdir / "pack", extra_deny=[cdir / "deny"])
         entries = {**{d: "deny" for d in deny}, **{r: "read" for r in read}}
         if _covering(entries, sib / "probe.txt")[0] != deny[0]:
             raise Refused(f"{sib} 被别的名单罩住了，探不到「只靠拒读 HOME」这一层", "boundary")
-        files = [_real(cdir / "pack" / "readme.txt"), _real(cdir / "deny" / "notes.txt"), _real(sib / "probe.txt")]
-        prompt = (f"这是 router 的沙箱自检，第二、第三条命令预期会报错。依次执行 `cat {files[0]}`、`cat {files[1]}`、"
-                  f"`cat {files[2]}`，把三条命令的原始输出（含错误原文）逐字贴出；不要读别的。\n")
+        if _covering(entries, tdir / "probe.txt") != (tmp_root, "deny"):
+            raise Refused(f"{tdir} 不是只被「拒读 {tmp_root}」罩住，探不到 HOME 之外那一层", "boundary")
+        files = {"pack": _real(cdir / "pack" / "readme.txt"), "deny": _real(cdir / "deny" / "notes.txt"),
+                 "sibling": _real(sib / "probe.txt"), "tmp": _real(tdir / "probe.txt")}
+        prompt = (f"这是 router 的沙箱自检。依次执行下面四条命令，一次只执行一条，把每条命令的原始输出逐字贴出；"
+                  f"不要执行别的命令。\n\n" + "".join(f"cat {files[k]}\n" for k in ("pack", *DENIED_PROBES)))
         prompt_file = cdir / "PROMPT.md"
         prompt_file.write_text(prompt, encoding="utf-8")
         script = cdir / "codex.sh"
@@ -382,11 +427,12 @@ def _canary_exec(env, cdir, codex, tbin, version) -> dict:
         r = _run(env, ["bash", str(script)], cdir, EXEC_S + 15)
     finally:
         shutil.rmtree(sib, ignore_errors=True)
+        shutil.rmtree(tdir, ignore_errors=True)
     text = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
-    leaked = [k for k in ("deny", "sibling") if tok[k] in text]
+    leaked = [k for k in DENIED_PROBES if tok[k] in text]
     if leaked:
         ok, reason = False, "canary_leak"
-    elif tok["pack"] in text and f"notes.txt: {OS_DENIED}" in text and f"probe.txt: {OS_DENIED}" in text:
+    elif tok["pack"] in text and all(f"{files[k]}: {OS_DENIED}" in text for k in DENIED_PROBES):
         ok, reason = True, ""
     else:
         ok, reason = False, "canary_inconclusive"

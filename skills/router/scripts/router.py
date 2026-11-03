@@ -8,6 +8,7 @@
 改状态的子命令都在 <状态目录>/.lock 上加排他锁：后台 watch 的 tick 和前台命令不会互相覆盖。
 """
 import argparse
+import copy
 import json
 import os
 import re
@@ -84,12 +85,22 @@ class Env:
 
     @contextmanager
     def state(self):
-        """load → 改 → save → 重画看板，全程持锁。出异常就不存。"""
+        """load → 改 → save → 重画看板，全程持锁。出异常就不存。
+        中途为了起进程先落过一次盘（续跑意图）、随后起进程失败：rollback() 把盘恢复成这条命令之前的样子。"""
         with self.locked():
             st = store.load_state(self.state_path)
+            self._snapshot = copy.deepcopy(st)
             yield st
             store.save_state(self.state_path, st)
             render_board(self, st)
+
+    def rollback(self) -> None:
+        snap = getattr(self, "_snapshot", None)
+        if snap is not None:
+            try:
+                store.save_state(self.state_path, snap)
+            except Exception:  # noqa: BLE001 — 盘上留着没起成的意图：下一轮过了宽限期按「没起过」处理
+                pass
 
     def ticket(self, st, tid):
         if tid not in st["tickets"]:
@@ -136,13 +147,22 @@ def _check_surfaces(env, names):
         raise Fail(f"未知代码面 {unknown}；只能用 surfaces.json 里的：{sorted(env.table)}")
 
 
+def _refuse_pending(t, tid) -> None:
+    """上次派单 / 续跑的意图还没核实（worker 可能已经在跑）：会起 / 停 / 交出 worker 的前台命令一律不做（RV M-1）。"""
+    if store.pending_intent(t):
+        why = (t.get("dispatch") or {}).get("unverified") or "上次起 worker 没落完盘"
+        raise Fail(f"{tid} 派单待核实（{why}），下一轮巡检后再试")
+
+
 def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
     force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
-    waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。"""
+    waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
+    续跑走与派单相同的事务：意图落盘 → 起进程（带启动回执）→ 命令结束时存盘；那次存盘失败，下一轮按回执认领。"""
     t = st["tickets"][tid]
     if t["status"] == store.TAKEOVER:
         raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
+    _refuse_pending(t, tid)
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
@@ -151,8 +171,16 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None)
             return "delivered"
         launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
-    launcher.run_worker(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), True, env.now())
-    store.set_status(st, tid, status, env.now(), waiting if waiting is not None else _resume_wait(kind, status))
+    wait = waiting if waiting is not None else _resume_wait(kind, status)
+    try:
+        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), status,
+                                    wait, env.now(), lambda: store.save_state(env.state_path, st))
+    except launcher.IntentNotSaved as e:
+        raise Fail(f"{tid} 没续跑：起进程前存盘失败（{e}）")
+    except Exception as e:  # noqa: BLE001 — 意图已落盘、进程没起：盘恢复成这条命令之前
+        env.rollback()
+        raise Fail(f"{tid} 没续跑：起不了 worker（{e}）")
+    store.set_status(st, tid, status, env.now(), wait)
     return "resumed"
 
 
