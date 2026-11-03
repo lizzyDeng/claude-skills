@@ -59,7 +59,7 @@
 **仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。
 1. 动手前把要改的文件整份备份到 `$ROUTER_HOME/backups/$ROUTER_TICKET/`（`cp -a`，保留目录结构）。
 2. 改完把 `diff -ru <备份> <现状>` 写到 `$ROUTER_HOME/cards/$ROUTER_TICKET.diff`，跑验收，贴真实输出。
-3. `python3 $ROUTER_CLI progress impl_done`，然后**退出**。router 会放锁并请用户核对；不满意就用备份恢复。
+3. `python3 $ROUTER_CLI progress impl_done`，然后**退出**。router 会请用户核对；核对前代码面仍由你持有（仓外没有 staging 隔离层，别的票不会来改）。不满意时你会被 `--resume` 叫醒，用户原话在 prompt 里：按原话改，或用备份恢复后重做，重写 diff、跑验收，再 `progress impl_done` 退出。
 
 ## 禁止
 

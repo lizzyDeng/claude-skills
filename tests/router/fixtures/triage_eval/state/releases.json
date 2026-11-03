@@ -1,0 +1,39 @@
+[
+  {
+    "date": "2098-11-30",
+    "what": "#9101 合成上线 A",
+    "metrics": [
+      "m_hz",
+      "m_flat_dirty",
+      "m_flat_clean"
+    ]
+  },
+  {
+    "date": "2098-12-01",
+    "what": "#9102 合成上线 B",
+    "metrics": [
+      "m_steady",
+      "m_small"
+    ]
+  },
+  {
+    "date": "2098-12-02",
+    "what": "#9103 合成上线 C",
+    "metrics": [
+      "m_ex_inst",
+      "m_ex_miss",
+      "m_ex_before",
+      "m_ex_after"
+    ]
+  },
+  {
+    "date": "2098-12-03",
+    "what": "#9104 合成上线 D",
+    "metrics": [
+      "m_ex_cross",
+      "m_ex_window",
+      "m_ex_erased",
+      "m_ex_immature"
+    ]
+  }
+]

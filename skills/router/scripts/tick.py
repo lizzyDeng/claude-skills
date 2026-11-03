@@ -27,6 +27,22 @@ import surfaces
 SKILL_DIR = Path(__file__).resolve().parent.parent
 WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review")
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
+# 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
+# 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
+RECEIPT_GRACE_S = 60
+BASE_BLOCK_TAIL = "：先不合、不叫 worker rebase / 修 CI"     # 第 5 步被远端 base 挡住时 waiting_for 的结尾
+# router 自己做、只记一条 decide 的两件事（重建 base、改回被自动改指的 PR）共用的授权说明
+AUTO_FIX_WHY = "用户 11-02 长期授权：base 被删时从 main 重建、改回被 GitHub 自动改指的 router PR、记一条 decide"
+
+
+def is_offrepo_glob(g, root) -> bool:
+    return g.startswith("~") or (g.startswith("/") and not g.startswith(str(root)))
+
+
+def is_offrepo(t, table, root) -> bool:
+    """票的代码面全在仓外（~/… 或仓外绝对路径）：没有 PR 可开，走「备份 → 改 → diff → 你核对」。"""
+    globs = [g for s in t["surfaces"] for g in table.get(s, {}).get("globs", [])]
+    return bool(globs) and all(is_offrepo_glob(g, root) for g in globs)
 
 
 def home_for(root: Path) -> Path:
@@ -41,10 +57,10 @@ def _ts(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() if s else 0
 
 
-def _blocks(state, tid):
-    t = state["tickets"][tid]
-    return sum(1 for o in state["tickets"].values() if o["id"] != tid and o["status"] not in store.SETTLED
-               and (tid in o["blocked_by"] or (o["status"] == store.QUEUED and set(o["surfaces"]) & set(t["surfaces"]))))
+def _empty_res() -> dict:
+    return {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
+            "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "notified": False,
+            "errors": []}
 
 
 class Run:
@@ -54,17 +70,171 @@ class Run:
         sp = self.home / "surfaces.json"
         self.table = surfaces.load_surfaces(sp) if sp.exists() else {}
         self.now = _iso(ctx.now())
-        self.res = {"triage_needed": None, "dispatched": [], "new_queue": [], "slow_path_events": [],
-                    "external_deliveries": [], "cards_for_review": [], "notified": False, "errors": []}
+        self.res = _empty_res()
+        self._base = None              # ensure_base 的结果：每个 Run 只查一次
+        self.fail_errors = []          # _fail 写进 errors 的那几条（start 已按结构化 dispatch_failed 报，不再重复）
 
-    def queue(self, tid, kind, summary):
-        qid = store.push_queue(self.state, tid, kind, summary, _blocks(self.state, tid) if tid else 0, self.now)
+    def queue(self, tid, kind, summary, topic=None):
+        """summary 里的「{qid}」换成这一项自己的编号（文案要写「回『Qn 好了』」）。"""
+        qid = store.push_queue(self.state, tid, kind, summary, self.now, topic=topic)
+        if "{qid}" in summary:
+            self.state["queue"][-1]["summary"] = summary.replace("{qid}", qid)
         self.res["new_queue"].append(qid)
         return qid
 
     def resume(self, tid, prompt, status):
-        launcher.run_worker(self.ctx, self.home, self.cfg, self.state, tid, prompt, True, self.now)
+        """续跑 = 与派单同一个事务（RV I-1）：意图（含启动回执路径）落盘 → 起进程 → 立刻存盘。
+        意图没落盘 ⇒ 一个进程都不起，进决定单（回答后续跑）；起不来 ⇒ 进决定单；
+        起了之后存盘失败 ⇒ 盘上留着续跑意图，下一轮按启动回执认领，不会再起第二个。"""
+        sp = self.home / "state.json"
+        try:
+            pid = launcher.resume_with_intent(self.ctx, self.home, self.cfg, self.state, tid, prompt, status, None,
+                                              _iso(self.ctx.now()), lambda: store.save_state(sp, self.state))
+        except launcher.IntentNotSaved as e:
+            return self._stuck(tid, f"{tid} 要续跑，但起进程前存盘失败（{str(e)[:120]}）：没起 worker；回答后续跑")
+        except Exception as e:  # noqa: BLE001 — 抛异常 ⇔ 子进程没起
+            return self._stuck(tid, f"{tid} 续跑起不来：{str(e)[:160]}")
         store.set_status(self.state, tid, status, self.now)
+        try:
+            store.save_state(sp, self.state)
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"续跑 {tid}：已起 worker（pid {pid}），但落盘失败：{e!r}；"
+                                      "盘上留着续跑意图，下一轮按启动回执认领，不会重起")
+
+    # ---- base（R1）：远端 base 在不在、是不是从我们认得的 tip 来的 ------------------
+    def ensure_base(self) -> dict:
+        """→ {"ok", "transient", "error", "wait"}。每个 Run 只查一次（结果缓存）。
+        ok=False ⇒ 这一轮一张都不派。transient（查不到远端 / 核实不了）⇒ 不重建、不进决定单，只记一条 errors。
+        状态：base_seen（见过的远端 tip）、base_incident（重建进行中，带幂等 key）、
+        base_problem（进了决定单的 base 问题；expected_sha = 重建时 main 的 sha，远端恢复后必须是它或它的后代）。"""
+        if self._base is None:
+            try:
+                self._base = self._check_base()
+            except Exception as e:  # noqa: BLE001 — 一律当「查不了」：不重建、不派
+                self._base = self._base_res(False, True, f"base 检查异常：{e!r}",
+                                            f"查不到 origin/{self._base_names()[0]}（下一轮再查）")
+            if not self._base["ok"] and self._base["transient"]:
+                self.res["errors"].append(f"base 检查：{self._base['error']}")
+        return self._base
+
+    def _base_names(self):
+        return self.cfg.get("base_branch", "staging"), self.cfg.get("main_branch", "main")
+
+    @staticmethod
+    def _base_res(ok, transient=False, error="", wait=""):
+        return {"ok": ok, "transient": transient, "error": error, "wait": wait}
+
+    def _check_base(self):
+        base, main = self._base_names()
+        kind, val = launcher.remote_branch(self.ctx, self.root, base)
+        if kind == "unknown":                   # 弱网 / 超时：永远不触发重建
+            return self._base_res(False, True, f"查不到 origin/{base}：{val}", f"查不到 origin/{base}（下一轮再查）")
+        if kind == "present":
+            return self._base_present(base, main, val)
+        return self._base_missing(base, main)
+
+    def _base_present(self, base, main, sha):
+        st = self.state
+        seen = st.get("base_seen") or {}
+        if seen.get("branch") != base or seen.get("sha") != sha:
+            st["base_seen"] = {"branch": base, "sha": sha, "at": self.now}
+        inc, bp = st.get("base_incident"), st.get("base_problem")
+        expected = (inc or {}).get("main_sha") or (bp or {}).get("expected_sha")
+        good = True
+        if expected and sha != expected:        # H1：远端恢复了也要验——必须是重建时的 main sha，或它的后代
+            good = launcher.is_ancestor(self.ctx, self.root, base, expected, sha)
+            if good is None:
+                return self._base_res(False, True, f"核实不了 origin/{base} {sha[:12]} 是否基于 {expected[:12]}",
+                                      f"核实 origin/{base} 中（下一轮再查）")
+        if inc:                                  # 上一轮推了、没来得及记账就崩：按 key 补记（记过就跳过）
+            st.pop("base_incident")
+            if not good:
+                return self._foreign_tip(base, main, sha, inc["main_sha"])
+            self._log_rebuild(inc, base, main, sha, late=True)
+        if bp:
+            if bp.get("kind") == "foreign_tip" and store.in_queue(st, bp.get("qid")):
+                # 认不出的 tip 不自愈，只认你的回答（回答后下一轮照样重验）
+                return self._base_res(False, error=f"远端 {base} 指向认不出的 tip（{bp['qid']}）",
+                                      wait=f"远端 {base} 是认不出的 tip，等你回答 {bp['qid']}")
+            if not good:
+                return self._foreign_tip(base, main, sha, expected)
+            self._withdraw_base_problem()        # 自愈：撤掉它的决定单项
+        return self._base_res(True)
+
+    def _base_missing(self, base, main):
+        st = self.state
+        bp = st.get("base_problem")
+        if bp and store.in_queue(st, bp.get("qid")):     # 已经在等你回答：退避，不重推
+            return self._base_res(False, error=f"远端 {base} 有问题（{bp['qid']}）",
+                                  wait=f"远端 {base} 有问题，等你回答 {bp['qid']}")
+        tracked = launcher.tracking_sha(self.ctx, self.root, base)
+        if not ((st.get("base_seen") or {}).get("branch") == base or tracked):
+            return self._base_problem("never_seen", f"远端没有 {base}，router 也从没见过它：检查 config 的 base_branch；"
+                                                    f"确认无误后回「{{qid}} 好了」")
+        kind, val = launcher.remote_branch(self.ctx, self.root, main)
+        if kind == "unknown":
+            return self._base_res(False, True, f"远端没有 {base}，查不到 origin/{main}：{val}",
+                                  f"查不到 origin/{main}（下一轮再查）")
+        if kind == "missing":
+            return self._base_problem("main_missing", f"远端没有 {base}，origin 也没有 {main}：不重建；"
+                                                      f"修好远端后回「{{qid}} 好了」")
+        m = val
+        inc = {"key": f"base:{base}:{self.now}:{m[:12]}", "main_sha": m,
+               "old": tracked or (st.get("base_seen") or {}).get("sha"), "at": self.now}
+        st["base_incident"] = inc
+        try:                                     # 先记意图再推：推了、没来得及记账就崩，下一轮按 key 对账
+            store.save_state(self.home / "state.json", st)
+        except Exception as e:  # noqa: BLE001
+            st.pop("base_incident", None)
+            return self._base_res(False, True, f"重建 {base} 前存盘失败：{e!r}", f"远端 {base} 待重建（下一轮再试）")
+        r = launcher.rebuild_branch(self.ctx, self.root, base, main, m)
+        if r["ok"]:
+            self._log_rebuild(inc, base, main, r["sha"], late=False, by_other=r.get("by_other"))
+            st.pop("base_incident", None)
+            st["base_seen"] = {"branch": base, "sha": r["sha"], "at": self.now}
+            if r.get("warn"):
+                self.res["errors"].append(f"base 重建：{r['warn']}")
+            self._withdraw_base_problem()
+            return self._base_res(True)
+        st.pop("base_incident", None)
+        if r.get("reason") == "foreign_tip":
+            return self._foreign_tip(base, main, r["sha"], m)
+        return self._base_problem("rebuild_failed",
+                                  f"远端 {base} 不存在，从 origin/{main} {m[:12]} 重建失败：{str(r.get('error', ''))[:120]}；"
+                                  f"修好后回「{{qid}} 好了」", expected=m)
+
+    def _withdraw_base_problem(self):
+        bp = self.state.pop("base_problem", None)
+        if bp and store.in_queue(self.state, bp.get("qid")):
+            store.pop_queue(self.state, bp["qid"])
+
+    def _base_problem(self, kind, summary, expected=None):
+        base = self._base_names()[0]
+        self._withdraw_base_problem()
+        qid = self.queue(None, "stuck", summary, topic="base")
+        self.state["base_problem"] = {"qid": qid, "kind": kind, "expected_sha": expected, "at": self.now}
+        return self._base_res(False, error=self.state["queue"][-1]["summary"],
+                              wait=f"远端 {base} 有问题，等你回答 {qid}")
+
+    def _foreign_tip(self, base, main, sha, expected):
+        self._withdraw_base_problem()
+        qid = self.queue(None, "stuck", f"远端 {base} 指向 {sha[:12]}，不是本次重建的 origin/{main} {expected[:12]}："
+                                        f"不从未知 tip 派工；把远端 {base} 改成 {expected[:12]} 或它的后代后回「{{qid}} 好了」",
+                         topic="base")
+        self.state["base_problem"] = {"qid": qid, "kind": "foreign_tip", "expected_sha": expected, "sha": sha,
+                                      "at": self.now}
+        return self._base_res(False, error=f"远端 {base} 指向认不出的 tip {sha[:12]}",
+                              wait=f"远端 {base} 是认不出的 tip，等你回答 {qid}")
+
+    def _log_rebuild(self, inc, base, main, sha, late, by_other=False):
+        m = inc["main_sha"]
+        what = (f"远端 {base} 不存在：已由别处从 origin/{main} {m[:12]} 重建（router 的推送被 lease 拒）" if by_other
+                else f"远端 {base} 不存在：从 origin/{main} {m[:12]} 重建")
+        what += "（补记）" if late else ""
+        what += f"；之后已前进到 {sha[:12]}" if sha and sha != m else ""
+        basis = f"ls-remote 无 refs/heads/{base}；上次见到 {inc.get('old') or '未知'}；--no-verify：推远端已有 commit"
+        store.append_decision(self.home / "decisions.md", self.state, "-", what, AUTO_FIX_WHY, basis, self.now,
+                              key=inc["key"])
 
     # ---- 0 ----
     def step0_weekly(self):
@@ -95,9 +265,25 @@ class Run:
 
     # ---- 2 ----
     def step2_exits(self):
+        try:                                     # 先对账上次没落完盘的派单 / 续跑：之后各步看到的才是真状态
+            self.recover_dispatch_intents()
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"step2 对账：{e!r}")
         for tid, t in list(self.state["tickets"].items()):
             w = t["worker"]
-            if t["status"] not in store.RUNNING or not w.get("pid") or launcher.worker_alive(self.ctx, w):
+            if store.pending_intent(t):          # 还待核实：worker 可能在跑，不判退出
+                continue
+            if t["status"] not in store.RUNNING or not w.get("pid"):
+                continue
+            live = launcher.worker_liveness(self.ctx, w)
+            if live == "unknown":                # ps 失败 / 超时 ≠ 没进程：不判退出、不清 pid、不起新的；只报一次
+                if not w.get("liveness_unknown"):
+                    w["liveness_unknown"] = self.now
+                    self.res["errors"].append(f"step2 {tid}：pid {w['pid']} 还在，但查不到它的启动时间（ps 失败 / 超时），"
+                                              "认不出是不是这个 worker：本轮不判退出")
+                continue
+            w.pop("liveness_unknown", None)
+            if live == "alive":
                 continue
             try:
                 self._handle_exit(tid, t)
@@ -105,10 +291,7 @@ class Run:
                 self.res["errors"].append(f"step2 {tid}：{e!r}")
 
     def _offrepo(self, t) -> bool:
-        """票的代码面全在仓外（~/… 或仓外绝对路径）：没有 PR 可开，走「备份 → 改 → diff → 你核对」。"""
-        globs = [g for s in t["surfaces"] for g in self.table.get(s, {}).get("globs", [])]
-        root = str(self.root)
-        return bool(globs) and all(g.startswith("~") or (g.startswith("/") and not g.startswith(root)) for g in globs)
+        return is_offrepo(t, self.table, self.root)
 
     def _handle_exit(self, tid, t):
         w = t["worker"]
@@ -221,6 +404,10 @@ class Run:
 
     # ---- 5 ----
     def step5_merge(self):
+        try:                                     # 5a 收尾放在加载合并闸之前：合并闸失效不该挡住本地清理
+            self.step5a_closeout()
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"step5a 收尾：{e!r}")
         repo, base = self.cfg["repo"], self.cfg.get("base_branch", "staging")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
@@ -249,9 +436,22 @@ class Run:
             t["fail_streak"] = {"step": step, "count": 1}
             self.resume(tid, prompt, store.EXECUTING)
 
+    def _base_blocks(self, t) -> bool:
+        """要合并、要叫 worker rebase / 修 CI 之前先看远端 base（每轮只查一次）：不对（认不出的 tip、被删待重建、
+        查不了）⇒ 什么都不做，waiting_for 写明原因（RV M-4：base 是认不出的 tip 时不往上合、不让 worker 基于它）。"""
+        b = self.ensure_base()
+        if b["ok"]:
+            return False
+        t["waiting_for"] = f"{b['wait'] or b['error'] or '远端 base 有问题'}{BASE_BLOCK_TAIL}"
+        return True
+
     def _verify(self, tid, t, repo, base, guard):
-        if launcher.worker_alive(self.ctx, t["worker"]):
-            return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）：等它退出
+        if store.pending_intent(t):
+            return                                # 续跑待核实：worker 可能在跑，等对账
+        if launcher.worker_liveness(self.ctx, t["worker"]) != "dead":
+            return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）或认不出：等它退出
+        if str(t.get("waiting_for") or "").endswith(BASE_BLOCK_TAIL):
+            t["waiting_for"] = store.DEFAULT_WAIT[store.VERIFYING]   # 上一轮被 base 挡住的说明：这一轮重新判
         if not t.get("card_confirmed"):
             self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
                        f"{tid}：方向卡没经你确认，PR 不合")
@@ -264,15 +464,15 @@ class Run:
         t["pr"] = pr
         st = github.pr_status(self.ctx, repo, pr)
         if st["base"] != base:
-            # 🔴 合进 main = 上 prod，归用户。base 不对一律不合
-            self._once(t, "wrong_base_reported", pr, tid, "stuck",
-                       f"{tid} PR #{pr} 的 base 是 {st['base']}，不是 {base}：不合（gh pr edit {pr} --base {base}）")
-            return
+            return self._wrong_base(tid, t, repo, base, pr, st)
         if st["merged"]:
             return self._settle(tid, t, st["merge_sha"] or "?")
         if st["state"] == "CLOSED":
             t["pr"] = None
             return self._stuck(tid, f"{tid} PR #{pr} 被关闭了（没合）")
+        if st["checks"] in ("failure", "success") or st["mergeable"] == "CONFLICTING":
+            if self._base_blocks(t):
+                return
         if st["checks"] == "failure":
             return self._retry_or_stuck(tid, t, "ci", f"{tid} PR #{pr} CI 红",
                                         f"【router】PR #{pr} 的 CI 红了。先 `gh pr checks {pr}` 看是哪项；"
@@ -292,7 +492,7 @@ class Run:
         if hits:
             return self._once(t, "leak_reported", st["head"], tid, "stuck",
                               f"{tid} PR #{pr} 含用户 uid 或原话（{len(hits)} 处），不合；要改掉并重写这条分支的历史")
-        if not github.merge_if_green(self.ctx, repo, pr, base):
+        if not github.merge_if_green(self.ctx, repo, pr, base, main=self.cfg.get("main_branch", "main")):
             fs = t["fail_streak"]
             t["fail_streak"] = {"step": "merge", "count": fs.get("count", 0) + 1 if fs.get("step") == "merge" else 1}
             if t["fail_streak"]["count"] >= 2:
@@ -300,30 +500,181 @@ class Run:
             return
         self._settle(tid, t, github.pr_status(self.ctx, repo, pr)["merge_sha"] or "?")
 
+    def _wrong_base(self, tid, t, repo, base, pr, st):
+        """🔴 合进 main = 上 prod，归用户。base 不对一律不合（合并闸 merge_if_green 再兜一道）。
+        唯一例外：PR 时间线最近一次改 base 是 GitHub 因 base 被删而自动改走的 ⇒ base 好了之后改回来，记一条 decide。
+        人手改过的不碰；时间线查不了 ⇒ 走原来的决定单。改回失败：第 1 次进 errors，第 2 次进决定单（topic=retarget），之后退避。"""
+        rf = t.get("retarget_fail") or {}
+        if store.in_queue(self.state, rf.get("qid")):
+            return                                         # 已在决定单等你回答：不重试
+        ev = github.last_base_change(self.ctx, repo, pr)
+        if github.is_auto_retarget(ev, base):
+            if not self.ensure_base()["ok"]:
+                return                                     # base 自己还没好（已进决定单 / errors）：先不改回
+            try:
+                github.retarget_pr(self.ctx, repo, pr, base)
+            except github.GhError as e:
+                rf.update(count=rf.get("count", 0) + 1, error=str(e)[:200], at=self.now)
+                t["retarget_fail"] = rf
+                if rf["count"] == 1:
+                    self.res["errors"].append(f"step5 {tid} PR #{pr} 改回 {base} 失败（第 1 次，下一轮重试）：{e}")
+                else:
+                    rf["qid"] = self.queue(tid, "stuck", f"{tid} PR #{pr} 改回 {base} 失败 {rf['count']} 次：{str(e)[:120]}"
+                                                         f"（可手工 gh pr edit {pr} --base {base}）；改好或要重试回「{{qid}} 改好了」",
+                                           topic="retarget")
+                return
+            store.append_decision(self.home / "decisions.md", self.state, tid,
+                                  f"PR #{pr} 被 GitHub 自动改指到 {st['base']}（{base} 曾被删）→ 改回 {base}", AUTO_FIX_WHY,
+                                  f"PR 时间线 AutomaticBaseChangeSucceededEvent {ev.get('oldBase')}→{ev.get('newBase')}"
+                                  f" @ {ev.get('createdAt')}", self.now)
+            t.pop("retarget_fail", None)
+            t.pop("wrong_base_reported", None)
+            return                                         # 下一轮重验 CI
+        self._once(t, "wrong_base_reported", pr, tid, "stuck",
+                   f"{tid} PR #{pr} 的 base 是 {st['base']}，不是 {base}：不合（gh pr edit {pr} --base {base}）")
+
     def _settle(self, tid, t, sha):
-        """一张票完成：仓内 = 合进 base；仓外 = 改完待你核对。放锁、通知下游、删 worktree、进「待你动手」。"""
+        """一张票改完。
+        仓内（sha = 合并 commit）：合进 base ⇒ 放锁、通知下游、删 worktree（成功才清指针）、进「待你动手」走查。
+        仓外（sha=None）：仓外没有 staging 隔离层，改完就是真身 ⇒ 待你核对（AWAIT_CHECK）：继续持锁、不解依赖、
+        不通知下游、不删 worktree（不满意时续跑要用它当 cwd）。核对后的收尾在 step5a_closeout。"""
         base = self.cfg.get("base_branch", "staging")
         t["merge_sha"] = sha
         t["fail_streak"] = {"step": "", "count": 0}
-        offrepo = sha is None
-        store.set_status(self.state, tid, store.MERGED, self.now, "等你核对仓外改动" if offrepo else f"等你 {base} 走查")
+        if sha is None:
+            store.set_status(self.state, tid, store.AWAIT_CHECK, self.now, "等你核对仓外改动")
+            self.queue(tid, "handson", f"核对 {tid} 的仓外改动：diff {self.home}/cards/{tid}.diff · "
+                                       f"备份 {self.home}/backups/{tid}/（满意说「{tid} 核对过了」；"
+                                       f"不满意说「{tid} 不满意：…」）", topic="offrepo")
+            return
+        store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
         except github.GuardEmpty as e:
             guard = None
             self.res["errors"].append(f"下游留言跳过（防泄漏闸失效）：{e}")
         if guard is not None:
-            self._notify_downstream(tid, t, sha or "仓外改动，无 commit", base, guard)
-        if t["worker"].get("worktree"):
+            self._notify_downstream(tid, t, sha, base, guard)
+        w = t["worker"]
+        if w.get("worktree"):
             try:
-                launcher.remove_worktree(self.ctx, self.root, t["worker"]["worktree"])
+                launcher.remove_worktree(self.ctx, self.root, w["worktree"])
             except RuntimeError as e:
-                self.res["errors"].append(f"删 worktree {tid}：{e}")
-        if offrepo:
-            self.queue(tid, "handson", f"核对 {tid} 的仓外改动：diff {self.home}/cards/{tid}.diff · "
-                                       f"备份 {self.home}/backups/{tid}/（不满意说「{tid} 回滚」）")
-        else:
-            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+                self.res["errors"].append(f"删 worktree {tid}：{e}")      # 删失败：保留指针，接管命令仍可用
+            else:
+                w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
+        self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+
+    # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
+    def step5a_closeout(self):
+        """DONE 且 closeout 还有 pending 的票，逐栏、逐目标先查后做（投递「至少一次」，靠 marker 去重成「恰好一次」）：
+        1 本地：worktree 干净才删、分支没有未推送提交才删；done 就清指针，kept 留指针并写明原因，error 下一轮重试。
+        2 GitHub：单独加载防泄漏闸；闸失效 ⇒ GitHub 各栏全部保持 pending（fail-closed），本地照做。
+          下游逐张留言（marker / 旧格式签名命中就不再留），再关本票 issue（已关不再关）。
+        一个目标失败只记在它自己身上，继续下一个；错误第 1 次进 errors，之后同样的失败不再刷屏。"""
+        todo = [(tid, t) for tid, t in self.state["tickets"].items()
+                if t["status"] == store.DONE and store.closeout_pending(t.get("closeout"))]
+        if not todo:
+            return
+        guard, guard_err = None, ""
+        if any(self._gh_open(t["closeout"]) for _, t in todo):
+            try:
+                guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
+            except github.GuardEmpty as e:
+                guard_err = f"收尾暂停：防泄漏闸失效（{e}）"
+        for tid, t in todo:
+            try:
+                self._closeout_one(tid, t, guard, guard_err)
+            except Exception as e:  # noqa: BLE001 — 一张票的收尾出错不挡别的票
+                self._closeout_note(tid, t, [f"{e!r}"], False)
+
+    @staticmethod
+    def _gh_open(co) -> bool:
+        o = store.closeout_open(co)
+        return bool(o["downstream"]) or "issue" in o["cols"]
+
+    def _closeout_one(self, tid, t, guard, guard_err):
+        co, w = t["closeout"], t["worker"]
+        errs, progressed = [], False
+        if co.get("worktree") == "pending" or co.get("branch") == "pending":
+            r = launcher.cleanup_ticket_checkout(self.ctx, self.root, w.get("worktree"), w.get("branch"))
+            for col in ("worktree", "branch"):
+                if co.get(col) != "pending":
+                    continue
+                v = r.get(col) or "error: 没有结果"
+                if v.startswith("error"):
+                    errs.append(f"{'worktree' if col == 'worktree' else '分支'}：{v[len('error: '):]}")
+                    continue
+                co[col] = v
+                progressed = True
+                if v == "done":
+                    w[col] = None             # 清了才清指针：看板不再给失效的接管命令
+        if self._gh_open(co):
+            if guard is None:
+                errs.append(guard_err or "收尾暂停：防泄漏闸失效")
+            else:
+                progressed |= self._closeout_github(tid, t, co, guard, errs)
+        self._closeout_note(tid, t, errs, progressed)
+
+    def _closeout_github(self, tid, t, co, guard, errs) -> bool:
+        repo, progressed = self.cfg["repo"], False
+        for oid, d in (co.get("downstream") or {}).items():
+            if not isinstance(d, dict) or d.get("state") != "pending":
+                continue
+            try:
+                github.comment_once(self.ctx, repo, d["issue"], self._downstream_body(tid, t, oid), guard,
+                                    f"<!-- router:downstream:{tid}->{oid} -->", legacy=github.legacy_downstream_re(tid))
+            except (github.GhError, github.LeakBlocked, ValueError, KeyError) as e:
+                d["error"] = str(e)[:200]
+                errs.append(f"下游 {oid} #{d.get('issue')}：{e}")
+                continue
+            d["state"] = "done"
+            d.pop("error", None)
+            progressed = True
+        if co.get("issue") == "pending":
+            try:
+                github.close_issue(self.ctx, repo, t["issue"], self._closeout_body(tid, t), guard,
+                                   f"<!-- router:closeout:{tid} -->")
+            except (github.GhError, github.LeakBlocked, ValueError) as e:
+                errs.append(f"关 issue #{t.get('issue')}：{e}")
+            else:
+                co["issue"] = "done"
+                progressed = True
+        return progressed
+
+    def _closeout_note(self, tid, t, errs, progressed):
+        """closeout.error = {at, msg, n}：n == 1 才进 errors；有一栏前进了就从 1 重新数（新的失败要让 router 看见）。"""
+        co = t["closeout"]
+        if not errs:
+            co.pop("error", None)
+            if not store.closeout_pending(co):
+                t["waiting_for"] = ""
+            return
+        prev = co.get("error") or {}
+        n = 1 if progressed or not prev else prev.get("n", 0) + 1
+        msg = "；".join(errs)[:400]
+        co["error"] = {"at": self.now, "msg": msg, "n": n}
+        if n == 1:
+            self.res["errors"].append(f"收尾 {tid}：{msg}")
+
+    def _done_date(self, t) -> str:
+        at = next((h["at"] for h in reversed(t.get("history", [])) if h.get("status") == store.DONE), self.now)
+        return str(at)[:10]
+
+    def _closeout_body(self, tid, t) -> str:
+        surf = "、".join(t.get("surfaces", [])) or "未声明"
+        return (f"仓外改动已由用户核对（{self._done_date(t)}），本票完成。改动在本机（代码面：{surf}），"
+                f"不经 PR / staging。由 /router 关闭。")
+
+    def _downstream_body(self, tid, t, oid) -> str:
+        o = self.state["tickets"].get(oid) or {}
+        shared = set(o.get("surfaces", [])) & set(t.get("surfaces", []))
+        why = ("依赖已解锁" if tid in o.get("blocked_by", []) else
+               f"共享代码面 {'、'.join(sorted(shared))} 已释放" if shared else "上游已完成")
+        issue = f" #{t['issue']}" if t.get("issue") else ""
+        return (f"上游 {tid}{issue}「{t['title']}」已完成（仓外改动，不经 PR；用户已核对）。\n"
+                f"- 改了什么：{(t.get('solution') or {}).get('text', '')[:300]}\n"
+                f"- 对本票的影响：{why}；开工 / 继续前先看本机最新的仓外文件。\n\n由 /router 自动留言。")
 
     def _notify_downstream(self, tid, t, sha, base, uids):
         for o in self.state["tickets"].values():
@@ -369,18 +720,157 @@ class Run:
     def step6_dispatch(self):
         self.res["dispatched"] = dispatch(self.ctx, self.root, self.cfg, self.state, run=self)
 
+    # ---- 派单事务（R2）：worktree → brief → 意图落盘 → 起进程 → 落盘 ------------------
+    def _dispatch_one(self, tid) -> str:
+        """→ "ok" | "failed" | "stop"（意图没落盘，本轮停派）| "ok_stop"（worker 已起但落盘失败，本轮停派）。
+        不变量：一张票同一时刻最多一个活 worker。起进程之前先把意图（含启动回执路径）落盘；
+        起了之后、落盘之前崩溃 ⇒ 下一轮 recover_dispatch_intents 按回执认领，不重起。"""
+        t = self.state["tickets"][tid]
+        w = t["worker"]
+        try:
+            wt, branch = launcher.create_worktree(self.ctx, self.root, self.cfg.get("base_branch", "staging"),
+                                                  self.cfg.get("worktree_dir", ".claude/worktrees"), tid)
+        except Exception as e:  # noqa: BLE001
+            self._fail(tid, "worktree", e)
+            return "failed"
+        w.update(worktree=str(wt), branch=branch)
+        try:
+            prompt = _brief(self, tid)
+        except Exception as e:  # noqa: BLE001
+            self._fail(tid, "brief", e)
+            return "failed"
+        before = {k: w.get(k) for k in ("session_id", "runs")}
+        log = launcher.prepare_run(w, self.home, tid)
+        receipt = launcher.receipt_path(log)
+        # at = 意图落盘这一刻（起进程前一刻），不是这轮开始：建 worktree / fetch 弱网可能已经花掉几分钟，
+        # 回执宽限期从这里算才不会被吃掉（RV M-3）
+        t["dispatch"] = {"phase": "spawning", "kind": "dispatch", "session_id": w["session_id"], "log": str(log),
+                         "receipt": str(receipt), "at": _iso(self.ctx.now())}
+        try:
+            store.save_state(self.home / "state.json", self.state)
+        except Exception as e:  # noqa: BLE001 — 意图没落盘：一个进程都不起，撤回内存里的意图
+            t.pop("dispatch", None)
+            w.update(before)
+            self._fail(tid, "intent", e)
+            return "stop"
+        try:
+            launcher.spawn_run(self.ctx, self.home, self.cfg, self.state, tid, prompt, False, self.now,
+                               log=log, receipt=receipt)
+        except Exception as e:  # noqa: BLE001 — 抛异常 ⇔ 子进程没起（ctx.spawn_detached 的语义）
+            t.pop("dispatch", None)
+            self._fail(tid, "spawn", e)
+            return "failed"
+        t["kickoff_at"] = self.now
+        store.set_status(self.state, tid, store.KICKOFF, self.now,
+                         f"写方向卡（{self.cfg.get('kickoff_budget_min', 30)} 分钟内）")
+        t.pop("dispatch", None)
+        t.pop("dispatch_fail", None)
+        try:
+            store.save_state(self.home / "state.json", self.state)     # 起了进程就落盘：这轮后面崩了也不会丢 worker
+        except Exception as e:  # noqa: BLE001 — worker 已经在跑：不算派发失败；盘上留着意图，下一轮按回执认领
+            self.res["errors"].append(f"dispatch {tid}：已起 worker（pid {w.get('pid')}），但落盘失败：{e!r}；"
+                                      "盘上留着启动意图，下一轮按启动回执认领，不会重起")
+            return "ok_stop"
+        return "ok"
+
+    def _fail(self, tid, phase, e):
+        """派发某阶段失败：第 1 次进 errors（带票号和阶段），第 2 次进决定单（topic=dispatch）后不再派；
+        用户回答或派成功后清零。"""
+        t = self.state["tickets"][tid]
+        msg = (str(e) or type(e).__name__)[:300]
+        df = t.get("dispatch_fail") or {}
+        df.update(count=df.get("count", 0) + 1, phase=phase, error=msg, at=self.now)
+        t["dispatch_fail"] = df
+        self.res["dispatch_failed"].append({"ticket": tid, "phase": phase, "error": msg})
+        if df["count"] == 1:
+            err = f"dispatch {tid}（阶段 {phase}）：{msg}"
+            self.res["errors"].append(err)
+            self.fail_errors.append(err)
+        elif not df.get("qid"):
+            df["qid"] = self.queue(tid, "stuck", f"{tid} 派发失败 {df['count']} 次（阶段 {phase}）：{msg[:120]}；"
+                                                 f"修好后回「{{qid}} 重派」", topic="dispatch")
+
+    # ---- 派单对账（R2 + H4）：上次落了意图、没落 commit 的票 ---------------------------
+    def recover_dispatch_intents(self):
+        """逐张处理 dispatch.phase == "spawning" 的票，证据只认启动回执（不扫 ps、不靠 argv）：
+        回执在：活（pid + 启动时间对得上）⇒ 认领；死 ⇒ 认领后走退出处理；判活失败 ⇒ 保留意图，不派不杀。
+        回执读不了 ⇒ 保留意图，不派不杀。回执不在：有日志 / transcript ⇒ 起过，认领后走退出处理；
+        意图还新（< RECEIPT_GRACE_S）⇒ 可能还在起，保留意图；
+        什么痕迹都没有且意图已旧 ⇒ 从没起过，清掉意图，这张票重新可派（sid 没用过，复用）。"""
+        for tid, t in list(self.state["tickets"].items()):
+            it = t.get("dispatch")
+            if not isinstance(it, dict) or it.get("phase") != "spawning":
+                continue
+            try:
+                self._recover_one(tid, t, it)
+            except Exception as e:  # noqa: BLE001 — 对账出错：保留意图，本票不派
+                self._unverified(tid, it, f"对账出错：{e!r}")
+
+    def _recover_one(self, tid, t, it):
+        try:
+            rec = launcher.read_receipt(it.get("receipt"))
+        except ValueError as e:
+            return self._unverified(tid, it, f"启动回执读不了：{e}")
+        if rec is not None:
+            if rec.get("session_id") != it.get("session_id"):
+                return self._unverified(tid, it, "启动回执的 session 对不上")
+            live = launcher.receipt_liveness(self.ctx, rec)
+            if live == "unknown":
+                return self._unverified(tid, it, f"pid {rec.get('pid')} 还在，但查不到它的启动时间，认不出是不是这个 worker")
+            if live == "alive":
+                return self._adopt(tid, t, it, rec["pid"], rec.get("pid_start"))
+            self._adopt(tid, t, it, None, None)
+            return self._handle_exit(tid, t)
+        if self._has_trace(it):
+            self._adopt(tid, t, it, None, None)
+            return self._handle_exit(tid, t)
+        if self.ctx.now().timestamp() - _ts(it.get("at")) < RECEIPT_GRACE_S:
+            return self._unverified(tid, it, "启动回执还没出现，可能还在起")
+        t.pop("dispatch", None)                            # 进程从没起过
+        if it.get("kind") == "resume":                     # 续跑没起来：要转给它的话还在，交给用户再续一次
+            self._stuck(tid, f"{tid} 续跑没起来（起进程前 router 中断：没有启动回执、日志或 transcript）；回答后续跑")
+        # 派单：重新可派（sid 没用过，复用）
+
+    def _has_trace(self, it) -> bool:
+        log = Path(it["log"]) if it.get("log") else None
+        if log and log.exists() and log.stat().st_size > 0:
+            return True
+        pd = Path(os.path.expanduser(self.cfg.get("claude_projects_dir", "~/.claude/projects")))
+        return bool(it.get("session_id")) and any(pd.glob(f"*/{it['session_id']}.jsonl"))
+
+    def _adopt(self, tid, t, it, pid, pid_start):
+        w = t["worker"]
+        w.update(session_id=it.get("session_id") or w.get("session_id"), pid=pid, pid_start=pid_start,
+                 log=it.get("log"), started_at=it.get("at"))
+        w.pop("exit", None)
+        if it.get("kind") == "resume":                     # 续跑：补上没来得及落盘的状态
+            store.set_status(self.state, tid, it.get("status") or t["status"], self.now, it.get("waiting"))
+        else:
+            t["kickoff_at"] = it.get("at")
+            if t["status"] == store.QUEUED:
+                store.set_status(self.state, tid, store.KICKOFF, self.now,
+                                 f"写方向卡（{self.cfg.get('kickoff_budget_min', 30)} 分钟内）")
+        t.pop("dispatch", None)
+        t.pop("dispatch_fail", None)
+
+    def _unverified(self, tid, it, reason):
+        it["unverified"] = reason
+        if not it.get("recover_reported"):
+            it["recover_reported"] = self.now
+            self.res["errors"].append(f"dispatch {tid}（阶段 recover）：{reason}；保留启动意图，本票不派、不杀")
+
     # ---- 7 ----
     def step7_board_and_notify(self):
+        # Lark 只在这里发（R4）：前台命令写进决定单的项、上一轮没发出去的项，都由这一轮推；先推再画看板（横幅是新的）
+        lark = self.cfg.get("lark_config") or None
+        out = notify.flush(self.state, os.path.expanduser(lark) if lark else None, self.ctx, self.now)
+        if out is not None:
+            self.res["notified"] = out == "sent"
+            self.res["notify"] = out
         board.write(self.home / "board.html",
                     board.render(self.state, store.recent_decisions(self.home / "decisions.md"),
                                  {tid: events.read_all(self.home, tid)[-5:] for tid in self.state["tickets"]},
                                  self.ctx.now(), self.cfg.get("slots")))
-        if self.res["new_queue"]:
-            q = sorted(self.state["queue"], key=lambda x: (-x["blocks"], int(x["id"][1:])))
-            text = f"router：等你 {len(q)} 件（{' '.join(x['id'] for x in q)}）"
-            out = notify.send(Path(os.path.expanduser(self.cfg.get("lark_config", ""))), text, self.ctx)
-            self.res["notified"] = out == "sent"
-            self.res["notify"] = out
 
 
 def _brief(run, tid):
@@ -406,58 +896,74 @@ def _brief(run, tid):
          "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"))
 
 
-def _explain_waits(run, picked, disk):
+def _explain_waits(run, picked, done, disk):
+    """排队的票在等什么（看板「在等」）。picked = 这一轮选中的，done = 真派出去的。判定顺序：
+    依赖 → 代码面锁 → base 问题 → 核实 worker 是否已起 → 派发失败 → 磁盘 → 名额真满 → 下一轮派。"""
     st = run.state
+    tickets = st["tickets"]
+    base_name = run.cfg.get("base_branch", "staging")
     locks = surfaces.held_locks(st)
-    for tid in picked:
-        for s in st["tickets"][tid]["surfaces"]:
-            locks.setdefault(s, tid)
-    for tid, t in st["tickets"].items():
-        if t["status"] != store.QUEUED or not t["start_ok"] or tid in picked:
+    free = scheduler.free_slots(st, run.cfg.get("slots", {"heavy": 3, "light": 2}))
+    base = run._base if run._base is not None and not run._base["ok"] else None
+    for tid, t in tickets.items():
+        if t["status"] != store.QUEUED or not t["start_ok"] or tid in done:
             continue
-        unsettled = [b for b in t["blocked_by"] if st["tickets"].get(b, {}).get("status") not in store.SETTLED]
+        unsettled = [b for b in t["blocked_by"] if tickets.get(b, {}).get("status") not in store.SETTLED]
         held = sorted((s, h) for s, h in locks.items() if s in t["surfaces"] and h != tid)
+        intent, df = t.get("dispatch") or {}, t.get("dispatch_fail") or {}
         if unsettled:
-            t["waiting_for"] = f"等 {'、'.join(unsettled)} 合进 {run.cfg.get('base_branch', 'staging')}"
+            checking = [b for b in unsettled if tickets.get(b, {}).get("status") == store.AWAIT_CHECK]
+            t["waiting_for"] = (f"等你核对 {'、'.join(checking)} 的仓外改动" if checking
+                                else f"等 {'、'.join(unsettled)} 合进 {base_name}")
         elif held:
             s, h = held[0]
-            t["waiting_for"] = f"等代码面 {s}（{('外部 session ' + Path(h[4:]).name) if h.startswith('ext:') else h} 持有）"
+            if h.startswith("ext:"):
+                who = f"外部 session {Path(h[4:]).name} 持有"
+            elif tickets.get(h, {}).get("status") == store.AWAIT_CHECK:
+                who = f"{h} 待你核对"
+            else:
+                who = f"{h} 持有"
+            t["waiting_for"] = f"等代码面 {s}（{who}）"
+        elif base:
+            t["waiting_for"] = base["wait"] or f"等 origin/{base_name}"
+        elif intent.get("phase") == "spawning":
+            t["waiting_for"] = f"核实 worker 是否已起（{intent.get('unverified') or '上次派发没落完盘'}）"
+        elif df:
+            t["waiting_for"] = (f"派发失败，等你回答 {df['qid']}" if df.get("qid") else
+                                f"派发失败（第 {df.get('count', 1)} 次，阶段 {df.get('phase')}）：{str(df.get('error', ''))[:120]}")
         elif t["weight"] == "heavy" and disk:
             t["waiting_for"] = f"磁盘：{disk}，先清再派重票"
-        else:
+        elif free.get(t["weight"], 0) <= 0:
             t["waiting_for"] = "等重名额" if t["weight"] == "heavy" else "等轻名额"
+        else:
+            t["waiting_for"] = "下一轮派"
 
 
 def dispatch(ctx, root, cfg, state, run=None) -> list:
-    """选票 → 开 worktree → 拼派单 → 起 worker → KICKOFF。start 子命令（已持锁）和第 6 步共用。"""
+    """对账上次没落完盘的派发 → 选票 → 查 base → 逐张派。start 子命令（已持锁）和第 6 步共用。
+    派单是一个五阶段事务（Run._dispatch_one），每张票自己的故障边界；失败结构化进 run.res["dispatch_failed"]。"""
     run = run or Run(ctx, root, cfg, state)
+    run.recover_dispatch_intents()
     heavy_cand = any(t["status"] == store.QUEUED and t["start_ok"] and t["weight"] == "heavy"
                      for t in state["tickets"].values())
     disk = run.disk_block() if heavy_cand else ""
-    heavy_blocked = bool(disk)
-    picked, done = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), heavy_blocked), []
-    for tid in picked:
-        t = state["tickets"][tid]
-        try:
-            wt, branch = launcher.create_worktree(ctx, Path(root), cfg.get("base_branch", "staging"),
-                                                  cfg.get("worktree_dir", ".claude/worktrees"), tid)
-        except RuntimeError as e:
-            run.res["errors"].append(f"dispatch {tid}：{e}")
-            continue
-        t["worker"].update(worktree=str(wt), branch=branch)
-        launcher.run_worker(ctx, run.home, cfg, state, tid, _brief(run, tid), False, run.now)
-        t["kickoff_at"] = run.now
-        store.set_status(state, tid, store.KICKOFF, run.now, f"写方向卡（{cfg.get('kickoff_budget_min', 30)} 分钟内）")
-        store.save_state(run.home / "state.json", state)     # 起了进程就落盘：这轮后面崩了也不会丢 worker
-        done.append(tid)
-    _explain_waits(run, done, disk)
+    picked = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), bool(disk))
+    done = []
+    if picked and run.ensure_base()["ok"]:
+        for tid in picked:
+            outcome = run._dispatch_one(tid)
+            if outcome in ("ok", "ok_stop"):
+                done.append(tid)
+            if outcome in ("stop", "ok_stop"):
+                break                                    # 存盘出了问题：这一轮不再派后面的票
+    _explain_waits(run, picked, done, disk)
     return done
 
 
 def _resurface(r):
     """router 被压缩 / 重启后，上一次 watch 交出去、还没处理完的东西再交一次（只在 watch 第一轮和 tick 子命令做）。"""
     for tid, t in r.state["tickets"].items():
-        if (t["status"] == store.KICKOFF and t.get("card_ready_at") and not launcher.worker_alive(r.ctx, t["worker"])
+        if (t["status"] == store.KICKOFF and t.get("card_ready_at") and launcher.worker_liveness(r.ctx, t["worker"]) == "dead"
                 and tid not in r.res["cards_for_review"]):
             r.res["cards_for_review"].append(tid)
     pending = [e for e in r.state.get("slow_path", []) if e not in r.res["slow_path_events"]]
@@ -465,6 +971,9 @@ def _resurface(r):
 
 
 def run(ctx, root, cfg, resurface=False) -> dict:
+    bad = store.base_branch_problem(cfg)
+    if bad:                                      # 配置把 base 写成 main：一步都不走（不派、不合、不重建），只报错
+        return {**_empty_res(), "errors": [bad]}
     home = home_for(root)
     with store.locked(home):
         state = store.load_state(home / "state.json")

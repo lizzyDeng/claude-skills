@@ -8,6 +8,7 @@
 改状态的子命令都在 <状态目录>/.lock 上加排他锁：后台 watch 的 tick 和前台命令不会互相覆盖。
 """
 import argparse
+import copy
 import json
 import os
 import re
@@ -28,7 +29,8 @@ from ctx import Ctx  # noqa: E402
 RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
-               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow"}
+               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow",
+               "review-pack", "review-canary"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -37,7 +39,22 @@ KIND_HINT = {
     "direction": "照原话继续当前阶段。",
     "stuck": "router 发现你上次没留下结果就退出了。先看 git status / git log 和你的笔记，确认做到哪，再照原话继续。",
     "conflict": "照原话处理代码面冲突后继续。",
+    "offrepo_reject": "用户核对你的仓外改动后不满意（原话见上）。先读 inbox；按原话改，或用 "
+                      "$ROUTER_HOME/backups/$ROUTER_TICKET/ 恢复后重做；改完重写 cards/$ROUTER_TICKET.diff、跑验收，"
+                      "再 progress impl_done 退出。",
 }
+
+
+# 续跑后「在等什么」（R5）：按续跑的原因写，不留空
+RESUME_WAIT = {"card": "执行中（方向卡已确认）", "reject": "按驳回重写方向卡", "spend": "照放行结论继续",
+               "stuck": "按回答续跑", "conflict": "按回答处理代码面冲突", "offrepo_reject": "按你的意见改仓外改动",
+               "handback": "你交还后继续"}
+
+
+def _resume_wait(kind, status) -> str:
+    if kind in RESUME_WAIT:
+        return RESUME_WAIT[kind]
+    return "按 router 转来的意见改方向卡" if status == store.KICKOFF else "按 router 转来的话继续"   # direction / tell --resume
 
 
 class Fail(Exception):
@@ -68,12 +85,22 @@ class Env:
 
     @contextmanager
     def state(self):
-        """load → 改 → save → 重画看板，全程持锁。出异常就不存。"""
+        """load → 改 → save → 重画看板，全程持锁。出异常就不存。
+        中途为了起进程先落过一次盘（续跑意图）、随后起进程失败：rollback() 把盘恢复成这条命令之前的样子。"""
         with self.locked():
             st = store.load_state(self.state_path)
+            self._snapshot = copy.deepcopy(st)
             yield st
             store.save_state(self.state_path, st)
             render_board(self, st)
+
+    def rollback(self) -> None:
+        snap = getattr(self, "_snapshot", None)
+        if snap is not None:
+            try:
+                store.save_state(self.state_path, snap)
+            except Exception:  # noqa: BLE001 — 盘上留着没起成的意图：下一轮过了宽限期按「没起过」处理
+                pass
 
     def ticket(self, st, tid):
         if tid not in st["tickets"]:
@@ -92,34 +119,17 @@ def render_board(env, st) -> None:
                              env.ctx.now()))
 
 
-def notify(env, text) -> str:
-    try:
-        import notify as nt
-    except ImportError:
-        return f"DRY RUN（notify 未接入）：{text}"
-    return nt.send(Path(os.path.expanduser(env.cfg.get("lark_config", ""))), text, env.ctx)
-
-
-def dispatch(env, st):
-    """→ (派出去的票, 派发时的错误)。"""
-    try:
-        import tick
-    except ImportError:
-        return [], []
-    run = tick.Run(env.ctx, env.root, env.cfg, st)
-    return tick.dispatch(env.ctx, env.root, env.cfg, st, run=run), run.res["errors"]
+def dispatch(env, st, run=None):
+    """→ (派出去的票, 结构化的派发失败 [{ticket, phase, error}], 其余错误)。
+    run 由 cmd_start 传入：它先用同一个 Run 查过 base，这里复用结果，不再查第二次。"""
+    import tick
+    run = run or tick.Run(env.ctx, env.root, env.cfg, st)
+    done = tick.dispatch(env.ctx, env.root, env.cfg, st, run=run)
+    return done, run.res["dispatch_failed"], [e for e in run.res["errors"] if e not in run.fail_errors]
 
 
 def _csv(s):
     return [x.strip() for x in (s or "").split(",") if x.strip()]
-
-
-def _blocks(st, tid) -> int:
-    """这张票挡住了几张：依赖它的 + 排队等它代码面的。"""
-    t = st["tickets"][tid]
-    return sum(1 for o in st["tickets"].values() if o["id"] != tid and o["status"] not in store.SETTLED
-               and (tid in o["blocked_by"]
-                    or (o["status"] == store.QUEUED and set(o["surfaces"]) & set(t["surfaces"]))))
 
 
 def _resume_prompt(kind, text, inbox):
@@ -137,12 +147,26 @@ def _check_surfaces(env, names):
         raise Fail(f"未知代码面 {unknown}；只能用 surfaces.json 里的：{sorted(env.table)}")
 
 
-def _resume(env, st, tid, kind, text, status, force_restart=False):
+def _refuse_pending(t, tid, ctx=None) -> None:
+    """会起 / 停 / 交出 worker 的前台命令，在认不出 worker 时一律不做：
+    上次派单 / 续跑的意图还没核实（worker 可能已经在跑，RV M-1）；给了 ctx 时，pid 在但 ps 查不到启动时间（RV M-2）。"""
+    if store.pending_intent(t):
+        why = (t.get("dispatch") or {}).get("unverified") or "上次起 worker 没落完盘"
+        raise Fail(f"{tid} 派单待核实（{why}），下一轮巡检后再试")
+    if ctx is not None and launcher.worker_liveness(ctx, t["worker"]) == "unknown":
+        raise Fail(f"{tid} 的 worker（pid {t['worker'].get('pid')}）还在，但查不到它的启动时间（ps 失败 / 超时），"
+                   "认不出是不是它：稍后再试")
+
+
+def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
-    force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。"""
+    force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
+    waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
+    续跑走与派单相同的事务：意图落盘 → 起进程（带启动回执）→ 命令结束时存盘；那次存盘失败，下一轮按回执认领。"""
     t = st["tickets"][tid]
     if t["status"] == store.TAKEOVER:
         raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
+    _refuse_pending(t, tid, env.ctx)
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
@@ -151,8 +175,16 @@ def _resume(env, st, tid, kind, text, status, force_restart=False):
             return "delivered"
         launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
-    launcher.run_worker(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), True, env.now())
-    store.set_status(st, tid, status, env.now())
+    wait = waiting if waiting is not None else _resume_wait(kind, status)
+    try:
+        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), status,
+                                    wait, env.now(), lambda: store.save_state(env.state_path, st))
+    except launcher.IntentNotSaved as e:
+        raise Fail(f"{tid} 没续跑：起进程前存盘失败（{e}）")
+    except Exception as e:  # noqa: BLE001 — 意图已落盘、进程没起：盘恢复成这条命令之前
+        env.rollback()
+        raise Fail(f"{tid} 没续跑：起不了 worker（{e}）")
+    store.set_status(st, tid, status, env.now(), wait)
     return "resumed"
 
 
@@ -223,9 +255,9 @@ def cmd_draft(a, env):
                     unknown.append({"ticket": tid, "depends_on": dep})
         st["batch"] = {"id": batch, "started": False, "started_at": None}
         n = sum(1 for t in created if st["tickets"][t]["status"] == store.DRAFT)
-        qid = store.push_queue(st, None, "start", f"派发单已备好（{n} 张）", n, env.now())
-    return {"ok": True, "batch": batch, "tickets": created, "queue": qid, "unknown_depends": unknown,
-            "notify": notify(env, f"router：派发单已备好（{n} 张，批次 {batch}）")}
+        qid = store.push_queue(st, None, "start", f"派发单已备好（{n} 张）", env.now())
+    # 不在这里发 Lark：start 项 notified_at=None，下一轮巡检统一推（R4）
+    return {"ok": True, "batch": batch, "tickets": created, "queue": qid, "unknown_depends": unknown}
 
 
 def cmd_add(a, env):
@@ -244,6 +276,10 @@ def cmd_add(a, env):
 
 
 def cmd_start(a, env):
+    import tick
+    bad = store.base_branch_problem(env.cfg)
+    if bad:                                           # 在任何 GitHub 写入、任何 git 操作之前
+        raise Fail(bad)
     repo = env.cfg["repo"]
     blocked, errors, warnings, started = [], [], [], []
     with env.locked():
@@ -258,7 +294,20 @@ def cmd_start(a, env):
         for tid in sel:
             if env.ticket(st, tid)["status"] not in (store.DRAFT, store.HOLD):
                 raise Fail(f"{tid} 状态是 {st['tickets'][tid]['status']}，不能 start")
-        uids = github.load_guard_uids(env.cfg.get("leak_guard_globs", []))
+        # 与其它 GitHub 写路径同一道闸（uid + 20 字原话窗口）；闸失效 ⇒ 什么都不做（fail-closed，RV I-3）
+        try:
+            guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
+        except github.GuardEmpty as e:
+            raise Fail(f"防泄漏闸失效，没有建任何 issue：{e}")
+        # 在任何 GitHub 写入（map / issue）之前先查远端 base：base 不对，一张 issue 都不建
+        run = tick.Run(env.ctx, env.root, env.cfg, st)
+        base = run.ensure_base()
+        if not base["ok"]:
+            if not base["transient"]:                    # 进了决定单：项先落盘，再 Fail
+                store.save_state(env.state_path, st)
+                render_board(env, st)
+            raise Fail(f"远端 {env.cfg.get('base_branch', 'staging')} 不可用，没有建任何 issue：{base['error']}",
+                       base_wait=base["wait"])
         if not st.get("map"):
             st["map"] = github.ensure_map(env.ctx, repo, env.cfg["map_title"])
             store.save_state(env.state_path, st)
@@ -266,7 +315,7 @@ def cmd_start(a, env):
             t = st["tickets"][tid]
             if t["issue"] is None:
                 try:
-                    t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, uids)
+                    t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, guard)
                 except github.LeakBlocked as e:
                     blocked.append({"ticket": tid, "hits": e.hits})
                     continue
@@ -293,8 +342,9 @@ def cmd_start(a, env):
                    for t in st["tickets"].values()):
             st["queue"] = [q for q in st["queue"] if q["kind"] != "start"]
         store.save_state(env.state_path, st)
-        dispatched, dispatch_errors = dispatch(env, st)
-        errors += [{"ticket": None, "error": e} for e in dispatch_errors]
+        dispatched, failed, other = dispatch(env, st, run)
+        errors += failed                                  # [{ticket, phase, error}]：哪张票、卡在哪一步
+        warnings += [{"ticket": None, "error": e} for e in other]
         store.save_state(env.state_path, st)
         render_board(env, st)
     res = {"ok": not blocked and not errors, "started": started, "dispatched": dispatched,
@@ -313,9 +363,28 @@ def cmd_answer(a, env):
             raise Fail(f"决定单里没有 {a.qid}")
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(a.text.splitlines())}")
-        resumed, delivered, hint = None, None, ""
+        resumed, delivered, hint, extra = None, None, "", {}
         t = st["tickets"].get(q["ticket"]) if q["ticket"] else None
-        if t and t["status"] == store.TAKEOVER:
+        topic = q.get("topic")
+        # 判定顺序：topic（base / retarget / dispatch）→ 接管中 → 续跑 worker → 待你动手（走查 / 核对）
+        if topic == "base":
+            bp = st.get("base_problem")
+            if bp and bp.get("qid") == q["id"]:
+                if bp.get("expected_sha"):               # H1：回答 ≠ 接受当前 tip；保留预期 sha，下一轮照样重验
+                    bp.update(qid=None, answered_at=env.now())
+                else:
+                    st.pop("base_problem")
+            hint = "下一轮巡检重查远端 base（仍不对会重新进决定单）"
+        elif topic == "retarget":
+            if t:
+                t.pop("retarget_fail", None)
+                t.pop("wrong_base_reported", None)
+            hint = "下一轮重验 PR（不唤醒 worker）"
+        elif topic == "dispatch":
+            if t:
+                t.pop("dispatch_fail", None)
+            hint = "下一轮重派"
+        elif t and t["status"] == store.TAKEOVER:
             hint = f"{t['id']} 在你接管中，回答已存档；还给 router 后再续跑"
         elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
             kind = q["kind"]
@@ -329,13 +398,26 @@ def cmd_answer(a, env):
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
             how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"))
             resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
+        elif t and q["kind"] == "handson":
+            if a.reject:
+                if t["status"] == store.MERGED:
+                    raise Fail(f"{t['id']} 是仓内票、已合 staging，没有驳回通道：不满意请 add 一张跟进票")
+                if t["status"] != store.AWAIT_CHECK:
+                    raise Fail(f"{t['id']} 状态是 {t['status']}，不在等你核对")
+                wt = t["worker"].get("worktree")
+                if not wt or not Path(wt).is_dir():
+                    raise Fail(f"{t['id']} 的 worktree 已不在，不能续跑：不满意请 add 一张跟进票")
+                how = _resume(env, st, t["id"], "offrepo_reject", a.text, store.EXECUTING)
+                resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
+            else:
+                extra = _checked(env, st, t)
+                hint = extra.pop("hint", "")
         elif q["kind"] == "start":
             hint = "派发单要用 start 子命令"
-        elif q["kind"] == "handson":
-            hint = "走查完用 walkthrough-done"
         elif q["kind"] == "prod":
             hint = "按 aifriends 发版流程上 prod，发完用 released"
-    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint}
+    return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint,
+            **extra}
 
 
 def cmd_submit_card(a, env):
@@ -346,6 +428,7 @@ def cmd_submit_card(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] != store.KICKOFF:
             raise Fail(f"{a.ticket} 状态是 {t['status']}，只有出方向卡阶段（kickoff）的票能交卡")
+        _refuse_pending(t, a.ticket, env.ctx)         # 认不出可能在跑的那个 worker：停不了它
         st["queue"] = [q for q in st["queue"] if not (q["kind"] == "card" and q["ticket"] == a.ticket)]   # 旧版本作废
         version = t.get("card", {}).get("version", 0) + 1
         t["card"] = {"path": str(card), "rounds": a.rounds, "codex": a.codex, "overtime": a.overtime,
@@ -358,7 +441,7 @@ def cmd_submit_card(a, env):
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
                                f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
-                               _blocks(st, a.ticket), env.now())
+                               env.now())
     return {"ok": True, "queue": qid, "version": version}
 
 
@@ -388,6 +471,8 @@ def cmd_tell(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] == store.TAKEOVER and a.resume:
             raise Fail(f"{a.ticket} 在你接管中：先「还给 router」（handback）再续跑")
+        if a.resume:
+            _refuse_pending(t, a.ticket, env.ctx)     # 先拒再投递：不然重试会投两份
         alive = launcher.worker_alive(env.ctx, t["worker"])
         if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
             events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": a.text})
@@ -412,6 +497,7 @@ def cmd_pause(a, env):
 def cmd_stop(a, env):
     with env.state() as st:
         t = env.ticket(st, a.ticket)
+        _refuse_pending(t, a.ticket, env.ctx)         # 可能在跑的那个 worker 认不出：停不了它
         launcher.stop_worker(env.ctx, t["worker"])
         t["worker"]["pid"] = None
         store.set_status(st, a.ticket, store.PAUSED, env.now(), "你让它立刻停")
@@ -424,6 +510,7 @@ def cmd_takeover(a, env):
         w = t["worker"]
         if not w.get("session_id"):
             raise Fail(f"{a.ticket} 还没有 worker session")
+        _refuse_pending(t, a.ticket, env.ctx)         # 后台可能已有 worker 在写同一个 session：不交出 resume 命令
         launcher.stop_worker(env.ctx, w)                # 同一个 session 不能两边同时写
         w["pid"] = None
         if t["status"] != store.TAKEOVER:
@@ -438,11 +525,13 @@ def cmd_handback(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] != store.TAKEOVER:
             raise Fail(f"{a.ticket} 不在接管中")
+        _refuse_pending(t, a.ticket)
         prev = t.pop("takeover_from", store.PAUSED)
         store.set_status(st, a.ticket, prev, env.now())       # 先解除接管，_resume 才肯续跑
         if prev in store.RUNNING:
             _resume(env, st, a.ticket, "direction",
-                    "用户接管结束，交还给 router。先看 git log / git status 了解用户做了什么，再按当前阶段继续。", prev)
+                    "用户接管结束，交还给 router。先看 git log / git status 了解用户做了什么，再按当前阶段继续。", prev,
+                    waiting=RESUME_WAIT["handback"])
         else:
             store.set_status(st, a.ticket, prev, env.now())
     return {"ok": True, "status": prev}
@@ -510,14 +599,44 @@ def cmd_inbox(a, env):
     return {"ok": True, "messages": msgs}
 
 
+def _closeout_targets(st, tid) -> dict:
+    """核对完那一刻的下游快照：没 settle、没 skip、有 issue，且依赖本票或共享代码面的票。
+    迁移来的旧票同样现算，不预设「已通知」：tick 留言前先查 marker / 旧格式签名，已留过的不重复。"""
+    t = st["tickets"][tid]
+    mine = set(t.get("surfaces", []))
+    return {o["id"]: {"issue": o["issue"], "state": "pending"} for o in st["tickets"].values()
+            if o["id"] != tid and o.get("issue") and o["status"] not in store.SETTLED | {store.SKIP}
+            and (tid in o.get("blocked_by", []) or mine & set(o.get("surfaces", [])))}
+
+
+def _checked(env, st, t) -> dict:
+    """用户说「T 走查过了 / T 核对过了」（walkthrough-done，或回答 handson 项）：
+    仓内已合 staging → 等上 prod；仓外待核对 → 完成，收尾（下游留言、关 issue、清 worktree / 分支）交给下一轮 tick。
+    只改本地状态，不碰网络。重复说一次是幂等的。"""
+    tid, status = t["id"], t["status"]
+    drop_handson = lambda: [q for q in st["queue"] if not (q["kind"] == "handson" and q["ticket"] == tid)]
+    if status == store.MERGED:
+        store.set_status(st, tid, store.AWAIT_PROD, env.now(), "等上 prod")
+        st["queue"] = drop_handson()
+        return {"status": store.AWAIT_PROD}
+    if status == store.AWAIT_CHECK:
+        t["closeout"] = {"downstream": _closeout_targets(st, tid), "issue": "pending" if t.get("issue") else "n/a",
+                         "worktree": "pending", "branch": "pending"}
+        store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：下游留言、关 issue、清 worktree）")
+        st["queue"] = drop_handson()
+        return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾在下一轮巡检完成"}
+    if status == store.DONE and store.closeout_pending(t.get("closeout")):
+        return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾还没做完，下一轮巡检继续"}
+    if status in (store.DONE, store.AWAIT_PROD):
+        st["queue"] = drop_handson()
+        return {"status": status, "already": True}
+    raise Fail(f"{tid} 还没合进 staging，也不在等你核对（{status}）")
+
+
 def cmd_walkthrough_done(a, env):
     with env.state() as st:
-        t = env.ticket(st, a.ticket)
-        if t["status"] != store.MERGED:
-            raise Fail(f"{a.ticket} 还没合进 staging（{t['status']}）")
-        store.set_status(st, a.ticket, store.AWAIT_PROD, env.now(), "等上 prod")
-        st["queue"] = [q for q in st["queue"] if not (q["kind"] == "handson" and q["ticket"] == a.ticket)]
-    return {"ok": True}
+        res = _checked(env, st, env.ticket(st, a.ticket))
+    return {"ok": True, **res}
 
 
 def _prod_item(env, st):
@@ -525,7 +644,7 @@ def _prod_item(env, st):
     ready = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
                    key=lambda x: int(x[1:]))
     if ready:
-        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", len(ready), env.now()), ready
+        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready
     return None, []
 
 
@@ -558,11 +677,28 @@ def _summary(st):
         counts[t["status"]] = counts.get(t["status"], 0) + 1
     used = {"heavy": 0, "light": 0}
     for t in st["tickets"].values():
-        if t["status"] in store.RUNNING:
+        if store.occupies_slot(t):
             used[t["weight"]] += 1
     used["heavy"] += sum(1 for e in st["external"].values() if e.get("active") and e.get("weight") == "heavy")
-    queue = sorted(st["queue"], key=lambda q: (-q["blocks"], int(q["id"][1:])))
-    return counts, used, queue
+    return counts, used, store.queue_view(st)       # 「几张 / 挡几张」读时现算（R3）
+
+
+def _closeout_line(co) -> str:
+    """仓外票收尾进度（status 文字版）：没做完的、有意保留的、最近一次出错。"""
+    o = store.closeout_open(co)
+    names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
+    parts = []
+    todo = [f"下游 {x}" for x in o["downstream"]] + [names[c] for c in o["cols"]]
+    if todo:
+        parts.append("收尾未完成：" + "、".join(todo))
+    kept = [f"{c}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
+            if isinstance(co, dict) and str(co.get(c, "")).startswith("kept")]
+    if kept:
+        parts.append("保留：" + "、".join(kept))
+    err = (co or {}).get("error") if isinstance(co, dict) else None
+    if todo and err:
+        parts.append(f"出错：{str(err.get('msg', ''))[:120]}")
+    return "".join(f" · {x}" for x in parts)
 
 
 def cmd_status(a, env):
@@ -582,9 +718,27 @@ def cmd_status(a, env):
         t = st["tickets"][tid]
         issue = f" #{t['issue']}" if t["issue"] else ""
         wait = f" · 等：{t['waiting_for']}" if t["waiting_for"] else ""
-        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}")
+        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}")
     print("\n".join(lines))
     return None
+
+
+def _review_call(fn, *args):
+    import review
+    try:
+        return {"ok": True, **fn(review, *args)}
+    except review.Refused as e:
+        raise Fail(str(e), reason=e.reason, **e.extra)
+
+
+def cmd_review_pack(a, env):
+    """方向审的 codex 材料 + 读边界 + 三道预检 → <home>/review/<T>/codex.sh。不过 ⇒ ok:false 带 reason，不给命令。"""
+    return _review_call(lambda r: r.pack(env, a.ticket, a.round))
+
+
+def cmd_review_canary(a, env):
+    """真 codex exec 金丝雀（一次 codex 订阅的常规审查用量）：只在 codex 升级、或从没跑过时需要。"""
+    return _review_call(lambda r: r.canary(env))
 
 
 def cmd_discover(a, env):
@@ -629,7 +783,7 @@ def build_parser():
     s = sub.add_parser("tell", help="写进 worker 收件箱")
     s.add_argument("ticket"); s.add_argument("text"); s.add_argument("--resume", action="store_true")
     for name, h in (("pause", "先停：做完当前这一步"), ("stop", "立刻停"), ("takeover", "我接管"),
-                    ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了")):
+                    ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了 / 仓外改动核对过了")):
         sub.add_parser(name, help=h).add_argument("ticket")
     s = sub.add_parser("surfaces", help="更新票的代码面 / 越界时分配锁（记一条决定）")
     s.add_argument("ticket"); s.add_argument("--set", required=True); s.add_argument("--why", required=True)
@@ -652,6 +806,9 @@ def build_parser():
     s = sub.add_parser("status", help="看板文字版")
     s.add_argument("--json", action="store_true")
     sub.add_parser("discover", help="扫外部 worktree，登记它们锁着的代码面")
+    s = sub.add_parser("review-pack", help="方向审：拼 codex 材料、设读边界、预检，生成 codex.sh")
+    s.add_argument("ticket"); s.add_argument("--round", type=int, default=1)
+    sub.add_parser("review-canary", help="用真 codex exec 验读边界（按 codex 版本记 canary.json）")
     extend_parser(sub)
     return p
 

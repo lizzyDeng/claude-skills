@@ -23,12 +23,12 @@ description: 一个 session 管全部待办：周报出来后分诊出派发单�
 
 | 返回字段 | 你做什么 |
 |---|---|
-| `triage_needed` | 分诊（第 3 节）→ `router.py draft --from <triage.json>`。只出草稿：不建 issue、不起 worker；draft 会推一条 Lark。 |
+| `triage_needed` | 分诊（第 3 节）→ `router.py draft --from <triage.json>`。只出草稿：不建 issue、不起 worker；draft 不直接发 Lark，下一轮巡检推（前台命令写进决定单的项都由 tick 推，发不出去下一轮重试）。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节）。 |
 | `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。 |
 | `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>"`；是新问题就 `router.py add …` 进草稿（等用户 start）。处理完 `router.py ack-slow`。 |
 | `external_deliveries` | 用户自己开的 session 的订阅投递。tick 已写进对方 worktree 的 `.claude/router-inbox.md`；再用 `ListAgents` 找到 cwd 对得上的 session，`SendMessage` 一句话提醒。**只转交信息，不给它们下指令。** |
-| `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。 |
+| `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。派发失败（第 2 次）、远端 base 缺失或指向认不出的 tip、改回 PR 失败（第 2 次）会自己进决定单，不用你搬；仓外票收尾失败第 1 次进 errors，之后只在看板票卡和 `status` 上显示（下一轮自动重试）。 |
 
 ## 3. 分诊（周报 → 派发单草稿）
 
@@ -44,7 +44,12 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 
 1. 并行做两件事：
    - 派一个 **Opus** Agent，prompt = `templates/direction_review.md` + 派单（票的 why / problem / 线索）+ 卡全文。输出 `{"pass": bool, "challenges": [...]}`。
-   - 后台跑 codex 一轮（只审一轮）：`timeout 330 codex exec -s read-only "<同一份材料>" < /dev/null > <home>/cards/<T>.codex.md 2>&1`。
+   - codex 一轮（只审一轮）：先 `router.py review-pack <T> [--round <n>]`，**不要自己拼 codex 命令**。读边界（默认拒绝整个 HOME，只放行审查目录和 codex 运行时）和三道预检只在 review-pack 里；仓外票只拷卡上引用的干净代码进 pack，数据目录、含 uid 的文件一律不拷。
+     - `ok: true` ⇒ 用 Bash 后台跑它给的 `codex_cmd`（`bash <home>/review/<T>/codex.sh`，输出在 `cards/<T>.codex[-rN].md`）。
+     - `reason: canary_stale`（codex 升级了、这个版本从没验过，或这个版本上次的金丝雀拿不准 / 超时）⇒ 先 `router.py review-canary`（一次真 codex exec，算 codex 订阅的常规审查用量），再重试**一次** review-pack；这张卡不再补跑第二次。
+     - 仍然 `ok: false`（boundary / canary_stale / canary_failed / leak / guard …）⇒ 本轮不跑 codex，`router.py decide --ticket <T> --decision "codex 跳过：<reason>" --why "<error 原文>" --basis "review-pack 输出"`，只用 Opus 审。
+     - review-canary 报 `canary_inconclusive`（模型没真执行命令、只是复述，或超时）不是定论：下一张卡的 review-pack 会再报 canary_stale、再补跑一次。
+     - review-canary 报 `canary_leak`（金丝雀读出了被拒路径的假数据）⇒ 另外**告诉用户**「codex 读边界失效」：这是安全事件，人要知道；只有这种情况 review-pack 才会一直报 canary_failed、跳过 codex，直到用户查过 codex 版本和配置。
 2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume`，worker 改卡后会再次 `progress card_ready`，回到这里。
 3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime]`。codex 与 Opus 有分歧：由你裁决，在卡末尾追加 `## router 裁决` 一段写明，再交。
 4. 超时（`waiting_for` 里有「超时」）照样交，加 `--overtime`，卡上注明哪部分没完成、为什么。
@@ -63,6 +68,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 | 上 prod：合 main 发版、写 prod 库 | **用户** |
 | 真人动手：staging 走查、登录、扫码（决定单「待你动手」） | **用户** |
 | 方向取舍、codex 分歧、优先级、拆票、依赖、何时派、合 staging（CI 绿后）、产品口径 | **你** |
+| 远端 base 被删时从 main 重建、改回被 GitHub 自动改指到 main 的 router PR | **router 自动**（用户 11-02 长期授权；tick 自己做，各记一条 decide） |
 
 你替用户做的每个决定都要落盘：`router.py decide --ticket <T> --decision "<决定>" --why "<理由>" --basis "<依据：文件 / 数据 / 规则>"`。用户说「推翻 Dn」：`router.py revoke <Dn> --reason "<用户原话>"`，受影响的票会被标「需复核」并收到通知。
 
@@ -85,8 +91,12 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 | 「还给 router」 | `router.py handback <T>` |
 | 「看板」/「现在什么情况」 | `router.py status`，只说要点 + 看板路径 |
 | 「加个需求：…」 | `router.py add --title … --problem … --evidence … --surfaces …`，进草稿，等用户单独 start |
-| 「T2 走查过了」 | `router.py walkthrough-done <T>`；攒够一批：`router.py prod-batch` |
+| 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支） |
+| 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
+| 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
 | 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2`（写进周报 releases.json） |
+
+`tell --resume` / 会唤醒 worker 的 `answer` / `stop` / `takeover` / `handback` / `submit-card` 报「派单待核实」（上次起 worker 没落完盘，后台可能已有一个在跑）或「查不到它的启动时间」（ps 失败）：不要重试、不要手动起 worker，等下一轮巡检对账后再执行同一条命令。
 
 ## 7. 回复用户的规矩
 
@@ -98,12 +108,12 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 
 - **prod 只读**：worker 只写 staging；写过 staging 数据的票必须在同一个 run 里回滚。`supercli db execute` 已在 worker 配置里禁用。
 - **用户 uid 和原话不进 GitHub**：建票和留言都过防泄漏闸（`leak_guard_globs`），命中就拒。worker 要证据，给本地路径。
-- **合 staging 只在 CI 检查非空且全部通过时**，由 tick 做；不许 `gh pr merge --auto`（staging 没有必需检查，`--auto` 会立刻合）。另外三道闸：方向卡没经用户确认不合；PR 的 base 不是 `base_branch`（例如漏写 `--base` 指向了 main）不合；PR 标题 / 正文 / diff 里有用户 uid 或原话不合。
+- **合 staging 只在 CI 检查非空且全部通过时**，由 tick 做；不许 `gh pr merge --auto`（staging 没有必需检查，`--auto` 会立刻合）。另外几道闸：方向卡没经用户确认不合；PR 的 base 不是 `base_branch`（例如漏写 `--base` 指向了 main）不合；PR 标题 / 正文 / diff 里有用户 uid 或原话不合；远端 `base_branch` 是认不出的 tip（决定单里的 base 项）时不合、也不叫 worker rebase。config 的 `base_branch` 写成 main / master / `main_branch` ⇒ start 和巡检一律拒绝工作（报错），先改 config。
 - 不给用户自己开的 session 下指令；只登记、只转交。
 - 你不改仓库代码、不自己定解法；派的是问题和证据。
 
 ## 9. 文件（`<项目根>/.claude/router/`，已 gitignore）
 
-`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md` · `backups/<T>/`（仓外票改前备份）· `logs/<T>-<n>.log` · `board.html`。
+`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `logs/<T>-<n>.log` · `board.html`。
 
 🔴 这个目录必须被 git 忽略（里面有周报证据和方向卡）。项目 `.gitignore` 没覆盖时，在 `.git/info/exclude` 加 `**/.claude/router/` 和 `**/.claude/router-inbox.md`。

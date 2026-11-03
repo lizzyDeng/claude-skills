@@ -31,10 +31,10 @@ def surfaces_for_files(files, table) -> set:
 
 
 def held_locks(state) -> dict:
-    """surface → 持有者（票号，或 ext:<worktree>）。票优先于外部 session 登记。"""
+    """surface → 持有者（票号，或 ext:<worktree>）。票优先于外部 session 登记。带未核实意图的票也持锁。"""
     locks = {}
     for tid, t in state["tickets"].items():
-        if t["status"] in store.LOCKING:
+        if store.holds_lock(t):
             for s in t["surfaces"]:
                 locks.setdefault(s, tid)
     for path, ext in state["external"].items():
