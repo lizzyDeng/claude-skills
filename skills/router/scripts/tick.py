@@ -268,7 +268,17 @@ class Run:
             w = t["worker"]
             if store.pending_intent(t):          # 还待核实：worker 可能在跑，不判退出
                 continue
-            if t["status"] not in store.RUNNING or not w.get("pid") or launcher.worker_alive(self.ctx, w):
+            if t["status"] not in store.RUNNING or not w.get("pid"):
+                continue
+            live = launcher.worker_liveness(self.ctx, w)
+            if live == "unknown":                # ps 失败 / 超时 ≠ 没进程：不判退出、不清 pid、不起新的；只报一次
+                if not w.get("liveness_unknown"):
+                    w["liveness_unknown"] = self.now
+                    self.res["errors"].append(f"step2 {tid}：pid {w['pid']} 还在，但查不到它的启动时间（ps 失败 / 超时），"
+                                              "认不出是不是这个 worker：本轮不判退出")
+                continue
+            w.pop("liveness_unknown", None)
+            if live == "alive":
                 continue
             try:
                 self._handle_exit(tid, t)
@@ -424,8 +434,8 @@ class Run:
     def _verify(self, tid, t, repo, base, guard):
         if store.pending_intent(t):
             return                                # 续跑待核实：worker 可能在跑，等对账
-        if launcher.worker_alive(self.ctx, t["worker"]):
-            return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）：等它退出
+        if launcher.worker_liveness(self.ctx, t["worker"]) != "dead":
+            return                                # worker 还在跑（修 CI / rebase / 用户刚还回来）或认不出：等它退出
         if not t.get("card_confirmed"):
             self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
                        f"{tid}：方向卡没经你确认，PR 不合")
@@ -932,7 +942,7 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
 def _resurface(r):
     """router 被压缩 / 重启后，上一次 watch 交出去、还没处理完的东西再交一次（只在 watch 第一轮和 tick 子命令做）。"""
     for tid, t in r.state["tickets"].items():
-        if (t["status"] == store.KICKOFF and t.get("card_ready_at") and not launcher.worker_alive(r.ctx, t["worker"])
+        if (t["status"] == store.KICKOFF and t.get("card_ready_at") and launcher.worker_liveness(r.ctx, t["worker"]) == "dead"
                 and tid not in r.res["cards_for_review"]):
             r.res["cards_for_review"].append(tid)
     pending = [e for e in r.state.get("slow_path", []) if e not in r.res["slow_path_events"]]

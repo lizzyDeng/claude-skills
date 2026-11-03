@@ -115,13 +115,6 @@ def _gh(ctx, args, timeout=GH_S) -> str:
     return r.stdout
 
 
-def load_guard_uids(globs) -> set:
-    try:
-        return load_guard(globs).uids
-    except GuardEmpty:
-        return set()
-
-
 def leak_hits(text: str, guard) -> list:
     """guard 可以是 Guard，也可以是 uid 集合。命中的 uid 原样返回；原话命中返回「原话：<前 12 字>…」。"""
     low = text.lower()

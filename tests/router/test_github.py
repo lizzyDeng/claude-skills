@@ -3,8 +3,8 @@ import json
 import pytest
 from conftest import FIX, FakeCtx
 
-from github import (LeakBlocked, add_blocked_by, comment, create_ticket_issue, ensure_map,
-                    leak_hits, load_guard_uids, merge_if_green, pr_for_branch, pr_status)
+from github import (GuardEmpty, LeakBlocked, add_blocked_by, comment, create_ticket_issue, ensure_map,
+                    leak_hits, load_guard, merge_if_green, pr_for_branch, pr_status)
 
 R = "o/r"
 TICKET = {"id": "T3", "title": "女用户被当成男性",
@@ -28,8 +28,9 @@ def gh_issue_fake():
 def test_guard_uids_from_users_json(tmp_path):
     (tmp_path / "w1").mkdir()
     (tmp_path / "w1" / "users.json").write_text(json.dumps({"5eed0001": {}, "ABCDEF12": {}, "short": {}, "zz99zz99": {}}))
-    assert load_guard_uids([str(tmp_path / "*" / "users.json")]) == {"5eed0001", "abcdef12"}
-    assert load_guard_uids([str(tmp_path / "nope" / "*.json")]) == set()
+    assert load_guard([str(tmp_path / "*" / "users.json")]).uids == {"5eed0001", "abcdef12"}
+    with pytest.raises(GuardEmpty):                     # 闸失效必须报错（fail-closed），不许吞成空集合
+        load_guard([str(tmp_path / "nope" / "*.json")])
 
 
 def test_leak_hits_case_insensitive():

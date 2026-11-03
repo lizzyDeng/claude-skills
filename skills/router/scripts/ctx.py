@@ -108,7 +108,9 @@ class Ctx:
         try:
             r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=30)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode != 0:                  # 超时 124 / 找不到进程 / ps 自己出错：一律「查不到」，不拿半截输出当启动时间
             return None
         return r.stdout.strip() or None
 

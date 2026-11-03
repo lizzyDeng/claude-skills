@@ -147,11 +147,15 @@ def _check_surfaces(env, names):
         raise Fail(f"未知代码面 {unknown}；只能用 surfaces.json 里的：{sorted(env.table)}")
 
 
-def _refuse_pending(t, tid) -> None:
-    """上次派单 / 续跑的意图还没核实（worker 可能已经在跑）：会起 / 停 / 交出 worker 的前台命令一律不做（RV M-1）。"""
+def _refuse_pending(t, tid, ctx=None) -> None:
+    """会起 / 停 / 交出 worker 的前台命令，在认不出 worker 时一律不做：
+    上次派单 / 续跑的意图还没核实（worker 可能已经在跑，RV M-1）；给了 ctx 时，pid 在但 ps 查不到启动时间（RV M-2）。"""
     if store.pending_intent(t):
         why = (t.get("dispatch") or {}).get("unverified") or "上次起 worker 没落完盘"
         raise Fail(f"{tid} 派单待核实（{why}），下一轮巡检后再试")
+    if ctx is not None and launcher.worker_liveness(ctx, t["worker"]) == "unknown":
+        raise Fail(f"{tid} 的 worker（pid {t['worker'].get('pid')}）还在，但查不到它的启动时间（ps 失败 / 超时），"
+                   "认不出是不是它：稍后再试")
 
 
 def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None):
@@ -162,7 +166,7 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None)
     t = st["tickets"][tid]
     if t["status"] == store.TAKEOVER:
         raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
-    _refuse_pending(t, tid)
+    _refuse_pending(t, tid, env.ctx)
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
@@ -287,6 +291,11 @@ def cmd_start(a, env):
         for tid in sel:
             if env.ticket(st, tid)["status"] not in (store.DRAFT, store.HOLD):
                 raise Fail(f"{tid} 状态是 {st['tickets'][tid]['status']}，不能 start")
+        # 与其它 GitHub 写路径同一道闸（uid + 20 字原话窗口）；闸失效 ⇒ 什么都不做（fail-closed，RV I-3）
+        try:
+            guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
+        except github.GuardEmpty as e:
+            raise Fail(f"防泄漏闸失效，没有建任何 issue：{e}")
         # 在任何 GitHub 写入（map / issue）之前先查远端 base：base 不对，一张 issue 都不建
         run = tick.Run(env.ctx, env.root, env.cfg, st)
         base = run.ensure_base()
@@ -296,7 +305,6 @@ def cmd_start(a, env):
                 render_board(env, st)
             raise Fail(f"远端 {env.cfg.get('base_branch', 'staging')} 不可用，没有建任何 issue：{base['error']}",
                        base_wait=base["wait"])
-        uids = github.load_guard_uids(env.cfg.get("leak_guard_globs", []))
         if not st.get("map"):
             st["map"] = github.ensure_map(env.ctx, repo, env.cfg["map_title"])
             store.save_state(env.state_path, st)
@@ -304,7 +312,7 @@ def cmd_start(a, env):
             t = st["tickets"][tid]
             if t["issue"] is None:
                 try:
-                    t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, uids)
+                    t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, guard)
                 except github.LeakBlocked as e:
                     blocked.append({"ticket": tid, "hits": e.hits})
                     continue
@@ -417,6 +425,7 @@ def cmd_submit_card(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] != store.KICKOFF:
             raise Fail(f"{a.ticket} 状态是 {t['status']}，只有出方向卡阶段（kickoff）的票能交卡")
+        _refuse_pending(t, a.ticket, env.ctx)         # 认不出可能在跑的那个 worker：停不了它
         st["queue"] = [q for q in st["queue"] if not (q["kind"] == "card" and q["ticket"] == a.ticket)]   # 旧版本作废
         version = t.get("card", {}).get("version", 0) + 1
         t["card"] = {"path": str(card), "rounds": a.rounds, "codex": a.codex, "overtime": a.overtime,
@@ -459,6 +468,8 @@ def cmd_tell(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] == store.TAKEOVER and a.resume:
             raise Fail(f"{a.ticket} 在你接管中：先「还给 router」（handback）再续跑")
+        if a.resume:
+            _refuse_pending(t, a.ticket, env.ctx)     # 先拒再投递：不然重试会投两份
         alive = launcher.worker_alive(env.ctx, t["worker"])
         if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
             events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": a.text})
@@ -483,6 +494,7 @@ def cmd_pause(a, env):
 def cmd_stop(a, env):
     with env.state() as st:
         t = env.ticket(st, a.ticket)
+        _refuse_pending(t, a.ticket, env.ctx)         # 可能在跑的那个 worker 认不出：停不了它
         launcher.stop_worker(env.ctx, t["worker"])
         t["worker"]["pid"] = None
         store.set_status(st, a.ticket, store.PAUSED, env.now(), "你让它立刻停")
@@ -495,6 +507,7 @@ def cmd_takeover(a, env):
         w = t["worker"]
         if not w.get("session_id"):
             raise Fail(f"{a.ticket} 还没有 worker session")
+        _refuse_pending(t, a.ticket, env.ctx)         # 后台可能已有 worker 在写同一个 session：不交出 resume 命令
         launcher.stop_worker(env.ctx, w)                # 同一个 session 不能两边同时写
         w["pid"] = None
         if t["status"] != store.TAKEOVER:
@@ -509,6 +522,7 @@ def cmd_handback(a, env):
         t = env.ticket(st, a.ticket)
         if t["status"] != store.TAKEOVER:
             raise Fail(f"{a.ticket} 不在接管中")
+        _refuse_pending(t, a.ticket)
         prev = t.pop("takeover_from", store.PAUSED)
         store.set_status(st, a.ticket, prev, env.now())       # 先解除接管，_resume 才肯续跑
         if prev in store.RUNNING:

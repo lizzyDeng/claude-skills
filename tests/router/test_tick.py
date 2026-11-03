@@ -1191,3 +1191,73 @@ def test_foreground_resume_crash_after_spawn_never_starts_second_worker(proj, mo
     assert len(_t1_spawns(proj)) == 1
     t = proj.state()["tickets"]["T1"]
     assert t["worker"]["pid"] == 10000 and t["status"] == "executing" and "dispatch" not in t
+
+
+def _unverified_intent(proj):
+    """T1 带派单意图：回执在、pid 10042 活着，但 ps 拿不到启动时间 ⇒ 认不出 ⇒ 意图保留，本票不派不杀。"""
+    _intent(proj)
+    proj.ctx.alive.add(10042)
+    proj.ctx.starts = {10042: None}
+    proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["dispatch"]["phase"] == "spawning" and t["status"] == "queued"
+    (proj.root / ".claude/worktrees/router-T1").mkdir(parents=True, exist_ok=True)
+    (proj.home / "config.json").write_text(json.dumps(proj.cfg))
+
+
+def _inbox(proj, tid="T1"):
+    f = proj.home / "inbox" / f"{tid}.jsonl"
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def test_foreground_commands_refuse_while_dispatch_intent_unverified(proj):          # F4（RV M-1）
+    import router
+    _unverified_intent(proj)
+    env = lambda: router.Env(proj.root, proj.ctx)
+    before = proj.state()["tickets"]["T1"]
+    with pytest.raises(router.Fail, match="派单待核实"):
+        router.cmd_tell(argparse.Namespace(ticket="T1", text="继续", resume=True), env())
+    assert _inbox(proj) == []                                            # 拒绝前不投递（不然重试会投两份）
+    with pytest.raises(router.Fail, match="派单待核实"):
+        router.cmd_takeover(argparse.Namespace(ticket="T1"), env())      # 不给出 resume 命令
+    with pytest.raises(router.Fail, match="派单待核实"):
+        router.cmd_stop(argparse.Namespace(ticket="T1"), env())
+    s = proj.state()
+    store.push_queue(s, "T1", "stuck", "T1 卡住", T0)
+    store.save_state(proj.home / "state.json", s)
+    with pytest.raises(router.Fail, match="派单待核实"):                  # 会唤醒 worker 的 answer
+        router.cmd_answer(argparse.Namespace(qid="Q1", text="继续", reject=False), env())
+    assert len(_t1_spawns(proj)) == 0 and 10042 in proj.ctx.alive
+    after = proj.state()["tickets"]["T1"]
+    assert after["status"] == before["status"] == "queued" and after["dispatch"] == before["dispatch"]
+    assert [q["id"] for q in proj.state()["queue"]] == ["Q1"]            # 回答没被吞
+    router.cmd_tell(argparse.Namespace(ticket="T1", text="只是留言", resume=False), env())   # 只投递收件箱：照常
+    assert len(_inbox(proj)) == 1
+
+
+def _live_executing(proj):
+    spec = running("executing", ["weekly-report"], pid=123)
+    spec[2]["worker"]["pid_start"] = "start-123"
+    proj.put(T1=spec)
+    proj.ctx.alive.add(123)
+
+
+@pytest.mark.parametrize("how", ["ps_empty", "ps_rc124"])
+def test_ps_failure_is_unknown_not_dead(proj, monkeypatch, how):                      # F5（RV M-2）
+    _live_executing(proj)
+    if how == "ps_empty":
+        proj.ctx.starts = {123: None}                                     # ps 没输出
+    else:                                                                 # 真 Ctx.proc_start，ps 超时 rc=124 还带了半截输出
+        import ctx as real_ctx
+        monkeypatch.setattr(real_ctx.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 124, "Mon Nov  2 10:00:00 2026\n", "timeout"))
+        real = real_ctx.Ctx()
+        assert real.proc_start(123) is None                              # rc≠0 一律「查不到」，不拿半截输出当启动时间
+        monkeypatch.setattr(proj.ctx, "proc_start", real.proc_start)
+    r1 = proj.run()
+    r2 = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "executing" and t["worker"]["pid"] == 123      # 不判退出、不清 pid
+    assert proj.state()["queue"] == [] and proj.ctx.spawn_attempts == []  # 不判 stuck、不起新 worker
+    assert 123 in proj.ctx.alive
+    assert len(_t1_errors(r1)) == 1 and _t1_errors(r2) == []            # 错误只报一次

@@ -102,12 +102,27 @@ def create_worktree(ctx, repo: Path, base_branch: str, wt_dir: str, tid: str):
     return wt, branch
 
 
-def worker_alive(ctx, w: dict) -> bool:
-    """pid 活着且启动时间和记录的一致（记录了的话）。pid 被别的进程复用 = 我们的 worker 已经死了。"""
+def worker_liveness(ctx, w: dict) -> str:
+    """→ "alive" | "dead" | "unknown"（RV M-2，鲁棒性清单②「ps 超时 ≠ 没进程」）。
+    pid 不在 = dead；没记启动时间 = 只能信 pid（alive）；查到的启动时间与记录一致 = alive、不一致 = pid 被复用 = dead；
+    pid 在、但 ps 查不到启动时间（失败 / 超时）= unknown —— 认不出是不是我们的 worker：不判退出、不清 pid、不起新的、不杀。"""
     pid = w.get("pid")
     if not pid or not ctx.pid_alive(pid):
-        return False
-    return not w.get("pid_start") or ctx.proc_start(pid) == w["pid_start"]
+        return "dead"
+    if not w.get("pid_start"):
+        return "alive"
+    try:
+        now = ctx.proc_start(pid)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if not now:
+        return "unknown"
+    return "alive" if now == w["pid_start"] else "dead"
+
+
+def worker_alive(ctx, w: dict) -> bool:
+    """确认是我们的 worker 且活着（unknown 不算）。要区分「死了」和「认不出」的调用方用 worker_liveness。"""
+    return worker_liveness(ctx, w) == "alive"
 
 
 def stop_worker(ctx, w: dict) -> None:
@@ -321,10 +336,6 @@ def receipt_liveness(ctx, r: dict) -> str:
     pid = r.get("pid")
     if not pid or not ctx.pid_alive(pid):
         return "dead"
-    try:
-        now = ctx.proc_start(pid)
-    except Exception:  # noqa: BLE001
+    if not r.get("pid_start"):
         return "unknown"
-    if not now or not r.get("pid_start"):
-        return "unknown"
-    return "alive" if worker_alive(ctx, {"pid": pid, "pid_start": r["pid_start"]}) else "dead"
+    return worker_liveness(ctx, {"pid": pid, "pid_start": r["pid_start"]})

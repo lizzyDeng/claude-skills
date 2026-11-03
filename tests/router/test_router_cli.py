@@ -57,6 +57,7 @@ def proj(tmp_path, monkeypatch):
     git_project(tmp_path, root)
     home.mkdir(parents=True)
     runs = tmp_path / "daily" / "runs"; (runs / "2026-10-26").mkdir(parents=True)
+    (runs / "2026-10-26" / "users.json").write_text(json.dumps({"5eed0001": {}}))   # 防泄漏闸要有文件可读（合成 uid）
     (tmp_path / "daily" / "state").mkdir()
     bin_ = tmp_path / "bin"; bin_.mkdir()
     (bin_ / "gh").write_text(GH_SHIM); (bin_ / "gh").chmod(0o755)
@@ -1238,3 +1239,32 @@ def test_review_canary_probes_unlisted_dir_outside_home_under_tmp(rv, monkeypatc
     c = json.loads((rv.home / "review" / "canary.json").read_text())
     assert out["ok"] is False and c["ok"] is False and c["reason"] == "canary_inconclusive"
     assert _tmp_probes() == before
+
+
+def _creates(p):
+    return [c for c in p.gh() if c[:2] == ["issue", "create"]]
+
+
+def test_start_fails_closed_when_leak_guard_matches_no_file(proj):                 # F3（RV I-3）
+    _cfg(proj, leak_guard_globs=[str(proj.tmp / "nope" / "*" / "users.json")])     # 闸失效：一个文件都没匹配到
+    proj.out("draft", "--from", str(FIX / "triage.json"))
+    r = proj.run("start", "T1", check=False)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and "防泄漏闸" in out["error"], out
+    assert _creates(proj) == [] and proj.gh() == []                                # 地图票都不建
+    assert proj.state()["tickets"]["T1"]["status"] == "draft"
+
+
+def test_start_blocks_issue_body_with_user_quote(proj):                            # F3：不只查 uid，还查原话窗口
+    quote = "the violet kettle hums before sunrise every day"                      # 合成原话
+    (proj.runs / "2026-10-26" / "users.json").write_text(json.dumps({"5eed0001": {"quote": quote}}))
+    tri = json.loads((FIX / "triage.json").read_text())
+    tri["tickets"][0]["problem"] = f"用户说「{quote}」"
+    (proj.tmp / "t.json").write_text(json.dumps(tri, ensure_ascii=False))
+    proj.out("draft", "--from", str(proj.tmp / "t.json"))
+    r = proj.run("start", "T1", check=False)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and [b["ticket"] for b in out["blocked"]] == ["T1"], out
+    assert any(h.startswith("原话：") for h in out["blocked"][0]["hits"])
+    assert [c[c.index("--title") + 1] for c in _creates(proj)] == ["her 周报问题"]   # 只有地图票，T1 没建
+    assert not any("violet kettle" in json.dumps(c) for c in proj.gh())
