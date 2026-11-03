@@ -666,16 +666,16 @@ class Run:
 
     # ---- 7 ----
     def step7_board_and_notify(self):
+        # Lark 只在这里发（R4）：前台命令写进决定单的项、上一轮没发出去的项，都由这一轮推；先推再画看板（横幅是新的）
+        lark = self.cfg.get("lark_config") or None
+        out = notify.flush(self.state, os.path.expanduser(lark) if lark else None, self.ctx, self.now)
+        if out is not None:
+            self.res["notified"] = out == "sent"
+            self.res["notify"] = out
         board.write(self.home / "board.html",
                     board.render(self.state, store.recent_decisions(self.home / "decisions.md"),
                                  {tid: events.read_all(self.home, tid)[-5:] for tid in self.state["tickets"]},
                                  self.ctx.now(), self.cfg.get("slots")))
-        if self.res["new_queue"]:
-            q = store.queue_view(self.state)
-            text = f"router：等你 {len(q)} 件（{' '.join(x['id'] for x in q)}）"
-            out = notify.send(Path(os.path.expanduser(self.cfg.get("lark_config", ""))), text, self.ctx)
-            self.res["notified"] = out == "sent"
-            self.res["notify"] = out
 
 
 def _brief(run, tid):
