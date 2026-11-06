@@ -11,6 +11,7 @@ router 只登记、只转交信息，不给它们下指令（spec §10）。
   - 已提交：分支自分叉点起改过、且至今仍与 base 不同的文件（squash 合进 base 后自动不再占锁）
   - 未提交改动
   - 计划要改：近期 conductor ledger / plan 里写到的文件路径（还在出方案、没动代码的 session 也要先占上）
+    只认本 session 新建或改过的 ledger：仓里已提交、原样检出的旧 ledger 不算（新 worktree 检出时 mtime 全是新的）
 分支 tip == 某个已合并 PR 的 head（squash 后判已合的唯一可靠办法），且没有 .claude/ 以外的未提交改动
 ⇒ 这个 session 的活已经合进去了：不占锁、不占重票名额。
 """
@@ -99,7 +100,11 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
         dirty = set(_status_files(ctx.run(["git", "-C", path, "status", "--porcelain"]).stdout))
         files |= dirty
         dirty_ts = max([Path(path, f).stat().st_mtime for f in dirty if Path(path, f).is_file()] or [0])
-        ledgers = sorted(Path(path, ".claude", "conductor", "runs").glob("*.md"),
+        # 仓里已提交、本 session 没动过的 ledger 是建 worktree 时一起检出的（mtime = 检出时间），不是它的计划
+        checked_out = set(ctx.run(["git", "-C", path, "-c", "core.quotePath=false", "ls-files", "--",
+                                   ".claude/conductor/runs"]).stdout.splitlines()) - files
+        ledgers = sorted((p for p in Path(path, ".claude", "conductor", "runs").glob("*.md")
+                          if str(p.relative_to(path)) not in checked_out),
                          key=lambda p: p.stat().st_mtime)
         ledger_ts = ledgers[-1].stat().st_mtime if ledgers else None
         commit = ctx.run(["git", "-C", path, "log", "-1", "--format=%ct", f"{base_ref}..HEAD"]).stdout.strip()
