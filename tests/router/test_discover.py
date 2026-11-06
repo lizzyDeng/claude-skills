@@ -123,3 +123,24 @@ def test_branch_merged_by_pr_head_releases_locks(fake, repo, table):  # 分诊�
     assert out[str(a)]["merged_pr"] == 941 and out[str(a)]["surfaces"] == [] and out[str(a)]["locking"] is False
     fake.script(["git", "-C", str(a), "status", "--porcelain"], " M crates/persona-engine/src/prompt_builder.rs\n")
     assert scan(fake, main, BASE, table, set(), 45, repo_slug="o/r")[str(a)]["locking"] is True   # 合完又在改 → 照样占锁
+
+
+def test_checked_out_ledgers_do_not_lock(fake, repo, table):  # 实测：新建 worktree 检出仓里已提交的旧 ledger，mtime 全是检出时间
+    tmp, main, a, b, r = repo
+    old = _ledger(b, 5, fake)
+    old.write_text("旧 run：改 crates/persona-engine/src/prompt_builder.rs")
+    os.utime(old, (fake.now().timestamp() - 300,) * 2)
+    fake.script(["git", "-C", str(b), "-c", "core.quotePath=false", "ls-files", "--", ".claude/conductor/runs"], ".claude/conductor/runs/run.md\n")
+    out = scan(fake, main, BASE, table, set(), 45)[str(b)]
+    assert out["planned_surfaces"] == [] and out["surfaces"] == ["llm-config"] and out["ledger"] is None
+
+    new = old.parent / "mine.md"; new.write_text("plan：改 services/api-server/src/services/her_chat/turn.rs")
+    os.utime(new, (fake.now().timestamp() - 60,) * 2)
+    out = scan(fake, main, BASE, table, set(), 45)[str(b)]          # 没提交的新 ledger 照样算
+    assert out["planned_surfaces"] == ["her-reply-prompt"] and out["ledger"].endswith("mine.md")
+
+    new.unlink()
+    fake.script(["git", "-C", str(b), "status", "--porcelain"],
+                " M .claude/conductor/runs/run.md\nR  old.py -> services/api-server/migrations/20261102_llm_config_x.sql\n")
+    out = scan(fake, main, BASE, table, set(), 45)[str(b)]          # 这个 session 改过的已提交 ledger 也算
+    assert out["planned_surfaces"] == ["her-reply-prompt"] and out["ledger"].endswith("run.md")
