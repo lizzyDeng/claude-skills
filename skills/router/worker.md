@@ -69,3 +69,4 @@
 - 改别的票锁着的代码面（先 `emit overreach`）。
 - 合并 PR、强推、直推 main / staging。
 - 退出时既没交卡、没发停止事件、也没报 `pr_opened`：router 会把它当成卡住。
+- 起不会自己退出的后台进程（压 CPU、轮询、等端口）。`&` 出去的循环必须自带时限，如 `(end=$((SECONDS+300)); while (( SECONDS < end )); do :; done) &`。别指望末尾的 `kill $PIDS` 或 `trap`：命令一被超时杀掉就执行不到，进程挂到 launchd 下一直跑（T46 留下 9 个空转 zsh，吃了 8 核两天）。
