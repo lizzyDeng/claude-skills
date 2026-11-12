@@ -14,17 +14,18 @@ JS = "(function(){\n  var btns=document.querySelectorAll('.tabs button');\n  var
 
 GROUP = {store.AWAIT_CARD: "you", store.STUCK: "you", store.TAKEOVER: "you", store.AWAIT_CHECK: "you",
          store.KICKOFF: "run", store.EXECUTING: "run", store.VERIFYING: "run",
+         store.POSTLAUNCH: "run",          # 已上线、还没验收完：不算「已完成」
          store.DRAFT: "q", store.QUEUED: "q",
          store.MERGED: "ok", store.AWAIT_PROD: "ok", store.DONE: "ok",
          store.PAUSED: "off", store.HOLD: "off", store.SKIP: "off"}
 GROUP_ORDER = {"you": 0, "run": 1, "q": 2, "ok": 3, "off": 4}
 PILL = {store.DRAFT: "待 start", store.QUEUED: "排队", store.KICKOFF: "出方向卡", store.AWAIT_CARD: "等你确认方向卡",
         store.EXECUTING: "执行", store.VERIFYING: "验收", store.MERGED: "已合 staging",
-        store.AWAIT_CHECK: "仓外已改 · 待你核对", store.AWAIT_PROD: "等上 prod",
+        store.AWAIT_CHECK: "仓外已改 · 待你核对", store.AWAIT_PROD: "等上 prod", store.POSTLAUNCH: "已上线 · 等验收",
         store.DONE: "完成", store.PAUSED: "暂停", store.TAKEOVER: "你接管", store.STUCK: "卡住",
         store.HOLD: "暂缓", store.SKIP: "不派"}
 KIND = {"start": "派发单", "card": "方向卡", "spend": "花钱放行", "prod": "上 prod", "handson": "待你动手",
-        "stuck": "卡住", "conflict": "代码面冲突", "direction": "方向问题"}
+        "stuck": "卡住", "conflict": "代码面冲突", "direction": "方向问题", "postlaunch": "上线验收"}
 
 
 def _e(x) -> str:
@@ -47,14 +48,31 @@ def _say(q) -> str:
             "handson": f"{t} 走查过了",
             "stuck": f"{t} 续跑 / 我接管 {t}",
             "conflict": f"{qid}：按谁来",
-            "direction": f"{qid}：…"}.get(q["kind"], qid)
+            "direction": f"{qid}：…",
+            "postlaunch": f"{qid} 知道了 / {qid}：…"}.get(q["kind"], qid)
 
 
 def _hhmm(ts: str) -> str:
-    return ts[5:16].replace("T", " ") if ts and len(ts) >= 16 else (ts or "")
+    return store.hhmm(ts)
 
 
-def _ticket_card(t, evs) -> str:
+def _postlaunch_spans(t, now) -> list:
+    """上线验收：下一次检查（时间、是否到期）+ 最近一次结论。"""
+    if not t.get("postlaunch"):
+        return []
+    v, out = store.postlaunch_view(t, now.strftime(store.ISO)), []
+    if v["next"]:
+        due = "（已到期）" if v["next"]["due"] else ""
+        out.append(f'<span>上线验收 · 下次检查：{_e(v["next"]["label"])} · {_e(_hhmm(v["next"]["at"]))} UTC{_e(due)}</span>')
+    if v["last"]:
+        r = v["last"]
+        tag = f'{r.get("type", "")} · ' if r.get("type") else ""
+        out.append(f'<span>上线验收 · 最近结论：{_e(r["check"])} {_e(tag)}<b>{_e(r["verdict"])}</b>'
+                   f'{"（覆盖）" if r.get("override") else ""}：{_e(str(r.get("summary", ""))[:200])}</span>')
+    return out
+
+
+def _ticket_card(t, evs, now=None) -> str:
     g = GROUP.get(t["status"], "off")
     why, sol = t.get("why", {}), t.get("solution", {})
     tags = [f'<span class="tagw">{"重" if t["weight"] == "heavy" else "轻"}</span>']
@@ -76,7 +94,7 @@ def _ticket_card(t, evs) -> str:
            [f"依赖 {b}" for b in t["blocked_by"]]
     foot.append(f'<span>订阅：{_e(" · ".join(subs) or "无")}</span>')
     w = t.get("worker", {})
-    if w.get("session_id") and w.get("worktree") and t["status"] not in (store.DONE, store.AWAIT_PROD):
+    if w.get("session_id") and w.get("worktree") and t["status"] not in (store.DONE, store.AWAIT_PROD, store.POSTLAUNCH):
         foot.append(f'<span>接管：<code>{_e("cd " + str(w["worktree"]) + " && claude --resume " + w["session_id"])}</code></span>')
     if t.get("pr"):
         foot.append(f'<span>PR #{_e(t["pr"])}</span>')
@@ -84,6 +102,8 @@ def _ticket_card(t, evs) -> str:
     if df:
         foot.append(f'<span>派发失败 {_e(df.get("count", 1))} 次（阶段 {_e(df.get("phase"))}）：{_e(str(df.get("error", ""))[:120])}</span>')
     foot += _closeout_spans(t.get("closeout"))
+    if now is not None:
+        foot += _postlaunch_spans(t, now)
     tl = "".join(f'<li><span class="ts">{_e(_hhmm(e.get("ts", "")))}</span>[{_e(e.get("phase") or e.get("type"))}] '
                  f'{_e(e.get("summary", ""))}</li>' for e in evs[-5:])
     return f"""<div class="issue" data-g="{g}">
@@ -162,7 +182,7 @@ def render(state, decisions, events, now, slots=None) -> str:
                    f'<span class="say">{_e(_say(q))}</span></div>' for q in queue) or \
         '<div class="row"><div class="what"><small>没有要你做的事。</small></div></div>'
     order = sorted(tickets.values(), key=lambda t: (GROUP_ORDER[GROUP.get(t["status"], "off")], t["priority"], int(t["id"][1:])))
-    cards = "".join(_ticket_card(t, events.get(t["id"], [])) for t in order)
+    cards = "".join(_ticket_card(t, events.get(t["id"], []), now) for t in order)
     cards += "".join(_external_card(p, e) for p, e in sorted(state["external"].items()))
     groups = {}
     for t in tickets.values():
@@ -197,6 +217,7 @@ def render(state, decisions, events, now, slots=None) -> str:
   <div class="stat run"><b>{count(store.RUNNING) + len(active_ext)}</b><span>在跑</span></div>
   <div class="stat q"><b>{count({store.DRAFT, store.QUEUED})}</b><span>待 start / 排队</span></div>
   <div class="stat ok"><b>{count(store.SETTLED)}</b><span>已合 / 已改完</span></div>
+  <div class="stat run"><b>{count({store.POSTLAUNCH})}</b><span>上线验收中</span></div>
   <div class="stat"><b>{count({store.HOLD, store.SKIP, store.PAUSED})}</b><span>暂缓</span></div>
 </div>
 {_banners(state)}<div class="slots">

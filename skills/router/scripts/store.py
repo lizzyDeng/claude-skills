@@ -12,6 +12,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DRAFT = "draft"
@@ -23,6 +24,7 @@ VERIFYING = "verifying"
 MERGED = "merged_staging"
 AWAIT_CHECK = "await_check"        # 仓外票改完、等用户核对：仓外没有 staging 隔离层，核对前持锁、不解依赖
 AWAIT_PROD = "await_prod"
+POSTLAUNCH = "postlaunch"          # 已上线、等上线验收：代码已在 prod ⇒ 不占名额、不持锁、对下游算已解锁
 DONE = "done"
 PAUSED = "paused"
 TAKEOVER = "takeover"
@@ -31,20 +33,20 @@ HOLD = "hold"
 SKIP = "skip"
 
 STATUSES = {DRAFT, QUEUED, KICKOFF, AWAIT_CARD, EXECUTING, VERIFYING, MERGED, AWAIT_CHECK, AWAIT_PROD,
-            DONE, PAUSED, TAKEOVER, STUCK, HOLD, SKIP}
+            POSTLAUNCH, DONE, PAUSED, TAKEOVER, STUCK, HOLD, SKIP}
 RUNNING = {KICKOFF, EXECUTING, VERIFYING}                                  # 占名额
 LOCKING = RUNNING | {AWAIT_CARD, PAUSED, TAKEOVER, STUCK, AWAIT_CHECK}      # 持锁
-SETTLED = {MERGED, AWAIT_PROD, DONE}                                        # 对下游算已解锁
+SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # 对下游算已解锁
 
-QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction"}
+QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
 QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
-                AWAIT_CHECK: "等你核对仓外改动", AWAIT_PROD: "等上 prod"}
-# topic=base 的项挡住的票：还没走完的（已合 / 等上 prod / 完成 / 暂缓 / 不派 的不算）
-_BASE_FREE = {MERGED, AWAIT_PROD, DONE, HOLD, SKIP}
+                AWAIT_CHECK: "等你核对仓外改动", AWAIT_PROD: "等上 prod", POSTLAUNCH: "等上线验收"}
+# topic=base 的项挡住的票：还没走完的（已合 / 等上 prod / 已上线 / 完成 / 暂缓 / 不派 的不算）
+_BASE_FREE = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE, HOLD, SKIP}
 
 
 class StateCorrupt(Exception):
@@ -217,6 +219,84 @@ def closeout_open(co) -> dict:
 def closeout_pending(co) -> bool:
     o = closeout_open(co)
     return bool(o["downstream"] or o["cols"])
+
+
+# ---- 上线验收（postlaunch）：released 之后 t0 + 1 / 3 / 7 天各查一次；票的终点是上线验收，不是 released ----
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+POSTLAUNCH_CHECKS = (("T+1", 1), ("T+3", 3), ("T+7", 7))
+VERDICTS = ("生效", "没入口", "没用", "有害", "看不出来")
+BAD_VERDICTS = ("没入口", "没用", "有害")          # 必须带当天动作，进决定单
+TICKET_TYPES = ("增长型", "风险型")                 # 增长型：拿出行为收益才算生效；风险型：行为不 worse 即可，写明代价
+# --behavior 的判定词：照周报 progress.<指标>.v 的口径
+BEHAVIOR_VERDICTS = ("better", "worse", "flat", "unclear", "small", "up_unconfirmed", "down_unconfirmed")
+
+
+def parse_iso(s) -> datetime:
+    return datetime.strptime(s, ISO).replace(tzinfo=timezone.utc)
+
+
+def postlaunch_plan(t0: str) -> dict:
+    base = parse_iso(t0)
+    return {"t0": t0, "checks": [{"label": label, "at": (base + timedelta(days=d)).strftime(ISO)}
+                                 for label, d in POSTLAUNCH_CHECKS],
+            "results": []}
+
+
+def postlaunch_effective(pl) -> dict:
+    """检查点 → 当前有效的那条结果（同一检查点提交多次：最后一次覆盖前面的）。"""
+    out = {}
+    for r in (pl or {}).get("results", []):
+        out[r.get("check")] = r
+    return out
+
+
+def postlaunch_next(t):
+    """下一个还没有结果的检查点（按 T+1 → T+7 的顺序）；都有结果了 → None。"""
+    pl = t.get("postlaunch") or {}
+    done = postlaunch_effective(pl)
+    return next((c for c in pl.get("checks", []) if c["label"] not in done), None)
+
+
+def postlaunch_due(t, now: str) -> list:
+    """到期、还没记结果的检查点（now ≥ at）。只有 postlaunch 的票会到期；漏掉的早检查点照样交。"""
+    if t.get("status") != POSTLAUNCH:
+        return []
+    pl = t.get("postlaunch") or {}
+    done, n = postlaunch_effective(pl), parse_iso(now)
+    return [c["label"] for c in pl.get("checks", []) if c["label"] not in done and n >= parse_iso(c["at"])]
+
+
+def postlaunch_view(t, now: str) -> dict:
+    """看板 / status 用：{"next": {"label", "at", "due"} | None, "last": 最近一次结果 | None}。
+    next 只对还在验收中的票给（完成的票不再有下一次检查）。"""
+    pl = t.get("postlaunch") or {}
+    nxt = postlaunch_next(t) if t.get("status") == POSTLAUNCH else None
+    if nxt:
+        nxt = {**nxt, "due": parse_iso(now) >= parse_iso(nxt["at"])}
+    results = pl.get("results") or []
+    return {"next": nxt, "last": results[-1] if results else None}
+
+
+def hhmm(ts) -> str:
+    """ISO → 「11-13 08:30」（UTC）。"""
+    return ts[5:16].replace("T", " ") if ts and len(ts) >= 16 else (ts or "")
+
+
+def postlaunch_wait(state, t, now: str) -> str:
+    """postlaunch 票的「在等什么」：到期 → router 跑检查；有没回的决定单 → 等你回；否则 → 下一个检查点的时间。"""
+    due = postlaunch_due(t, now)
+    if due:
+        return f"上线验收 {'、'.join(due)} 到期：router 跑检查"
+    v = postlaunch_view(t, now)
+    parts = []
+    items = [q for q in state.get("queue", []) if q.get("kind") == "postlaunch" and q.get("ticket") == t.get("id")]
+    if items and v["last"]:
+        parts.append(f"上线验收 {v['last']['check']} {v['last']['verdict']}：等你回 {items[-1]['id']}")
+    if v["next"]:
+        parts.append(f"等 {v['next']['label']} 上线验收（{hhmm(v['next']['at'])} UTC）")
+    elif not items:
+        parts.append("上线验收检查点已走完")
+    return "；".join(parts)
 
 
 def in_queue(state, qid) -> bool:

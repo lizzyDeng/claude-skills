@@ -14,6 +14,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,8 +30,8 @@ from ctx import Ctx  # noqa: E402
 RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
-               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "surfaces", "ack-slow",
-               "review-pack", "review-canary"}
+               "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
+               "ack-slow", "review-pack", "review-canary"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -384,6 +385,8 @@ def cmd_answer(a, env):
             if t:
                 t.pop("dispatch_fail", None)
             hint = "下一轮重派"
+        elif q["kind"] == "postlaunch":
+            hint, extra = _postlaunch_answered(env, st, t, q)
         elif t and t["status"] == store.TAKEOVER:
             hint = f"{t['id']} 在你接管中，回答已存档；还给 router 后再续跑"
         elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
@@ -627,7 +630,7 @@ def _checked(env, st, t) -> dict:
         return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾在下一轮巡检完成"}
     if status == store.DONE and store.closeout_pending(t.get("closeout")):
         return {"status": store.DONE, "closeout": t["closeout"], "hint": "收尾还没做完，下一轮巡检继续"}
-    if status in (store.DONE, store.AWAIT_PROD):
+    if status in (store.DONE, store.AWAIT_PROD, store.POSTLAUNCH):
         st["queue"] = drop_handson()
         return {"status": status, "already": True}
     raise Fail(f"{tid} 还没合进 staging，也不在等你核对（{status}）")
@@ -654,10 +657,26 @@ def cmd_prod_batch(a, env):
     return {"ok": True, "queue": qid, "tickets": ready}
 
 
+def _parse_t0(s) -> str:
+    """--t0：带时区的 ISO（2026-11-12T03:00:00Z / 2026-11-12T11:00:00+08:00）→ UTC 的 ISO。
+    不带时区的拒绝：router 一律按 UTC 记，猜错时区 = 检查点整体错开几个小时。"""
+    try:
+        dt = datetime.fromisoformat(s.strip())
+    except ValueError:
+        raise Fail(f"--t0 不是 ISO 时间：{s!r}（例：2026-11-12T03:00:00Z）")
+    if dt.tzinfo is None:
+        raise Fail(f"--t0 要带时区（Z 或 +08:00）：{s!r}")
+    return dt.astimezone(timezone.utc).strftime(store.ISO)
+
+
 def cmd_released(a, env):
+    """发完 prod：写周报 releases.json（照旧），票进上线验收（postlaunch），不进 done。
+    票的终点是上线验收：t0 + 1 / 3 / 7 天各查一次（tick 到期交 postlaunch_due）。
+    已经验收过又重新上线（改了配置再发）：旧的验收记录挪进 postlaunch_prev，从新的 t0 重新查。"""
     runs = env.cfg.get("weekly_runs_dir")
     if not runs:
         raise Fail("config 缺 weekly_runs_dir")
+    t0 = _parse_t0(a.t0) if a.t0 else env.now()
     rel = Path(os.path.expanduser(runs)).parent / "state" / "releases.json"
     with env.state() as st:
         for tid in a.tickets:
@@ -665,10 +684,114 @@ def cmd_released(a, env):
         lines = json.loads(rel.read_text(encoding="utf-8")) if rel.exists() else []
         entry = {"date": env.ctx.now().strftime("%Y-%m-%d"), "what": a.what, "metrics": _csv(a.metrics)}
         store._atomic_write(rel, json.dumps(lines + [entry], ensure_ascii=False, indent=2) + "\n")
+        plans = {}
         for tid in a.tickets:
-            store.set_status(st, tid, store.DONE, env.now())
+            t = st["tickets"][tid]
+            if t.get("postlaunch"):
+                t.setdefault("postlaunch_prev", []).append(t["postlaunch"])
+            t["postlaunch"] = plans[tid] = store.postlaunch_plan(t0)
+            store.set_status(st, tid, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
         _prod_item(env, st)
-    return {"ok": True, "release": entry, "path": str(rel)}
+    return {"ok": True, "release": entry, "path": str(rel), "postlaunch": plans}
+
+
+_BEHAVIOR = re.compile(r"^(?P<metric>[^=]+?)\s*=\s*(?P<before>.+?)\s*(?:→|->)\s*(?P<after>.+?)\s*[,，]\s*(?P<v>[a-z_]+)\s*$")
+
+
+def _behavior(items) -> list:
+    """--behavior "<指标=前→后, verdict>"（可多次）：格式不对就拒；verdict 用周报 progress 的判定词。"""
+    out = []
+    for b in items or []:
+        m = _BEHAVIOR.match(b.strip())
+        if not m or m.group("v") not in store.BEHAVIOR_VERDICTS:
+            raise Fail(f"--behavior 格式是「<指标>=<前>→<后>, <verdict>」，verdict 取 {'/'.join(store.BEHAVIOR_VERDICTS)}："
+                       f"{b!r}")
+        out.append(b.strip())
+    return out
+
+
+def _postlaunch_say(tid, r, qid) -> str:
+    """postlaunch 决定单项：结论 + 摘要 + 动作 + 要你回什么（看板「等你」一栏原样显示）。"""
+    beh = f"；行为：{'；'.join(r['behavior'])}" if r.get("behavior") else ""
+    return (f"{tid} 上线验收 {r['check']}（{r['type']}）{r['verdict']}：{r['summary']}{beh}；当天动作：{r['action']}；"
+            f"回「{qid} 知道了」，或「{qid}：<你的意见>」")
+
+
+def cmd_postlaunch_result(a, env):
+    """记一次上线验收结论（router 跑完检查后调）。
+    生效 ⇒ done；看不出来 ⇒ 等下一个检查点（T+7 也看不出来 ⇒ done，交周报）；
+    没入口 / 没用 / 有害 ⇒ 留在 postlaunch、进决定单（kind=postlaunch），必须带当天动作。
+    增长型判生效必须拿出行为收益（--behavior 至少一条 better、没有 worse）；机制生效但行为 flat 算没用。
+    风险型判生效：行为不 worse 即可（给了 --behavior 且有 worse ⇒ 拒，算有害）。
+    同一检查点重复提交 = 覆盖（照样追加进 results，标 override）；同票没回的旧 postlaunch 项被新结论取代。"""
+    summary, action = a.summary.strip(), (a.action or "").strip()
+    if not summary:
+        raise Fail("--summary 不能空：一句话，带关键数字")
+    if a.verdict in store.BAD_VERDICTS and not action:
+        raise Fail(f"结论是「{a.verdict}」：必须带 --action（当天就做的动作）")
+    behavior = _behavior(a.behavior)
+    verdicts = [_BEHAVIOR.match(b).group("v") for b in behavior]
+    if a.type == "风险型" and a.verdict == "生效" and "worse" in verdicts:
+        raise Fail("风险型的行为指标变差了（worse）：不能判「生效」，行为 worse 算「有害」")
+    if a.type == "增长型" and a.verdict == "生效":
+        if not behavior:
+            raise Fail("增长型判「生效」必须拿出行为收益：加 --behavior \"<指标>=<前>→<后>, better\"")
+        if "better" not in verdicts or "worse" in verdicts:
+            raise Fail(f"增长型的行为指标没有确认过的正收益（{'、'.join(verdicts)}）：不能判「生效」；"
+                       "机制生效但行为 flat 算「没用」，看不出来就记「看不出来」")
+    with env.state() as st:
+        t = env.ticket(st, a.ticket)
+        pl = t.get("postlaunch")
+        if not pl:
+            raise Fail(f"{a.ticket} 没有上线验收记录：先 released")
+        check = next((c for c in pl["checks"] if c["label"] == a.check), None)
+        if check is None:
+            raise Fail(f"{a.ticket} 没有检查点 {a.check}")
+        prev = store.postlaunch_effective(pl).get(a.check)
+        if t["status"] != store.POSTLAUNCH and not (t["status"] == store.DONE and prev):
+            raise Fail(f"{a.ticket} 状态是 {t['status']}，不在上线验收中")
+        if store.parse_iso(env.now()) < store.parse_iso(check["at"]):
+            raise Fail(f"{a.ticket} 的 {a.check} 还没到（{check['at']}）：样本窗口不够，到点再查")
+        r = {"check": a.check, "type": a.type, "verdict": a.verdict, "summary": summary, "action": action,
+             "behavior": behavior, "at": env.now()}
+        if prev:
+            r.update(override=True, replaces={"verdict": prev["verdict"], "at": prev["at"]})
+        superseded = [q["id"] for q in st["queue"] if q["kind"] == "postlaunch" and q["ticket"] == a.ticket]
+        st["queue"] = [q for q in st["queue"] if q["id"] not in superseded]
+        qid = None
+        last = a.check == pl["checks"][-1]["label"]
+        if a.verdict == "生效":
+            pl["results"].append(r)
+            store.set_status(st, a.ticket, store.DONE, env.now(), "")
+        elif a.verdict == "看不出来":
+            pl["results"].append(r)
+            if last or store.postlaunch_next(t) is None:
+                r["note"] = "交周报"
+                store.set_status(st, a.ticket, store.DONE, env.now(), f"上线验收到 {a.check} 仍看不出来：交周报")
+            else:
+                store.set_status(st, a.ticket, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
+        else:
+            qid = store.push_queue(st, a.ticket, "postlaunch", "", env.now())
+            st["queue"][-1]["summary"] = _postlaunch_say(a.ticket, r, qid)
+            r["queue"] = qid
+            pl["results"].append(r)
+            store.set_status(st, a.ticket, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
+        status = t["status"]
+    return {"ok": True, "ticket": a.ticket, "status": status, "result": r, "queue": qid, "superseded": superseded}
+
+
+def _postlaunch_answered(env, st, t, q):
+    """用户回 postlaunch 项：只记原话（answers.md 已写），不唤醒任何 worker。
+    检查点都走完了 ⇒ 这张票的上线验收结束（done）；还有检查点 ⇒ 照常等下一个。"""
+    if not t or t["status"] != store.POSTLAUNCH:
+        return "已记原话（不唤醒 worker）", {}
+    if store.postlaunch_next(t) is None:
+        last = store.postlaunch_view(t, env.now())["last"] or {}
+        store.set_status(st, t["id"], store.DONE, env.now(),
+                         f"上线验收结束（{last.get('check', '')} {last.get('verdict', '')}），你已回 {q['id']}")
+        return "已记原话（不唤醒 worker）；检查点都走完了，上线验收结束", {"status": store.DONE}
+    t["waiting_for"] = store.postlaunch_wait(st, t, env.now())
+    return "已记原话（不唤醒 worker）；照原话调整，下一个检查点照常查", {"status": t["status"]}
 
 
 def _summary(st):
@@ -701,6 +824,23 @@ def _closeout_line(co) -> str:
     return "".join(f" · {x}" for x in parts)
 
 
+def _postlaunch_line(t, now) -> str:
+    """上线验收（status 文字版）：下一次检查的时间、最近一次结论。"""
+    if not t.get("postlaunch"):
+        return ""
+    v, parts = store.postlaunch_view(t, now), []
+    if v["next"]:
+        parts.append(f"下次检查 {v['next']['label']} {store.hhmm(v['next']['at'])} UTC"
+                     f"{'（已到期）' if v['next']['due'] else ''}")
+    if v["last"]:
+        r = v["last"]
+        parts.append(f"最近结论 {r['check']} {r['verdict']}{'（覆盖）' if r.get('override') else ''}："
+                     f"{str(r.get('summary', ''))[:120]}")
+    elif not v["next"]:
+        parts.append("上线验收没有结论")
+    return "".join(f" · {x}" for x in parts)
+
+
 def cmd_status(a, env):
     with env.locked():
         st = store.load_state(env.state_path)
@@ -718,7 +858,8 @@ def cmd_status(a, env):
         t = st["tickets"][tid]
         issue = f" #{t['issue']}" if t["issue"] else ""
         wait = f" · 等：{t['waiting_for']}" if t["waiting_for"] else ""
-        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}")
+        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}"
+                     f"{_postlaunch_line(t, env.now())}")
     print("\n".join(lines))
     return None
 
@@ -800,9 +941,19 @@ def build_parser():
     s = sub.add_parser("inbox", help="worker 读收件箱")
     s.add_argument("--ticket")
     sub.add_parser("prod-batch", help="把等上 prod 的票攒成一条决定")
-    s = sub.add_parser("released", help="发完 prod：票改完成、写周报 releases.json")
+    s = sub.add_parser("released", help="发完 prod：写周报 releases.json，票进上线验收（不是完成）")
     s.add_argument("--tickets", nargs="+", required=True); s.add_argument("--what", required=True)
     s.add_argument("--metrics", required=True)
+    s.add_argument("--t0", help="生效时刻（带时区的 ISO）；配置类上线的生效时刻和执行 released 的时刻不同时用，缺省 = 现在")
+    s = sub.add_parser("postlaunch-result", help="记一次上线验收结论（T+1 / T+3 / T+7）")
+    s.add_argument("ticket")
+    s.add_argument("--check", required=True, choices=[c for c, _ in store.POSTLAUNCH_CHECKS])
+    s.add_argument("--verdict", required=True, choices=list(store.VERDICTS))
+    s.add_argument("--type", required=True, choices=list(store.TICKET_TYPES))
+    s.add_argument("--summary", required=True, help="一句话，带关键数字")
+    s.add_argument("--action", help="当天动作；没入口 / 没用 / 有害必填")
+    s.add_argument("--behavior", action="append", default=[],
+                   help="行为指标「<指标>=<前>→<后>, <verdict>」，可多次；增长型判生效必填且要有 better")
     s = sub.add_parser("status", help="看板文字版")
     s.add_argument("--json", action="store_true")
     sub.add_parser("discover", help="扫外部 worktree，登记它们锁着的代码面")

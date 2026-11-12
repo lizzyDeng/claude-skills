@@ -318,3 +318,95 @@ def test_triage_eval_checker_flags_dispatch_for_better_and_down_unconfirmed(tmp_
         held = _good(); held["tickets"].append(_ticket(f"{m} 提醒", m, decision="hold"))  # 要提醒就 hold：不算违反
         rc, text = _check(tmp_path, held)
         assert rc == 0, (m, text)
+
+
+# ---- 上线验收（postlaunch）：方向卡一节、方向审第 4 问、通用模板、SKILL 协议 ---------------------
+
+def test_docs_reference_postlaunch_commands():
+    known = help_commands()
+    used = set()
+    for doc in ("SKILL.md", "templates/postlaunch.md"):
+        used |= set(CMD.findall((SKILL / doc).read_text(encoding="utf-8")))
+    assert used - known == set()
+    assert {"postlaunch-result", "released"} <= used
+
+
+def test_card_template_has_postlaunch_section_with_type_and_three_layers():
+    """方向卡「上线验收」：先标类型（增长型 / 风险型），再分三层：① 入口 ② 机制 ③ 行为收益（必答，主体）。"""
+    for doc in ("worker.md", "templates/brief.md"):
+        text = (SKILL / doc).read_text(encoding="utf-8")
+        i = text.find("上线验收")
+        assert i >= 0, doc
+        sec = text[i:]
+        for mark, words in (("①", ("入口", "覆盖率")), ("②", ("机制",)),
+                            ("③", ("行为收益", "必答", "触点", "接着发", "下一条长度", "后续轮数", "离开率",
+                                   "上线前同类触点", "留存", "small"))):
+            j = sec.find(mark)
+            assert j >= 0, (doc, mark)
+            seg = sec[j:j + 400]
+            for w in words:
+                assert w in seg, (doc, mark, w)
+        assert sec.find("增长型") < sec.find("①") and sec.find("风险型") < sec.find("①"), doc   # 先标类型
+        assert "flat" in sec and "没用" in sec and "代价" in sec, doc
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    tpl = re.search(r"^##[^\n]*方向卡模板[^\n]*\n(.*?)(?=^## )", worker, re.S | re.M).group(1)
+    assert "上线验收" in tpl and "postlaunch_brief" in worker
+    assert "$postlaunch_brief" in (SKILL / "templates" / "brief.md").read_text(encoding="utf-8")
+
+
+def test_worker_doc_explains_zero_code_tickets():
+    text = (SKILL / "worker.md").read_text(encoding="utf-8")
+    sec = _section(text, "第 3 段")
+    assert "零代码" in sec and "impl_done" in sec
+
+
+def test_direction_review_asks_about_postlaunch_discrimination():
+    text = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
+    items = re.findall(r"^(\d+)\.\s\*\*(.*?)\*\*", text, re.M)
+    assert [int(n) for n, _ in items] == [1, 2, 3, 4]
+    q4 = text[text.index("4. "):]
+    assert "上线验收" in q4 and "判别力" in q4 and "T+1" in q4 and "没生效" in q4
+    assert "行为收益" in q4 and "触点" in q4 and "bug 不再出现" in q4                # 只证明 bug 没了也算挑战
+
+
+POSTLAUNCH_SECTIONS = ("上线", "入口", "机制", "行为收益", "护栏", "结论和动作")
+VERDICTS = ("生效", "没入口", "没用", "有害", "看不出来")
+
+
+def test_postlaunch_template_has_six_sections_and_five_verdicts():
+    import github
+    text = (SKILL / "templates" / "postlaunch.md").read_text(encoding="utf-8")
+    heads = re.findall(r"^\d+\.\s\*\*(.+?)\*\*", text, re.M)
+    assert tuple(heads) == POSTLAUNCH_SECTIONS
+    for v in VERDICTS:                                                       # 每类结论一行：判据 + 当天动作
+        row = re.search(r"^\|\s*" + v + r"\s*\|(.+)\|(.+)\|\s*$", text, re.M)
+        assert row and row.group(2).strip(), v
+    assert "postlaunch_brief" in text and "只读" in text
+    for w in ("增长型", "风险型", "--type", "--behavior", "代价", "small"):
+        assert w in text, w
+    good = re.search(r"^\|\s*生效\s*\|(.+)\|(.+)\|\s*$", text, re.M).group(1)
+    assert "增长型" in good and "风险型" in good                                 # 生效的判据按类型分
+    useless = re.search(r"^\|\s*没用\s*\|(.+)\|(.+)\|\s*$", text, re.M).group(1)
+    assert "机制" in useless and "flat" in useless                               # 增长型：机制生效但行为 flat = 没用
+    for word in re.findall(r"[0-9A-Za-z_-]{6,}", text):                      # 不出现项目专属的 uid
+        assert not github._is_uid(word), word
+    for banned in ("aifriends", "her-", "girlfriend", "supercli", "persona"):  # 不出现项目专属的名字
+        assert banned not in text.lower(), banned
+
+
+def test_skill_documents_postlaunch_protocol():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s2 = _section(text, "2.")
+    row = next(l for l in s2.splitlines() if "`postlaunch_due`" in l)
+    assert "templates/postlaunch.md" in row and "postlaunch-result" in row and "postlaunch_brief" in row
+    s5 = _section(text, "5.")
+    assert "关开关" in s5 and "改配置" in s5 and "修复票" in s5
+    s6 = _section(text, "6.")
+    assert "postlaunch-result" in s6 and "--t0" in s6
+    pl = re.search(r"^## [^\n]*上线验收[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    assert pl, "SKILL.md 缺「上线验收」一节"
+    body = pl.group(1)
+    assert "released" in body and "postlaunch" in body and "done" in body
+    for x in ("T+1", "T+3", "T+7", *VERDICTS, "交周报", "增长型", "风险型", "--type", "--behavior", "flat"):
+        assert x in body, x
+    assert "票的终点是上线验收，不是 released" in text

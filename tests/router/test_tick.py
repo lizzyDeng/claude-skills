@@ -1403,3 +1403,141 @@ def test_base_block_note_is_cleared_once_base_heals(proj):                      
     proj.run()
     t = proj.state()["tickets"]["T1"]
     assert t["status"] == "verifying" and t["waiting_for"] == "等 CI"
+
+
+# =============================================================================
+# 上线验收（postlaunch）：到期检查每轮都交；零代码仓内票 impl_done ⇒ 等上 prod
+# =============================================================================
+from types import SimpleNamespace  # noqa: E402
+
+
+def _postlaunch(t0=T0, results=(), **kw):
+    pl = store.postlaunch_plan(t0)
+    pl["results"] = list(results)
+    return ("postlaunch", kw.pop("surfaces", ["her-reply-prompt"]), {"postlaunch": pl, "issue": 31, **kw})
+
+
+def _record(proj, tid, check, verdict="看不出来"):
+    s = proj.state()
+    s["tickets"][tid]["postlaunch"]["results"].append({"check": check, "verdict": verdict, "summary": "命中 3/40",
+                                                       "action": "", "at": tick._iso(proj.ctx.now())})
+    store.save_state(proj.home / "state.json", s)
+
+
+def test_postlaunch_check_due_only_when_time_comes_and_repeats_until_recorded(proj):
+    proj.put(T1=_postlaunch())
+    assert proj.run()["postlaunch_due"] == []
+    assert "T+1" in proj.state()["tickets"]["T1"]["waiting_for"]                 # 看板上写着下一次检查
+    proj.ctx.advance(24 * 60 - 1)
+    assert proj.run()["postlaunch_due"] == []                                    # 差一分钟：没到
+    proj.ctx.advance(1)
+    due = [{"ticket": "T1", "check": "T+1"}]
+    assert proj.run()["postlaunch_due"] == due                                   # now ≥ at
+    assert proj.run()["postlaunch_due"] == due                                   # 没记结果：每一轮都重复交
+    assert "到期" in proj.state()["tickets"]["T1"]["waiting_for"]
+    _record(proj, "T1", "T+1")
+    assert proj.run()["postlaunch_due"] == []                                    # 记了就不再交
+    proj.ctx.advance(2 * 24 * 60)
+    assert proj.run()["postlaunch_due"] == [{"ticket": "T1", "check": "T+3"}]
+
+
+def test_postlaunch_ticket_holds_no_slot_or_lock_and_unblocks_dependents(proj):
+    proj.cfg["slots"] = {"heavy": 1, "light": 1}                               # 只剩一个重名额：T1 占了就派不出 T2
+    proj.put(T1=_postlaunch(weight="heavy"),
+             T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "start_ok": True, "blocked_by": ["T1"], "issue": 32}))
+    res = proj.run()
+    assert res["dispatched"] == ["T2"] and proj.state()["tickets"]["T2"]["status"] == "kickoff"
+    assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+
+
+def test_watch_hands_postlaunch_due_every_round_until_recorded(proj, monkeypatch):
+    proj.put(T1=_postlaunch())
+    proj.ctx.advance(24 * 60)
+    monkeypatch.setattr(tick.time, "sleep", lambda s: None)
+    env = SimpleNamespace(ctx=proj.ctx, root=proj.root, cfg=proj.cfg)
+    a = SimpleNamespace(interval=0, max_minutes=0)
+    for _ in range(2):                                                           # 每一次 watch 首轮都交出来（压缩 / 重启后不丢）
+        out = tick.cmd_watch(a, env)
+        assert "postlaunch_due" in out["woke"] and out["postlaunch_due"] == [{"ticket": "T1", "check": "T+1"}]
+    _record(proj, "T1", "T+1")
+    out = tick.cmd_watch(a, env)
+    assert out["woke"] == ["max_minutes"] and out["postlaunch_due"] == []
+
+
+def test_zero_code_inrepo_impl_done_awaits_prod_not_stuck(proj):
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31),
+             T2=("queued", ["her-reply-prompt"], {"start_ok": True, "blocked_by": ["T1"], "issue": 32}))
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    s = proj.state()
+    t = s["tickets"]["T1"]
+    assert t["status"] == "await_prod"
+    assert t["waiting_for"] == "零代码：router 执行配置后 released --t0"
+    assert [q for q in s["queue"] if q["kind"] == "stuck"] == []                 # 不再被判成卡住
+    assert res["dispatched"] == ["T2"]                                           # 零代码：对下游算已解锁
+
+
+@pytest.mark.parametrize("extra", [{"card_confirmed": False}, {"card_confirmed": True, "pr": 41}],
+                         ids=["card-unconfirmed", "has-pr"])
+def test_inrepo_impl_done_without_confirmed_card_or_with_pr_is_not_zero_code(proj, extra):
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), **extra))
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    proj.run()
+    assert proj.state()["tickets"]["T1"]["status"] != "await_prod"
+
+
+def test_dispatch_brief_asks_for_postlaunch_section_with_project_brief(proj):
+    proj.cfg["postlaunch_brief"] = "~/proj-notes/postlaunch-brief.md"
+    proj.put(T1=("queued", ["her-reply-prompt"], {"start_ok": True}))
+    proj.run()
+    brief = proj.ctx.spawned[0]["cmd"][proj.ctx.spawned[0]["cmd"].index("-p") + 1]
+    assert "上线验收" in brief and "~/proj-notes/postlaunch-brief.md" in brief
+    assert "零代码" in brief                                                     # 仓内票的收尾写明零代码怎么走
+
+
+# 用户 11-12：「注意worktree 清理不要等到第二天」——零代码票 impl_done 当场清 worktree / 分支，
+# 不留到上 prod 或上线验收之后（配置写在 router home 的 cards/<T>.config.md，用不着 worktree）
+def test_zero_code_impl_done_removes_clean_worktree_and_branch_right_away(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    proj.ctx.script(["git", "-C", str(proj.root), "rev-parse", "--verify", "--quiet", "refs/heads/router/T1"], "abc\n")
+    proj.ctx.script(["git", "-C", str(proj.root), "rev-list", "--count", "router/T1", "--not", "--remotes"], "0\n")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "await_prod"
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(wt)] in proj.ctx.calls      # 当场删，不等上 prod
+    assert ["git", "-C", str(proj.root), "branch", "-D", "router/T1"] in proj.ctx.calls
+    assert t["worker"]["worktree"] is None and t["worker"]["branch"] is None
+    assert res["errors"] == []
+
+
+def test_zero_code_dirty_worktree_is_kept_and_reported_once(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], " M notes.md\n")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "await_prod"
+    assert t["worker"]["worktree"] == str(wt)                                      # 有未提交改动：不删，指针保留
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(wt)] not in proj.ctx.calls
+    assert any("T1" in e and "未提交" in e for e in res["errors"])                  # 报出来，要人处理
+    assert proj.run()["errors"] == []                                              # 只报一次，不刷屏
+
+
+def test_zero_code_git_failure_retries_next_round(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=1, stderr="index.lock exists")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    assert any("T1" in e for e in proj.run()["errors"])
+    assert proj.state()["tickets"]["T1"]["worker"]["worktree"] == str(wt)
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=0)   # 锁没了
+    proj.run()                                                                     # 下一轮重试成功
+    assert proj.state()["tickets"]["T1"]["worker"]["worktree"] is None

@@ -1,6 +1,6 @@
 ---
 name: router
-description: 一个 session 管全部待办：周报出来后分诊出派发单，用户说 start 才派 headless worker（每票一个 worktree），收方向卡和决定、按「代码面 + 标签」订阅转交事件、CI 全绿后合 staging、维护本地看板。触发词：router、/router、派发周报、分诊周报、看板、start、推翻 Dn、我接管、还给 router。
+description: 一个 session 管全部待办：周报出来后分诊出派发单，用户说 start 才派 headless worker（每票一个 worktree），收方向卡和决定、按「代码面 + 标签」订阅转交事件、CI 全绿后合 staging、上 prod 后跟进上线验收（T+1/T+3/T+7）、维护本地看板。触发词：router、/router、派发周报、分诊周报、看板、start、推翻 Dn、我接管、还给 router。
 ---
 
 # /router — 一个 session 管全部待办，worker 并行修
@@ -9,12 +9,14 @@ description: 一个 session 管全部待办：周报出来后分诊出派发单�
 
 **你（router）只做五件事**：分诊、派发、转交、在授权范围内做决定、维护决定单和看板。**不改仓库代码，不自己定解法。**
 
+**票的终点是上线验收，不是 released**：上 prod 之后第 1、3、7 天查 prod 上的真实效果，有问题或没用当天就调整（第 7 节）。
+
 下文 `router.py` = `python3 ~/.claude/skills/router/scripts/router.py --root <项目根>`（项目根 = 主仓 checkout，例如 `/Users/apple/works/viber-code/aifriends`）。每个子命令都打一行 JSON：`{"ok": …}`。
 
 ## 1. 启动（每次 /router，包括压缩或重启之后）
 
 1. `router.py discover`：扫外部 worktree，认出用户自己开着的 session，登记它们锁着的代码面。
-2. `router.py tick`：跑一轮巡检，然后 `router.py status` 读出决定单和全部票。状态只以 `state.json` / `decisions.md` 为准，不靠你的记忆。`tick` 和每个 watch 的第一轮会把上次没处理完的方向卡、慢路径事件**再交一次**（压缩或重启后不会丢）。
+2. `router.py tick`：跑一轮巡检，然后 `router.py status` 读出决定单和全部票。状态只以 `state.json` / `decisions.md` 为准，不靠你的记忆。`tick` 和每个 watch 的第一轮会把上次没处理完的方向卡、慢路径事件**再交一次**（压缩或重启后不会丢）；到期的上线验收（`postlaunch_due`）每一轮都交，直到结果记上。
 3. 用 Bash **后台**跑 `router.py watch`（`run_in_background: true`）。它有事才退出：退出就是一个事件，你被通知。
 4. 每次 watch 退出：按下面第 2 节处理它返回的 JSON，**处理完再起一个新的 watch**。
 5. 告诉用户看板路径：`<项目根>/.claude/router/board.html`（只读，30 秒自动刷新）。
@@ -25,6 +27,7 @@ description: 一个 session 管全部待办：周报出来后分诊出派发单�
 |---|---|
 | `triage_needed` | 分诊（第 3 节）→ `router.py draft --from <triage.json>`。只出草稿：不建 issue、不起 worker；draft 不直接发 Lark，下一轮巡检推（前台命令写进决定单的项都由 tick 推，发不出去下一轮重试）。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节）。 |
+| `postlaunch_due` | 每项 `{ticket, check}` 跑一次上线验收（第 7 节）：派一个 **Opus** Agent，prompt = `templates/postlaunch.md` 全文 + config `postlaunch_brief` 指向的项目 brief 全文 + 派单 + 方向卡 + 之前的结论；拿它回的 JSON 跑 `router.py postlaunch-result <T> --check … --type … --verdict … --summary "…" [--action "…"] [--behavior "…"]`。没入口 / 没用 / 有害：当天就做动作（第 5 节）。没记结果之前每一轮都会再交。 |
 | `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。 |
 | `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>"`；是新问题就 `router.py add …` 进草稿（等用户 start）。处理完 `router.py ack-slow`。 |
 | `external_deliveries` | 用户自己开的 session 的订阅投递。tick 已写进对方 worktree 的 `.claude/router-inbox.md`；再用 `ListAgents` 找到 cwd 对得上的 session，`SendMessage` 一句话提醒。**只转交信息，不给它们下指令。** |
@@ -69,6 +72,8 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 | 真人动手：staging 走查、登录、扫码（决定单「待你动手」） | **用户** |
 | 方向取舍、codex 分歧、优先级、拆票、依赖、何时派、合 staging（CI 绿后）、产品口径 | **你** |
 | 远端 base 被删时从 main 重建、改回被 GitHub 自动改指到 main 的 router PR | **router 自动**（用户 11-02 长期授权；tick 自己做，各记一条 decide） |
+| 上线验收的当天动作：关开关、改配置 | **你**照授权执行（用户给过的授权范围内直接做，记一条 decide；超出授权的写 prod 仍归用户，进决定单） |
+| 上线验收的当天动作：要改代码 | 开修复票：`router.py add …`（写清是哪张票的哪个检查点、什么结论），等用户 start |
 
 你替用户做的每个决定都要落盘：`router.py decide --ticket <T> --decision "<决定>" --why "<理由>" --basis "<依据：文件 / 数据 / 规则>"`。用户说「推翻 Dn」：`router.py revoke <Dn> --reason "<用户原话>"`，受影响的票会被标「需复核」并收到通知。
 
@@ -94,17 +99,40 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 | 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支） |
 | 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
 | 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
-| 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2`（写进周报 releases.json） |
+| 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2 [--t0 <ISO>]`（写进周报 releases.json；票进上线验收 postlaunch，不是完成）。零代码票先执行配置，`--t0` 写配置生效的时刻（带时区） |
+| 「Qn 知道了」/「Qn：…」（上线验收项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话调整。检查点都走完了 ⇒ 票完成 |
+| （检查点到期：`postlaunch_due`） | 跑完检查后 `router.py postlaunch-result <T> --check T+1 --type 增长型 --verdict … --summary "…" [--action "…"] [--behavior "…"]` |
 
 `tell --resume` / 会唤醒 worker 的 `answer` / `stop` / `takeover` / `handback` / `submit-card` 报「派单待核实」（上次起 worker 没落完盘，后台可能已有一个在跑）或「查不到它的启动时间」（ps 失败）：不要重试、不要手动起 worker，等下一轮巡检对账后再执行同一条命令。
 
-## 7. 回复用户的规矩
+## 7. 上线验收（票的终点）
+
+**票的终点是上线验收，不是 released。** 状态链：… → `await_prod` →（上 prod）`released` → `postlaunch`（已上线、等上线验收：代码已在 prod，不占名额、不持锁、对下游算已解锁）→ `done`。用户要的不是「bugfix 有没有作用」，而是「这次改动对线上行为有没有正收益」。
+
+- **检查点**：`released` 记 t0（缺省 = 执行 released 的时刻；配置类上线的生效时刻不一样时用 `--t0`），排三个检查点 T+1 / T+3 / T+7 = t0 + 1 / 3 / 7 天。到点（now ≥ at）还没结果的，tick 每一轮都放进 `postlaunch_due`。
+- **零代码票**（仓内票、只改配置、没有 PR）：worker 报 `impl_done` ⇒ 进 `await_prod`（「零代码：router 执行配置后 released --t0」），tick 当场删它的 worktree 和本地分支（干净才删；有未提交改动 ⇒ 保留并报一次 errors；git 失败下一轮重试——worktree 清理不等到上 prod 或上线验收），和仓内票一起攒进 `prod-batch`；用户放行上 prod 后你执行配置（照 worker 写的 `cards/<T>.config.md`），再 `released --t0 <生效时刻>`。
+- **跑检查**：`templates/postlaunch.md`（通用，六段：上线 / 入口 / 机制 / 行为收益 / 护栏 / 结论和动作）+ 项目 brief（config `postlaunch_brief`：项目专属的取数方法和判定口径只写在那里）。报告在 `postlaunch/<T>-<检查点>.md`。prod 只读。
+- **类型**（`--type`，必填，照方向卡）：**增长型**必须拿出行为收益才算「生效」——`--behavior "<指标>=<前>→<后>, better"` 至少一条 better、没有 worse，否则拒记；机制生效但行为 flat 算「没用」。**风险型**行为不 worse 即可，summary 写明代价。
+- **五类结论**（`router.py postlaunch-result`）：
+
+| 结论 | 票去哪 |
+|---|---|
+| 生效 | `done` |
+| 看不出来 | 留在 `postlaunch`，等下一个检查点；T+7 也看不出来 ⇒ `done`，注明「交周报」 |
+| 没入口 / 没用 / 有害 | 留在 `postlaunch`，进决定单（kind=`postlaunch`，写结论 + 摘要 + 动作 + 要用户回什么）；必须带 `--action`（当天动作），当天就做 |
+
+- 同一个检查点重复提交 = 覆盖（照样追加进 results，标 `override`）；同一张票没回的旧 postlaunch 项被新结论取代。
+- 用户回 postlaunch 项：`router.py answer <Qn> "<原话>"` 只记原话，不唤醒任何 worker；照原话调整（关开关、改配置照授权，改代码开修复票）。最后一个检查点之后的回答 ⇒ 票 `done`。
+- 取数失败修不好：不编结论，记「看不出来」，summary 写清为什么查不了，并告诉用户。
+- 看板和 `status` 上每张 postlaunch 票都显示下一次检查的时间和最近一次结论。
+
+## 8. 回复用户的规矩
 
 - 每条 ≤ 100 字；决定单要列全，按「挡住了几张票」排序。
-- 叫用户只有五种理由：start、确认方向卡、花钱、上 prod、真人动手。其余你自己定并 `decide`。
+- 叫用户只有六种理由：start、确认方向卡、花钱、上 prod、真人动手、上线验收没过（没入口 / 没用 / 有害）。其余你自己定并 `decide`。
 - 不复述 worker 的长篇输出；给结论 + 卡 / 日志路径。
 
-## 8. 红线
+## 9. 红线
 
 - **prod 只读**：worker 只写 staging；写过 staging 数据的票必须在同一个 run 里回滚。`supercli db execute` 已在 worker 配置里禁用。
 - **用户 uid 和原话不进 GitHub**：建票和留言都过防泄漏闸（`leak_guard_globs`），命中就拒。worker 要证据，给本地路径。
@@ -112,8 +140,8 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 - 不给用户自己开的 session 下指令；只登记、只转交。
 - 你不改仓库代码、不自己定解法；派的是问题和证据。
 
-## 9. 文件（`<项目根>/.claude/router/`，已 gitignore）
+## 10. 文件（`<项目根>/.claude/router/`，已 gitignore）
 
-`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `logs/<T>-<n>.log` · `board.html`。
+`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json` · `decisions.md` · `answers.md`（用户原话存档）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `postlaunch/<T>-<检查点>.md`（上线验收报告）· `cards/<T>.config.md`（零代码票要执行的配置）· `logs/<T>-<n>.log` · `board.html`。config 的 `postlaunch_brief`：项目上线验收 brief 的路径（取数方法、口径、判定标准）。
 
 🔴 这个目录必须被 git 忽略（里面有周报证据和方向卡）。项目 `.gitignore` 没覆盖时，在 `.git/info/exclude` 加 `**/.claude/router/` 和 `**/.claude/router-inbox.md`。
