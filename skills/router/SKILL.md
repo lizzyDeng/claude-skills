@@ -110,7 +110,7 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 **票的终点是上线验收，不是 released。** 状态链：… → `await_prod` →（上 prod）`released` → `postlaunch`（已上线、等上线验收：代码已在 prod，不占名额、不持锁、对下游算已解锁）→ `done`。用户要的不是「bugfix 有没有作用」，而是「这次改动对线上行为有没有正收益」。
 
 - **检查点**：`released` 记 t0（缺省 = 执行 released 的时刻；配置类上线的生效时刻不一样时用 `--t0`），排三个检查点 T+1 / T+3 / T+7 = t0 + 1 / 3 / 7 天。到点（now ≥ at）还没结果的，tick 每一轮都放进 `postlaunch_due`。
-- **零代码票**（仓内票、只改配置、没有 PR）：worker 报 `impl_done` ⇒ 进 `await_prod`（「零代码：router 执行配置后 released --t0」），和仓内票一起攒进 `prod-batch`；用户放行上 prod 后你执行配置（照 worker 写的 `cards/<T>.config.md`），再 `released --t0 <生效时刻>`。
+- **零代码票**（仓内票、只改配置、没有 PR）：worker 报 `impl_done` ⇒ 进 `await_prod`（「零代码：router 执行配置后 released --t0」），tick 当场删它的 worktree 和本地分支（干净才删；有未提交改动 ⇒ 保留并报一次 errors；git 失败下一轮重试——worktree 清理不等到上 prod 或上线验收），和仓内票一起攒进 `prod-batch`；用户放行上 prod 后你执行配置（照 worker 写的 `cards/<T>.config.md`），再 `released --t0 <生效时刻>`。
 - **跑检查**：`templates/postlaunch.md`（通用，六段：上线 / 入口 / 机制 / 行为收益 / 护栏 / 结论和动作）+ 项目 brief（config `postlaunch_brief`：项目专属的取数方法和判定口径只写在那里）。报告在 `postlaunch/<T>-<检查点>.md`。prod 只读。
 - **类型**（`--type`，必填，照方向卡）：**增长型**必须拿出行为收益才算「生效」——`--behavior "<指标>=<前>→<后>, better"` 至少一条 better、没有 worse，否则拒记；机制生效但行为 flat 算「没用」。**风险型**行为不 worse 即可，summary 写明代价。
 - **五类结论**（`router.py postlaunch-result`）：

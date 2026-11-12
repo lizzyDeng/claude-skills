@@ -329,6 +329,7 @@ class Run:
             # 零代码仓内票（方向卡确认的方案只改配置）：没有 PR 可合，等用户放行上 prod，router 执行配置后 released --t0
             t["fail_streak"] = {"step": "", "count": 0}
             store.set_status(self.state, tid, store.AWAIT_PROD, self.now, ZERO_CODE_WAIT)
+            self._drop_zero_code_checkout(tid, t)
         elif pause:
             store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
         elif result and result.get("is_error"):
@@ -409,12 +410,37 @@ class Run:
                 t["waiting_for"] = f"方向卡超时（> {budget // 60} 分钟），router 照常交卡并注明缺什么"
                 self.res["cards_for_review"].append(tid)
 
+    def _drop_zero_code_checkout(self, tid, t):
+        """零代码票 impl_done ⇒ 当场清本地 worktree / 分支（用户 11-12：「worktree 清理不要等到第二天」）。
+        要执行的配置在 router home 的 cards/<T>.config.md，上 prod、上线验收都用不着 worktree。
+        干净才删、没有未推送提交才删（launcher.cleanup_ticket_checkout）：
+        kept（有未提交改动 / 未推送提交）⇒ 保留指针、报一次 errors 要人处理，不再重试；
+        error（git 失败）⇒ 保留指针、报 errors，下一轮巡检重试。"""
+        w = t["worker"]
+        if not (w.get("worktree") or w.get("branch")) or t.get("checkout_kept"):
+            return
+        r = launcher.cleanup_ticket_checkout(self.ctx, self.root, w.get("worktree"), w.get("branch"))
+        for col in ("worktree", "branch"):
+            if r.get(col) == "done":
+                w[col] = None
+        kept = [f"{col}：{r[col][len('kept: '):]}" for col in ("worktree", "branch")
+                if str(r.get(col, "")).startswith("kept")]
+        errs = [f"{col}：{r[col][len('error: '):]}" for col in ("worktree", "branch")
+                if str(r.get(col, "")).startswith("error")]
+        if kept:
+            t["checkout_kept"] = "；".join(kept)
+            self.res["errors"].append(f"{tid} 零代码票本地没清（{t['checkout_kept']}），要人处理")
+        elif errs:
+            self.res["errors"].append(f"{tid} 零代码票清 worktree 失败（{'；'.join(errs)}），下一轮重试")
+
     # ---- 4b ----
     def step4b_postlaunch(self):
         """上线验收：到期（now ≥ at）、还没记结果的检查点每一轮都交（postlaunch_due），直到 postlaunch-result 记上；
         压缩 / 重启后 watch 首轮照样交，不会丢。顺手把 postlaunch 票的「在等什么」刷成下一次检查的时间。"""
         for tid in sorted(self.state["tickets"], key=lambda x: int(x[1:])):
             t = self.state["tickets"][tid]
+            if t["status"] == store.AWAIT_PROD and t.get("waiting_for") == ZERO_CODE_WAIT:
+                self._drop_zero_code_checkout(tid, t)              # 上一轮 git 失败的，这一轮重试
             if t["status"] != store.POSTLAUNCH or not t.get("postlaunch"):
                 continue
             self.res["postlaunch_due"] += [{"ticket": tid, "check": c} for c in store.postlaunch_due(t, self.now)]

@@ -1493,3 +1493,51 @@ def test_dispatch_brief_asks_for_postlaunch_section_with_project_brief(proj):
     brief = proj.ctx.spawned[0]["cmd"][proj.ctx.spawned[0]["cmd"].index("-p") + 1]
     assert "上线验收" in brief and "~/proj-notes/postlaunch-brief.md" in brief
     assert "零代码" in brief                                                     # 仓内票的收尾写明零代码怎么走
+
+
+# 用户 11-12：「注意worktree 清理不要等到第二天」——零代码票 impl_done 当场清 worktree / 分支，
+# 不留到上 prod 或上线验收之后（配置写在 router home 的 cards/<T>.config.md，用不着 worktree）
+def test_zero_code_impl_done_removes_clean_worktree_and_branch_right_away(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    proj.ctx.script(["git", "-C", str(proj.root), "rev-parse", "--verify", "--quiet", "refs/heads/router/T1"], "abc\n")
+    proj.ctx.script(["git", "-C", str(proj.root), "rev-list", "--count", "router/T1", "--not", "--remotes"], "0\n")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "await_prod"
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(wt)] in proj.ctx.calls      # 当场删，不等上 prod
+    assert ["git", "-C", str(proj.root), "branch", "-D", "router/T1"] in proj.ctx.calls
+    assert t["worker"]["worktree"] is None and t["worker"]["branch"] is None
+    assert res["errors"] == []
+
+
+def test_zero_code_dirty_worktree_is_kept_and_reported_once(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], " M notes.md\n")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    res = proj.run()
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "await_prod"
+    assert t["worker"]["worktree"] == str(wt)                                      # 有未提交改动：不删，指针保留
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(wt)] not in proj.ctx.calls
+    assert any("T1" in e and "未提交" in e for e in res["errors"])                  # 报出来，要人处理
+    assert proj.run()["errors"] == []                                              # 只报一次，不刷屏
+
+
+def test_zero_code_git_failure_retries_next_round(proj, tmp_path):
+    wt = tmp_path / "wt-T1"; wt.mkdir()
+    proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31))
+    s = proj.state(); s["tickets"]["T1"]["worker"]["worktree"] = str(wt); store.save_state(proj.home / "state.json", s)
+    proj.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=1, stderr="index.lock exists")
+    events.emit_progress(proj.home, "T1", "impl_done", "2026-11-02T10:01:00Z")
+    assert any("T1" in e for e in proj.run()["errors"])
+    assert proj.state()["tickets"]["T1"]["worker"]["worktree"] == str(wt)
+    proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=0)   # 锁没了
+    proj.run()                                                                     # 下一轮重试成功
+    assert proj.state()["tickets"]["T1"]["worker"]["worktree"] is None

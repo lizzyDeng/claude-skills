@@ -71,6 +71,7 @@
 1. 把要执行的配置改动写到 `$ROUTER_HOME/cards/$ROUTER_TICKET.config.md`：改哪个键、改前值、改后值、执行命令或后台步骤、回滚办法。
 2. 能在 staging 验的先在 staging 验（写过就在同一个 run 里回滚），贴真实输出。**不许写 prod**：prod 由 router 在用户放行上 prod 后执行。
 3. `python3 $ROUTER_CLI progress impl_done`，然后**退出**。票进「等上 prod」，router 执行配置后用 `released --t0 <生效时刻>` 开始上线验收（方向卡第 9 项）。
+   router 收到 impl_done 当场删掉你的 worktree 和本地分支，**所以退出前所有要留的东西都写在 `$ROUTER_HOME/cards/` 下**（配置、读数 SQL、分析脚本），worktree 里不留未提交的改动（有未提交改动的 worktree 不会被删，会报给人处理）。
 
 ## 禁止
 
