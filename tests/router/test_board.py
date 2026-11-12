@@ -110,3 +110,27 @@ def test_board_hides_takeover_for_cleared_or_done_worker():
     for sid in ("sid-1", "sid-2", "sid-4"):
         assert f"claude --resume {sid}" not in html, sid
     assert "cd /wt/t3 &amp;&amp; claude --resume sid-3" in html
+
+
+# ---- 上线验收（postlaunch）：下一次检查的时间 + 最近一次结论 ------------------------------
+
+def test_board_shows_postlaunch_next_check_last_result_and_item():
+    import store
+    pl1 = store.postlaunch_plan("2026-11-01T08:00:00Z")
+    pl1["results"] = [{"check": "T+1", "verdict": "没入口", "summary": "命中 0 人：开关没开", "action": "照授权打开开关",
+                       "at": "2026-11-02T09:00:00Z"}]
+    pl2 = store.postlaunch_plan("2026-10-20T08:00:00Z")
+    pl2["results"] = [{"check": "T+1", "verdict": "生效", "summary": "转化 2.0% → 2.6%", "action": "",
+                       "at": "2026-10-21T09:00:00Z"}]
+    st = make_state(T1=("postlaunch", ["a"], {"postlaunch": pl1, "worker": {"session_id": "sid-1", "worktree": "/wt/t1"}}),
+                    T2=("done", ["b"], {"postlaunch": pl2}))
+    st["queue"] = [{"id": "Q1", "ticket": "T1", "kind": "postlaunch", "summary": "T1 上线验收 T+1 没入口", "created_at": "t"}]
+    html = render(st, [], {}, NOW)
+    g, card = _card_of(html, "T1")
+    assert g != "ok"                                                     # 没验收完不算「已完成」
+    assert "已上线" in card and "T+3" in card and "11-04 08:00" in card  # 下一次检查
+    assert "没入口" in card and "命中 0 人：开关没开" in card              # 最近一次结论
+    assert "claude --resume sid-1" not in card                           # 没有 worker 可接管
+    _, card2 = _card_of(html, "T2")
+    assert "生效" in card2 and "转化 2.0% → 2.6%" in card2
+    assert "上线验收" in html and "Q1 知道了" in html                      # 决定单：类型名 + 你回什么

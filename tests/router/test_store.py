@@ -187,3 +187,36 @@ def test_append_decision_with_key_is_idempotent(tmp_path):                 # R1 
     assert store.decision_with_key(d, key) == "D1" and store.decision_with_key(d, "base:other") is None
     assert store.append_decision(d, s, "-", "另一件", "w", "b", "t3") == "D2"      # 不带 key 照旧每次一行
     assert store.recent_decisions(d)[1]["decision"].startswith("远端 staging 不存在")
+
+
+# ---- 上线验收（postlaunch）：已上线、等验收；票的终点是上线验收，不是 released ----------------
+
+def test_postlaunch_status_frees_slot_and_lock_and_unblocks_dependents():
+    assert store.POSTLAUNCH == "postlaunch" and store.POSTLAUNCH in store.STATUSES
+    assert store.POSTLAUNCH not in store.RUNNING and store.POSTLAUNCH not in store.LOCKING   # 代码已在 prod：不占名额、不持锁
+    assert store.POSTLAUNCH in store.SETTLED                                                  # 对下游算已解锁
+    assert "postlaunch" in store.QUEUE_KINDS
+    s = make_state(T1=("postlaunch", ["a"]))
+    assert not store.occupies_slot(s["tickets"]["T1"]) and not store.holds_lock(s["tickets"]["T1"])
+
+
+def test_postlaunch_plan_has_three_checks_from_t0():
+    pl = store.postlaunch_plan("2026-11-10T08:30:00Z")
+    assert pl == {"t0": "2026-11-10T08:30:00Z",
+                  "checks": [{"label": "T+1", "at": "2026-11-11T08:30:00Z"},
+                             {"label": "T+3", "at": "2026-11-13T08:30:00Z"},
+                             {"label": "T+7", "at": "2026-11-17T08:30:00Z"}],
+                  "results": []}
+
+
+def test_postlaunch_due_only_after_time_and_until_recorded():
+    s = make_state(T1=("postlaunch", ["a"], {"postlaunch": store.postlaunch_plan("2026-11-10T08:30:00Z")}))
+    t = s["tickets"]["T1"]
+    assert store.postlaunch_due(t, "2026-11-11T08:29:59Z") == []
+    assert store.postlaunch_due(t, "2026-11-11T08:30:00Z") == ["T+1"]                      # now ≥ at
+    assert store.postlaunch_due(t, "2026-11-13T09:00:00Z") == ["T+1", "T+3"]               # 漏了的也照交
+    t["postlaunch"]["results"].append({"check": "T+1", "verdict": "看不出来", "summary": "命中 3/40", "action": "",
+                                       "at": "2026-11-13T09:00:00Z"})
+    assert store.postlaunch_due(t, "2026-11-13T09:00:00Z") == ["T+3"]
+    t["status"] = "done"
+    assert store.postlaunch_due(t, "2026-11-20T00:00:00Z") == []                           # 只有 postlaunch 的票会到期

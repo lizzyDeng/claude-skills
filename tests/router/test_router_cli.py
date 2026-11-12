@@ -291,7 +291,7 @@ def test_walkthrough_prod_batch_and_released(proj):
     proj.out("released", "--tickets", "T1", "T2", "--what", "#941 承认是 AI", "--metrics", "claims_human,offline_meet")
     rel = json.loads(releases.read_text())
     assert rel[0] == old[0] and rel[1]["what"] == "#941 承认是 AI" and rel[1]["metrics"] == ["claims_human", "offline_meet"]
-    st = proj.state(); assert {st["tickets"][t]["status"] for t in ("T1", "T2")} == {"done"} and st["queue"] == []
+    st = proj.state(); assert {st["tickets"][t]["status"] for t in ("T1", "T2")} == {"postlaunch"} and st["queue"] == []
 
 
 def test_status_text_and_json(proj):
@@ -1466,3 +1466,236 @@ def test_review_canary_records_failure_when_probe_dir_cannot_be_created(rv, monk
     assert c["ok"] is False and c["reason"] == "boundary"                 # review-pack 下次报 canary_stale，补跑
     assert not (rv.tmp / ".router-canary-probe").exists()                 # 已建的 HOME 同级探针照样删掉
     assert not [x for x in rv.codex_log() if x["argv"][:1] == ["exec"]]
+
+
+# =============================================================================
+# 上线验收（postlaunch）：released → postlaunch → done；票的终点是上线验收，不是 released
+# =============================================================================
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+_ISO = "%Y-%m-%dT%H:%M:%SZ"
+BAD = ("没入口", "没用", "有害")
+
+
+def _ago(days=0, hours=0):
+    return (_dt.now(_tz.utc) - _td(days=days, hours=hours)).strftime(_ISO)
+
+
+def _plus(iso, days):
+    return (_dt.strptime(iso, _ISO) + _td(days=days)).strftime(_ISO)
+
+
+def _released(proj, t0=None, **extra):
+    """T1 等上 prod（带一个 worker session：答 postlaunch 项时不许唤醒它），然后 released。"""
+    wt = proj.tmp / "wt"; wt.mkdir(exist_ok=True)
+    seed(proj, T1=("await_prod", ["her-reply-prompt"], {"title": "付费页改价", "issue": 51, "card_confirmed": True,
+                                                        "worker": {"session_id": "sid-5eed00a1", "worktree": str(wt),
+                                                                   "runs": 1}}), **extra)
+    args = ["released", "--tickets", "T1", "--what", "付费页改价", "--metrics", "pay_conv"]
+    return proj.out(*args, *(["--t0", t0] if t0 else []))
+
+
+GAIN = "接着发的比例=41%→47%, better"
+
+
+def _result(proj, check, verdict, summary="命中 12 人 / 覆盖 40%", action=None, check_ok=True, typ="风险型",
+            behavior=()):
+    args = ["postlaunch-result", "T1", "--check", check, "--verdict", verdict, "--summary", summary]
+    args += ["--type", typ] if typ else []
+    args += ["--action", action] if action is not None else []
+    for b in ([behavior] if isinstance(behavior, str) else behavior):
+        args += ["--behavior", b]
+    r = proj.run(*args, check=False)
+    if check_ok:
+        assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout), r.returncode
+
+
+def test_released_enters_postlaunch_with_t0_and_three_checks(proj):
+    before = _dt.now(_tz.utc).replace(microsecond=0)
+    out = _released(proj)
+    after = _dt.now(_tz.utc)
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "postlaunch"                                           # 不再直接进 done
+    pl = t["postlaunch"]
+    t0 = _dt.strptime(pl["t0"], _ISO).replace(tzinfo=_tz.utc)
+    assert before <= t0 <= after                                                 # 不传 --t0 = 现在
+    assert pl["checks"] == [{"label": l, "at": _plus(pl["t0"], d)} for l, d in (("T+1", 1), ("T+3", 3), ("T+7", 7))]
+    assert pl["results"] == []
+    rel = json.loads((proj.tmp / "daily" / "state" / "releases.json").read_text())
+    assert rel[-1] == {"date": out["release"]["date"], "what": "付费页改价", "metrics": ["pay_conv"]}   # releases.json 照旧
+
+
+def test_released_t0_option_sets_checks_from_effective_time(proj):
+    _released(proj, t0="2026-11-10T16:30:00+08:00")                              # 带时区的 ISO：统一存 UTC
+    pl = proj.state()["tickets"]["T1"]["postlaunch"]
+    assert pl["t0"] == "2026-11-10T08:30:00Z"
+    assert [c["at"] for c in pl["checks"]] == ["2026-11-11T08:30:00Z", "2026-11-13T08:30:00Z", "2026-11-17T08:30:00Z"]
+
+
+def test_released_rejects_t0_without_timezone(proj):
+    seed(proj, T1=("await_prod", ["her-reply-prompt"]))
+    r = proj.run("released", "--tickets", "T1", "--what", "x", "--metrics", "m", "--t0", "2026-11-10T08:30:00", check=False)
+    assert r.returncode == 1 and "时区" in json.loads(r.stdout)["error"]
+    assert proj.state()["tickets"]["T1"]["status"] == "await_prod"
+
+
+def test_postlaunch_result_refuses_check_that_is_not_due_yet(proj):
+    _released(proj)                                                              # t0 = 现在：T+1 还没到
+    out, rc = _result(proj, "T+1", "生效", check_ok=False)
+    assert rc == 1 and "还没到" in out["error"]
+    assert proj.state()["tickets"]["T1"]["postlaunch"]["results"] == []
+
+
+@pytest.mark.parametrize("verdict,status,queued", [("生效", "done", False), ("看不出来", "postlaunch", False),
+                                                   ("没入口", "postlaunch", True), ("没用", "postlaunch", True),
+                                                   ("有害", "postlaunch", True)])
+def test_postlaunch_result_transitions_for_each_verdict(proj, verdict, status, queued):
+    _released(proj, t0=_ago(days=1, hours=1))
+    action = "关开关 pay_v2（照授权）" if verdict in BAD else None
+    out, _ = _result(proj, "T+1", verdict, action=action, typ="增长型", behavior=GAIN if verdict == "生效" else ())
+    st = proj.state()
+    t = st["tickets"]["T1"]
+    assert t["status"] == status
+    r = t["postlaunch"]["results"]
+    assert len(r) == 1 and r[0]["check"] == "T+1" and r[0]["verdict"] == verdict and r[0]["summary"] == "命中 12 人 / 覆盖 40%"
+    assert r[0]["type"] == "增长型"                                              # 类型记进结果
+    items = [q for q in st["queue"] if q["kind"] == "postlaunch"]
+    if queued:
+        assert len(items) == 1 and items[0]["ticket"] == "T1" and out["queue"] == items[0]["id"]
+        say = items[0]["summary"]                                                # 结论 + 摘要 + 动作 + 要用户回什么
+        for part in (verdict, "命中 12 人 / 覆盖 40%", "关开关 pay_v2（照授权）", f"回「{items[0]['id']}"):
+            assert part in say, (part, say)
+        assert r[0]["action"] == "关开关 pay_v2（照授权）"
+    else:
+        assert items == []
+    if verdict == "看不出来":
+        assert "T+3" in t["waiting_for"]                                         # 等下一个检查点
+
+
+@pytest.mark.parametrize("verdict", BAD)
+@pytest.mark.parametrize("action", [None, "  "], ids=["missing", "blank"])
+def test_bad_verdict_without_action_is_refused(proj, verdict, action):
+    _released(proj, t0=_ago(days=1, hours=1))
+    out, rc = _result(proj, "T+1", verdict, action=action, check_ok=False)
+    assert rc == 1 and "--action" in out["error"]
+    st = proj.state()
+    assert st["tickets"]["T1"]["postlaunch"]["results"] == [] and st["queue"] == []
+
+
+def test_unclear_through_t7_finishes_and_hands_to_weekly(proj):
+    _released(proj, t0=_ago(days=7, hours=1))
+    for check in ("T+1", "T+3"):
+        _result(proj, check, "看不出来", summary="样本 9 人，不够")
+        assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+    _result(proj, "T+7", "看不出来", summary="样本 20 人，仍不够")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "done" and "交周报" in t["waiting_for"]
+    assert "交周报" in t["postlaunch"]["results"][-1].get("note", "")
+
+
+def test_resubmitting_a_check_overrides_and_says_so(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    _result(proj, "T+1", "看不出来", summary="命中 0 人")
+    _result(proj, "T+1", "没入口", summary="命中 0 人：开关没开", action="照授权打开开关 pay_v2")
+    st = proj.state()
+    r = st["tickets"]["T1"]["postlaunch"]["results"]
+    assert [x["verdict"] for x in r] == ["看不出来", "没入口"]                    # 每次都追加
+    assert r[1].get("override") is True and not r[0].get("override")             # 写明是覆盖
+    assert st["tickets"]["T1"]["status"] == "postlaunch"
+    assert [q["kind"] for q in st["queue"]] == ["postlaunch"]
+
+
+def test_answer_postlaunch_item_only_records_and_wakes_no_worker(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    qid = _result(proj, "T+1", "没用", summary="命中 30 人，转化 2.1% → 2.0%", action="开修复票")[0]["queue"]
+    out = proj.out("answer", qid, "a purple elephant reads poems")
+    assert out["resumed"] is None and out["delivered"] is None
+    assert proj.claude() == []                                                   # 没起任何 worker
+    assert not (proj.home / "inbox" / "T1.jsonl").exists()                       # 也没往收件箱投
+    assert "a purple elephant reads poems" in (proj.home / "answers.md").read_text()
+    st = proj.state()
+    assert st["queue"] == [] and st["tickets"]["T1"]["status"] == "postlaunch"   # 还有 T+3 / T+7：照常等
+
+
+def test_answer_postlaunch_item_after_last_check_finishes_ticket(proj):
+    _released(proj, t0=_ago(days=7, hours=1))
+    for check in ("T+1", "T+3"):
+        _result(proj, check, "看不出来")
+    qid = _result(proj, "T+7", "有害", summary="退款率 1.2% → 3.4%", action="照授权回滚配置")[0]["queue"]
+    assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+    proj.out("answer", qid, "a purple elephant reads poems")
+    assert proj.claude() == []
+    assert proj.state()["tickets"]["T1"]["status"] == "done"                     # 检查点走完、你也回了：结束
+
+
+def test_status_and_board_show_postlaunch_next_check_and_last_result(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    _result(proj, "T+1", "看不出来", summary="命中 7 人 / 覆盖 12%")
+    nxt = proj.state()["tickets"]["T1"]["postlaunch"]["checks"][1]["at"]
+    txt = proj.run("status").stdout
+    line = next(l for l in txt.splitlines() if "T1" in l and "postlaunch" in l)
+    assert "T+3" in line and nxt[5:16].replace("T", " ") in line                # 下一次检查的时间
+    assert "看不出来" in line and "命中 7 人 / 覆盖 12%" in line                 # 最近一次结论
+    board = (proj.home / "board.html").read_text()
+    assert "T+3" in board and "命中 7 人 / 覆盖 12%" in board and "看不出来" in board
+
+
+def test_watch_hands_postlaunch_due_every_round_until_result(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    for _ in range(2):
+        out = proj.out("watch", "--interval", "1", "--max-minutes", "0")
+        assert "postlaunch_due" in out["woke"] and out["postlaunch_due"] == [{"ticket": "T1", "check": "T+1"}]
+    _result(proj, "T+1", "看不出来")
+    out = proj.out("watch", "--interval", "1", "--max-minutes", "0")
+    assert out["postlaunch_due"] == [] and "postlaunch_due" not in out["woke"]
+
+
+def test_worker_cannot_record_postlaunch_result(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    r = proj.run("postlaunch-result", "T1", "--check", "T+1", "--verdict", "生效", "--summary", "x", "--type", "风险型",
+                 env={"ROUTER_TICKET": "T1", "ROUTER_HOME": str(proj.home)}, check=False)
+    assert "worker 不许调用" in json.loads(r.stdout)["error"]
+    assert r.returncode == 2 and proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+
+
+# ---- 上线验收补充（用户 11-12：统计只看 bugfix 有没有作用，论证不了需求本身对线上行为有正收益）------------
+
+def test_postlaunch_result_requires_type(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    _, rc = _result(proj, "T+1", "看不出来", typ=None, check_ok=False)
+    assert rc != 0 and proj.state()["tickets"]["T1"]["postlaunch"]["results"] == []
+    _, rc = _result(proj, "T+1", "看不出来", typ="随便型", check_ok=False)
+    assert rc != 0 and proj.state()["tickets"]["T1"]["postlaunch"]["results"] == []
+
+
+def test_growth_effective_requires_behavior_gain(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    out, rc = _result(proj, "T+1", "生效", typ="增长型", check_ok=False)                 # 没带行为指标
+    assert rc == 1 and "--behavior" in out["error"]
+    out, rc = _result(proj, "T+1", "生效", typ="增长型", behavior="接着发的比例=41%→41%, flat", check_ok=False)
+    assert rc == 1 and "没用" in out["error"]                                            # 机制生效但行为 flat = 没用
+    out, rc = _result(proj, "T+1", "生效", typ="增长型", behavior="接着发的比例 41% 到 47%", check_ok=False)
+    assert rc == 1 and "--behavior" in out["error"]                                      # 格式不对
+    assert proj.state()["tickets"]["T1"]["postlaunch"]["results"] == []
+    _result(proj, "T+1", "生效", typ="增长型", behavior=[GAIN, "次日回访=22%→23%, small"])
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "done"
+    assert t["postlaunch"]["results"][0]["behavior"] == [GAIN, "次日回访=22%→23%, small"]
+
+
+def test_risk_effective_needs_no_behavior_gain(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    _result(proj, "T+1", "生效", typ="风险型", summary="自称真人 9 → 0；接着发的比例 41% → 40%（flat），代价：回复慢 0.2 秒")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "done" and t["postlaunch"]["results"][0]["type"] == "风险型"
+
+
+def test_growth_mechanism_works_but_behavior_flat_is_recorded_as_useless(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    qid = _result(proj, "T+1", "没用", typ="增长型", behavior="接着发的比例=41%→41%, flat",
+                  summary="机制生效：新开场命中 30 人；行为 flat", action="开修复票重查根因")[0]["queue"]
+    st = proj.state()
+    assert st["tickets"]["T1"]["status"] == "postlaunch"
+    item = next(q for q in st["queue"] if q["id"] == qid)
+    assert "增长型" in item["summary"] and "接着发的比例=41%→41%, flat" in item["summary"]
