@@ -1,7 +1,7 @@
 """一轮巡检。顺序写死（计划 Task 9），实现者不要改顺序：
 
 0 新周报 → triage_needed      1 扫外部 session，查抢锁      2 处理退出的 worker
-3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时
+3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时；4b 上线验收到期
 5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       6 派发      7 看板 + Lark
 
 整轮持 <home>/.lock。每一步单独 try：一步出错不拖垮后面几步，错误进返回值。
@@ -25,7 +25,10 @@ import store
 import surfaces
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review")
+WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
+             "postlaunch_due")
+# 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
+ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
 # 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
 # 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
@@ -59,8 +62,8 @@ def _ts(s):
 
 def _empty_res() -> dict:
     return {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
-            "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "notified": False,
-            "errors": []}
+            "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "postlaunch_due": [],
+            "notified": False, "errors": []}
 
 
 class Run:
@@ -322,6 +325,10 @@ class Run:
             t["verifying_at"] = self.now
         elif phase == "impl_done" and t.get("card_confirmed") and self._offrepo(t):
             self._settle(tid, t, sha=None)
+        elif phase == "impl_done" and t.get("card_confirmed") and not t.get("pr"):
+            # 零代码仓内票（方向卡确认的方案只改配置）：没有 PR 可合，等用户放行上 prod，router 执行配置后 released --t0
+            t["fail_streak"] = {"step": "", "count": 0}
+            store.set_status(self.state, tid, store.AWAIT_PROD, self.now, ZERO_CODE_WAIT)
         elif pause:
             store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
         elif result and result.get("is_error"):
@@ -401,6 +408,17 @@ class Run:
                 t["overtime_flagged"] = t["kickoff_at"]
                 t["waiting_for"] = f"方向卡超时（> {budget // 60} 分钟），router 照常交卡并注明缺什么"
                 self.res["cards_for_review"].append(tid)
+
+    # ---- 4b ----
+    def step4b_postlaunch(self):
+        """上线验收：到期（now ≥ at）、还没记结果的检查点每一轮都交（postlaunch_due），直到 postlaunch-result 记上；
+        压缩 / 重启后 watch 首轮照样交，不会丢。顺手把 postlaunch 票的「在等什么」刷成下一次检查的时间。"""
+        for tid in sorted(self.state["tickets"], key=lambda x: int(x[1:])):
+            t = self.state["tickets"][tid]
+            if t["status"] != store.POSTLAUNCH or not t.get("postlaunch"):
+                continue
+            self.res["postlaunch_due"] += [{"ticket": tid, "check": c} for c in store.postlaunch_due(t, self.now)]
+            t["waiting_for"] = store.postlaunch_wait(self.state, t, self.now)
 
     # ---- 5 ----
     def step5_merge(self):
@@ -888,12 +906,15 @@ def _brief(run, tid):
         blocked_by="、".join(t["blocked_by"]) or "无", base_branch=run.cfg.get("base_branch", "staging"),
         router_home=str(run.home), router_cli=str(Path(__file__).resolve().with_name("router.py")),
         card_path=str(run.home / "cards" / f"{tid}.md"), kickoff_budget=run.cfg.get("kickoff_budget_min", 30),
+        postlaunch_brief=run.cfg.get("postlaunch_brief") or "（config 没配 postlaunch_brief：按项目周报的判定口径写，卡上注明）",
         finish=(f"这张票只改仓外目录（{'、'.join(t['surfaces'])}），不推分支、不开 PR：开改前把要动的文件整份备份到 "
                 f"{run.home}/backups/{tid}/（cp -a，保留目录结构）；改完把 `diff -ru <备份> <现状>` 写到 "
                 f"{run.home}/cards/{tid}.diff，跑验收，然后 progress impl_done 退出。")
         if run._offrepo(t) else
         (f"改完照 worker.md 第 3 段：推 router/{tid}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
-         "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"))
+         "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"
+         "方向卡确认的方案只改配置、不改仓库代码（零代码票）：不开 PR，照 worker.md 第 3 段「零代码票」做，"
+         "然后 progress impl_done 退出。"))
 
 
 def _explain_waits(run, picked, done, disk):
@@ -979,7 +1000,7 @@ def run(ctx, root, cfg, resurface=False) -> dict:
         state = store.load_state(home / "state.json")
         r = Run(ctx, root, cfg, state)
         for step in (r.step0_weekly, r.step1_external, r.step2_exits, r.step3_events, r.step4_patrol,
-                     r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
+                     r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
             try:
                 step()
             except Exception as e:  # 一步出错不拖垮整轮；错误交给 router

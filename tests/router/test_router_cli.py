@@ -1508,7 +1508,7 @@ def _result(proj, check, verdict, summary="命中 12 人 / 覆盖 40%", action=N
     r = proj.run(*args, check=False)
     if check_ok:
         assert r.returncode == 0, r.stdout + r.stderr
-    return json.loads(r.stdout), r.returncode
+    return (json.loads(r.stdout) if r.stdout.strip() else {"stderr": r.stderr}), r.returncode   # argparse 拒绝时只有 stderr
 
 
 def test_released_enters_postlaunch_with_t0_and_three_checks(proj):
@@ -1699,3 +1699,20 @@ def test_growth_mechanism_works_but_behavior_flat_is_recorded_as_useless(proj):
     assert st["tickets"]["T1"]["status"] == "postlaunch"
     item = next(q for q in st["queue"] if q["id"] == qid)
     assert "增长型" in item["summary"] and "接着发的比例=41%→41%, flat" in item["summary"]
+
+
+def test_risk_effective_refused_when_behavior_is_worse(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    out, rc = _result(proj, "T+1", "生效", typ="风险型", behavior="离开率=12%→19%, worse", check_ok=False)
+    assert rc == 1 and "有害" in out["error"]                                    # 风险型：行为不 worse 才算生效
+    assert proj.state()["tickets"]["T1"]["postlaunch"]["results"] == []
+
+
+def test_rerelease_restarts_postlaunch_and_keeps_previous_round(proj):
+    _released(proj, t0=_ago(days=1, hours=1))
+    _result(proj, "T+1", "没入口", summary="命中 0 人：开关没开", action="照授权打开开关")
+    first = proj.state()["tickets"]["T1"]["postlaunch"]
+    proj.out("released", "--tickets", "T1", "--what", "付费页改价（开关已开）", "--metrics", "pay_conv")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "postlaunch" and t["postlaunch"]["results"] == []      # 从新的 t0 重新查
+    assert t["postlaunch_prev"] == [first]                                       # 上一轮的结论留档
