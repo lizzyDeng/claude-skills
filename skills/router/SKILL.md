@@ -44,7 +44,7 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 | `return_to_user` | 业务票连续 3 次判「没用」，每项 `{ticket, attempt}`。worker **不续跑**，票停在 postlaunch，决定单上有一条 `return` 项。告诉用户（≤ 100 字）：这几次各试了什么方向、判定是什么（`status --json` 里这张票的 `attempts`），问题本身可能要重新定义；等他回，照第 6 节办：他给了新方向 ⇒ `router.py redirect <T> "<原话>" --as-user`（`return` 项清掉、没用的连续计数归零）。`return` 项没回之前 `redirect --as-router` 一律被拒：下一个方向只能由用户定，没用的连续计数也只在用户定方向时归零。他要重新定义问题 ⇒ 新问题 `router.py add --business …` 并 start，原票 `router.py close <T>`；他要关 ⇒ `router.py close <T>`。 |
 | `analyst_done` | 分析 agent 跑完要你看的，每项 `{run, mode, out}` 或 `{run, mode, failed: true, error}`。`mode=calibrate` 且没失败 ⇒ 判校准（第 3 节）。`mode=migrate` 且没失败 ⇒ 产出没落：把整份迁移清单（每个问题和它 `absorbs` 的老票、`attach`、`walls`）交给用户确认，他确认后 `router.py migrate-apply <run> --said "<原话>" [--skip …] [--hold …]`（第 3 节）。`failed` ⇒ 读 `error` 和 `<home>/analyst/logs/<run>.log`：能修就修（config、claude 登录、brief 路径），修好 `router.py analyst run --mode <mode>` 重跑（daily 当天不会自动重跑）；「校准未过」拒收 weekly 是预期，不用修；被防泄漏闸整份拒收 ⇒ 重跑，不要手改它的产出再收；修不了告诉用户。daily / weekly 跑成功不进这里：判定、墙、提议 tick 已经落好（新项进 `new_queue`，单条没落的进 `errors`）。 |
 | `releases_unlabeled` | 新周报的 `release_sync.unlabeled`：自动发现、还没标 metrics 的上线（原来由分诊转，现在巡检直接交你）。转给用户：一条 ≤ 100 字，列出清单，请他补标 metrics（周报的上线对账，不在 router 内）。 |
-| `prod_ready` | 票级授权的业务票合进 staging（或零代码做完）进了 `await_prod`，每项 `{ticket}`。跑 `router.py prod-batch`，按第 7 节的发版批次规则办：`router_ships` 非空 ⇒ 整批都能由你上，照项目发版流程上 prod，发完照 `router_ships` 逐张 `released`（业务票带 `--rollback`），各记一条 decide；`router_ships` 为空 ⇒ staging 上还有待走查 / 待放行的票，合 main 会把它们一起带上去，不能自己上：prod-batch 已推一条整批 prod 项（`batch` 里每张票的状态），告诉用户（≤ 100 字）：哪几张在等、各卡在走查还是放行，要他回「Qn 放行」或先走查。之后每次 `walkthrough-done` / `released` 改了批次，都再跑一次 `prod-batch`。 |
+| `prod_ready` | 票级授权的业务票合进 staging（或零代码做完）进了 `await_prod`，每项 `{ticket}`。跑 `router.py prod-batch`（它会 fetch 并核对 staging 领先 main 的提交），按第 7 节的发版批次规则办：`router_ships` 非空 ⇒ 整批都能由你上，照项目发版流程上 prod，发完照 `router_ships` 逐张 `released`（业务票带 `--rollback`），各记一条 decide；`router_ships` 为空 ⇒ staging 上还有待走查 / 待放行的票，合 main 会把它们一起带上去，不能自己上：prod-batch 已推一条整批 prod 项（`batch` 里每张票的状态），告诉用户（≤ 100 字）：哪几张在等、各卡在走查还是放行，要他回「Qn 放行」或先走查。之后每次 `walkthrough-done` / `released` 改了批次，都再跑一次 `prod-batch`。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节）。业务票审完 submit 即自动确认；老票和维护票的卡交用户。 |
 | `postlaunch_due` | 只有老票和维护票有（业务票的验证交 daily）。每项 `{ticket, check}` 跑一次上线验收（第 7 节）：派一个 **Opus** Agent，prompt = `templates/postlaunch.md` 全文 + config `postlaunch_brief` 指向的项目 brief 全文 + 派单 + 方向卡 + 之前的结论；拿它回的 JSON 跑 `router.py postlaunch-result <T> --check … --type … --verdict … --summary "…" [--action "…"] [--behavior "…"]`。没入口 / 没用 / 有害：当天就做动作（第 5 节）。没记结果之前每一轮都会再交。 |
 | `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。判真项（`verify_problem`）写：问题、人群、卡在哪、影响分、证据路径（`state.json` 的 `proposals.<P>`），要他回「Qn 真」/「Qn 真，先放着」/「Qn 不是：理由」；提议结束（`close`）要他回「Qn 关」/「Qn 不关」；`harm` / `return` 见上面两行。业务票 worker 停下来问的方向（`direction` 项）不交用户，你定（第 5 节）。topic=next 的方向项（「要下一个方向吗」：空闲的业务票挂了新墙，或用户回了「不关」）也是你定：`router.py redirect <T> "<下一个方向>" --as-router`（清掉这一项、票回队列），记一条 decide。 |
@@ -130,11 +130,11 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「Qn 真」 | `router.py answer <Qn> "真"`：建业务票并当场 start（建 issue、进队列，按影响分派）。他顺带改影响（「人群其实更大」）⇒ 再 `router.py impact <T> --size … --gap … --confidence <low / mid / high>`（记一条决定） |
 | 「Qn 真，先放着」 | `router.py answer <Qn> "真，先放着"`：只建票（草稿，不建 issue）；他说做了再 `router.py start <T>` |
 | 「Qn 不是：<理由>」 | `router.py answer <Qn> "不是：<理由>"`：记进 `analyst/rejected.jsonl`，分析 agent 以后不再提同类，除非有新证据。只说「不是」没理由会被拒：问他理由 |
-| 「Qn 关」 | `router.py answer <Qn> "关"`：业务票收尾（下一轮巡检关 issue、清 worktree）。worker 还在跑会被拒：先 `router.py stop <T>` 再执行 |
+| 「Qn 关」 | `router.py answer <Qn> "关"`：业务票收尾（下一轮巡检关 issue、清 worktree）。worker 还在跑会被拒：先 `router.py stop <T>` 再执行。还有在途尝试 / 改动也会被拒，办法同下面「关 T3」 |
 | 「Qn 不关」 | `router.py answer <Qn> "不关"`：票照旧 |
 | 「Qn 知道了」/「Qn：…」（`harm` / `return` 项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话办（换方向、关票、重新定义问题见下面几行） |
 | 「T3 换成：…」/「T3 换个方向：…」（业务票没有在途尝试时：判了有害 / 没用 / 有用之后、连续没用退回之后、墙拆完又挂了新墙） | `router.py redirect <T> "<原话>" --as-user`：新方向进收件箱、票回队列派新 worker；清掉这张票的 `harm` / `return` / 卡住重排 / 问下一个方向的项。有在途尝试（已派还没 released，或上线了还没判完）会被拒：等判完 |
-| 「关 T3」 | `router.py close <T> [--reason "<原话里的理由>"]`：业务票收尾（同「Qn 关」）。worker 还在跑会被拒：先 `router.py stop <T>` |
+| 「关 T3」 | `router.py close <T> [--reason "<原话里的理由>"]`：业务票收尾（同「Qn 关」）。worker 还在跑会被拒：先 `router.py stop <T>`。还有在途尝试（已上线、还在等 daily 判定）或改动还在 staging / 仓外真身上（merged_staging / await_prod / await_check）也会被拒——关了之后有害判定落不下、撤不回：等 daily 判完再关；他要现在关，你先照这次尝试的撤回办法撤回、核实生效，再 `router.py close <T> --rolled-back`（记一条 decide「关票前已撤回」） |
 | 「把 T5 并进 T7」 | `router.py absorb T7 T5`：老票挂到业务票下（验收过的记一次历史尝试，还在做的出了验收结论再记） |
 | 「迁移清单可以」/「迁移可以，k3 不要，k2 先放着」 | `router.py migrate-apply <run> --said "<原话>" [--skip k3] [--hold k2]`（`<run>` 是 `analyst_done` 里 migrate 那次的编号） |
 | 「Qn 重排」（判定后没排上队的卡住项，topic=requeue） | `router.py answer <Qn> "<原话>"`：再排一次队，派新 worker（不在旧 worker 上续跑）；判定后的下一步和他的原话（标「用户原话（逐字）」）一起进收件箱；router 自己处理时加 `--as-router` |
@@ -189,9 +189,11 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 快速尝试、快速验证：不做 A/B，不算显著性，只看碰到改动的人的真实对话。
 
 - **上 prod**：业务票合 staging（或零代码做完）后不走查，直接进 `await_prod`，tick 交 `prod_ready` 叫醒你跑 `router.py prod-batch`。
-- **发版批次**：上 prod = 合 main 发版，staging 领先 main 的票会**一起**上去。所以你自己上 prod 只限于：staging 领先 main 的每一张票（`merged_staging` / `await_prod`）都满足两条之一——是票级授权的业务票、而且已经可以上（上一次尝试判完了）；或用户已经放行上 prod。prod-batch 按这条算：
+- **发版批次**：上 prod = 合 main 发版，staging 领先 main 的东西会**一起**上去。所以你自己上 prod 只限于：staging 领先 main 的每一张票、每一个提交都满足两条之一——是票级授权的业务票、而且已经可以上（上一次尝试判完了）；或用户已经放行上 prod。prod-batch 按这条算：
+  - **批次里的票**：合进过 staging、之后还没 released 的每一张票（看合并记录 `merge_sha` 和状态历史，不看票现在的状态：stop / takeover / close 都不会让它出批次），加上所有 `await_prod` 的票。
+  - **提交对账**：先 `git fetch` origin 的 main 和 base，再列 `origin/<main_branch>..origin/<base_branch>` 的每个提交，逐个对到批次里的票。对得上 = 提交 sha 就是这张票记的合并 sha（`merge_sha`）；或者它是普通提交（单个父提交）、标题以「(#<PR 号>)」结尾（squash 合并的默认标题），PR 号是批次里某张票的 PR。merge 提交（多个父提交）只认 sha。对不上的提交（用户自己 session 推的、同事的 PR、release 回合的 merge 提交……）一律算没放行，列进整批项；git 核对不了（fetch / log 失败）也一样，router 不自己上（fail-closed）。
   - 整批都满足 ⇒ `router_ships` = 整批，**你自己**照项目发版流程上 prod，每次都带开关，发完逐张 `router.py released --tickets <T> --what "<这次尝试的方向>" --metrics … --rollback "<撤回办法：关哪个开关 / 回哪个配置>" [--t0 <生效时刻>] [--config-keys …]`（业务票的撤回办法照方向卡上写的；用户放行过的老票照 v1 不带 `--rollback`；各记一条 decide）。
-  - 还有待走查、待放行（或上一次尝试还没判）的票 ⇒ `router_ships` 为空，决定单上一条整批 prod 项，列出整批每张票的状态（输出的 `batch`）。告诉用户，等他走查完、或回「Qn 放行」（整批每张记已放行，你再整批上）。
+  - 还有待走查、待放行（或上一次尝试还没判、代码还在 staging 上的已停 / 接管 / 已关的票）、对不上的提交，或核对不了 ⇒ `router_ships` 为空，决定单上一条整批 prod 项，列出整批每张票的状态（输出的 `batch`）、对不上的提交（`commits`）和核对成没成（`verified`）。告诉用户，等他走查完、或回「Qn 放行」（整批每张票、每个列出的提交记已放行，你再整批上）。批次不变（同一组票、同一组对不上的提交）时这一项原地更新、保留 Q 号，用户照看到的号回就行；批次变了才换一条新的（要重新放行）。
   - 没有业务票等上 prod 时照 v1：`tickets`（老票、维护票）攒成一条「上 prod：…」等用户。
   - 要发应用商店包的不在授权里：交用户。
 - **仓外改动的业务票**：没有 staging 隔离层，改完就是真身。用户核对过（「T 核对过了」）= 这次尝试上线：记一次尝试（撤回办法 = 从 `<home>/backups/<T>/` 恢复），票进 postlaunch 等 daily 判定，**不关票**。关业务票只走 `router.py close` 或判真流程里的「关」。

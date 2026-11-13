@@ -417,3 +417,14 @@ def test_worker_and_brief_business_pr_refs_not_closes():
     assert "router 转述 / 决定" in worker                                               # #14：worker 认得 router 的话
     daily = (SKILL / "templates" / "analyst_daily.md").read_text(encoding="utf-8")
     assert "满 7 天" in daily and "`hit_wall` = 0" in daily and "判 `no_entry`" in daily   # #13
+
+
+def test_skill_residual_close_gate_and_batch_attribution():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s6 = _section(text, "6.")
+    close = next(l for l in s6.splitlines() if l.startswith("| 「关 T3」"))
+    assert "--rolled-back" in close and "等 daily 判完" in close                     # 残留 1：在途尝试先判完或撤回
+    s7 = re.search(r"^### 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M).group(1)
+    for w in ("还没 released", "stop / takeover / close", "git fetch", "origin/<main_branch>..origin/<base_branch>",
+              "merge_sha", "(#<PR 号>)", "单个父提交", "对不上", "核对不了", "Q 号"):        # 残留 2 / 3：批次成员、对账规则
+        assert w in s7, w

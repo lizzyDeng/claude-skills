@@ -929,13 +929,31 @@ def cmd_migrate_apply(a, env):
     return res
 
 
-def _close_business(env, st, tid, why, basis) -> None:
-    """关业务票（「Qn 关」和「关 Tn」共用）：走 v1 收尾（下一轮巡检关 issue、清 worktree / 分支），清掉它在决定单上的项。"""
+def _inflight_change(t) -> str:
+    """业务票还有在途的改动（关票前要先判完或撤回）→ 说明；没有 → ""。
+    已上线的尝试还在等判定；或改动已在 staging（merged_staging / await_prod）/ 仓外真身上（await_check）、还没判。"""
+    if t["status"] in (store.MERGED, store.AWAIT_PROD, store.AWAIT_CHECK):
+        where = "仓外真身上" if t["status"] == store.AWAIT_CHECK else "staging 上"
+        return f"还有在途的改动（状态 {t['status']}：已在{where}，还没上线判定）"
+    if store.attempt_inflight(t):
+        cur = store.current_attempt(t) or {}
+        return f"还有在途尝试（尝试 {cur.get('n', '?')} 已上线、还在等 daily 判定）"
+    return ""
+
+
+def _close_business(env, st, tid, why, basis, rolled_back=False) -> None:
+    """关业务票（「Qn 关」和「关 Tn」共用）：走 v1 收尾（下一轮巡检关 issue、清 worktree / 分支），清掉它在决定单上的项。
+    还有在途尝试 / 改动（终审残留 #1）⇒ 拒：关了之后有害判定就落不下、撤不回。等 daily 判完，或 router 先照撤回办法撤回、
+    再 close --rolled-back（记一条 decide）。"""
     ct = env.ticket(st, tid)
     if store.ticket_kind(ct) != "business":
         raise Fail(f"{tid} 不是业务票，不能这样关")
     if ct["status"] == store.DONE:
         raise Fail(f"{tid} 已经关了")
+    inflight = _inflight_change(ct)
+    if inflight and not rolled_back:
+        raise Fail(f"{tid} {inflight}：先等 daily 判完再关；要现在关，先照撤回办法撤回，"
+                   f"再 router.py close {tid} --rolled-back")
     _refuse_pending(ct, tid, env.ctx)                 # 派单待核实 / 认不出的 worker：可能正在起，不关
     pid = ct["worker"].get("pid")
     if pid and env.ctx.pid_alive(pid):
@@ -952,6 +970,10 @@ def _close_business(env, st, tid, why, basis) -> None:
         ct["closeout"]["old_branches"] = {b: "pending" for b in olds}
     st["queue"] = [q for q in st["queue"] if q.get("ticket") != tid]
     store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
+    if inflight:                                      # --rolled-back：router 担保已撤回，记下来
+        rb = (store.current_attempt(ct) or {}).get("rollback") or "（这次改动还没记撤回办法）"
+        store.append_decision(env.decisions, st, tid, f"关票前已撤回在途改动：{inflight}",
+                              "close --rolled-back：router 已照撤回办法撤回", f"撤回办法：{rb}", env.now())
     store.append_decision(env.decisions, st, tid, "关闭业务票", why, basis, env.now())
 
 
@@ -1088,7 +1110,7 @@ def cmd_close(a, env):
     reason = (a.reason or "").strip()
     with env.state() as st:
         _close_business(env, st, a.ticket, reason or "用户要关",
-                        f"用户：关 {a.ticket}" + (f"（{reason}）" if reason else ""))
+                        f"用户：关 {a.ticket}" + (f"（{reason}）" if reason else ""), rolled_back=a.rolled_back)
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | - | close | {a.ticket} | 关 {a.ticket}" + (f"：{reason}" if reason else ""))
     return {"ok": True, "ticket": a.ticket, "status": store.DONE}
@@ -1357,72 +1379,152 @@ def cmd_walkthrough_done(a, env):
     return {"ok": True, **res}
 
 
-# 发版批次（终审 #6）：上 prod = 合 main 发版，staging 上领先 main 的票会一起上去
+# 发版批次（终审 #6 + 残留 #2/#3）：上 prod = 合 main 发版，staging 上领先 main 的东西会一起上去
 PROD_STATE = {"ready": "可上", "approved": "已放行", "walkthrough": "待走查", "release": "待放行",
               "unjudged": "上次尝试还没判"}
 _PROD_OK = ("ready", "approved")
 _PROD_GO = re.compile(r"^(?:放行|上\s*prod)" + _END, re.I)
 _KIND_ZH = {"business": "业务票", "maint": "维护票", "legacy": "老票"}
+_PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")             # squash 合并的默认标题：「<PR 标题> (#<PR 号>)」
 
 
-def _prod_state(t) -> str:
-    """staging 领先 main 的一张票（merged_staging / await_prod）能不能由 router 带上 prod。"""
+def _prod_state(t):
+    """批次里一张票能不能由 router 带上 prod → (状态码, 给人看的说明)。"""
     if t["status"] == store.AWAIT_PROD and store.router_owned(t):
-        return "unjudged" if store.attempt_inflight(t) else "ready"
+        code = "unjudged" if store.attempt_inflight(t) else "ready"
+        return code, PROD_STATE[code]
     if t.get("prod_ok"):
-        return "approved"
-    return "walkthrough" if t["status"] == store.MERGED else "release"
+        return "approved", PROD_STATE["approved"]
+    if t["status"] in (store.MERGED, store.AWAIT_PROD):
+        code = "walkthrough" if t["status"] == store.MERGED else "release"
+        return code, PROD_STATE[code]
+    return "parked", f"代码还在 staging 上（票 {t['status']}）"      # stop / takeover / close 之后：照样跟着上
 
 
-def _prod_item(env, st):
-    """→ (prod 项号 | None, tickets, router_ships, batch | None)。
-    没有业务票等上 prod：照 v1（老票 / 维护票攒成一条「上 prod：…」交用户），batch=None。
-    有：整批 = staging 上领先 main 的每一张票（merged_staging / await_prod）。每一张都是可上的票级授权业务票、
-    或用户已放行 ⇒ router_ships = 整批，router 自己上；否则 router_ships 为空，推一条用户 prod 项列出整批和每张的状态。"""
-    st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
+def _needs_batch(st) -> bool:
+    """有票级授权的业务票等上 prod ⇒ 走整批规则；没有就照 v1（老票、维护票攒成一条交用户）。"""
+    return any(t["status"] == store.AWAIT_PROD and store.router_owned(t) for t in st["tickets"].values())
+
+
+def _staging_commits(env) -> dict:
+    """fetch 后列出 origin/<main>..origin/<base> 的提交：{"ok", "error", "commits": [{sha, parents, subject}]}。
+    git 失败 ⇒ ok=False（调用方 fail-closed：router 不自己上）。"""
+    main, base = env.cfg.get("main_branch", "main"), env.cfg.get("base_branch", "staging")
+    f = env.ctx.run(["git", "-C", str(env.root), "fetch", "-q", "origin", main, base], timeout=launcher.FETCH_S)
+    if f.returncode != 0:
+        return {"ok": False, "error": f"git fetch 失败：{launcher._err(f)[:160]}", "commits": []}
+    r = env.ctx.run(["git", "-C", str(env.root), "log", "--format=%H%x1f%P%x1f%s", f"origin/{main}..origin/{base}"])
+    if r.returncode != 0:
+        return {"ok": False, "error": f"git log 失败：{launcher._err(r)[:160]}", "commits": []}
+    commits = []
+    for line in (r.stdout or "").splitlines():
+        sha, parents, subject = (line.split("\x1f") + ["", ""])[:3]
+        if sha.strip():
+            commits.append({"sha": sha.strip(), "parents": len(parents.split()), "subject": subject.strip()})
+    return {"ok": True, "error": "", "commits": commits}
+
+
+def _staging_commits_if_needed(env):
+    """不持锁先看一眼：要走整批规则才 fetch（fetch 可能要几十秒，不能占着 router 的锁）；老票单独时不碰 git。"""
+    try:
+        peek = store.load_state(env.state_path)
+    except store.StateCorrupt:
+        return None
+    return _staging_commits(env) if _needs_batch(peek) else None
+
+
+def _attribute(st, members, commits) -> list:
+    """对不上批次里任何一张票的提交。对上的规则：提交 sha = 这张票记的合并 sha（merge_sha，gh 给的合并 commit）；
+    或者它是普通提交（单个父提交）、标题以「(#<这张票的 PR 号>)」结尾。merge 提交（多个父提交）只认 sha。"""
+    shas = {str(st["tickets"][tid].get("merge_sha")): tid for tid in members
+            if st["tickets"][tid].get("merge_sha") not in (None, "", "?")}
+    prs = {str(st["tickets"][tid].get("pr")): tid for tid in members if st["tickets"][tid].get("pr")}
+    out = []
+    for c in commits:
+        if c["sha"] in shas:
+            continue
+        m = _PR_SUFFIX.search(c["subject"])
+        if c["parents"] == 1 and m and m.group(1) in prs:
+            continue
+        out.append(c)
+    return out
+
+
+def _prod_item(env, st, check=None):
+    """→ (prod 项号 | None, tickets, router_ships, batch | None, 对账 | None)。check = _staging_commits 的结果（None = 没核对）。
+    没有业务票等上 prod：照 v1（老票 / 维护票攒成一条「上 prod：…」交用户），batch=None、不碰 git。
+    有：整批 = staging 上合进来、还没 released 的每一张票（store.staging_pending，不看现在的状态）+ 所有 await_prod 的票；
+    再拿 origin/<main>..origin/<base> 的提交对账（_attribute）。每张票都是可上的票级授权业务票或用户已放行、每个提交都对得上
+    （或用户放行过）、而且核对成功 ⇒ router_ships = 整批，router 自己上；否则 router_ships 为空，决定单上一条整批 prod 项
+    （每张票的状态 + 对不上的提交）。批次不变（同一组票、同一组对不上的提交、同样核对成没成）就原地更新这一项、保留 Q 号。"""
     tk, num = st["tickets"], (lambda x: int(x[1:]))
     waiting = sorted((tid for tid, t in tk.items() if t["status"] == store.AWAIT_PROD), key=num)
     ready = [tid for tid in waiting if not store.router_owned(tk[tid])]
-    if not any(store.router_owned(tk[tid]) for tid in waiting):
+    if not _needs_batch(st):
+        st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
         if ready:
-            return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, [], None
-        return None, [], [], None
+            return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, [], None, None
+        return None, [], [], None, None
+    members = [tid for tid, t in tk.items() if store.staging_pending(t)]
+    tids = sorted(set(members) | set(waiting), key=num)
     rows = []
-    for tid in sorted((x for x, t in tk.items() if t["status"] in (store.MERGED, store.AWAIT_PROD)), key=num):
-        code = _prod_state(tk[tid])
-        rows.append({"ticket": tid, "kind": store.ticket_kind(tk[tid]), "status": tk[tid]["status"],
-                     "state": PROD_STATE[code], "ok": code in _PROD_OK})
+    for tid in tids:
+        code, label = _prod_state(tk[tid])
+        rows.append({"ticket": tid, "kind": store.ticket_kind(tk[tid]), "status": tk[tid]["status"], "state": label,
+                     "ok": code in _PROD_OK})
+    check = check or {"ok": False, "error": "没核对 staging 上的提交（再跑一次 prod-batch）", "commits": []}
+    approved = st.get("prod_ok_commits") or {}
+    if check["ok"] and approved:                      # 已经上了 main 的提交不用再记放行
+        live = {c["sha"] for c in check["commits"]}
+        st["prod_ok_commits"] = approved = {k: v for k, v in approved.items() if k in live}
+    loose = [{"sha": c["sha"], "subject": c["subject"], "state": "已放行" if c["sha"] in approved else "对不上票"}
+             for c in _attribute(st, members, check["commits"])]
     batch = [{k: v for k, v in r.items() if k != "ok"} for r in rows]
-    if all(r["ok"] for r in rows):
-        return None, [], [r["ticket"] for r in rows], batch
-    summary = ("上 prod（整批：合 main 会把 staging 上这些票一起带上去，回「放行」= 整批一起上）："
-               + "；".join(f"{r['ticket']} {_KIND_ZH.get(r['kind'], r['kind'])}·{r['state']}" for r in rows))
-    qid = store.push_queue(st, None, "prod", summary, env.now())
-    st["queue"][-1]["batch"] = [r["ticket"] for r in rows]
-    return qid, ready, [], batch
+    recon = {"verified": check["ok"], "commits": loose, **({"verify_error": check["error"]} if not check["ok"] else {})}
+    old = [q for q in st["queue"] if q["kind"] == "prod"]
+    if check["ok"] and all(r["ok"] for r in rows) and all(c["state"] == "已放行" for c in loose):
+        st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
+        return None, [], [r["ticket"] for r in rows], batch, recon
+    key = "|".join([",".join(tids), ",".join(sorted(c["sha"] for c in loose)), "ok" if check["ok"] else "unverified"])
+    parts = [f"{r['ticket']} {_KIND_ZH.get(r['kind'], r['kind'])}·{r['state']}" for r in rows]
+    parts += [f"提交 {c['sha'][:12]}「{c['subject'][:40]}」·{c['state']}" for c in loose]
+    if not check["ok"]:
+        parts.append(f"核对不了 staging 领先 main 的提交（{check['error']}）")
+    summary = ("上 prod（整批：合 main 会把 staging 上这些一起带上去，回「放行」= 整批一起上）：" + "；".join(parts))
+    keep = next((q for q in old if q.get("batch_key") == key), None)
+    st["queue"] = [q for q in st["queue"] if q["kind"] != "prod" or q is keep]
+    if keep is None:
+        store.push_queue(st, None, "prod", summary, env.now())
+        keep = st["queue"][-1]
+    keep.update(summary=summary, batch=tids, commits=[c["sha"] for c in loose], batch_key=key)
+    return keep["id"], ready, [], batch, recon
 
 
 def _prod_answered(env, st, q, text):
-    """用户回整批 prod 项：「放行」/「上 prod」⇒ 整批每张票记已放行（prod_ok），router 照项目发版流程整批上；
+    """用户回整批 prod 项：「放行」/「上 prod」⇒ 整批每张票、每个列出的提交都记已放行，router 照项目发版流程整批上；
     别的话只记原话（answers.md 已写），不放行。"""
     if not _PROD_GO.match((text or "").strip()):
         return "原话已记，没放行：整批照旧等你（再跑 prod-batch 会重推这一项）", {"approved": []}
     approved = []
     for tid in q.get("batch") or []:
         t = st["tickets"].get(tid)
-        if t and t["status"] in (store.MERGED, store.AWAIT_PROD):
+        if t is not None:
             t["prod_ok"] = env.now()
             approved.append(tid)
+    for sha in q.get("commits") or []:
+        st.setdefault("prod_ok_commits", {})[sha] = env.now()
     return ("用户放行整批：照项目发版流程上 prod（整批一起），发完逐张 released（业务票带 --rollback）",
-            {"approved": approved})
+            {"approved": approved, "approved_commits": list(q.get("commits") or [])})
 
 
 def cmd_prod_batch(a, env):
+    check = _staging_commits_if_needed(env)
     with env.state() as st:
-        qid, ready, ships, batch = _prod_item(env, st)
+        qid, ready, ships, batch, recon = _prod_item(env, st, check)
     out = {"ok": True, "queue": qid, "tickets": ready, "router_ships": ships}
-    if batch is not None:                             # 有业务票等上 prod：整批和每张的状态（老票单独时不出这一栏）
+    if batch is not None:                             # 有业务票等上 prod：整批、每张的状态、对账（老票单独时不出这几栏）
         out["batch"] = batch
+        out.update(recon)
     return out
 
 
@@ -1450,6 +1552,7 @@ def cmd_released(a, env):
         raise Fail("config 缺 weekly_runs_dir")
     t0 = _parse_t0(a.t0) if a.t0 else env.now()
     rel = Path(os.path.expanduser(runs)).parent / "state" / "releases.json"
+    check = _staging_commits_if_needed(env)            # 发完之后重算整批项要用（老票单独时不碰 git）
     with env.state() as st:
         for tid in a.tickets:
             env.ticket(st, tid)
@@ -1474,6 +1577,7 @@ def cmd_released(a, env):
         plans = {}
         for tid in a.tickets:
             t = st["tickets"][tid]
+            t.pop("prod_ok", None)                                       # 放行只管这一次发版
             if tid in biz:                                               # 验收交给 daily 的判定，不排 T+1/T+3/T+7
                 n = store.add_attempt(st, tid, a.what, t0, a.rollback.strip())
                 att = next(x for x in t["attempts"] if x.get("n") == n)   # 这次上线的 PR / 合并 sha / 分支记在尝试上：
@@ -1485,7 +1589,7 @@ def cmd_released(a, env):
                 t.setdefault("postlaunch_prev", []).append(t["postlaunch"])
             t["postlaunch"] = plans[tid] = store.postlaunch_plan(t0)
             store.set_status(st, tid, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
-        _prod_item(env, st)
+        _prod_item(env, st, check)
     return {"ok": True, "release": entry, "path": str(rel), "postlaunch": plans}
 
 
@@ -1574,7 +1678,7 @@ def _requeue_business(env, st, tid, text, wait) -> None:
     t["pr"] = None                                    # 上一次的 PR 已合：留着会让新 worker 一报 pr_opened 就被当成已合
     t["fail_streak"] = {"step": "", "count": 0}
     for k in ("merge_sha", "verifying_at", "checkout_kept", "unconfirmed_reported", "no_pr_reported", "no_ci_reported",
-              "leak_reported", "wrong_base_reported", "retarget_fail"):
+              "leak_reported", "wrong_base_reported", "retarget_fail", "prod_ok"):
         t.pop(k, None)
     events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
     t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
@@ -1972,6 +2076,8 @@ def build_parser():
     g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，进 answers.md）")
     s = sub.add_parser("close", help="用户说「关 Tn」：关业务票（收尾：关 issue、清 worktree）")
     s.add_argument("ticket"); s.add_argument("--reason")
+    s.add_argument("--rolled-back", action="store_true",
+                   help="还有在途尝试 / 改动时：router 已照撤回办法撤回，确认要关（记一条 decide）")
     s = sub.add_parser("absorb", help="把老票并进已有的业务票（设 parent；验收过的记一次历史尝试）")
     s.add_argument("ticket"); s.add_argument("olds", nargs="+")
     s = sub.add_parser("migrate-apply", help="用户确认整份迁移清单后落 migrate 的产出（建业务票、并老票）")

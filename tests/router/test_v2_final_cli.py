@@ -5,7 +5,7 @@ import json
 
 from test_business_cli import (_A1, _biz, _biz_closeable, _daily, _inbox_text, _push_q, _rel, _verdict, calibrate,
                                load, propose)
-from test_router_cli import proj, seed, wait_until  # noqa: F401  (proj 是 fixture)
+from test_router_cli import proj, push_main, seed, wait_until  # noqa: F401  (proj 是 fixture)
 
 NO_WALL_WAIT = "墙已全部拆完，等分析 agent 提议结束"
 
@@ -23,7 +23,7 @@ def _patch(proj, tid="T1", **fields):
 
 def test_closed_business_ticket_is_not_revived_by_verdict(proj):
     _biz(proj, attempts=_A1)
-    proj.out("close", "T1")
+    proj.out("close", "T1", "--rolled-back")                                   # 在途尝试：撤回之后才关得了（残留修复 1）
     r = _verdict(proj, "useless", check=False)
     assert r.returncode == 1 and "已关" in json.loads(r.stdout)["error"]
     out = _daily(proj, {"verdicts": [{"ticket": "T1", "attempt": 1, "verdict": "useless", "touched": 1, "hit_wall": 1,
@@ -162,6 +162,7 @@ def test_offrepo_business_walkthrough_done_same_path(proj):
 # ---- #6 发版批次：staging 上还有待走查 / 待放行的票，业务票不能被 router 自己带上 prod ----------------------
 
 def test_prod_batch_holds_business_when_legacy_awaits_walkthrough(proj):
+    push_main(proj.root)
     seed(proj, T1=("merged_staging", [], {"title": "老票", "merge_sha": "aaa"}),
          T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": [],
                                 "merge_sha": "bbb"}))
@@ -179,6 +180,7 @@ def test_prod_batch_holds_business_when_legacy_awaits_walkthrough(proj):
 
 
 def test_prod_batch_holds_business_when_legacy_awaits_release(proj):
+    push_main(proj.root)
     seed(proj, T1=("await_prod", [], {"title": "老票", "merge_sha": "aaa"}),
          T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": []}))
     out = proj.out("prod-batch")

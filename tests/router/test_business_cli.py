@@ -1,7 +1,7 @@
 import json
 
 from conftest import FIX
-from test_router_cli import proj, seed, wait_until  # noqa: F401  (proj 是 fixture)
+from test_router_cli import proj, push_main, seed, wait_until  # noqa: F401  (proj 是 fixture)
 
 
 def load(**over):
@@ -511,6 +511,7 @@ def test_prod_batch_separates_router_ships(proj):
 
 
 def test_prod_batch_only_business_makes_no_item(proj):
+    push_main(proj.root)                                                     # staging 不领先 main：没有对不上的提交
     seed(proj, T2=("await_prod", [], {"kind": "business", "authorized": True}))
     out = json.loads(proj.run("prod-batch").stdout)
     assert out["queue"] is None and out["tickets"] == [] and out["router_ships"] == ["T2"]

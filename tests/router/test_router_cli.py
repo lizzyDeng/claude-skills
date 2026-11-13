@@ -42,6 +42,19 @@ def git_project(tmp_path, root):
     g("add", ".gitignore", cwd=root); g("commit", "-qm", "init", cwd=root); g("push", "-q", "origin", "HEAD:staging", cwd=root)
 
 
+def push_main(root):
+    """远端补一条 main（= 当前 staging）：prod-batch 要核对 origin/main..origin/staging。"""
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=root, check=True, capture_output=True)
+
+
+def staging_commit(root, subject):
+    """往远端 staging 推一个空提交（合成标题）→ 它的 sha。"""
+    g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True, text=True).stdout
+    g("commit", "-q", "--allow-empty", "-m", subject)
+    g("push", "-q", "origin", "HEAD:staging")
+    return g("rev-parse", "HEAD").strip()
+
+
 def wait_until(cond, timeout=10):
     end = time.time() + timeout
     while time.time() < end:

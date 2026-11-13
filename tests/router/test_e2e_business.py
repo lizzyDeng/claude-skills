@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 from conftest import FIX, SCRIPTS
-from test_router_cli import FAKE, git_project
+from test_router_cli import FAKE, git_project, push_main
 
 CLI = SCRIPTS / "router.py"
 
@@ -61,7 +61,7 @@ elif args[:2] == ["pr", "view"]:
 @pytest.fixture
 def e2e(tmp_path, monkeypatch):
     root = tmp_path / "proj"; home = root / ".claude" / "router"
-    git_project(tmp_path, root); home.mkdir(parents=True)
+    git_project(tmp_path, root); push_main(root); home.mkdir(parents=True)
     runs = tmp_path / "daily" / "runs"; runs.mkdir(parents=True)          # 没有已发出的周报：不起 weekly
     (tmp_path / "daily" / "state").mkdir()
     bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "gh").write_text(GH); (bin_ / "gh").chmod(0o755)

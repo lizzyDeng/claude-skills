@@ -218,6 +218,24 @@ def attempt_inflight(t: dict) -> bool:
     return any(a.get("verdict") in (None, "pending_sample") for a in t.get("attempts") or [] if not a.get("historical"))
 
 
+def staging_pending(t: dict) -> bool:
+    """这张票的改动合进了 staging、之后还没 released（合 main 发版会把它一起带上去）。不看票现在的状态：
+    stop / takeover / close 都不会让它离开发版批次（终审残留 #2a）。
+    依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch。
+    老票、维护票之后直接是 done 的也算 released（老版 released 直接记 done）；业务票之后是 done = 关了票，代码还在 staging。
+    没有 history（手写的 state）就按状态算。"""
+    if not t.get("merge_sha"):
+        return False
+    h = [x.get("status") for x in t.get("history") or []]
+    marks = [i for i, s in enumerate(h) if s in (MERGED, AWAIT_PROD)]
+    if not marks:
+        return t.get("status") in (MERGED, AWAIT_PROD)
+    after = h[marks[-1] + 1:]
+    if POSTLAUNCH in after:
+        return False
+    return not (DONE in after and ticket_kind(t) != "business")
+
+
 def current_attempt(t: dict):
     """业务票的「当前尝试」= 最后一条非历史的尝试（历史尝试是并进来的老票，不参与判定）；没有 → None。
     daily 的票况、verdict、released 的在途检查、看板 / status 的最近判定都按它。"""
