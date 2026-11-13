@@ -123,6 +123,36 @@ def test_build_cmd_uses_fable_default():
     assert cmd[:3] == ["py", "fake.py", "-p"] and cmd[cmd.index("--model") + 1] == "claude-x"
 
 
+def test_weekly_prompt_scopes_this_week(ap):
+    """9b（finding 7）：weekly 拿到的是本周 daily 产出的清单和本周周报目录，不是通配。"""
+    d = ap.home / "analyst" / "out"; d.mkdir(parents=True)
+    runs = {}
+    for rid, since, until in (("daily-1", "2026-10-28", "2026-10-29"), ("daily-2", "2026-11-08", "2026-11-09"),
+                              ("daily-3", "2026-11-12", "2026-11-13"), ("daily-4", "2026-11-11", "2026-11-12")):
+        (d / f"{rid}.json").write_text("{}")
+        runs[rid] = {"mode": "daily", "out": str(d / f"{rid}.json"), "since": since, "until": until, "ingested": "x"}
+    runs["daily-4"]["failed"] = True                                            # 失败的那次没有可读产出
+    s = make_state(); s["analyst"] = {"runs": runs}
+    store.save_state(ap.home / "state.json", s)
+    wk = weekly_dir(ap, "2026-11-09")
+    env = SimpleNamespace(cfg=ap.cfg, home=ap.home)
+    text = analyst.render(env, "weekly", "2026-11-06", "2026-11-13", d / "w.json", week="2026-11-09")
+    assert str(d / "daily-2.json") in text and str(d / "daily-3.json") in text
+    assert str(d / "daily-1.json") not in text and str(d / "daily-4.json") not in text
+    assert str(wk) in text and "daily-*.json" not in text
+    tpl = (analyst.SKILL_DIR / "templates" / "analyst_weekly.md").read_text(encoding="utf-8")
+    assert "$daily_outs" in tpl and "$weekly_dir" in tpl
+
+
+def test_weekly_start_passes_week_to_prompt(ap):
+    wk = weekly_dir(ap, "2026-11-09")
+    ap.run()                                                                    # 新周报 ⇒ 起 weekly
+    (rid, r), = runs(ap, "weekly").items()
+    assert r["week"] == "2026-11-09"
+    sp = ap.ctx.spawned[-1]
+    assert str(wk) in sp["cmd"][sp["cmd"].index("-p") + 1]
+
+
 def test_calibrate_prompt_has_no_state(ap):
     s = make_state(T1=biz("测试墙甲"), T2=("done", [], {"title": "测试老票甲"}))
     store.save_state(ap.home / "state.json", s)

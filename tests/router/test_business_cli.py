@@ -328,14 +328,15 @@ def _verdict(proj, v="useless", n=1, *extra, check=True):
 _A1 = [{"n": 1, "direction": "d", "at": "2026-11-01T00:00:00Z", "rollback": "关开关 x", "verdict": None}]
 
 
-def test_verdict_useless_resumes_worker(proj):
+def test_verdict_useless_requeues_even_with_worktree(proj):
+    """9b（concern 4 裁决）：新方向一律重新排队，worktree 还在也不在原 worker 上 resume。"""
     _biz(proj, attempts=_A1)
     out = json.loads(_verdict(proj).stdout)
     assert "change_direction" in out["actions"]
-    assert proj.state()["tickets"]["T1"]["status"] == "executing"
-    wait_until(lambda: proj.claude())
-    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
-    assert "换方向" in prompt
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "queued" and t["card_confirmed"] is False and proj.claude() == []
+    inbox = json.loads(proj.run("inbox", "--ticket", "T1").stdout)
+    assert "换方向" in json.dumps(inbox, ensure_ascii=False)
 
 
 def test_verdict_useless_third_time_returns_to_user(proj):
@@ -364,12 +365,13 @@ def test_verdict_no_entry_wakes(proj):
     assert proj.out("tick")["no_entry"] == [{"ticket": "T1", "attempt": 1}]
 
 
-def test_verdict_useful_next_wall_resumes(proj):
+def test_verdict_useful_next_wall_requeues(proj):
     _biz(proj, attempts=_A1)
     out = json.loads(_verdict(proj, "useful").stdout)
     assert out["actions"] == ["next_wall"]
     t = proj.state()["tickets"]["T1"]
-    assert t["status"] == "executing" and [w["status"] for w in t["walls"]] == ["broken", "open"]
+    assert t["status"] == "queued" and [w["status"] for w in t["walls"]] == ["broken", "open"]
+    assert proj.claude() == []
 
 
 def test_verdict_next_wall_with_no_open_walls_does_not_resume(proj):
@@ -762,3 +764,239 @@ def test_status_json_adds_kind_and_business_fields(tmp_path):
     assert out["T2"]["kind"] == "business" and out["T2"]["walls_open"] == 1 and out["T2"]["last_verdict"] == "flat"
     assert out["T3"]["kind"] == "maint" and out["T3"]["tasks_open"] == 1
     assert "kind" not in st["tickets"]["T1"]
+
+
+# ---- Task 9b：换方向（redirect）/ router 代答（answer --as-router）/ 关票（close）/ 并旧票（absorb） ----
+
+def _push_q(proj, ticket, kind, summary="合成项"):
+    st = proj.state()
+    st["seq"]["queue"] += 1
+    qid = f"Q{st['seq']['queue']}"
+    st["queue"].append({"id": qid, "ticket": ticket, "kind": kind, "summary": summary, "created_at": "x",
+                        "notified_at": "x"})
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    return qid
+
+
+def _inbox_text(proj, tid="T1"):
+    return json.dumps(json.loads(proj.run("inbox", "--ticket", tid).stdout), ensure_ascii=False)
+
+
+def test_redirect_after_harmful_requeues_as_router(proj):
+    _biz(proj, attempts=_A1)
+    _verdict(proj, "harmful")
+    out = proj.out("redirect", "T1", "换成测试方向乙", "--as-router")
+    s = proj.state(); t = s["tickets"]["T1"]
+    assert out["ok"] and t["status"] == "queued" and t["card_confirmed"] is False
+    assert not [q for q in s["queue"] if q["kind"] == "harm"]                  # harm 项清掉
+    assert proj.claude() == []                                                  # 不 resume：交给调度器重新派
+    inbox = _inbox_text(proj)
+    assert "router 决定" in inbox and "换成测试方向乙" in inbox and "用户原话" not in inbox
+    dec = (proj.home / "decisions.md").read_text()
+    assert "换方向" in dec and "换成测试方向乙" in dec
+    assert not (proj.home / "answers.md").exists() or "换成测试方向乙" not in (proj.home / "answers.md").read_text()
+
+
+def test_redirect_after_return_as_user_resets_streak(proj):
+    _biz(proj, attempts=_A1, streak=2)
+    _verdict(proj)                                                              # 第 3 次没用 ⇒ return
+    assert [q["kind"] for q in proj.state()["queue"]] == ["return"]
+    proj.out("redirect", "T1", "测试用户给的方向", "--as-user")
+    s = proj.state(); t = s["tickets"]["T1"]
+    assert t["status"] == "queued" and t["no_use_streak"] == 0 and s["queue"] == []
+    inbox = _inbox_text(proj)                                                   # 读一次就标已读：只读一次
+    assert "用户原话（逐字）" in inbox and "测试用户给的方向" in inbox
+    assert "测试用户给的方向" in (proj.home / "answers.md").read_text()        # 用户原话照常存档
+
+
+def test_redirect_refusals(proj):
+    seed(proj, T1=("postlaunch", [], {"title": "老票"}))
+    r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+    assert r.returncode == 1 and "业务票" in json.loads(r.stdout)["error"]
+    _biz(proj, status="executing", attempts=_A1)
+    r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+    assert r.returncode == 1 and "postlaunch" in json.loads(r.stdout)["error"]
+    for v in (None, "pending_sample", "useful", "no_entry"):                    # 只收有害 / 没用（含连续没用退回）
+        _biz(proj, attempts=[{**_A1[0], "verdict": v}])
+        r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+        assert r.returncode == 1, v
+        assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+    _biz(proj, attempts=[{**_A1[0], "verdict": "harmful"}])
+    assert proj.run("redirect", "T1", "x", check=False).returncode == 2         # 来源必须写明：--as-router / --as-user
+    assert proj.run("redirect", "T1", "  ", "--as-router", check=False).returncode == 1
+    assert proj.run("redirect", "T1", "x", "--as-router", env={"ROUTER_TICKET": "T1"}, check=False).returncode == 2
+
+
+def test_redirect_refused_while_worker_alive(proj):
+    import subprocess, sys
+    _biz(proj, attempts=[{**_A1[0], "verdict": "harmful"}])
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        st = proj.state(); st["tickets"]["T1"]["worker"]["pid"] = p.pid
+        (proj.home / "state.json").write_text(json.dumps(st))
+        r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+        assert r.returncode == 1 and "stop" in json.loads(r.stdout)["error"]
+        assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
+    finally:
+        p.kill(); p.wait()
+
+
+def test_answer_as_router_labels_router_decision(proj):
+    _biz(proj, status="paused")
+    qid = _push_q(proj, "T1", "direction", "T1：要不要换做法")
+    out = proj.out("answer", qid, "试测试方向丙", "--as-router")
+    assert out["resumed"] == "T1"
+    wait_until(lambda: proj.claude())
+    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    assert "router 决定" in prompt and "试测试方向丙" in prompt and "用户原话（逐字）" not in prompt
+    line = (proj.home / "answers.md").read_text().strip().splitlines()[-1]
+    assert "router 决定：试测试方向丙" in line
+
+
+def test_answer_as_router_refusals(proj):
+    seed(proj, T1=("paused", [], {"title": "老票", "worker": {"session_id": "s", "worktree": str(proj.tmp), "runs": 1}}))
+    qid = _push_q(proj, "T1", "direction")
+    r = proj.run("answer", qid, "x", "--as-router", check=False)
+    assert r.returncode == 1 and "业务票" in json.loads(r.stdout)["error"]
+    assert qid in [q["id"] for q in proj.state()["queue"]]                      # 拒了：项还在
+    _biz(proj, status="paused")
+    for kind in ("spend", "harm", "return"):                                    # 花钱 / 撤不回 / 发商店包、退回用户的：只能用户回
+        qid = _push_q(proj, "T1", kind)
+        r = proj.run("answer", qid, "x", "--as-router", check=False)
+        assert r.returncode == 1, kind
+    propose(proj, load(maint=[]))
+    r = proj.run("answer", _first_q(proj), "真", "--as-router", check=False)    # 判真只归用户
+    assert r.returncode == 1
+    assert proj.claude() == []
+
+
+def test_close_command_closes_business_and_clears_items(proj):
+    t1 = _biz_closeable(proj)
+    _push_q(proj, t1, "harm")
+    out = proj.out("close", t1)
+    s = proj.state()
+    assert out["ok"] and s["tickets"][t1]["status"] == "done"
+    assert s["tickets"][t1]["closeout"]["worktree"] == "pending"
+    assert not [q for q in s["queue"] if q["ticket"] == t1]
+    assert "关闭业务票" in (proj.home / "decisions.md").read_text()
+
+
+def test_close_command_refusals(proj):
+    seed(proj, T1=("postlaunch", [], {"title": "老票"}))
+    r = proj.run("close", "T1", check=False)
+    assert r.returncode == 1 and "业务票" in json.loads(r.stdout)["error"]
+    import subprocess, sys
+    t1 = _biz_closeable(proj)
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        s = proj.state(); s["tickets"][t1]["worker"]["pid"] = p.pid
+        (proj.home / "state.json").write_text(json.dumps(s))
+        r = proj.run("close", t1, check=False)
+        assert r.returncode == 1 and "stop" in json.loads(r.stdout)["error"]
+        assert proj.state()["tickets"][t1]["status"] == "draft"
+    finally:
+        p.kill(); p.wait()
+    proj.out("close", t1)
+    r = proj.run("close", t1, check=False)                                      # 已关的不再关
+    assert r.returncode == 1
+
+
+_HIST5 = {"n": 1, "direction": "老票五", "shipped_at": "2026-11-01T00:00:00Z", "verdict": "legacy",
+          "legacy_verdict": "没用", "historical": True}
+
+
+def test_absorb_into_existing_business(proj):
+    _biz(proj, status="executing")
+    st = proj.state()
+    for tid, status, extra in (("T5", "postlaunch", {"title": "老票五", "postlaunch": {
+                                   "t0": "2026-11-01T00:00:00Z", "checks": [],
+                                   "results": [{"check": "T+1", "verdict": "没用"}]}}),
+                               ("T6", "executing", {"title": "老票六"})):
+        from conftest import make_state
+        st["tickets"][tid] = make_state(**{tid: (status, [], extra)})["tickets"][tid]
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    out = proj.out("absorb", "T1", "T5", "T6")
+    s = proj.state(); t1 = s["tickets"]["T1"]
+    assert out["ok"] and s["tickets"]["T5"]["parent"] == "T1" and s["tickets"]["T6"]["parent"] == "T1"
+    assert t1["attempts"] == [_HIST5] and t1["absorbs"] == ["T5", "T6"]       # 在做的 T6 只挂 parent
+    assert "T5" in (proj.home / "decisions.md").read_text()
+    proj.out("absorb", "T1", "T5")                                              # 重复并：不重复记尝试
+    assert proj.state()["tickets"]["T1"]["attempts"] == [_HIST5]
+
+
+def test_absorb_refusals(proj):
+    from conftest import make_state
+    s = make_state(T1=("postlaunch", [], {"title": "老票"}), T2=("executing", [], {"title": "老票二"}),
+                   T3=("draft", [], {"kind": "business", "authorized": True, "title": "业务三", "attempts": [],
+                                     "walls": [], "absorbs": []}),
+                   T4=("draft", [], {"kind": "business", "authorized": True, "title": "业务四", "attempts": [],
+                                     "walls": [], "absorbs": []}),
+                   T5=("executing", [], {"title": "老票五", "parent": "T4"}))
+    (proj.home / "state.json").write_text(json.dumps(s, ensure_ascii=False))
+    for args in (("T1", "T2"),            # 目标不是业务票
+                 ("T3", "T4"),            # 并的不是老票
+                 ("T3", "T5"),            # 已并进别的业务票
+                 ("T3", "T99"),           # 不存在
+                 ("T3", "T3")):
+        r = proj.run("absorb", *args, check=False)
+        assert r.returncode == 1, args
+    assert proj.state()["tickets"]["T2"].get("parent") is None
+    assert proj.run("absorb", "T3", "T2", env={"ROUTER_TICKET": "T3"}, check=False).returncode == 2
+
+
+def test_parented_legacy_postlaunch_result_records_parent_attempt(proj):
+    from datetime import datetime as dt, timedelta as td, timezone as tz
+    t0 = (dt.now(tz.utc) - td(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    seed(proj, T1=("await_prod", ["her-reply-prompt"], {"title": "老票一", "issue": 51, "card_confirmed": True,
+                                                        "parent": "T2"}),
+         T2=("executing", [], {"kind": "business", "authorized": True, "title": "业务二", "attempts": [],
+                               "walls": [], "absorbs": ["T1"]}))
+    proj.out("released", "--tickets", "T1", "--what", "x", "--metrics", "m", "--t0", t0)
+    assert proj.state()["tickets"]["T2"]["attempts"] == []                     # 上线了还没验收：不算
+    args = ["postlaunch-result", "T1", "--check", "T+1", "--type", "风险型", "--summary", "合成摘要"]
+    proj.out(*args, "--verdict", "看不出来")
+    atts = proj.state()["tickets"]["T2"]["attempts"]
+    assert atts == [{"n": 1, "direction": "老票一", "shipped_at": t0, "verdict": "legacy",
+                     "legacy_verdict": "看不出来", "historical": True}]
+    proj.out(*args, "--verdict", "生效")                                       # 同检查点覆盖：更新那一条，不重复记
+    atts = proj.state()["tickets"]["T2"]["attempts"]
+    assert len(atts) == 1 and atts[0]["legacy_verdict"] == "生效"
+    assert proj.state()["tickets"]["T1"]["status"] == "done"
+
+
+def _seed_attach(proj):
+    from conftest import make_state
+    s = make_state(T5=("postlaunch", [], {"title": "老票五", "postlaunch": {
+                       "t0": "2026-11-01T00:00:00Z", "checks": [], "results": [{"check": "T+1", "verdict": "没用"}]}}),
+                   T6=("executing", [], {"title": "老票六"}),
+                   T7=("executing", [], {"kind": "business", "authorized": True, "title": "业务七", "attempts": [],
+                                         "walls": [], "absorbs": []}))
+    (proj.home / "state.json").write_text(json.dumps(s, ensure_ascii=False))
+
+
+def test_migrate_attach_links_legacy_to_existing_business(proj):
+    """9b（finding 9）：migrate 能把老票挂到已开的业务票上（同 absorb），不用再判真。"""
+    _seed_attach(proj)
+    out = json.loads(propose(proj, load(mode="migrate", problems=[], maint=[],
+                                        attach=[{"ticket": "T7", "absorbs": ["T5", "T6"]}])).stdout)
+    s = proj.state()
+    assert out["ok"] and out["attached"] == {"T7": ["T5", "T6"]}
+    assert s["tickets"]["T5"]["parent"] == "T7" and s["tickets"]["T6"]["parent"] == "T7"
+    assert s["tickets"]["T7"]["attempts"] == [{**_HIST5}] and s["tickets"]["T7"]["absorbs"] == ["T5", "T6"]
+    assert not [q for q in s["queue"] if q["kind"] == "verify_problem"]
+    assert "并入老票" in (proj.home / "decisions.md").read_text()
+
+
+def test_attach_refused_outside_migrate_or_bad_target(proj):
+    _seed_attach(proj)
+    calibrate(proj)
+    for data in (load(mode="weekly", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": ["T5"]}]),
+                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T6", "absorbs": ["T5"]}]),
+                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": ["T99"]}]),
+                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": []}])):
+        r = propose(proj, data, check=False)
+        assert r.returncode == 1, data["attach"]
+    d = load(mode="migrate", maint=[], attach=[{"ticket": "T7", "absorbs": ["T5"]}])
+    d["problems"][0]["absorbs"] = ["T5"]                                        # 同一张老票不能两头并
+    assert propose(proj, d, check=False).returncode == 1
+    assert proj.state()["tickets"]["T5"].get("parent") is None

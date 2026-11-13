@@ -91,8 +91,39 @@ def state_summary(st, mode) -> str:
     return "\n".join(lines)
 
 
-def render(env, mode, since, until, out_path, st=None) -> str:
-    """templates/analyst_<mode>.md 代入 $brief $out $since $until $home $state_summary。
+def daily_outs(st, since, until) -> list:
+    """时间窗 [since, until] 里跑完、收过的 daily 产出路径（按跑的先后）。失败的、文件不在的不算。"""
+    out = []
+    for r in ((st.get("analyst") or {}).get("runs") or {}).values():
+        if r.get("mode") != "daily" or r.get("failed") or not r.get("out") or not Path(r["out"]).exists():
+            continue
+        if (since and (r.get("since") or "") < since) or (until and (r.get("until") or "") > until):
+            continue
+        out.append((r.get("started_at") or r.get("until") or "", r["out"]))
+    return [o for _, o in sorted(out)]
+
+
+def latest_week(cfg):
+    """周报目录里最新一期已发出（有 sent）的期号；没有 → None。"""
+    runs = Path(os.path.expanduser(cfg.get("weekly_runs_dir") or ""))
+    if not cfg.get("weekly_runs_dir") or not runs.is_dir():
+        return None
+    weeks = sorted(d.name for d in runs.iterdir() if (d / "sent").exists())
+    return weeks[-1] if weeks else None
+
+
+def weekly_dir(cfg, week) -> str:
+    if not cfg.get("weekly_runs_dir"):
+        return "（config 没配 weekly_runs_dir）"
+    week = week or latest_week(cfg)
+    if not week:
+        return "（没找到已发出的周报）"
+    return str(Path(os.path.expanduser(cfg["weekly_runs_dir"])) / week)
+
+
+def render(env, mode, since, until, out_path, st=None, week=None) -> str:
+    """templates/analyst_<mode>.md 代入 $brief $out $since $until $home $state_summary；
+    weekly 另代入 $daily_outs（本周 daily 产出清单）和 $weekly_dir（本期周报目录，week 不给就取最新一期）。
     st 不给就读 <home>/state.json（tick 里传内存中的 state）。calibrate 不读、不代入票况。"""
     if mode not in MODES:
         raise AnalystError(f"不认识的模式 {mode}")
@@ -100,10 +131,15 @@ def render(env, mode, since, until, out_path, st=None) -> str:
         st = store.load_state(Path(env.home) / "state.json")
     tpl = string.Template((SKILL_DIR / "templates" / f"analyst_{mode}.md").read_text(encoding="utf-8"))
     brief = (env.cfg.get("analyst") or {}).get("brief") or ""
+    extra = {}
+    if mode == "weekly":
+        outs = daily_outs(st, since, until)
+        extra = {"daily_outs": "\n".join(f"  - {o}" for o in outs) or "  - （这段时间没有 daily 产出）",
+                 "weekly_dir": weekly_dir(env.cfg, week)}
     return tpl.safe_substitute(
         brief=os.path.expanduser(brief) if brief else "（config 没配 analyst.brief）",
         out=str(out_path), since=since or "", until=until or "", home=str(env.home),
-        state_summary=state_summary(st, mode) if mode != "calibrate" else "")
+        state_summary=state_summary(st, mode) if mode != "calibrate" else "", **extra)
 
 
 def finished(run) -> bool:
@@ -118,7 +154,7 @@ def active_run(ctx, st, mode):
     return None
 
 
-def start(env, st, mode, since=None, until=None) -> str:
+def start(env, st, mode, since=None, until=None, week=None) -> str:
     """起一次分析 agent，记进 st["analyst"]["runs"][run_id]（调用方持锁、负责存盘）→ run_id。
     同模式已有在跑的就不起第二个，返回它的 run_id。起进程失败原样抛（ctx.spawn_detached 的语义）。"""
     if mode not in MODES:
@@ -138,7 +174,9 @@ def start(env, st, mode, since=None, until=None) -> str:
     out, log = adir / "out" / f"{rid}.json", adir / "logs" / f"{rid}.log"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.unlink(missing_ok=True)                  # 编号复用（state 重建过）时，旧产出不能冒充这一次的
-    cmd = build_cmd(env.cfg, render(env, mode, since, until, out, st=st))
+    if mode == "weekly":
+        week = week or latest_week(env.cfg)
+    cmd = build_cmd(env.cfg, render(env, mode, since, until, out, st=st, week=week))
     if mode == "calibrate":                      # 盲跑：不在 router 状态目录里起，也不告诉它在哪（None = 连继承的一起去掉）
         cwd, penv = Path(tempfile.mkdtemp(prefix="router-calibrate-")), {"ROUTER_HOME": None, "ROUTER_TICKET": ANALYST_ENV}
     else:
@@ -151,7 +189,7 @@ def start(env, st, mode, since=None, until=None) -> str:
     an.setdefault("runs", {})[rid] = {"mode": mode, "pid": pid, "pid_start": pid_start,
                                       "started_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                                       "out": str(out), "log": str(log), "since": since, "until": until,
-                                      "cwd": str(cwd)}
+                                      "cwd": str(cwd), **({"week": week} if mode == "weekly" and week else {})}
     return rid
 
 

@@ -7,7 +7,9 @@ OUT=$out
 - 项目 brief（取数入口和口径，先读）：$brief
 - 时间范围（UTC 日期）：$since ～ $until
 - 被用户否过的问题：先读 $home/analyst/rejected.jsonl（每行 `{"key","title","reason","at"}`）。同类问题不再提，除非有新证据：填 `new_evidence`，写明新在哪。
-- 本周每日验证的产出：$home/analyst/out/daily-*.json（`notes` 里记着首聊里的候选问题，先看）。
+- 本期周报目录（summary.json、上线流水都在这里）：$weekly_dir
+- 本周每日验证的产出（`notes` 里记着首聊里的候选问题，先看）：
+$daily_outs
 - worker 上报的 bug 和事实：$home/events/*.jsonl 里 `type` 是 `finding` 的。
 - 代码面名字表：$home/surfaces.json。
 
@@ -25,7 +27,7 @@ $state_summary
 4. 看漏斗每一环掉在哪（口径照 brief）。
 5. 看已开业务票的墙还在不在（上面「现有业务票」里没拆的墙）。
 
-周报的 summary 和上线流水、prod 只读聚合、应用商店评论（取得到的话）、业内资料（联网查）都可以用。
+本期周报目录里的 summary 和上线流水、prod 只读聚合、应用商店评论（取得到的话）、业内资料（联网查）都可以用。
 
 ## 先归并，再提新问题
 

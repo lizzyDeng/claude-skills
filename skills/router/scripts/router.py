@@ -32,7 +32,12 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
-               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact"}
+               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact",
+               "redirect", "close", "absorb"}
+# answer --as-router 只收这几类、且只收票级授权的业务票：花钱 / 撤不回 / 发商店包（spend）、判真、关票、
+# 有害 / 退回（harm、return）都归用户
+AS_ROUTER_KINDS = {"card", "direction", "stuck", "conflict"}
+ROUTER_LABEL = "router 决定"
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -50,6 +55,8 @@ KIND_HINT = {
 # 续跑后「在等什么」（R5）：按续跑的原因写，不留空
 RETURN_WAIT = "连续 3 次没用，退回用户定夺"
 NO_WALL_WAIT = "墙已全部拆完，等分析 agent 提议结束"
+REQUEUE_WAIT = "判定已记，等调度器派新 worker 接着做（读收件箱和尝试记录）"
+REDIRECT_WAIT = "已换方向，等调度器派新 worker（读收件箱和尝试记录）"
 RESUME_WAIT = {"card": "执行中（方向卡已确认）", "reject": "按驳回重写方向卡", "spend": "照放行结论继续",
                "stuck": "按回答续跑", "conflict": "按回答处理代码面冲突", "offrepo_reject": "按你的意见改仓外改动",
                "handback": "你交还后继续"}
@@ -137,13 +144,17 @@ def _csv(s):
 
 
 def _resume_prompt(kind, text, inbox, as_router=False):
-    head = ["router 的说明（不是用户原话）：", text] if as_router else ["用户原话（逐字）：", text]
+    head = [f"{ROUTER_LABEL}（不是用户原话）：", text] if as_router else ["用户原话（逐字）：", text]
     parts = ["【router】你之前停下等的事有了回答。", "", *head, ""]
     if inbox:
         parts += ["你停下期间收件箱收到的：",
                   *[f"- [{m.get('type')}] {m.get('summary', '')}（来自 {m.get('ticket', 'router')}）" for m in inbox], ""]
-    hint = ("方向卡已确认（票级授权，router 代为确认）。进入 worker.md 第 2 段「执行」。"
-            if as_router and kind == "card" else KIND_HINT.get(kind, KIND_HINT["direction"]))
+    if as_router and kind == "card":
+        hint = "方向卡已确认（票级授权，router 代为确认）。进入 worker.md 第 2 段「执行」。"
+    elif as_router:
+        hint = f"照上面的{ROUTER_LABEL}继续当前阶段（票级授权，router 代为回答）。"
+    else:
+        hint = KIND_HINT.get(kind, KIND_HINT["direction"])
     parts += [hint, "先按 worker.md 读一次 inbox，再继续。"]
     return "\n".join(parts)
 
@@ -396,16 +407,32 @@ def _start_locked(env, st, sel):
     return res
 
 
+def _check_as_router(st, q, reject) -> None:
+    """answer --as-router：只收票级授权的业务票、只收 AS_ROUTER_KINDS（其余归用户）。拒 ⇒ Fail，不存盘：项留在决定单里。"""
+    if reject:
+        raise Fail("--as-router 不能和 --reject 一起用")
+    t = st["tickets"].get(q["ticket"] or "")
+    if not t or not store.router_owned(t):
+        raise Fail(f"{q['id']} 不是票级授权的业务票的项：只能由用户回（去掉 --as-router，照用户原话答）")
+    if q["kind"] not in AS_ROUTER_KINDS:
+        raise Fail(f"{q['id']} 是 {q['kind']} 项：归用户定（花钱 / 撤不回 / 发商店包、判真、关票、有害、退回），不能代答")
+
+
 def cmd_answer(a, env):
+    as_router = bool(getattr(a, "as_router", False))
     with env.state() as st:
         try:
             q = store.pop_queue(st, a.qid)
         except KeyError:
             raise Fail(f"决定单里没有 {a.qid}")
+        if as_router:
+            _check_as_router(st, q, a.reject)
         if q["kind"] in ("verify_problem", "close"):      # 格式不对 ⇒ Fail，不存盘：项留在决定单里
             return _answer_business(env, st, q, a.text)
+        said = " ".join(a.text.splitlines())
         _append_local(env.home / "answers.md",
-                      f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(a.text.splitlines())}")
+                      f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | "
+                      f"{f'{ROUTER_LABEL}：{said}' if as_router else said}")
         resumed, delivered, hint, extra = None, None, "", {}
         t = st["tickets"].get(q["ticket"]) if q["ticket"] else None
         topic = q.get("topic")
@@ -441,7 +468,7 @@ def cmd_answer(a, env):
                 t["card_confirmed"] = True
                 t["solution"]["source"] = t["solution"]["source"].replace("待你确认", "已确认")
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
-            how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"))
+            how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"), as_router=as_router)
             resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
         elif t and q["kind"] == "handson":
             if a.reject:
@@ -525,7 +552,19 @@ def propose_from(env, st, data) -> dict:
     if mode == "weekly" and (st.get("analyst") or {}).get("calibrated") is not True:
         raise Fail("校准未过：analyst 校准通过前，weekly 的提议一律不收（migrate 不受限）")
     problems, walls, close = data.get("problems", []), data.get("walls", []), data.get("close", [])
-    maint = data.get("maint", [])
+    maint, attach = data.get("maint", []), data.get("attach", [])
+    if attach and mode != "migrate":
+        raise Fail("attach（老票挂到已开的业务票）只收 migrate 的产出")
+    if not isinstance(attach, list):
+        raise Fail("attach 须是列表")
+    for i, x in enumerate(attach):
+        if not isinstance(x, dict):
+            raise Fail(f"attach[{i}] 不是对象")
+        _check_absorb(st, x.get("ticket"), x.get("absorbs"))
+    attached_ids = [oid for x in attach for oid in x["absorbs"]]
+    both = sorted(set(attached_ids) & {oid for p in problems if isinstance(p, dict) for oid in p.get("absorbs", [])})
+    if both or len(attached_ids) != len(set(attached_ids)):
+        raise Fail(f"同一张老票只能并进一个问题：{both or attached_ids}")
     for i, p in enumerate(problems):
         _check_problem(i, p)
     for i, m in enumerate(maint):
@@ -544,7 +583,7 @@ def propose_from(env, st, data) -> dict:
         guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
     except github.GuardEmpty as e:
         raise Fail(f"防泄漏闸失效，提议一条都没收：{e}")
-    texts = [json.dumps(x, ensure_ascii=False) for x in (*problems, *maint, *walls, *close)]
+    texts = [json.dumps(x, ensure_ascii=False) for x in (*problems, *maint, *walls, *close, *attach)]
     hits = sorted({h for tx in texts for h in github.leak_hits(tx, guard)})
     if hits:
         raise Fail("提议里有 uid / 用户原话，整份拒收", hits=hits)
@@ -572,9 +611,18 @@ def propose_from(env, st, data) -> dict:
         tid = maint_add(env, st, m)
         if tid not in mids:
             mids.append(tid)
+    attached = {}
+    for x in attach:                                  # 问题已判过真（已开的业务票）：挂老票不用再判，记一条决定
+        for oid in x["absorbs"]:
+            _link_legacy(st, x["ticket"], oid)
+        attached.setdefault(x["ticket"], []).extend(x["absorbs"])
+    for tid, olds in attached.items():
+        store.append_decision(env.decisions, st, tid, f"并入老票 {' '.join(olds)}",
+                              "migrate：同一群人想要的同一件东西（spec §4.7）", "分析 agent migrate 产出（attach）", at)
     # 只建 / 追加 DRAFT，不在这里 start：start 会建 issue、起 worker、中途落盘，不能放进可回滚的收产出里
     to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start}
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start,
+            "attached": attached}
 
 
 def _check_maint(env, st, i, m) -> None:
@@ -718,18 +766,7 @@ def _answer_business(env, st, q, text) -> dict:
                   f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(t.splitlines())}")
     if q["kind"] == "close":
         if verb == "close":
-            ct = st["tickets"][q["ticket"]]
-            if store.ticket_kind(ct) != "business":
-                raise Fail(f"{q['ticket']} 不是业务票，不能这样关")
-            pid = ct["worker"].get("pid")
-            if pid and env.ctx.pid_alive(pid):
-                raise Fail(f"{q['ticket']} 的 worker 还在跑（pid {pid}）：先 stop {q['ticket']}，再回「关」")
-            ct["closeout"] = {"downstream": _closeout_targets(st, q["ticket"]),
-                              "issue": "pending" if ct.get("issue") else "n/a",
-                              "worktree": "pending", "branch": "pending"}
-            store.set_status(st, q["ticket"], store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
-            store.append_decision(env.decisions, st, q["ticket"], "关闭业务票", q.get("reason", ""),
-                                  f"用户回答 {q['id']}：{t}", env.now())
+            _close_business(env, st, q["ticket"], q.get("reason", ""), f"用户回答 {q['id']}：{t}")
         return {"ok": True, "queue": q["id"], "kind": "close", "ticket": q["ticket"], "closed": verb == "close"}
     prop = st.get("proposals", {}).get(q.get("proposal") or "")
     if prop is None:
@@ -747,20 +784,141 @@ def _answer_business(env, st, q, text) -> dict:
     _biz_issue_fields(nt)
     nt["history"].append({"at": env.now(), "status": store.DRAFT})
     for old_id in nt["absorbs"]:                      # R1：被吸收的老票计为一次已结束的历史尝试
-        old = st["tickets"].get(old_id)
-        if old is None:
-            continue
-        old["parent"] = tid
-        pl = old.get("postlaunch") or {}
-        results = pl.get("results") or []
-        if old["status"] in (store.POSTLAUNCH, store.DONE) and results:   # 只有真上线并验收过的老票才算一次历史尝试
-            nt["attempts"].append({"n": len(nt["attempts"]) + 1, "direction": old["title"],
-                                   "shipped_at": pl.get("t0"), "verdict": "legacy",
-                                   "legacy_verdict": results[-1].get("verdict"), "historical": True})
+        if old_id in st["tickets"]:
+            _link_legacy(st, tid, old_id)
     res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
     if verb == "true":
         res["start"] = _start_locked(env, st, [tid])
     return res
+
+
+def _close_business(env, st, tid, why, basis) -> None:
+    """关业务票（「Qn 关」和「关 Tn」共用）：走 v1 收尾（下一轮巡检关 issue、清 worktree / 分支），清掉它在决定单上的项。"""
+    ct = env.ticket(st, tid)
+    if store.ticket_kind(ct) != "business":
+        raise Fail(f"{tid} 不是业务票，不能这样关")
+    if ct["status"] == store.DONE:
+        raise Fail(f"{tid} 已经关了")
+    pid = ct["worker"].get("pid")
+    if pid and env.ctx.pid_alive(pid):
+        raise Fail(f"{tid} 的 worker 还在跑（pid {pid}）：先 stop {tid}，再关")
+    ct["closeout"] = {"downstream": _closeout_targets(st, tid),
+                      "issue": "pending" if ct.get("issue") else "n/a",
+                      "worktree": "pending", "branch": "pending"}
+    st["queue"] = [q for q in st["queue"] if q.get("ticket") != tid]
+    store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
+    store.append_decision(env.decisions, st, tid, "关闭业务票", why, basis, env.now())
+
+
+def _legacy_attempt(st, tid, old) -> None:
+    """老票 old（parent = 业务票 tid）有上线验收结论 ⇒ 在 tid 上记 / 更新一条历史尝试（R1 形状），结论取最新一条。
+    老票上记着它对应的尝试号（parent_attempt），之后的结论只更新那一条，不重复记。没上线验收过的不记。"""
+    pl = old.get("postlaunch") or {}
+    results = pl.get("results") or []
+    if old["status"] not in (store.POSTLAUNCH, store.DONE) or not results:
+        return
+    nt = st["tickets"][tid]
+    rec = {"direction": old["title"], "shipped_at": pl.get("t0"), "verdict": "legacy",
+           "legacy_verdict": results[-1].get("verdict"), "historical": True}
+    n = old.get("parent_attempt")
+    cur = next((x for x in nt["attempts"] if n and x.get("n") == n and x.get("historical")), None)
+    if cur is not None:
+        cur.update(rec)
+        return
+    n = max((x.get("n", 0) for x in nt["attempts"]), default=0) + 1
+    nt["attempts"].append({"n": n, **rec})
+    old["parent_attempt"] = n
+
+
+def _link_legacy(st, tid, old_id) -> None:
+    """老票并进业务票 tid（spec §4.7）：设 parent；已上线验收过的立即记一次历史尝试，还在做的等它出了上线验收结论再记
+    （postlaunch-result 里的钩子）。幂等。"""
+    old = st["tickets"][old_id]
+    old["parent"] = tid
+    absorbs = st["tickets"][tid].setdefault("absorbs", [])
+    if old_id not in absorbs:
+        absorbs.append(old_id)
+    _legacy_attempt(st, tid, old)
+
+
+def _check_absorb(st, tid, olds) -> None:
+    """并老票的校验（absorb 命令和 migrate 的 attach 共用）：目标是业务票；并的都是存在的老票，没并进别的业务票。"""
+    t = st["tickets"].get(tid)
+    if t is None:
+        raise Fail(f"没有 {tid}")
+    if store.ticket_kind(t) != "business":
+        raise Fail(f"{tid} 不是业务票：只能并进业务票")
+    if not isinstance(olds, list) or not olds or not all(isinstance(x, str) for x in olds):
+        raise Fail(f"并进 {tid} 的老票须是非空的票号列表")
+    for oid in olds:
+        o = st["tickets"].get(oid)
+        if o is None:
+            raise Fail(f"没有 {oid}")
+        if oid == tid or store.ticket_kind(o) != "legacy":
+            raise Fail(f"{oid} 不是老票（kind={store.ticket_kind(o)}）：只有老票能并进业务票")
+        if o.get("parent") not in (None, tid):
+            raise Fail(f"{oid} 已经并进了 {o['parent']}")
+
+
+def cmd_redirect(a, env):
+    """业务票换方向（9b）：判了有害 / 没用（含连续 3 次没用退回用户）之后，新方向写进收件箱、票回 queued，
+    调度器派新 worker（读收件箱和尝试记录，出新方向卡）。不在原 worker 上 resume。清掉这张票的 harm / return 项。"""
+    text = (a.text or "").strip()
+    if not text:
+        raise Fail("新方向不能空")
+    with env.state() as st:
+        t = env.ticket(st, a.ticket)
+        if store.ticket_kind(t) != "business":
+            raise Fail(f"{a.ticket} 不是业务票：redirect 只给业务票（老票用 tell / add 跟进票）")
+        if t["status"] != store.POSTLAUNCH:
+            raise Fail(f"{a.ticket} 状态是 {t['status']}：只有 postlaunch 里判了有害 / 没用的业务票才用 redirect 换方向")
+        last = next((x for x in reversed(t.get("attempts") or []) if not x.get("historical")), None)
+        verdict = (last or {}).get("verdict")
+        if verdict not in ("harmful", "useless"):
+            raise Fail(f"{a.ticket} 最近一次尝试的判定是 {verdict or '待判'}：只有判了有害 / 没用（含连续没用退回）才换方向")
+        returned = t.get("waiting_for") == RETURN_WAIT or any(
+            q.get("ticket") == a.ticket and q["kind"] == "return" for q in st["queue"])
+        label = ROUTER_LABEL if a.as_router else "用户原话（逐字）"
+        _requeue_business(env, st, a.ticket,
+                          f"换方向（尝试 {last['n']} 判定 {verdict}）。{label}：{text}。"
+                          "先读尝试记录，再从第 1 段写新方向卡。", REDIRECT_WAIT)
+        cleared = [q["id"] for q in st["queue"] if q.get("ticket") == a.ticket and q["kind"] in ("harm", "return")]
+        st["queue"] = [q for q in st["queue"] if q["id"] not in cleared]
+        if returned:                                  # 退回用户后由他定了新方向：没用的连续计数重新算
+            t["no_use_streak"] = 0
+        if not a.as_router:
+            _append_local(env.home / "answers.md",
+                          f"- {env.now()} | - | redirect | {a.ticket} | {' '.join(text.splitlines())}")
+        did = store.append_decision(
+            env.decisions, st, a.ticket, f"换方向：{text}",
+            "票级授权：router 定下一个方向" if a.as_router else "用户定的方向（原话见 answers.md）",
+            f"尝试 {last['n']} 判定 {verdict}" + ("；连续没用已退回用户" if returned else ""), env.now())
+    return {"ok": True, "ticket": a.ticket, "status": store.QUEUED, "cleared": cleared, "decision": did}
+
+
+def cmd_close(a, env):
+    """用户说「关 Tn」：关业务票（同「Qn 关」的收尾）。worker 还活着 ⇒ 拒，先 stop。"""
+    reason = (a.reason or "").strip()
+    with env.state() as st:
+        _close_business(env, st, a.ticket, reason or "用户要关",
+                        f"用户：关 {a.ticket}" + (f"（{reason}）" if reason else ""))
+        _append_local(env.home / "answers.md",
+                      f"- {env.now()} | - | close | {a.ticket} | 关 {a.ticket}" + (f"：{reason}" if reason else ""))
+    return {"ok": True, "ticket": a.ticket, "status": store.DONE}
+
+
+def cmd_absorb(a, env):
+    """把老票并进已有的业务票（spec §4.7）。全部校验过才动：目标是业务票；并的都是存在的老票，没并进别的业务票。"""
+    with env.state() as st:
+        _check_absorb(st, a.ticket, a.olds)
+        t = st["tickets"][a.ticket]
+        before = {x.get("n") for x in t["attempts"]}
+        for oid in a.olds:
+            _link_legacy(st, a.ticket, oid)
+        added = [x["n"] for x in t["attempts"] if x.get("n") not in before]
+        did = store.append_decision(env.decisions, st, a.ticket, f"并入老票 {' '.join(a.olds)}",
+                                    "同一群人想要的同一件东西（spec §4.7）", "router.py absorb", env.now())
+    return {"ok": True, "ticket": a.ticket, "absorbed": a.olds, "attempts_added": added, "decision": did}
 
 
 def cmd_submit_card(a, env):
@@ -1116,20 +1274,27 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
     return actions
 
 
+def _requeue_business(env, st, tid, text, wait) -> None:
+    """业务票的下一次尝试：话写进收件箱 + 回 queued，调度器派新 worker（新 worker 读收件箱和尝试记录，从第 1 段出新卡）。
+    不在原 worker 上 resume，也不看 worktree 在不在（9b：一条路径）。认不出可能在跑的 worker ⇒ Fail（_refuse_pending）。"""
+    t = st["tickets"][tid]
+    _refuse_pending(t, tid, env.ctx)
+    if launcher.worker_alive(env.ctx, t["worker"]):
+        raise Fail(f"{tid} 的 worker 还在跑（pid {t['worker'].get('pid')}）：先 stop {tid} 再换方向")
+    t["worker"]["pid"] = None
+    events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+    t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
+    t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
+    store.set_status(st, tid, store.QUEUED, env.now(), wait)
+
+
 def _follow_up(env, st, tid, t, text) -> None:
-    """判定已落（调用方不依赖续跑成败）。没 worktree（合并后已清）：话写进收件箱 + 回 queued，调度器派新 worker；
-    其余 Fail：判定保留，推 stuck 项带原因。"""
-    w = t["worker"]
-    if not (w.get("worktree") and w.get("session_id")):
-        events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
-        t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
-        t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
-        store.set_status(st, tid, store.QUEUED, env.now(), "判定已记，等调度器派新 worker 接着做（读收件箱和尝试记录）")
-        return
+    """判定已落（调用方不依赖续跑成败）：一律重新排队（9b，concern 4 裁决）。排不了（派单待核实 / worker 认不出或还活着）：
+    判定保留，推 stuck 项带原因。"""
     try:
-        _resume(env, st, tid, "direction", text, store.EXECUTING)
+        _requeue_business(env, st, tid, text, REQUEUE_WAIT)
     except Fail as e:
-        store.push_queue(st, tid, "stuck", f"{tid} 判定已记，但没能叫醒 worker：{e}", env.now())
+        store.push_queue(st, tid, "stuck", f"{tid} 判定已记，但没能重新排队：{e}", env.now())
 
 
 def cmd_verdict(a, env):
@@ -1307,6 +1472,9 @@ def cmd_postlaunch_result(a, env):
             r["queue"] = qid
             pl["results"].append(r)
             store.set_status(st, a.ticket, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
+        parent = st["tickets"].get(t.get("parent") or "")
+        if parent is not None and store.ticket_kind(parent) == "business":   # 并进业务票的老票：结论记成它的历史尝试
+            _legacy_attempt(st, parent["id"], t)
         status = t["status"]
     return {"ok": True, "ticket": a.ticket, "status": status, "result": r, "queue": qid, "superseded": superseded}
 
@@ -1474,6 +1642,17 @@ def build_parser():
     s = sub.add_parser("answer", help="回答决定单上的一项，原话转给 worker")
     s.add_argument("qid"); s.add_argument("text")
     s.add_argument("--reject", action="store_true", help="驳回方向卡：worker 回第 1 段重写")
+    s.add_argument("--as-router", action="store_true",
+                   help="router 按票级授权代答（只收业务票的方向 / 卡住 / 冲突项）：标为 router 决定，不冒充用户原话")
+    s = sub.add_parser("redirect", help="业务票换方向：判了有害 / 没用后，新方向进收件箱、重新排队派新 worker")
+    s.add_argument("ticket"); s.add_argument("text")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--as-router", action="store_true", help="router 按票级授权定的方向（不进用户原话存档）")
+    g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，进 answers.md）")
+    s = sub.add_parser("close", help="用户说「关 Tn」：关业务票（收尾：关 issue、清 worktree）")
+    s.add_argument("ticket"); s.add_argument("--reason")
+    s = sub.add_parser("absorb", help="把老票并进已有的业务票（设 parent；验收过的记一次历史尝试）")
+    s.add_argument("ticket"); s.add_argument("olds", nargs="+")
     s = sub.add_parser("submit-card", help="方向卡进决定单")
     s.add_argument("ticket"); s.add_argument("--card", required=True)
     s.add_argument("--rounds", type=int, default=0); s.add_argument("--codex")

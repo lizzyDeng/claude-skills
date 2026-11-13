@@ -258,7 +258,7 @@ class Run:
             self._analyst_failed(None, "weekly", f"新周报 {latest}：config 没配 analyst.brief，分析 agent 没跑 weekly")
             return
         try:
-            rid = analyst.start(self._env(), self.state, "weekly")
+            rid = analyst.start(self._env(), self.state, "weekly", week=latest)
         except Exception as e:  # noqa: BLE001
             self._analyst_failed(None, "weekly", f"新周报 {latest}：分析 agent weekly 没起来（{str(e)[:160]}）；"
                                                  "修好后跑 router.py analyst run --mode weekly")
@@ -374,7 +374,7 @@ class Run:
             elif mode in ("weekly", "migrate"):
                 out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
                 result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
-                          "maint": out["maint"]}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
+                          "maint": out["maint"], "attached": out.get("attached", {})}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
             else:
                 result = {}
                 run = self.state["analyst"]["runs"][rid]
@@ -1071,11 +1071,17 @@ class Run:
 
 
 def _brief(run, tid):
+    """派单 = templates/brief.md；业务票（kind=business）再代入 templates/brief_business.md 那一节（9b，concern 5）。"""
     t = run.state["tickets"][tid]
     why = t.get("why", {})
+    kind = store.ticket_kind(t)
     tpl = string.Template((SKILL_DIR / "templates" / "brief.md").read_text(encoding="utf-8"))
+    biz = ""
+    if kind == "business":
+        biz = string.Template((SKILL_DIR / "templates" / "brief_business.md").read_text(encoding="utf-8")) \
+            .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"))
     return tpl.safe_substitute(
-        ticket=tid, title=t["title"],
+        ticket=tid, title=t["title"], kind=kind, business_section=biz,
         issue_line=f"GitHub：{run.cfg['repo']}#{t['issue']}" if t.get("issue") else "（没有 issue）",
         worker_md=str(SKILL_DIR / "worker.md"),
         why_metric=why.get("metric", ""), why_users=why.get("users", ""), why_evidence=why.get("evidence", ""),

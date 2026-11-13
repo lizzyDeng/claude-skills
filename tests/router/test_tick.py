@@ -229,6 +229,19 @@ def test_dispatch_creates_worktree_and_brief(proj):
         assert part in brief
 
 
+def test_brief_business_section_only_for_business(proj):
+    """9b（concern 5）：派单带票类型；「业务票」一节只在 kind=business 时出现。"""
+    proj.put(T1=("queued", ["weekly-report"], {"start_ok": True, "issue": 7, "title": "老票"}),
+             T2=("queued", ["her-reply-prompt"], {"start_ok": True, "issue": 8, "title": "业务票", "kind": "business",
+                                                  "authorized": True, "attempts": [], "walls": []}))
+    proj.run()
+    briefs = {sp["env"]["ROUTER_TICKET"]: sp["cmd"][sp["cmd"].index("-p") + 1] for sp in proj.ctx.spawned}
+    assert set(briefs) == {"T1", "T2"}
+    assert "票类型：legacy" in briefs["T1"] and "## 业务票" not in briefs["T1"]
+    assert "票类型：business" in briefs["T2"] and "## 业务票" in briefs["T2"]
+    assert "$" not in briefs["T2"].replace("$ROUTER", "")                      # 没有漏代入的变量
+
+
 def test_waiting_for_explains_queue_reason(proj):
     proj.put(T1=("executing", ["her-reply-prompt"], {"weight": "heavy", "worker": {"pid": 123, "log": None}}),
              T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "start_ok": True}),

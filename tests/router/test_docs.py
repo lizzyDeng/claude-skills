@@ -2,10 +2,8 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
 
-import pytest
-from conftest import FIX, SCRIPTS
+from conftest import SCRIPTS
 
 SKILL = SCRIPTS.parent
 CLI = SCRIPTS / "router.py"
@@ -23,7 +21,8 @@ ANALYST_MODES = ("daily", "weekly", "calibrate", "migrate")
 def test_docs_reference_only_existing_subcommands():
     known = help_commands()
     used = set()
-    docs = ("SKILL.md", "worker.md", "templates/brief.md", *(f"templates/analyst_{m}.md" for m in ANALYST_MODES))
+    docs = ("SKILL.md", "worker.md", "templates/brief.md", "templates/brief_business.md",
+            *(f"templates/analyst_{m}.md" for m in ANALYST_MODES))
     for doc in docs:
         used |= set(CMD.findall((SKILL / doc).read_text(encoding="utf-8")))
     assert used, "文档里一个 router.py 子命令都没引用"
@@ -31,7 +30,7 @@ def test_docs_reference_only_existing_subcommands():
     # 协议依赖的关键子命令都要在文档里出现过（v2：分诊 draft 退场，分析 agent / 判定 / 维护 / 影响分进场）
     assert {"discover", "tick", "watch", "start", "answer", "submit-card", "decide", "tell",
             "emit", "progress", "inbox", "status",
-            "analyst", "verdict", "maint", "impact", "released", "prod-batch"} <= used
+            "analyst", "verdict", "maint", "impact", "released", "prod-batch", "redirect", "close", "absorb"} <= used
     assert not (SKILL / "templates" / "triage.md").exists(), "v1 分诊模板应已删除（由分析 agent 模板替代）"
 
 
@@ -159,7 +158,7 @@ def test_postlaunch_template_has_six_sections_and_five_verdicts():
 def test_skill_documents_postlaunch_protocol():
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     s2 = _section(text, "2.")
-    row = next(l for l in s2.splitlines() if "`postlaunch_due`" in l)
+    row = next(l for l in s2.splitlines() if l.startswith("| `postlaunch_due`"))
     assert "templates/postlaunch.md" in row and "postlaunch-result" in row and "postlaunch_brief" in row
     s5 = _section(text, "5.")
     assert "关开关" in s5 and "改配置" in s5 and "修复票" in s5
@@ -263,6 +262,7 @@ def test_analyst_migrate_groups_by_same_people_same_want():
     assert "$state_summary" in text and "同一群人想要的同一件东西" in text and "absorbs" in text
     ex = _json_example(text, "migrate")
     assert any(p["absorbs"] for p in ex["problems"])
+    assert "attach" in text and all(set(x) == {"ticket", "absorbs"} for x in ex["attach"]) and ex["attach"]  # 9b f9
 
 
 # ---- v2：SKILL.md 协议（票级授权 / 判真 / 唤醒键 / 分析 agent）、worker 的业务票循环 ---------------
@@ -309,7 +309,9 @@ def test_skill_v2_sections():
 
 
 def test_worker_and_brief_business_section():
-    for doc in ("worker.md", "templates/brief.md"):
+    brief = (SKILL / "templates" / "brief.md").read_text(encoding="utf-8")
+    assert "$kind" in brief and "$business_section" in brief and "## 业务票" not in brief   # 业务票一节按 kind 代入
+    for doc in ("worker.md", "templates/brief_business.md"):
         text = (SKILL / doc).read_text(encoding="utf-8")
         m = re.search(r"^## 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
         assert m, f"{doc} 缺「## 业务票」一节"
@@ -321,3 +323,32 @@ def test_worker_and_brief_business_section():
     stop = re.search(r"^##[^\n]*三种情况[^\n]*\n(.*?)(?=^## )", (SKILL / "worker.md").read_text(encoding="utf-8"),
                      re.S | re.M).group(1)
     assert "irreversible" in stop and "store_release" in stop
+
+
+# ---- Task 9b：协议跟代码对齐（换方向 / 代答 / 关票 / 并旧票 / 唤醒键投递 / 重启恢复） -----------------
+
+ONCE_KEYS = ("rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled")
+REDELIVERED = ("cards_for_review", "slow_path_events", "postlaunch_due")
+
+
+def test_skill_9b_commands_and_wording():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s2 = _section(text, "2.")
+    pre = s2.split("| 返回字段 |")[0]                                          # 表格前的说明：哪些只交一次、哪些会重投
+    for k in ONCE_KEYS + REDELIVERED:
+        assert f"`{k}`" in pre, k
+    rows = {m.group(1): line for line in s2.splitlines() for m in [re.match(r"^\|\s*`([a-z_]+)`", line)] if m}
+    for k in ("rollback_needed", "return_to_user"):
+        assert "router.py redirect" in rows[k] and "--resume" not in rows[k], k   # 换方向一律 redirect
+    assert 'answer <Qn> "router 决定' not in text                               # 代答走 --as-router，不冒充原话
+    assert "answer <Qn>" in _section(text, "5.") and "--as-router" in _section(text, "5.")
+    s6 = _section(text, "6.")
+    assert "「关 T" in s6 and "router.py close" in s6 and "router.py redirect" in s6
+    assert "router.py absorb" in text
+    s1 = _section(text, "1.")
+    assert "`harm`" in s1 and "`return`" in s1 and "没有入口" in s1             # 重启恢复：查挂着的撤回 / 退回 / 等入口
+    for doc in ("SKILL.md", "templates/analyst_daily.md"):                     # 新墙挂在末尾，下一次对准第一道没拆的墙
+        assert "下一次尝试拆它" not in (SKILL / doc).read_text(encoding="utf-8"), doc
+    assert "第一道没拆的墙" in text
+    mig = (SKILL / "templates" / "analyst_migrate.md").read_text(encoding="utf-8")
+    assert "absorb" in mig and "做完算一次" not in mig and "做完算一次" not in text
