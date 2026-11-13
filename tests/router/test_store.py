@@ -220,3 +220,38 @@ def test_postlaunch_due_only_after_time_and_until_recorded():
     assert store.postlaunch_due(t, "2026-11-13T09:00:00Z") == ["T+3"]
     t["status"] = "done"
     assert store.postlaunch_due(t, "2026-11-20T00:00:00Z") == []                           # 只有 postlaunch 的票会到期
+
+
+def _qitems(state, *items):
+    for i, it in enumerate(items, 1):
+        state["queue"].append({"id": f"Q{i}", "at": "2026-11-01T00:00:00Z", "summary": "s", **it})
+
+
+def test_queue_view_orders_by_impact():
+    from conftest import make_state
+    lo = {"size": 0.2, "gap": 1.0, "confidence": "high"}
+    hi = {"size": 0.5, "gap": 1.0, "confidence": "high"}
+    s = make_state(T1=("executing", []), T2=("executing", []), T3=("queued", []))
+    s["tickets"]["T1"].update(kind="business", impact=lo)
+    s["tickets"]["T2"].update(kind="business", impact=hi)
+    s["tickets"]["T3"]["blocked_by"] = []
+    s["tickets"]["T3"]["blocked_by"] = ["T1"]
+    _qitems(s, {"kind": "card", "ticket": "T1"}, {"kind": "card", "ticket": "T2"})
+    assert [v["id"] for v in store.queue_view(s)] == ["Q2", "Q1"]
+
+
+def test_queue_view_verify_problem_uses_proposal_impact():
+    from conftest import make_state
+    s = make_state(T1=("executing", []))
+    s["proposals"] = {"P1": {"impact": {"size": 0.5, "gap": 1.0, "confidence": "high"}}}
+    _qitems(s, {"kind": "card", "ticket": "T1"}, {"kind": "verify_problem", "proposal": "P1"},
+            {"kind": "verify_problem", "proposal": "P404"})
+    assert [v["id"] for v in store.queue_view(s)] == ["Q2", "Q1", "Q3"]
+
+
+def test_legacy_queue_order_unchanged():
+    from conftest import make_state
+    s = make_state(T1=("executing", []), T2=("executing", []), T3=("queued", []))
+    s["tickets"]["T3"]["blocked_by"] = ["T2"]
+    _qitems(s, {"kind": "card", "ticket": "T1"}, {"kind": "card", "ticket": "T2"})
+    assert [v["id"] for v in store.queue_view(s)] == ["Q2", "Q1"]   # T2 挡 T3 ⇒ blocks 更大

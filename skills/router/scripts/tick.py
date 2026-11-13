@@ -994,7 +994,8 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
     heavy_cand = any(t["status"] == store.QUEUED and t["start_ok"] and t["weight"] == "heavy"
                      for t in state["tickets"].values())
     disk = run.disk_block() if heavy_cand else ""
-    picked = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), bool(disk))
+    picked = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), bool(disk),
+                                     cfg.get("analyst", {}).get("maint_slots", 1))
     done = []
     if picked and run.ensure_base()["ok"]:
         for tid in picked:

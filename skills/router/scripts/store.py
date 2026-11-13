@@ -38,7 +38,8 @@ RUNNING = {KICKOFF, EXECUTING, VERIFYING}                                  # 占
 LOCKING = RUNNING | {AWAIT_CARD, PAUSED, TAKEOVER, STUCK, AWAIT_CHECK}      # 持锁
 SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # 对下游算已解锁
 
-QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch"}
+QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch",
+               "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
 QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo"}
 
@@ -211,8 +212,23 @@ def new_business_ticket(state: dict, *, title, segment, want, walls, metric, evi
 def impact_score(t: dict) -> float:
     if ticket_kind(t) != "business":
         return 0.0
-    imp = t.get("impact") or {}
-    return float(imp.get("size", 0)) * float(imp.get("gap", 0)) * _CONFIDENCE.get(imp.get("confidence"), 0.5)
+    return impact_of_dict(t.get("impact"))
+
+
+def impact_of_dict(imp) -> float:
+    """影响分公式只此一处：size × gap × 置信权重；缺字段 ⇒ 0。"""
+    imp = imp or {}
+    if not imp.get("size") or not imp.get("gap"):
+        return 0.0
+    return float(imp["size"]) * float(imp["gap"]) * _CONFIDENCE.get(imp.get("confidence"), 0.5)
+
+
+def queue_impact(state: dict, q: dict) -> float:
+    """决定单项的业务影响：verify_problem 取提议里的 impact；带票号的取该票的 impact_score；其余 0。"""
+    if q.get("kind") == "verify_problem":
+        return impact_of_dict((state.get("proposals", {}).get(q.get("proposal") or "") or {}).get("impact"))
+    t = state["tickets"].get(q.get("ticket") or "")
+    return impact_score(t) if t else 0.0
 
 
 def attach_wall(state: dict, tid: str, text: str, source: str, at: str) -> str:
@@ -431,7 +447,7 @@ def queue_blocks(state, q) -> int:
 
 
 def queue_view(state) -> list:
-    """决定单的读视图：每项浅拷贝 + 现算 blocks；start 项的「几张」按当前草稿重写；按 (-blocks, 序号) 排。
+    """决定单的读视图：每项浅拷贝 + 现算 blocks；start 项的「几张」按当前草稿重写；按 (-impact, -blocks, 序号) 排。
     只读：不改 state 本身（status 这类只读命令不存盘）。"""
     out = []
     for q in state["queue"]:
@@ -439,8 +455,9 @@ def queue_view(state) -> list:
         v["blocks"] = queue_blocks(state, q)
         if q.get("kind") == "start":
             v["summary"] = f"派发单已备好（{v['blocks']} 张）"
+        v["impact"] = queue_impact(state, q)
         out.append(v)
-    return sorted(out, key=lambda v: (-v["blocks"], int(v["id"][1:])))
+    return sorted(out, key=lambda v: (-v["impact"], -v["blocks"], int(v["id"][1:])))
 
 
 def pop_queue(state, qid) -> dict:
