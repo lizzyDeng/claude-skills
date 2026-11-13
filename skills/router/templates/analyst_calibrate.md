@@ -2,20 +2,44 @@
 
 OUT=$out
 
+你是一个分析 agent，这是你的第一次。只给你数据入口和时间范围：从原始数据里自己找出用户来这里想要、却没拿到的东西。你的结果会和一份你看不到的清单对照，看你能不能自己找出来。
+
+这是盲跑：当前目录是一个空的临时目录。不要去找别的状态目录、已有的票、已有的问题清单或结论；brief 里如果有写「已知问题」「已知结论」一类的段落，跳过不读。
+
 - 项目 brief（只看取数入口和口径）：$brief
 - 时间范围（UTC 日期）：$since ～ $until
 
-只从原始数据里找问题。盲跑：当前目录是一个空的临时目录；不要去找 router 的状态目录、已有的票或已有结论。
+🔴 红线：会进 GitHub 的字段（title、segment、want、walls、metric、evidence）不写 uid，也不写用户原话；只写聚合数、改写过的描述和本地路径。真实对话只在本机读。只读：不写库、不动开关、不开票。
 
-🔴 红线：会进 GitHub 的字段（title、segment、want、walls、metric、evidence）不写 uid，也不写用户原话。只读：不写库、不动开关、不开票。
+## 方法（只看原始数据，不套周报的分类）
+
+1. 读这段时间新用户的第一段对话。
+2. 对比「第二天回来的人」和「没回来的人」：他们的第一段聊天有什么不同。
+3. 看每个人离开前的最后几句：她说了什么，他说了什么。
+4. 看漏斗每一环掉在哪（口径照 brief）。
+
+## problems 每条怎么写
+
+一条 = 一个问题：一群人想要的一件东西，卡在哪几步。不要按机制拆成几条。找到几条写几条，按影响从大到小排。
+
+- `key`：这类问题的短名（英文小写加连字符）。
+- `title`：一句话的问题。
+- `segment`：哪群人。
+- `want`：他们来这里要的东西。
+- `walls`：卡在哪（没拿到、离开的那一步），按先后列，至少一道。
+- `metric`：建议指标。`name`；`now` 现在是多少（聚合数）；`direction` 往哪个方向变算好（`up` / `down`）。
+- `evidence`：本地路径加聚合数字。
+- `impact`：三项都要有。`size` 人群规模（0–1）；`gap` 缺口（0–1，离「满足」差多少）；`confidence` 把握（`low` / `mid` / `high`）。
+- `absorbs` 写空列表，`new_evidence` 写空串（校准不涉及已有的票）。
 
 ## 产出
 
-把结果写成一个 JSON 文件，路径就是上面 `OUT=` 那一行，格式：
+把结果写成一个 JSON 文件，路径就是开头 OUT 那一行，格式：
 
 ```json
 {"mode": "calibrate",
- "problems": [{"key": "示例键", "title": "示例问题", "segment": "示例人群", "want": "示例想要", "walls": ["示例墙"],
-               "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"}, "evidence": ["示例证据"],
-               "impact": {"size": 0.3, "gap": 0.5, "confidence": "mid"}, "absorbs": [], "new_evidence": ""}]}
+ "problems": [{"key": "example-segment-want", "title": "示例问题", "segment": "示例人群", "want": "示例想要",
+               "walls": ["示例墙"], "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"},
+               "evidence": ["示例：本地路径 + 聚合数"], "impact": {"size": 0.3, "gap": 0.5, "confidence": "mid"},
+               "absorbs": [], "new_evidence": ""}]}
 ```

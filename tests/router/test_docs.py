@@ -17,16 +17,22 @@ def help_commands():
     return set(re.search(r"\{([a-z,-]+)\}", out).group(1).split(","))
 
 
+ANALYST_MODES = ("daily", "weekly", "calibrate", "migrate")
+
+
 def test_docs_reference_only_existing_subcommands():
     known = help_commands()
     used = set()
-    for doc in ("SKILL.md", "worker.md", "templates/brief.md", "templates/triage.md"):
+    docs = ("SKILL.md", "worker.md", "templates/brief.md", *(f"templates/analyst_{m}.md" for m in ANALYST_MODES))
+    for doc in docs:
         used |= set(CMD.findall((SKILL / doc).read_text(encoding="utf-8")))
     assert used, "文档里一个 router.py 子命令都没引用"
     assert used - known == set()
-    # 协议依赖的关键子命令都要在文档里出现过
-    assert {"discover", "tick", "watch", "draft", "start", "answer", "submit-card", "decide", "tell",
-            "emit", "progress", "inbox", "status"} <= used
+    # 协议依赖的关键子命令都要在文档里出现过（v2：分诊 draft 退场，分析 agent / 判定 / 维护 / 影响分进场）
+    assert {"discover", "tick", "watch", "start", "answer", "submit-card", "decide", "tell",
+            "emit", "progress", "inbox", "status",
+            "analyst", "verdict", "maint", "impact", "released", "prod-batch"} <= used
+    assert not (SKILL / "templates" / "triage.md").exists(), "v1 分诊模板应已删除（由分析 agent 模板替代）"
 
 
 def test_worker_doc_lists_exactly_three_stop_conditions():
@@ -48,23 +54,9 @@ def test_skill_frontmatter_and_triggers():
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     fm = re.match(r"^---\n(.*?)\n---\n", text, re.S).group(1)
     assert re.search(r"^name: router$", fm, re.M)
-    for trig in ("router", "派发周报", "看板", "start"):
+    for trig in ("router", "派发周报", "看板", "start", "判真"):
         assert trig in fm
-
-
-def test_triage_schema_matches_draft_loader(tmp_path):
-    text = (SKILL / "templates" / "triage.md").read_text(encoding="utf-8")
-    example = json.loads(re.search(r"```json\n(.*?)\n```", text, re.S).group(1))
-    (tmp_path / "t.json").write_text(json.dumps(example, ensure_ascii=False))
-    home = tmp_path / ".claude" / "router"; home.mkdir(parents=True)
-    (home / "config.json").write_text(json.dumps({"repo": "o/r", "lark_config": str(tmp_path / "none.json")}))
-    (home / "surfaces.json").write_text((FIX / "surfaces.json").read_text())
-    r = subprocess.run([sys.executable, str(CLI), "--root", str(tmp_path), "draft", "--from", str(tmp_path / "t.json")],
-                       capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
-    keys = {"title", "weight", "priority", "why", "problem", "problem_anchor", "clue", "surfaces", "tags",
-            "depends_on", "covered_by", "decision", "reason"}
-    assert all(set(t) == keys for t in example["tickets"])
+    assert "分诊" not in fm                                                    # v2：没有分诊了
 
 
 def test_direction_review_output_schema():
@@ -88,236 +80,6 @@ def test_skill_codex_review_goes_through_review_pack():
     assert "review-pack" in sec and "review-canary" in sec
     assert "canary_stale" in sec and "canary_leak" in sec                  # 过期先补跑金丝雀；泄漏要告诉用户
     assert 'codex exec -s read-only "<同一份材料>"' not in text            # 手拼命令删掉
-
-
-# ---- R8 + H3：分诊模板认识周报契约，且有行为级检查（⑩） ---------------------------------
-
-EXCLUSION_CODES = ("instrument", "instrument_missing", "before_has", "after_has", "crossing",
-                   "window_short", "evidence_erased", "immature")
-TRIAGE_EVAL = FIX / "triage_eval"
-CHECK = Path(__file__).resolve().parent / "triage_eval_check.py"
-
-
-def _rules(text):
-    sec = _section(text, "规则")
-    return {int(n): body for n, body in re.findall(r"^(\d+)\.\s(.*?)(?=^\d+\.\s|\Z)", sec, re.S | re.M)}
-
-
-def test_triage_knows_weekly_progress_contract():
-    text = (SKILL / "templates" / "triage.md").read_text(encoding="utf-8")
-    for term in ("why_text", "no_release", "_unconfirmed", "baseline.instrument", "prior_same_instrument",
-                 *EXCLUSION_CODES):
-        assert term in text, term
-    rules = _rules(text)
-    r8 = rules[8]
-    assert "复查" in r8 and "flat" in r8 and "why == []" in r8
-    for code in (*EXCLUSION_CODES, "no_release", "small"):
-        assert code in r8, f"第 8 条没列出排除项 {code}"
-    assert "_unconfirmed" in rules[1] and "不要自己拿 z 推判定" in rules[1]
-
-
-def _fixture():
-    week = next((TRIAGE_EVAL / "runs").iterdir())
-    summary = json.loads((week / "summary.json").read_text(encoding="utf-8"))
-    releases = json.loads((TRIAGE_EVAL / "state" / "releases.json").read_text(encoding="utf-8"))
-    return week.name, summary, releases
-
-
-def _released_old(week, releases, days=14):
-    from datetime import date
-    w = date.fromisoformat(week)
-    return {m for r in releases if (w - date.fromisoformat(r["date"])).days >= days for m in r["metrics"]}
-
-
-def _code(w):
-    return w.split(":", 1)[0]
-
-
-def _strings(o):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            yield k
-            yield from _strings(v)
-    elif isinstance(o, list):
-        for v in o:
-            yield from _strings(v)
-    elif isinstance(o, str):
-        yield o
-
-
-def test_triage_eval_fixtures_are_synthetic():
-    import github
-    assert TRIAGE_EVAL.is_dir(), "缺 tests/router/fixtures/triage_eval/"
-    files = [p for p in TRIAGE_EVAL.rglob("*") if p.is_file()]
-    assert len(files) >= 3
-    _, summary, _ = _fixture()
-    assert {"m_hz", "m_flat_dirty", "m_flat_clean"} <= set(summary["progress"])
-    for f in files:
-        if f.suffix != ".json":
-            continue
-        for s in _strings(json.loads(f.read_text(encoding="utf-8"))):
-            assert not github._is_uid(s), (f.name, s)                           # 不许出现像 uid 的值
-            long_en = re.search(r"[A-Za-z]+(?: [A-Za-z]+){3,}", s)
-            long_zh = len(re.findall(r"[一-鿿]", s)) >= 12
-            assert not (len(s) >= 20 and (long_en or long_zh)), (f.name, s)     # 不许有像用户原话的长句
-
-
-def test_triage_eval_fixture_covers_every_exclusion_code():               # H3：逐类覆盖
-    week, summary, releases = _fixture()
-    prog = summary["progress"]
-    names = list(prog)
-    assert not [(a, b) for a in names for b in names if a != b and a in b], "指标名互为子串，检查器会认错"
-    old = _released_old(week, releases)
-    for code in EXCLUSION_CODES:                                             # 每个排除码各有一个「只因它被排除」的已上线 flat
-        hit = [m for m, p in prog.items() if m in old and p["v"] == "flat" and [_code(w) for w in p["why"]] == [code]
-               and p.get("why_text")]
-        assert hit, f"没有只带 {code} 的已上线 flat 指标"
-        if code in ("before_has", "after_has", "crossing"):
-            assert ":" in prog[hit[0]]["why"][0]
-    assert [m for m, p in prog.items() if m in old and p["v"] == "flat" and len(p["why"]) >= 2]      # m_flat_dirty 一类
-    assert [m for m, p in prog.items() if p["v"] == "no_release" and abs(p.get("z", 0)) >= 2]        # 有趋势、无上线可归因
-    assert [m for m, p in prog.items() if m in old and p["v"] == "small" and p["why"] and p.get("why_text")]
-    assert [m for m, p in prog.items() if p["v"].endswith("_unconfirmed") and abs(p["z"]) >= 2]     # 被封顶的「显著」
-    assert [m for m, p in prog.items() if p["v"] == "worse" and p["why"] == []]                     # 正对照：该出票
-    clean = [m for m in old if m in prog and prog[m]["v"] == "flat" and prog[m]["why"] == []]
-    assert summary["instrument"] != summary["baseline"]["instrument"]                                # 跨口径
-    assert summary["prior_same_instrument"]["instrument"] == summary["instrument"]
-    prior, base = summary["prior_same_instrument"]["metrics"], summary["baseline"]["metrics"]
-    with_prior, without = [m for m in clean if m in prior], [m for m in clean if m not in prior]
-    assert with_prior and without, "要同时有「有同口径基线」和「无同口径基线」两种干净 flat"
-    for m in clean:
-        assert "value" in prog[m] and m in base
-        vals = [str(prog[m]["value"]), str(base[m]["value"])] + ([str(prior[m]["value"])] if m in prior else [])
-        assert not [(a, b) for a in vals for b in vals if a != b and a in b], f"{m} 的数值互为子串"
-
-
-# ---- 检查器：好输出 exit 0；每一类坏输出 exit 1 并点名 ------------------------------------
-
-def _ticket(title, metric, decision="dispatch", users="", reason="r"):
-    return {"title": title, "weight": "light", "priority": 5,
-            "why": {"metric": metric, "users": users, "evidence": "runs/2099-01-05/summary.json#progress"},
-            "problem": "p", "problem_anchor": "", "clue": "", "surfaces": [], "tags": [], "depends_on": [],
-            "covered_by": "", "decision": decision, "reason": reason}
-
-
-def _good():
-    week, summary, releases = _fixture()
-    prog, old = summary["progress"], _released_old(week, releases)
-    prior = summary["prior_same_instrument"]["metrics"]
-    date_of = {m: r["date"] for r in releases for m in r["metrics"]}
-    tickets = [_ticket(f"{m} 确认变差", m) for m, p in prog.items() if p["v"] == "worse"]
-    clean = sorted(m for m in old if m in prog and prog[m]["v"] == "flat" and prog[m]["why"] == [])
-    for m in clean:
-        before = str(prior[m]["value"]) if m in prior else "无同口径基线"
-        tickets.append(_ticket(f"方向可能错：{m}", m, users=f"上线 {date_of[m]}；前 {before} → 后 {prog[m]['value']}"))
-    not_reviewed = [{"metric": m, "reason": f"不出复查票：{prog[m].get('why_text', '')}"}
-                    for m in sorted(old) if m in prog and m not in clean]
-    return {"batch": week, "tickets": tickets, "not_reviewed": not_reviewed}
-
-
-def _check(tmp_path, out):
-    f = tmp_path / "triage.json"; f.write_text(json.dumps(out, ensure_ascii=False))
-    r = subprocess.run([sys.executable, str(CHECK), str(f)], capture_output=True, text=True, timeout=30)
-    return r.returncode, r.stdout + r.stderr
-
-
-def _flagged(text, cls, metric):
-    return any(cls in line and metric in line for line in text.splitlines())
-
-
-def test_triage_eval_checker_discriminates(tmp_path):
-    rc, text = _check(tmp_path, _good())
-    assert rc == 0, text
-    bad = _good(); bad["tickets"].append(_ticket("m_hz 显著上升", "m_hz"))                       # 被封顶的判定出了票
-    rc, text = _check(tmp_path, bad)
-    assert rc == 1 and _flagged(text, "unconfirmed_dispatch", "m_hz"), text
-    bad = _good(); bad["tickets"].append(_ticket("方向可能错：m_flat_dirty", "m_flat_dirty"))  # 口径不干净的 flat 出了复查票
-    rc, text = _check(tmp_path, bad)
-    assert rc == 1 and _flagged(text, "review_not_clean", "m_flat_dirty"), text
-    bad = _good(); bad["tickets"] = [t for t in bad["tickets"] if t["why"]["metric"] != "m_flat_clean"]   # 漏了该出的复查票
-    rc, text = _check(tmp_path, bad)
-    assert rc == 1 and _flagged(text, "missing_review", "m_flat_clean"), text
-
-
-def _excluded_by(code):
-    week, summary, releases = _fixture()
-    old = _released_old(week, releases)
-    return next(m for m, p in summary["progress"].items()
-                if m in old and p["v"] == "flat" and [_code(w) for w in p["why"]] == [code])
-
-
-@pytest.mark.parametrize("code", EXCLUSION_CODES)
-def test_triage_eval_checker_flags_review_for_each_exclusion_code(tmp_path, code):       # H3
-    m = _excluded_by(code)
-    bad = _good(); bad["tickets"].append(_ticket(f"方向可能错：{m}", m))
-    rc, text = _check(tmp_path, bad)
-    assert rc == 1 and _flagged(text, "review_not_clean", m), text
-
-
-def test_triage_eval_checker_flags_no_release_small_why_text_and_baseline(tmp_path):    # H3
-    week, summary, releases = _fixture()
-    prog, old = summary["progress"], _released_old(week, releases)
-    no_rel = next(m for m, p in prog.items() if p["v"] == "no_release")
-    small = next(m for m, p in prog.items() if p["v"] == "small" and m in old)
-    worse = next(m for m, p in prog.items() if p["v"] == "worse")
-    prior, base = summary["prior_same_instrument"]["metrics"], summary["baseline"]["metrics"]
-    clean = [m for m in old if m in prog and prog[m]["v"] == "flat" and prog[m]["why"] == []]
-    with_prior = next(m for m in clean if m in prior)
-    without = next(m for m in clean if m not in prior)
-    cases = []
-    bad = _good(); bad["tickets"].append(_ticket(f"{no_rel} 趋势", no_rel)); cases.append((bad, "unconfirmed_dispatch", no_rel))
-    bad = _good(); bad["tickets"].append(_ticket(f"{small} 变化", small)); cases.append((bad, "unconfirmed_dispatch", small))
-    bad = _good(); bad["tickets"].append(_ticket(f"方向可能错：{small}", small)); cases.append((bad, "review_not_clean", small))
-    bad = _good(); bad["tickets"] = [t for t in bad["tickets"] if t["why"]["metric"] != worse]
-    cases.append((bad, "missing_dispatch", worse))                                       # 正对照：确认变差必须出票
-    bad = _good(); bad["not_reviewed"] = [x for x in bad["not_reviewed"] if x["metric"] != small]
-    cases.append((bad, "why_text", small))                                               # 没交代为什么不复查
-    bad = _good()
-    for x in bad["not_reviewed"]:
-        if x["metric"] == small:
-            x["reason"] = "证据不足"                                                       # 换了说法、没贴 why_text 原文
-    cases.append((bad, "why_text", small))
-    bad = _good()
-    for t in bad["tickets"]:
-        if t["why"]["metric"] == with_prior:                                             # 跨口径还拿 baseline 当「前」
-            t["why"]["users"] = f"前 {base[with_prior]['value']} → 后 {prog[with_prior]['value']}"
-    cases.append((bad, "baseline", with_prior))
-    bad = _good()
-    for t in bad["tickets"]:
-        if t["why"]["metric"] == without:                                                # 没有同口径基线却编了一个
-            t["why"]["users"] = f"前 {base[without]['value']} → 后 {prog[without]['value']}"
-    cases.append((bad, "baseline", without))
-    bad = _good(); bad["tickets"].append(_ticket(f"方向可能错：{with_prior}（重复）", with_prior))
-    cases.append((bad, "missing_review", with_prior))                                    # 恰好一张
-    for out, cls, metric in cases:
-        rc, text = _check(tmp_path, out)
-        assert rc == 1 and _flagged(text, cls, metric), (cls, metric, text)
-
-
-def test_triage_eval_template_documents_not_reviewed_and_baseline_rule():             # H3：检查器要的输出，模板得写明
-    text = (SKILL / "templates" / "triage.md").read_text(encoding="utf-8")
-    assert "not_reviewed" in text and "无同口径基线" in text
-    rule = [b for b in _rules(text).values() if "prior_same_instrument" in b]
-    assert rule and "baseline.instrument" in rule[0]
-
-
-def test_triage_eval_checker_flags_dispatch_for_better_and_down_unconfirmed(tmp_path):   # F13（RV I3-9）
-    week, summary, releases = _fixture()
-    prog = summary["progress"]
-    better = [m for m, p in prog.items() if p["v"] == "better"]
-    down = [m for m, p in prog.items() if p["v"] == "down_unconfirmed"]
-    assert better and down, "夹具要各有一个 better 和 down_unconfirmed 指标"
-    assert not (set(better) | set(down)) & {m for r in releases for m in r["metrics"]}   # 不碰 releases 里的判定
-    assert [m for m in down if abs(prog[m]["z"]) >= 2]                    # 被封顶的「显著下降」
-    rc, text = _check(tmp_path, _good())
-    assert rc == 0, text
-    for m in better + down:                                               # 规则 1：better 不出票，*_unconfirmed 不单独出票
-        bad = _good(); bad["tickets"].append(_ticket(f"{m} 变化", m))
-        rc, text = _check(tmp_path, bad)
-        assert rc == 1 and _flagged(text, "unconfirmed_dispatch", m), (m, text)
-        held = _good(); held["tickets"].append(_ticket(f"{m} 提醒", m, decision="hold"))  # 要提醒就 hold：不算违反
-        rc, text = _check(tmp_path, held)
-        assert rc == 0, (m, text)
 
 
 # ---- 上线验收（postlaunch）：方向卡一节、方向审第 4 问、通用模板、SKILL 协议 ---------------------
@@ -410,3 +172,152 @@ def test_skill_documents_postlaunch_protocol():
     for x in ("T+1", "T+3", "T+7", *VERDICTS, "交周报", "增长型", "风险型", "--type", "--behavior", "flat"):
         assert x in body, x
     assert "票的终点是上线验收，不是 released" in text
+
+
+# ---- v2：分析 agent 模板（每日 / 每周 / 校准 / 迁移）----------------------------------------------
+
+GH_FIELDS = ("title", "segment", "want", "walls", "metric", "evidence")
+PROBLEM_KEYS = {"key", "title", "segment", "want", "walls", "metric", "evidence", "impact", "absorbs", "new_evidence"}
+VERDICT_KEYS = {"ticket", "attempt", "verdict", "touched", "hit_wall", "continued", "note", "new_wall"}
+
+
+def _analyst_tpl(mode):
+    return (SKILL / "templates" / f"analyst_{mode}.md").read_text(encoding="utf-8")
+
+
+def _json_example(text, mode):
+    blocks = re.findall(r"```json\n(.*?)\n```", text, re.S)
+    assert len(blocks) == 1, f"{mode}：要恰好一个 ```json 输出示例"
+    return json.loads(blocks[0])
+
+
+def _check_problems(mode, ex):
+    import router
+    assert ex.get("mode") == mode and ex["problems"], mode
+    for i, p in enumerate(ex["problems"]):
+        assert set(p) == PROBLEM_KEYS, (mode, set(p) ^ PROBLEM_KEYS)
+        assert set(p["metric"]) == {"name", "now", "direction"} and set(p["impact"]) == {"size", "gap", "confidence"}
+        router._check_problem(i, p)                     # 和 propose 的校验是同一个函数：示例照抄也收得进来
+
+
+def test_analyst_templates_contract():
+    import store
+    for mode in ANALYST_MODES:
+        text = _analyst_tpl(mode)
+        assert re.search(r"^OUT=\$out$", text, re.M), f"{mode} 缺一行 OUT=$out"
+        assert text.index("OUT=") == text.index("OUT=$out"), f"{mode}：第一个 OUT= 必须就是那一行（运行器按它找产出路径）"
+        red = [line for line in text.splitlines() if "会进 GitHub 的字段" in line]
+        assert red, f"{mode} 缺红线句"
+        assert all(f in red[0] for f in GH_FIELDS) and "uid" in red[0] and "原话" in red[0], (mode, red[0])
+        ex = _json_example(text, mode)
+        if mode == "daily":
+            assert set(ex) <= {"verdicts", "walls", "notes"} and ex["verdicts"], set(ex)
+            for v in ex["verdicts"]:
+                assert set(v) == VERDICT_KEYS, set(v) ^ VERDICT_KEYS
+                assert v["verdict"] in store.BIZ_VERDICTS
+                assert all(type(v[k]) is int for k in ("attempt", "touched", "hit_wall", "continued"))
+                if v["verdict"] == "wall_broken_not_retained":
+                    assert v["new_wall"]
+            assert all(set(w) == {"ticket", "text"} for w in ex["walls"])
+        else:
+            _check_problems(mode, ex)
+    # 校准：盲跑，只给数据入口和时间范围
+    cal = _analyst_tpl("calibrate")
+    assert "$state_summary" not in cal and "$home" not in cal
+    assert "$brief" in cal and "$since" in cal and "$until" in cal
+    assert all(p["absorbs"] == [] for p in _json_example(cal, "calibrate")["problems"])
+
+
+def test_analyst_daily_three_steps_and_verdict_words():
+    import store
+    text = _analyst_tpl("daily")
+    assert [h for h in re.findall(r"^\d+\.\s\*\*(.+?)\*\*", text, re.M)][:3] == ["覆盖", "读对话", "判定"]
+    for v in store.BIZ_VERDICTS:                        # 判定词只能用这六个
+        assert f"`{v}`" in text, v
+    assert "走到墙" in text and "不到 3" in text and "pending_sample" in text
+    assert "7 天" in text and "多数" in text            # 待样本最长 7 天；不一致按多数判
+    for banned in ("显著", "对照组", "置信区间", "A/B"):  # 不做 A/B
+        assert banned not in text, banned
+    assert "$state_summary" in text
+
+
+def test_analyst_weekly_method_impact_maint_and_rejected_memory():
+    text = _analyst_tpl("weekly")
+    for w in ("第一段对话", "第二天回来", "离开前", "漏斗", "墙还在不在"):   # spec §6 方法五条
+        assert w in text, w
+    assert "$home/analyst/rejected.jsonl" in text and "new_evidence" in text
+    assert "size" in text and "gap" in text and "confidence" in text
+    assert "`maint`" in text and "$home/surfaces.json" in text           # 维护项的代码面只能用 surfaces.json 里有的
+    assert "同一群人想要的同一件东西" in text                               # 先归并再提新问题
+    ex = _json_example(text, "weekly")
+    assert set(ex) <= {"mode", "problems", "maint", "walls", "close", "diagnosis"}
+    assert all(set(m) == {"title", "problem", "surfaces", "unblocks"} for m in ex["maint"]) and ex["maint"]
+    assert all(set(w) == {"ticket", "text"} for w in ex["walls"])
+    assert all(set(c) == {"ticket", "reason"} for c in ex["close"])
+    for banned in ("显著", "对照组", "置信区间"):
+        assert banned not in text, banned
+
+
+def test_analyst_migrate_groups_by_same_people_same_want():
+    text = _analyst_tpl("migrate")
+    assert "$state_summary" in text and "同一群人想要的同一件东西" in text and "absorbs" in text
+    ex = _json_example(text, "migrate")
+    assert any(p["absorbs"] for p in ex["problems"])
+
+
+# ---- v2：SKILL.md 协议（票级授权 / 判真 / 唤醒键 / 分析 agent）、worker 的业务票循环 ---------------
+
+V2_WAKE_ROWS = ("analyst_done", "rollback_needed", "no_entry", "return_to_user", "releases_unlabeled")
+
+
+def test_skill_v2_sections():
+    import tick
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "票级授权" in text and "判真" in text and "rollback_needed" in text
+    assert "triage_needed" not in text and "triage.md" not in text
+    # §2：每个唤醒键一行，写清 router 怎么做；表里的键和 tick 的 WAKE_KEYS 一一对上
+    s2 = _section(text, "2.")
+    rows = {m.group(1): line for line in s2.splitlines() for m in [re.match(r"^\|\s*`([a-z_]+)`", line)] if m}
+    for k in tick.WAKE_KEYS:
+        assert k in rows, f"第 2 节缺 `{k}` 一行"
+    for k in V2_WAKE_ROWS:
+        assert len(rows[k]) > 60, k
+    assert "当天照 rollback 文本撤回" in rows["rollback_needed"] and "告诉用户" in rows["rollback_needed"]
+    # §1 启动：分析 agent 的状态和校准状态
+    s1 = _section(text, "1.")
+    assert "分诊" not in s1 and "analyst" in s1 and "calibrated" in s1
+    # §3 分析 agent：先盲跑 calibrate → 对照已知问题判 → analyst calibrated → migrate
+    s3 = _section(text, "3.")
+    order = [s3.find(x) for x in ("--mode calibrate", "已知问题", "analyst calibrated", "--mode migrate")]
+    assert -1 not in order and order == sorted(order), order
+    for m in ANALYST_MODES:
+        assert m in s3, m
+    # §4：业务票的方向卡照旧方向审，submit 后自动确认
+    s4 = _section(text, "4.")
+    assert "业务票" in s4 and "自动确认" in s4 and "票级授权" in s4
+    # §5 谁定什么
+    s5 = _section(text, "5.")
+    for w in ("判真", "票内换方向", "上 prod", "票级授权", "花钱", "撤不回", "商店包"):
+        assert w in s5, w
+    # §6：判真 / 关票的五种回答
+    s6 = _section(text, "6.")
+    for say in ("「Qn 真」", "「Qn 真，先放着」", "「Qn 不是：", "「Qn 关」", "「Qn 不关」"):
+        assert say in s6, say
+    assert "router_ships" in text                       # prod-batch 分出来由 router 自己上的业务票
+    # 决定单按业务影响排，不再按「挡住了几张票」排
+    assert "按业务影响" in text and "按「挡住了几张票」排序" not in text
+
+
+def test_worker_and_brief_business_section():
+    for doc in ("worker.md", "templates/brief.md"):
+        text = (SKILL / doc).read_text(encoding="utf-8")
+        m = re.search(r"^## 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+        assert m, f"{doc} 缺「## 业务票」一节"
+        sec = m.group(1)
+        for w in ("一个问题", "一个方向", "开关", "回放", "报价", "判定", "--rollback"):
+            assert w in sec, (doc, w)
+        for tag in ("spend", "irreversible", "store_release"):
+            assert tag in text, (doc, tag)
+    stop = re.search(r"^##[^\n]*三种情况[^\n]*\n(.*?)(?=^## )", (SKILL / "worker.md").read_text(encoding="utf-8"),
+                     re.S | re.M).group(1)
+    assert "irreversible" in stop and "store_release" in stop

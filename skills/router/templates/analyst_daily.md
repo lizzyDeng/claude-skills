@@ -1,23 +1,61 @@
-# 分析 agent · daily（每日验证前一天的上线）
+# 分析 agent · daily（每日验证：前一天上线的改动有没有用）
 
 OUT=$out
 
+你是 router 的分析 agent。今天的活：给每张业务票「已上线、等判定」的那次尝试下结论，router 当天照结论调整（拆下一道墙 / 换方向 / 撤回 / 查入口）。你只读数据、写一个 JSON 文件：不写代码、不开票、不派活、不写库、不动开关。
+
 - 项目 brief（取数入口和口径，先读）：$brief
 - 时间范围（UTC 日期）：$since ～ $until
+- 顺带读前一天新用户的第一段对话：有新发现就记进 `notes`（候选问题，每周诊断会读）。
 
-🔴 红线：会进 GitHub 的字段（title、segment、want、walls、metric、evidence、note、new_wall、text）不写 uid，也不写用户原话。只读：不写库、不动开关、不开票。
+🔴 红线：会进 GitHub 的字段（title、segment、want、walls、metric、evidence，以及本模板的 note、new_wall、walls[].text）不写 uid，也不写用户原话；只写聚合数、改写过的描述和本地路径。真实对话只在本机读。只读：不写库、不动开关、不开票。
 
 ## 现有业务票
 
 $state_summary
 
+只判「最近一次尝试」的判定是「待判」或 `pending_sample` 的那些。已经有别的判定的不要再判（router 会拒收）。没有等判定的尝试：`verdicts` 写空列表。
+
+## 每次尝试按三步走
+
+1. **覆盖**：数真实碰到新代码的人（剔除测试机，口径照 brief）。前端改动看设备上报的前端版本；服务端改动看每轮快照里的新标记。碰到 0 人：判 `no_entry`，到此为止，不判效果（router 当天去查开关、部署和覆盖）。
+2. **读对话**：碰到改动的人，他们上线之后的对话全部读完。每个人看两件事：
+   - 他有没有走到这堵墙（票上第一道没拆的墙）；走到了，墙还在不在；
+   - 他有没有接着聊下去（门槛照 brief，例如聊到第 10 条）。
+3. **判定**：分母只算走到墙的人。碰到了新代码、但没走到墙的人（例如从没要过图），只计入 `touched`，不计入判定。
+
+| 判定 | 什么时候判 | 还要写什么 |
+|---|---|---|
+| `useful` | 墙没了，他也接着聊了 | — |
+| `wall_broken_not_retained` | 墙没了，但他还是在门槛前走了 | `new_wall`：从他离开前的几句里找出下一道墙（她说了什么、他说了什么，改写成描述，不抄原话） |
+| `useless` | 墙还在 | note 写墙是怎么还在的 |
+| `harmful` | 有人明显被伤到，或者护栏指标变坏（护栏照 brief） | note 写伤到了什么、几个人；router 当天撤回 |
+| `no_entry` | 碰到 0 人（第 1 步） | note 写查了什么 |
+| `pending_sample` | 走到墙的人不到 3 个 | note 写现在几个 |
+
+- 判定词只能用上表这六个。
+- 走到墙的人不到 3 个：判 `pending_sample`，每天重读，最长 7 天（从第一次判 `pending_sample` 算起，约上线后第 8 天）。满 7 天有几个按几个判，不许再判 `pending_sample`（router 会拒收）。
+- 几个人结果不一致：按多数判，同时在 note 里写少数人的情况。
+- 样本小也照样判，只数人头、不做统计检验；note 写清看了几个人、几段对话。
+- 两张业务票碰到同一群人：在 note 里注明重叠（哪张票、几个人）。
+
+## 新的墙、候选问题
+
+- 读对话时发现某张已开业务票卡在了新的一步（同一群人想要的同一件东西）：写进 `walls`，router 直接挂上（问题已经判过真，不用再判）。
+- 不是哪张已开票的事（另一群人，或同一群人想要的另一件东西）：不要写进 `walls`，写进 `notes` 作为候选问题（人群 / 想要什么 / 卡在哪 / 证据路径），每周诊断会读。`notes` 只留在本机，也只写聚合数和本地路径。
+
 ## 产出
 
-对每张等判定的尝试按「覆盖 → 读对话 → 判定」给结论。判定词只能用：no_entry、pending_sample、useful、wall_broken_not_retained、useless、harmful。
-把结果写成一个 JSON 文件，路径就是上面 `OUT=` 那一行，格式：
+把结果写成一个 JSON 文件，路径就是开头 OUT 那一行，格式：
+
+- `touched`：碰到新代码的人数；`hit_wall`：其中走到墙的人数（判定的分母）；`continued`：走到墙的人里接着聊过门槛的人数。四个数（含 `attempt`）都是整数。
+- `new_wall`：只有 `wall_broken_not_retained` 必填，其余写 `null`。
 
 ```json
-{"verdicts": [{"ticket": "T1", "attempt": 1, "verdict": "pending_sample", "touched": 2, "hit_wall": 1, "continued": 0, "note": "示例：走到墙的人不到 3 个"}],
- "walls": [{"ticket": "T1", "text": "示例墙"}],
- "notes": "示例"}
+{"verdicts": [{"ticket": "T1", "attempt": 2, "verdict": "pending_sample", "touched": 5, "hit_wall": 2, "continued": 1,
+               "note": "示例：碰到 5 人，走到墙 2 人（读了 2 段对话），不到 3 人", "new_wall": null},
+              {"ticket": "T3", "attempt": 1, "verdict": "wall_broken_not_retained", "touched": 6, "hit_wall": 4,
+               "continued": 1, "note": "示例：4 人走到墙，墙都没了，3 人在门槛前走了", "new_wall": "示例：下一道墙的改写描述"}],
+ "walls": [{"ticket": "T1", "text": "示例：新发现的墙（改写描述）"}],
+ "notes": "示例：候选问题（人群 / 想要什么 / 卡在哪 / 证据路径）"}
 ```
