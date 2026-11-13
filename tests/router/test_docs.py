@@ -125,7 +125,7 @@ def test_worker_doc_explains_zero_code_tickets():
 def test_direction_review_asks_about_postlaunch_discrimination():
     text = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
     items = re.findall(r"^(\d+)\.\s\*\*(.*?)\*\*", text, re.M)
-    assert [int(n) for n, _ in items] == [1, 2, 3, 4]
+    assert [int(n) for n, _ in items][:4] == [1, 2, 3, 4]                          # v2.1 在后面加了必看项
     q4 = text[text.index("4. "):]
     assert "上线验收" in q4 and "判别力" in q4 and "T+1" in q4 and "没生效" in q4
     assert "行为收益" in q4 and "触点" in q4 and "bug 不再出现" in q4                # 只证明 bug 没了也算挑战
@@ -252,7 +252,7 @@ def test_analyst_weekly_method_impact_maint_and_rejected_memory():
     assert "`maint`" in text and "$home/surfaces.json" in text           # 维护项的代码面只能用 surfaces.json 里有的
     assert "同一群人想要的同一件东西" in text                               # 先归并再提新问题
     ex = _json_example(text, "weekly")
-    assert set(ex) <= {"mode", "problems", "maint", "walls", "close", "diagnosis"}
+    assert set(ex) <= {"mode", "problems", "maint", "walls", "close", "diagnosis", "notes"}   # v2.1：小问题进 notes
     assert all(set(m) == {"title", "problem", "surfaces", "unblocks"} for m in ex["maint"]) and ex["maint"]
     assert all(set(w) == {"ticket", "text"} for w in ex["walls"])
     assert all(set(c) == {"ticket", "reason"} for c in ex["close"])

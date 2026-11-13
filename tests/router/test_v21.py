@@ -158,3 +158,203 @@ def test_v21_1_docs_card_and_scope():
         body = (SKILL / doc).read_text(encoding="utf-8")
         assert "代为确认" not in body and "交用户确认" in body, doc
 
+
+# ---- 第 2 条（+ 补充 A）：一个业务目标一张票，卡点是票里的墙；墙是根因不是表象；业务票能并进另一张业务票 ----------
+
+def _bt(status="postlaunch", **extra):
+    """合成业务票（make_state 的规格）：两道墙，可带尝试。"""
+    base = {"kind": "business", "authorized": True, "title": "合成业务票", "issue": None, "card_confirmed": True,
+            "segment": "合成人群", "want": "合成想要", "metric": {"name": "合成指标"}, "evidence": [],
+            "impact": {}, "absorbs": [], "attempts": [], "no_use_streak": 0, "tasks": [], "parent": None,
+            "walls": [{"id": "W1", "text": "墙1", "status": "open", "source": "analyst", "at": "x"},
+                      {"id": "W2", "text": "墙2", "status": "open", "source": "analyst", "at": "x"}]}
+    base.update(extra)
+    return (status, ["her-reply-prompt"], base)
+
+
+def _seed2(proj, **tickets):
+    from conftest import make_state
+    st = make_state(**tickets)
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    return st
+
+
+def _merge(proj, target="T1", source="T2", *extra, check=True):
+    r = proj.run("merge", target, source, "--said", "合成：T2 并进 T1", *extra, check=check)
+    return json.loads(r.stdout) if check else r
+
+
+_PEND = {"n": 1, "direction": "合成方向乙", "at": "2026-11-01T00:00:00Z", "rollback": "合成：关开关乙", "verdict": None}
+_DONE1 = {"n": 1, "direction": "合成方向甲", "at": "2026-10-20T00:00:00Z", "rollback": "合成：关开关甲",
+          "verdict": "useful", "wall": "W1"}
+
+
+def test_v21_2_merge_moves_walls_evidence_attempts_and_marks_source(proj):
+    _seed2(proj, T1=_bt(attempts=[dict(_DONE1)], evidence=["合成证据甲"],
+                        walls=[{"id": "W1", "text": "墙1", "status": "broken", "source": "analyst", "at": "x"},
+                               {"id": "W2", "text": "墙2", "status": "open", "source": "analyst", "at": "x"}]),
+           T2=_bt(title="合成业务票二", evidence=["合成证据乙", "合成证据甲"],
+                  attempts=[{**_DONE1, "direction": "合成方向丙", "verdict": "useless", "wall": "W1"}]))
+    out = proj.out("merge", "T1", "T2", "--said", "合成：T2 并进 T1")
+    s = proj.state(); t1, t2 = s["tickets"]["T1"], s["tickets"]["T2"]
+    assert out["walls"] == {"W1": "W3", "W2": "W4"} and out["attempts"] == {"1": 2}
+    assert [w["id"] for w in t1["walls"]] == ["W1", "W2", "W3", "W4"] and t1["walls"][2]["from"] == "T2/W1"
+    assert t1["evidence"] == ["合成证据甲", "合成证据乙"]
+    (moved,) = [a for a in t1["attempts"] if a.get("merged_from")]
+    assert moved["n"] == 2 and moved["merged_from"] == "T2" and moved["orig_n"] == 1 and moved["wall"] == "W3"
+    assert t1["attempts"][-1]["n"] == 1                                              # 判完的并入尝试排前面：当前尝试还是 T1 自己的
+    assert t2["status"] == "done" and t2["merged_into"] == "T1" and t2["walls"] == [] and t2["attempts"] == []
+    assert "已并入 T1" in t2["waiting_for"]
+    assert "并入 T2" in (proj.home / "decisions.md").read_text()
+    assert "合成：T2 并进 T1" in (proj.home / "answers.md").read_text()
+    assert "已并入 T1" in (proj.home / "board.html").read_text()
+    assert "已并入 T1" in proj.run("status").stdout
+    import analyst
+    assert "合成业务票二" not in analyst.state_summary(proj.state(), "daily")      # 已并的票不再判、不再派
+    proj.out("tick")
+    assert proj.state()["tickets"]["T2"]["status"] == "done" and not proj.claude()
+
+
+def test_v21_2_merge_inflight_attempt_daily_verdict_lands_on_target(proj):
+    """被并票带着已上线待判的尝试：判定照常归到目标票，daily 写到目标票不报错，拆的是被并过来的那道墙。"""
+    _seed2(proj, T1=_bt(attempts=[dict(_DONE1)],
+                        walls=[{"id": "W1", "text": "墙1", "status": "broken", "source": "analyst", "at": "x"},
+                               {"id": "W2", "text": "墙2", "status": "open", "source": "analyst", "at": "x"}]),
+           T2=_bt(title="合成业务票二", attempts=[dict(_PEND)]))
+    out = _merge(proj)
+    t1 = proj.state()["tickets"]["T1"]
+    n = out["attempts"]["1"]
+    assert t1["attempts"][-1]["n"] == n and t1["attempts"][-1]["verdict"] is None
+    assert t1["attempts"][-1]["wall"] == "W3"                                      # 它当时对准的是 T2 的 W1
+    assert f"尝试 {n}" in t1["waiting_for"]
+    import analyst
+    assert f"尝试 {n}「合成方向乙」" in analyst.state_summary(proj.state(), "daily")
+    d = {"verdicts": [{"ticket": "T1", "attempt": n, "verdict": "useful", "touched": 4, "hit_wall": 3, "continued": 3,
+                       "note": "合成：3 人走到墙，墙没了"}]}
+    p = proj.tmp / "d.json"; p.write_text(json.dumps(d, ensure_ascii=False))
+    res = proj.out("apply-daily", "--from", str(p))
+    assert res["errors"] == [] and len(res["applied"]) == 1
+    t1 = proj.state()["tickets"]["T1"]
+    assert {w["id"]: w["status"] for w in t1["walls"]} == {"W1": "broken", "W2": "open", "W3": "broken", "W4": "open"}
+    assert t1["status"] == "queued"                                               # 目标票空闲：照常拆下一道墙
+    r = proj.run("verdict", "T2", "--attempt", "1", "--verdict", "useful", "--touched", "1", "--hit-wall", "1",
+                 "--continued", "1", "--note", "合成", check=False)
+    assert r.returncode == 1                                                      # 被并票不再收判定
+
+
+def test_v21_2_merge_two_inflight_both_judged_on_target(proj):
+    _seed2(proj, T1=_bt(attempts=[{**_PEND, "direction": "合成方向甲", "wall": "W1"}]),
+           T2=_bt(title="合成业务票二", attempts=[dict(_PEND)]))
+    out = _merge(proj)
+    n2 = out["attempts"]["1"]
+    import analyst
+    summ = analyst.state_summary(proj.state(), "daily")
+    assert "尝试 1「合成方向甲」" in summ and f"尝试 {n2}「合成方向乙」" in summ and "并自 T2" in summ
+    first = json.loads(_verdict(proj, "useful", 1).stdout)                        # 还有一个在等判定：先不重新排队
+    t1 = proj.state()["tickets"]["T1"]
+    assert "deferred" in first["actions"] and t1["status"] == "postlaunch" and t1["walls"][0]["status"] == "broken"
+    assert proj.run("released", "--tickets", "T1", "--what", "x", "--metrics", "m", "--rollback", "r",
+                    check=False).returncode == 1                                  # 一次只验一个：还有待判的不许上新的
+    r = proj.run("redirect", "T1", "--new-card", check=False)
+    assert r.returncode == 1 and "在途" in json.loads(r.stdout)["error"]            # 还有待判：不换方向
+    second = json.loads(_verdict(proj, "useless", n2).stdout)
+    assert "change_direction" in second["actions"] and proj.state()["tickets"]["T1"]["status"] == "queued"
+
+
+def test_v21_2_merge_into_busy_target_defers_requeue(proj):
+    wt = proj.tmp / "wt1"; wt.mkdir()
+    _seed2(proj, T1=_bt(status="executing", worker={"session_id": "s1", "worktree": str(wt), "runs": 1}),
+           T2=_bt(title="合成业务票二", attempts=[dict(_PEND)]))
+    _merge(proj)
+    t1 = proj.state()["tickets"]["T1"]
+    n = t1["attempts"][-1]["n"]
+    assert t1["status"] == "executing"
+    out = json.loads(_verdict(proj, "useless", n).stdout)
+    t1 = proj.state()["tickets"]["T1"]
+    assert "deferred" in out["actions"] and t1["status"] == "executing" and t1["worker"]["session_id"] == "s1"
+    assert "合成备注" in _inbox(proj)                                               # 判定转给在做的 worker
+
+
+def test_v21_2_merge_refusals(proj):
+    import subprocess
+    _seed2(proj, T1=_bt(), T2=_bt(status="executing"), T3=("postlaunch", [], {"title": "老票"}),
+           T4=_bt(status="await_prod", merge_sha="abc", history=[{"at": "x", "status": "await_prod"}]),
+           T5=_bt(status="paused", pr=55), T6=_bt(status="done", merged_into="T1"))
+    for args in (("T1", "T1"), ("T1", "T2"), ("T1", "T3"), ("T3", "T1"), ("T1", "T4"), ("T1", "T5"), ("T1", "T6"),
+                 ("T6", "T1"), ("T1", "T99")):
+        r = _merge(proj, *args, check=False)
+        assert r.returncode == 1, args
+    assert proj.run("merge", "T1", "T2", check=False).returncode == 2                # --said 必填（用户原话）
+    assert proj.run("merge", "T1", "T2", "--said", "x", env={"ROUTER_TICKET": "T1"}, check=False).returncode == 2
+    assert proj.state()["tickets"]["T2"]["status"] == "executing"
+
+
+def test_v21_2_merge_walls_first_and_harm_item_moves(proj):
+    _seed2(proj, T1=_bt(), T2=_bt(title="合成业务票二", attempts=[{**_PEND, "verdict": "harmful", "wall": "W1"}]))
+    st = proj.state()
+    st["seq"]["queue"] = 5
+    st["queue"] = [{"id": "Q4", "ticket": "T2", "kind": "harm", "summary": "T2 尝试 1 有害，需撤回：合成", "created_at": "x",
+                    "notified_at": "x"},
+                   {"id": "Q5", "ticket": "T2", "kind": "close", "summary": "合成", "created_at": "x", "notified_at": "x"}]
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    out = _merge(proj, "T1", "T2", "--walls-first")
+    s = proj.state()
+    assert [w["text"] for w in s["tickets"]["T1"]["walls"]] == ["墙1", "墙2", "墙1", "墙2"]
+    assert [w.get("from") for w in s["tickets"]["T1"]["walls"]][:2] == ["T2/W1", "T2/W2"]
+    assert [(q["id"], q["ticket"]) for q in s["queue"]] == [("Q4", "T1")]          # 有害待撤回挪过去；其余作废
+    assert out["moved_items"] == ["Q4"] and out["dropped_items"] == ["Q5"]
+
+
+def test_v21_2_merge_reparents_absorbed_legacy(proj):
+    from conftest import make_state
+    st = make_state(T1=_bt(attempts=[dict(_DONE1)]),
+                    T2=_bt(title="合成业务票二", absorbs=["T5"],
+                           attempts=[{"n": 1, "direction": "老票五", "shipped_at": "x", "verdict": "legacy",
+                                      "legacy_verdict": "没用", "historical": True}]),
+                    T5=("postlaunch", [], {"title": "老票五", "parent": "T2", "parent_attempt": 1}))
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    out = _merge(proj)
+    s = proj.state()
+    assert s["tickets"]["T5"]["parent"] == "T1" and s["tickets"]["T5"]["parent_attempt"] == out["attempts"]["1"]
+    assert s["tickets"]["T1"]["absorbs"] == ["T5"]
+    hist = [a for a in s["tickets"]["T1"]["attempts"] if a.get("historical")]
+    assert len(hist) == 1 and s["tickets"]["T1"]["attempts"][-1]["n"] == 1        # 历史尝试排在 live 尝试之前
+
+
+def test_v21_2_attempt_breaks_its_own_wall(proj):
+    """released 记下这次尝试对准的墙；判定拆的是那一道（不是判定那一刻的第一道没拆的墙）。"""
+    _seed2(proj, T1=_bt(status="await_prod"))
+    proj.out("released", "--tickets", "T1", "--what", "合成", "--metrics", "m", "--rollback", "合成：关开关")
+    assert proj.state()["tickets"]["T1"]["attempts"][0]["wall"] == "W1"
+
+
+def test_v21_2_propose_flags_same_metric_and_skips_small(proj):
+    from test_business_cli import load, put
+    d = load(maint=[])
+    d["problems"][1]["metric"] = dict(d["problems"][0]["metric"])                  # 两条同一指标
+    out = proj.out("propose", "--from", put(proj, d))
+    s = proj.state()
+    p1, p2 = s["proposals"]["P1"], s["proposals"]["P2"]
+    assert p1["same_metric"] == ["P2"] and p2["same_metric"] == ["P1"]
+    vq = [q for q in s["queue"] if q["kind"] == "verify_problem"]
+    assert all("同指标" in q["summary"] for q in vq)
+    d = load(maint=[])
+    d["problems"][0]["key"], d["problems"][1]["key"] = "k8", "k9"
+    d["problems"][1]["impact"] = {"size": 0.05, "gap": 0.9, "confidence": "high"}   # 人群 < 10%：不成问题
+    out = proj.out("propose", "--from", put(proj, d))
+    assert [p["key"] for p in out["proposals"]] == ["k8"] and out["skipped_small"] == ["k9"]
+
+
+def test_v21_2_templates_one_goal_one_ticket_and_root_cause_walls():
+    from test_docs import SKILL, _section
+    for mode in ("weekly", "calibrate", "migrate"):
+        text = (SKILL / "templates" / f"analyst_{mode}.md").read_text(encoding="utf-8")
+        for w in ("业务目标", "同一指标", "只出一条", "新用户不开口", "开口几句就走", "聊到第 10 句", "不能拆两条",
+                  "自下而上", "在哪一刻走", "表象", "根因", "10%", "notes", "解释了多少", "占比"):
+            assert w in text, (mode, w)
+    rev = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
+    assert "表象" in rev and "小群体" in rev
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "按根归并" in _section(skill, "3.") and "router.py merge" in skill
+    s6 = _section(skill, "6.")
+    assert "router.py merge" in s6 and "--said" in s6

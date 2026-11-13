@@ -67,7 +67,8 @@ def build_cmd(cfg, prompt: str) -> list:
 
 def _attempt_line(a) -> str:
     when = a.get("at") or a.get("shipped_at") or "?"
-    return f"尝试 {a.get('n')}「{a.get('direction', '')}」上线 {when}，判定 {a.get('verdict') or '待判'}"
+    src = f"（并自 {a['merged_from']} 的尝试 {a.get('orig_n', '?')}）" if a.get("merged_from") else ""
+    return f"尝试 {a.get('n')}「{a.get('direction', '')}」{src}上线 {when}，判定 {a.get('verdict') or '待判'}"
 
 
 def state_summary(st, mode) -> str:
@@ -84,6 +85,11 @@ def state_summary(st, mode) -> str:
         cur = store.current_attempt(t)                # 当前尝试 = 最后一条非历史的（历史尝试排在哪都不能盖住它）
         hist = sum(1 for a in t.get("attempts") or [] if a.get("historical"))
         last = _attempt_line(cur) if cur else "还没有尝试"
+        # 并票（v2.1）后一张票可能同时有几次尝试在等判定：都列出来，daily 都要判
+        more = [a for a in t.get("attempts") or [] if a is not cur and not a.get("historical")
+                and a.get("verdict") in (None, "pending_sample")]
+        if more:
+            last += "；另有待判：" + "；".join(_attempt_line(a) for a in more)
         if hist:
             last += f"（另有 {hist} 条老票的历史尝试，不用判）"
         lines.append(f"- {tid}｜{t.get('title', '')}｜{t.get('segment', '')}｜{t.get('status')}｜墙：{walls}｜{last}")

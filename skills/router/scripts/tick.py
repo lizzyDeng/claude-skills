@@ -898,6 +898,11 @@ class Run:
         return str(at)[:10]
 
     def _closeout_body(self, tid, t) -> str:
+        if t.get("merged_into"):                       # v2.1：并进另一张业务票（同一业务目标）
+            into = self.state["tickets"].get(t["merged_into"]) or {}
+            ref = f" #{into['issue']}" if into.get("issue") else ""
+            return (f"本票已并入 {t['merged_into']}{ref}（同一业务目标、同一指标）：墙、证据、尝试都挪过去了，"
+                    "之后在那张票上推进。由 /router 关闭。")
         surf = "、".join(t.get("surfaces", [])) or "未声明"
         return (f"仓外改动已由用户核对（{self._done_date(t)}），本票完成。改动在本机（代码面：{surf}），"
                 f"不经 PR / staging。由 /router 关闭。")

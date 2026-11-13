@@ -91,6 +91,10 @@ def _ticket_card(t, evs, now=None) -> str:
         tags.append('<span class="pill p-review">需复核</span>')
     no = f"#{t['issue']}" if t.get("issue") else t["id"]
     wait = t.get("waiting_for") or ""
+    if t.get("merged_into"):                                    # v2.1：并进了另一张业务票
+        g = "off"
+        tags.append(f'<span class="pill p-off">已并入 {_e(t["merged_into"])}</span>')
+        wait = wait or f"已并入 {t['merged_into']}"
     if sol.get("kind") == "card":
         sol_cell = (f'<div class="cell sol"><h4>解法 · {_e(sol.get("source"))}</h4><p>{_e(sol.get("text"))}</p>'
                     f'<span class="src">{_e(t.get("card", {}).get("path", ""))}</span></div>')

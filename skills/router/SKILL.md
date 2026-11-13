@@ -70,11 +70,13 @@ config `analyst`：`brief`（项目取数 brief 的路径：取数入口、口�
 2. watch 交回 `analyst_done`（mode=calibrate）：读它的 `out`，对照项目的已知问题清单判过没过。同一群人卡在同一处就算找到（说法不同不要紧）；已知问题都找到才算过。已知问题清单不要写进 `analyst.brief` 指向的文件（calibrate 会读那个文件）：放在只有你读的地方。
 3. `router.py analyst calibrated --pass --note "<找到了哪几个、还找到了什么>"`（没过用 `--fail`，note 写漏了哪几个）。
 4. 告诉用户：过没过、它还找到了哪些别的问题（≤ 100 字，详情给 out 路径）。
-5. 过了 ⇒ `router.py analyst run --mode migrate`。跑完 watch 交回 `analyst_done`（mode=migrate）：读它的 `out`，把整份迁移清单交给用户（≤ 100 字给要点，详情给 out 路径）：每个问题（人群、想要、墙、影响分）和它并进来的老票，`attach` 里哪些老票并进哪张已开的业务票，`walls`。用户确认后（可以去掉几条、先放着几条）：`router.py migrate-apply <run> --said "<用户原话>" [--skip <key 或业务票号>,…] [--hold <key>,…]`——问题直接建成业务票（确认 = 判真，默认 start；`--hold` 的只建票），`absorbs` / `attach` 的老票并进去，`walls` 挂上；整份校验过才落，一份 run 只落一次。被并的老票（判真时按 `absorbs`、或 `attach` / `router.py absorb` 并进已开的业务票）：已上线验过收的立即记成业务票的一次历史尝试；还在做的不打断，等它出了上线验收结论（`postlaunch-result`）时自动记一次，之后的结论更新同一条。没过 ⇒ 先修方法（模板、brief 的取数入口）再重跑 calibrate。校准通过之前：新问题只由用户直接提（`router.py add --business …`），在做的票照常做。
+5. 过了 ⇒ `router.py analyst run --mode migrate`。跑完 watch 交回 `analyst_done`（mode=migrate）：读它的 `out`，**先按根归并**（同一群人想要的同一件事 = 同一指标只留一条，两条同指标的给用户标出来、建议并成一条），再把整份迁移清单交给用户（≤ 100 字给要点，详情给 out 路径）：每个问题（人群、想要、墙、影响分）和它并进来的老票，`attach` 里哪些老票并进哪张已开的业务票，`walls`。用户确认后（可以去掉几条、先放着几条）：`router.py migrate-apply <run> --said "<用户原话>" [--skip <key 或业务票号>,…] [--hold <key>,…]`——问题直接建成业务票（确认 = 判真，默认 start；`--hold` 的只建票），`absorbs` / `attach` 的老票并进去，`walls` 挂上；整份校验过才落，一份 run 只落一次。被并的老票（判真时按 `absorbs`、或 `attach` / `router.py absorb` 并进已开的业务票）：已上线验过收的立即记成业务票的一次历史尝试；还在做的不打断，等它出了上线验收结论（`postlaunch-result`）时自动记一次，之后的结论更新同一条。没过 ⇒ 先修方法（模板、brief 的取数入口）再重跑 calibrate。校准通过之前：新问题只由用户直接提（`router.py add --business …`），在做的票照常做。
 
 手动重跑某个模式：`router.py analyst run --mode <模式> [--since YYYY-MM-DD] [--until YYYY-MM-DD]`（同模式已有在跑的不会起第二个）。tick 收产出失败、而产出本身没问题时（例如防泄漏闸配置坏了，已修好）：`router.py apply-daily --from <out>`（daily）/ `router.py propose --from <out>`（weekly）手动收；migrate 只走 `migrate-apply`。
 
 票的来源只有三个：用户判真的问题、用户直接提的问题、维护项（分析 agent 每周列的 / worker 上报的 bug）。老 backlog 要用户点名才收。
+
+**开业务票前先按根归并**（v2.1）：一个业务目标一张票，卡点是票里的墙。判真项、迁移清单交给用户之前，先看有没有同一群人想要的同一件事（同一指标）被拆成了几条（判真项摘要里标了「同指标」的先看）：有就告诉用户这几条是同一目标的几道墙，建议只判真一条、其余并进去（`--skip` 掉，或开票后 `router.py merge <留下的> <并掉的> --said "<原话>"`）。墙是根因不是表象；影响面不到 10% 的不成墙。已经开出来的两张业务票是同一目标：告诉用户，他同意后 `router.py merge`。
 
 ## 4. 方向审（方向卡 → 决定单，派发后 ≤ 30 分钟）
 
@@ -136,7 +138,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「Qn 知道了」/「Qn：…」（`harm` / `return` 项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话办（换方向、关票、重新定义问题见下面几行） |
 | 「T3 换成：…」/「T3 换个方向：…」（业务票没有在途尝试时：判了有害 / 没用 / 有用之后、连续没用退回之后、墙拆完又挂了新墙） | `router.py redirect <T> "<原话>" --as-user`：新方向进收件箱、票回队列派新 worker；清掉这张票的 `harm` / `return` / 卡住重排 / 问下一个方向的项。有在途尝试（已派还没 released，或上线了还没判完）会被拒：等判完 |
 | 「关 T3」 | `router.py close <T> [--reason "<原话里的理由>"]`：业务票收尾（同「Qn 关」）。worker 还在跑会被拒：先 `router.py stop <T>`。还有在途尝试（已上线、还在等 daily 判定）或改动还在 staging / 仓外真身上（合进了 staging 还没 released / 仓外改了还没核对上线；看合并记录和状态历史，不看票现在的状态：stop / takeover 之后照样拒）也会被拒——关了之后有害判定落不下、撤不回：等 daily 判完再关；他要现在关，你先照拒绝信息里这次在途改动的撤回办法撤回（staging 上的 = revert 这次的 PR / 合并 sha；仓外的 = 从 `backups/<T>/` 恢复；已上线在等判定的 = 这次尝试的 `--rollback`）、核实生效，再 `router.py close <T> --rolled-back`（记一条 decide「关票前已撤回」，撤回办法写的是这次在途的改动） |
-| 「把 T5 并进 T7」 | `router.py absorb T7 T5`：老票挂到业务票下（验收过的记一次历史尝试，还在做的出了验收结论再记） |
+| 「把 T5 并进 T7」 | T5 是老票：`router.py absorb T7 T5`：老票挂到业务票下（验收过的记一次历史尝试，还在做的出了验收结论再记）。T5 也是业务票（同一业务目标 / 同一指标）：`router.py merge T7 T5 --said "<原话>"`：T5 的墙、证据、尝试（含已上线待判的，判定照常落到 T7）、并进来的老票挪到 T7，T5 标「已并入 T7」（下一轮巡检关 issue、清本地），有害待撤回项跟过去；被并的票正在做一次尝试（已派、还没上线）会被拒：等上线或先 stop。被并的墙排在前面（它的卡点在用户路径上更早）加 `--walls-first` |
 | 「迁移清单可以」/「迁移可以，k3 不要，k2 先放着」 | `router.py migrate-apply <run> --said "<原话>" [--skip k3] [--hold k2]`（`<run>` 是 `analyst_done` 里 migrate 那次的编号） |
 | 「Qn 重排」（判定后没排上队的卡住项，topic=requeue） | `router.py answer <Qn> "<原话>"`：再排一次队，派新 worker（不在旧 worker 上续跑）；判定后的下一步和他的原话（标「用户原话（逐字）」）一起进收件箱；router 自己处理时加 `--as-router` |
 | 「Qn：<方向>」（问「要下一个方向吗」的项，topic=next） | `router.py answer <Qn> "<原话>"`（= `redirect --as-user`）。你不定方向：`answer --as-router` 和 `redirect --as-router` 一律拒；要往下走就 `router.py redirect <T> --new-card`（新 worker 出方向卡交用户确认） |

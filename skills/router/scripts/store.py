@@ -296,14 +296,27 @@ def attach_wall(state: dict, tid: str, text: str, source: str, at: str) -> str:
     return wid
 
 
+def first_open_wall(t: dict):
+    """第一道没拆的墙的编号；没有 → None。"""
+    return next((w.get("id") for w in t.get("walls") or [] if w.get("status") == "open"), None)
+
+
 def add_attempt(state: dict, tid: str, direction: str, at: str, rollback: str) -> int:
-    attempts = state["tickets"][tid]["attempts"]
+    """记一次尝试；wall = 这次尝试对准的墙（上线那一刻第一道没拆的墙），判定拆的就是它（v2.1：并票后墙的顺序会变）。"""
+    t = state["tickets"][tid]
+    attempts = t["attempts"]
     n = max((a.get("n", 0) for a in attempts), default=0) + 1
-    attempts.append({"n": n, "direction": direction, "at": at, "rollback": rollback, "verdict": None})
+    attempts.append({"n": n, "direction": direction, "at": at, "rollback": rollback, "verdict": None,
+                     "wall": first_open_wall(t)})
     return n
 
 
-def _break_first_open(t: dict) -> None:
+def _break_wall(t: dict, wid=None) -> None:
+    """拆这次尝试对准的那道墙（wid，还没拆的话）；没记 wid（v2.1 之前的尝试）或它已经拆了 ⇒ 拆第一道没拆的墙。"""
+    for w in t["walls"]:
+        if wid and w.get("id") == wid and w["status"] == "open":
+            w["status"] = "broken"
+            return
     for w in t["walls"]:
         if w["status"] == "open":
             w["status"] = "broken"
@@ -341,9 +354,9 @@ def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touc
     elif verdict == "pending_sample":
         actions = ["wait"]
     elif verdict == "useful":
-        _break_first_open(t); t["no_use_streak"] = 0; actions = ["next_wall"]
+        _break_wall(t, a.get("wall")); t["no_use_streak"] = 0; actions = ["next_wall"]
     elif verdict == "wall_broken_not_retained":
-        _break_first_open(t); t["no_use_streak"] = 0
+        _break_wall(t, a.get("wall")); t["no_use_streak"] = 0
         attach_wall(state, tid, new_wall, "verdict", at); actions = ["next_wall"]
     elif verdict == "useless":
         t["no_use_streak"] += 1

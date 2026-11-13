@@ -33,7 +33,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
                "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact",
-               "redirect", "close", "absorb", "migrate-apply"}
+               "redirect", "close", "absorb", "migrate-apply", "merge"}
 # answer --as-router 只收这几类、且只收票级授权的业务票：方向卡（card）、花钱 / 撤不回 / 发商店包（spend）、判真、关票、
 # 有害 / 退回（harm、return）都归用户；方向项里问「要下一个方向吗」（next）和「核心假设被推翻」（assumption）也归用户（v2.1 第 1 条）
 AS_ROUTER_KINDS = {"direction", "stuck", "conflict"}
@@ -615,10 +615,13 @@ def propose_from(env, st, data) -> dict:
     rejected, at = _rejected_keys(env), env.now()
     pending = {(st.get("proposals", {}).get(q.get("proposal") or "") or {}).get("key")
                for q in st["queue"] if q["kind"] == "verify_problem"}
-    out, skipped = [], []
+    out, skipped, small = [], [], []
     for p in problems:
         if p["key"] in pending or (p["key"] in rejected and not (p.get("new_evidence") or "").strip()):
             skipped.append(p["key"])
+            continue
+        if (p.get("impact") or {}).get("size", 1) < SMALL_SHARE:   # 人群 < 10%：不成问题（v2.1 补充 A），该写进 notes
+            small.append(p["key"])
             continue
         st["seq"]["proposal"] = st["seq"].get("proposal", 0) + 1
         pid = f"P{st['seq']['proposal']}"
@@ -626,6 +629,7 @@ def propose_from(env, st, data) -> dict:
         qid = store.push_queue(st, None, "verify_problem", f"判真：{p['title']}（{p['segment']}）", at)
         st["queue"][-1]["proposal"] = pid
         out.append({"id": pid, "key": p["key"], "title": p["title"], "queue": qid})
+    _flag_same_metric(st, [x["id"] for x in out])
     offered = []
     for w in walls:
         offered.append(_add_wall(env, st, w["ticket"], w["text"], "weekly")[1])
@@ -639,8 +643,35 @@ def propose_from(env, st, data) -> dict:
             mids.append(tid)
     # 只建 / 追加 DRAFT，不在这里 start：start 会建 issue、起 worker、中途落盘，不能放进可回滚的收产出里
     to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start,
-            "next_items": [q for q in offered if q]}
+    return {"ok": True, "proposals": out, "skipped": skipped, "skipped_small": small, "maint": mids,
+            "to_start": to_start, "next_items": [q for q in offered if q]}
+
+
+SMALL_SHARE = 0.1          # v2.1 补充 A：人群 / 解释的流失不到 10% 的不成问题、不成墙
+
+
+def _metric_key(m) -> str:
+    return re.sub(r"\s+", "", str((m or {}).get("name", "") if isinstance(m, dict) else m or "")).lower()
+
+
+def _flag_same_metric(st, pids) -> None:
+    """新进决定单的判真提议：和别的待判提议、或在途的业务票同一指标 ⇒ 记 same_metric、判真项摘要里提一句
+    （v2.1 第 2 条：同一指标只出一条，router 判真前先按根归并）。只提示，不拦。"""
+    props = st.get("proposals") or {}
+    waiting = {q.get("proposal") for q in st["queue"] if q["kind"] == "verify_problem"}
+    live = {tid: _metric_key(t.get("metric")) for tid, t in st["tickets"].items()
+            if store.ticket_kind(t) == "business" and t["status"] not in (store.DONE, store.SKIP)}
+    for pid in pids:
+        key = _metric_key(props[pid].get("metric"))
+        if not key:
+            continue
+        same = [o for o in sorted(waiting) if o and o != pid and _metric_key((props.get(o) or {}).get("metric")) == key]
+        same += [tid for tid, k in live.items() if k == key]
+        if not same:
+            continue
+        props[pid]["same_metric"] = same
+        q = next(q for q in st["queue"] if q.get("proposal") == pid)
+        q["summary"] += f"（和 {'、'.join(same)} 同指标「{props[pid]['metric'].get('name', '')}」：先看是不是同一目标，是就并成一条）"
 
 
 def _refuse_leaks(env, items) -> None:
@@ -1067,8 +1098,11 @@ def _redirect_core(env, st, tid, text, who, record_answer=True) -> dict:
                    "当前尝试已判完的业务票")
     last = store.current_attempt(t)
     verdict = (last or {}).get("verdict")
-    if last is None or verdict in (None, "pending_sample"):
-        raise Fail(f"{tid} 有在途尝试：尝试 {(last or {}).get('n', '?')} 还在等 daily 判定（{verdict or '待判'}），判完再换方向")
+    waiting = next((a for a in t.get("attempts") or [] if not a.get("historical")
+                    and a.get("verdict") in (None, "pending_sample")), None)     # 并票后可能不止一次在等判定
+    if last is None or waiting is not None:
+        w = waiting or last or {}
+        raise Fail(f"{tid} 有在途尝试：尝试 {w.get('n', '?')} 还在等 daily 判定（{w.get('verdict') or '待判'}），判完再换方向")
     pending_return = [q["id"] for q in st["queue"] if q.get("ticket") == tid and q["kind"] == "return"]
     if pending_return and who != "user":
         raise Fail(f"{tid} 已退回用户（{'、'.join(pending_return)} 还没回）：下一步由用户定（换方向 / 重新定义问题 / 关），"
@@ -1158,6 +1192,124 @@ def cmd_absorb(a, env):
         did = store.append_decision(env.decisions, st, a.ticket, f"并入老票 {' '.join(a.olds)}",
                                     "同一群人想要的同一件东西（spec §4.7）", "router.py absorb", env.now())
     return {"ok": True, "ticket": a.ticket, "absorbed": a.olds, "attempts_added": added, "decision": did}
+
+
+# 并票（v2.1 第 2 条）：一个业务目标一张票，同一指标的两张业务票并成一张
+MERGE_SOURCE_OK = {store.DRAFT, store.HOLD, store.QUEUED, store.POSTLAUNCH, store.PAUSED, store.STUCK}
+
+
+def _merge_checks(env, st, tid, sid) -> None:
+    if tid == sid:
+        raise Fail("不能把票并进自己")
+    for x in (tid, sid):
+        t = env.ticket(st, x)
+        if store.ticket_kind(t) != "business":
+            raise Fail(f"{x} 不是业务票：merge 只并业务票（老票并进业务票用 absorb）")
+        if t.get("merged_into"):
+            raise Fail(f"{x} 已经并进了 {t['merged_into']}")
+    t, s = st["tickets"][tid], st["tickets"][sid]
+    if t["status"] in (store.DONE, store.SKIP):
+        raise Fail(f"{tid} 已关（{t['status']}）：不能往关掉的票里并")
+    if s["status"] not in MERGE_SOURCE_OK:
+        raise Fail(f"{sid} 正在做一次尝试（{s['status']}）：等这次尝试上线（之后的判定会跟着并过去），"
+                   f"或 stop 之后再并")
+    _refuse_pending(s, sid, env.ctx)
+    if launcher.worker_alive(env.ctx, s["worker"]):
+        raise Fail(f"{sid} 的 worker 还在跑（pid {s['worker'].get('pid')}）：先 stop {sid} 再并")
+    if store.staging_pending(s) or store.offrepo_pending(s):
+        raise Fail(f"{sid} 还有改动在 staging / 仓外真身上、没上线判定：等它上线（判定会跟着并过去）或撤回之后再并")
+    if s.get("pr") and not s.get("merge_sha"):
+        raise Fail(f"{sid} 的 PR #{s['pr']} 还开着没合：先关掉或等它合进 staging、上线之后再并")
+
+
+def merge_business(env, st, tid, sid, said, walls_first=False) -> dict:
+    """把业务票 sid 并进业务票 tid（调用方持锁、负责存盘）：墙 / 证据 / 尝试（含已上线待判的）/ 并进来的老票挪到 tid，
+    sid 标成已并（done + merged_into，下一轮巡检关 issue、清本地），不再派发、不再收判定；记一条 decide。
+    墙重新编号（记 from = 原票/原编号）；尝试重新编号（记 merged_from / orig_n），对准的墙一并换号——判定拆的是它原来对准的那道。
+    sid 决定单上的有害待撤回项挪到 tid（撤回照样要做），其余项作废。"""
+    _merge_checks(env, st, tid, sid)
+    t, s, at = st["tickets"][tid], st["tickets"][sid], env.now()
+    for x in (t, s):                                   # v2.1 之前的在途尝试没记对准哪道墙：按并之前的第一道没拆的墙补上
+        first = store.first_open_wall(x)
+        for a in x.get("attempts") or []:
+            if not a.get("historical") and a.get("verdict") in (None, "pending_sample") and "wall" not in a:
+                a["wall"] = first
+    nums = [int(w["id"][1:]) for w in t["walls"] if str(w.get("id", "")).startswith("W") and w["id"][1:].isdigit()]
+    nxt, wmap, moved_walls = max(nums, default=0), {}, []
+    for w in s.get("walls") or []:
+        nxt += 1
+        wmap[w.get("id")] = f"W{nxt}"
+        moved_walls.append({**w, "id": f"W{nxt}", "from": f"{sid}/{w.get('id')}"})
+    t["walls"] = moved_walls + t["walls"] if walls_first else t["walls"] + moved_walls
+    t["evidence"] = list(t.get("evidence") or []) + [e for e in s.get("evidence") or [] if e not in (t.get("evidence") or [])]
+    n, amap = max((a.get("n", 0) for a in t["attempts"]), default=0), {}
+    hist, done, live = [], [], []
+    for a in s.get("attempts") or []:
+        n += 1
+        amap[a.get("n")] = n
+        b = {**a, "n": n, "merged_from": sid, "orig_n": a.get("n")}
+        if b.get("wall") in wmap:
+            b["wall"] = wmap[b["wall"]]
+        (hist if a.get("historical") else live if a.get("verdict") in (None, "pending_sample") else done).append(b)
+    first_live = next((i for i, a in enumerate(t["attempts"]) if not a.get("historical")), len(t["attempts"]))
+    t["attempts"][first_live:first_live] = hist + done     # 历史 / 判完的排在目标票自己的尝试之前；待判的排最后
+    t["attempts"] += live
+    olds = []
+    for oid in s.get("absorbs") or []:                 # 并进被并票的老票：改挂到目标票，历史尝试号跟着换
+        o = st["tickets"].get(oid)
+        if o is None:
+            continue
+        o["parent"] = tid
+        if o.get("parent_attempt") in amap:
+            o["parent_attempt"] = amap[o["parent_attempt"]]
+        if oid not in t.setdefault("absorbs", []):
+            t["absorbs"].append(oid)
+        olds.append(oid)
+    moved_q, dropped_q = [], []
+    for q in st["queue"]:
+        if q.get("ticket") != sid:
+            continue
+        if q["kind"] == "harm":                        # 有害待撤回：撤回照样要做，挪到目标票
+            q["ticket"], q["summary"] = tid, f"（并自 {sid}）{q['summary']}"
+            moved_q.append(q["id"])
+        else:
+            dropped_q.append(q["id"])
+    st["queue"] = [q for q in st["queue"] if q["id"] not in dropped_q]
+    for items in (st.get("wake") or {}).values():      # 还没交给 router 的唤醒项：票号、尝试号跟着换
+        for it in items:
+            if isinstance(it, dict) and it.get("ticket") == sid:
+                it["ticket"] = tid
+                if it.get("attempt") in amap:
+                    it["attempt"] = amap[it["attempt"]]
+    s["walls"], s["attempts"], s["absorbs"], s["evidence"] = [], [], [], []
+    s["merged_into"], s["merged_at"] = tid, at
+    s["closeout"] = {"downstream": {}, "issue": "pending" if s.get("issue") else "n/a",
+                     "worktree": "pending", "branch": "pending"}
+    store.set_status(st, sid, store.DONE, at, f"已并入 {tid}（收尾中：下一轮巡检关 issue、清 worktree）")
+    pending = [a for a in t["attempts"] if not a.get("historical") and a.get("verdict") in (None, "pending_sample")]
+    offered = None
+    if t["status"] == store.POSTLAUNCH and live:
+        t["waiting_for"] = "等 daily 判定" + "、".join(f"尝试 {a['n']}" for a in pending) + f"（含并自 {sid} 的）"
+    elif t["status"] == store.POSTLAUNCH and not pending:
+        offered = _offer_next(env, st, tid, f"并入 {sid}，墙多了")
+    _append_local(env.home / "answers.md", f"- {at} | - | merge | {tid}←{sid} | {' '.join(said.splitlines())}")
+    did = store.append_decision(
+        env.decisions, st, tid, f"并入 {sid}：墙 {'、'.join(f'{k}→{v}' for k, v in wmap.items()) or '无'}；"
+        f"尝试 {'、'.join(f'{k}→{v}' for k, v in amap.items()) or '无'}" + (f"；老票 {'、'.join(olds)}" if olds else ""),
+        "用户确认：同一业务目标（同一指标）只留一张票（v2.1 第 2 条）",
+        f"用户原话见 answers.md（merge）；{sid} 原指标「{(s.get('metric') or {}).get('name', '')}」", at)
+    return {"ok": True, "target": tid, "source": sid, "walls": wmap, "attempts": {str(k): v for k, v in amap.items()},
+            "absorbs": olds, "moved_items": moved_q, "dropped_items": dropped_q, "decision": did,
+            **({"next_item": offered} if offered else {})}
+
+
+def cmd_merge(a, env):
+    """用户说「把 T5 并进 T7」（两张都是业务票）：merge T7 T5 --said "<原话>"。见 merge_business。"""
+    said = (a.said or "").strip()
+    if not said:
+        raise Fail("--said 要写用户确认并票时的原话")
+    with env.state() as st:
+        return merge_business(env, st, a.target, a.source, said, walls_first=a.walls_first)
 
 
 def cmd_submit_card(a, env):
@@ -1711,6 +1863,11 @@ def _wake(st, key, item) -> None:
     st.setdefault("wake", {}).setdefault(key, []).append(item)
 
 
+# 判定落下时票正在做别的事（只有并票之后会出现）：不重新排队
+_VERDICT_BUSY = {store.DRAFT, store.HOLD, store.QUEUED, store.KICKOFF, store.AWAIT_CARD, store.EXECUTING,
+                 store.VERIFYING, store.MERGED, store.AWAIT_CHECK, store.AWAIT_PROD}
+
+
 def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, note, new_wall=None) -> list:
     t = env.ticket(st, tid)
     if store.ticket_kind(t) != "business":
@@ -1728,6 +1885,16 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
     att = next(x for x in t["attempts"] if x.get("n") == n)
     if "return_to_user" in actions:                                      # 连续没用：退回用户，不再叫醒 worker
         actions = [x for x in actions if x != "change_direction"]
+    # 并票（v2.1）之后：目标票正在做别的尝试，或还有别的尝试在等判定 ⇒ 判定照记、墙照拆，但不重新排队 / 不退回
+    # （会打断正在做的那次）；判定转进它的收件箱。撤回、查入口照常（改动已经在 prod 上）。
+    busy = t["status"] in _VERDICT_BUSY
+    deferred = [x for x in actions if x in ("next_wall", "change_direction", "return_to_user")] \
+        if busy or store.attempt_inflight(t) else []
+    if deferred:
+        actions = [x for x in actions if x not in deferred]
+        events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell",
+                                       "summary": f"尝试 {n}「{att.get('direction', '')}」判定 {verdict}（{note}）。"
+                                                  "这张票还有别的尝试在做 / 在等判定：先不重新排队，墙的状态见尝试记录"})
     for act in actions:
         if act in ("next_wall", "change_direction"):
             opens = [w for w in t["walls"] if w["status"] == "open"]
@@ -1743,13 +1910,15 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
             store.push_queue(st, tid, "return", f"{tid} 连续 {t['no_use_streak']} 次没用，退回用户定夺", env.now())
             _wake(st, "return_to_user", {"ticket": tid, "attempt": n})
         elif act == "rollback":
-            t["waiting_for"] = "有害：等 router 按回滚办法撤回"
+            if not busy:
+                t["waiting_for"] = "有害：等 router 按回滚办法撤回"
             store.push_queue(st, tid, "harm", f"{tid} 尝试 {n} 有害，需撤回：{att.get('rollback', '')}", env.now())
             _wake(st, "rollback_needed", {"ticket": tid, "rollback": att.get("rollback", "")})
         elif act == "check_entry":
-            t["waiting_for"] = "没有入口：等 router 查入口"
+            if not busy:
+                t["waiting_for"] = "没有入口：等 router 查入口"
             _wake(st, "no_entry", {"ticket": tid, "attempt": n})
-    return actions
+    return actions + (["deferred"] if deferred else [])
 
 
 def _requeue_business(env, st, tid, text, wait) -> None:
@@ -2100,7 +2269,8 @@ def cmd_status(a, env):
         t = st["tickets"][tid]
         issue = f" #{t['issue']}" if t["issue"] else ""
         wait = f" · 等：{t['waiting_for']}" if t["waiting_for"] else ""
-        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}"
+        merged = f" · 已并入 {t['merged_into']}" if t.get("merged_into") else ""
+        lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{merged}{wait}{_closeout_line(t.get('closeout'))}"
                      f"{_postlaunch_line(t, env.now())}{_stale_line(t)}")
     print("\n".join(lines))
     return None
@@ -2183,6 +2353,10 @@ def build_parser():
                    help="还有在途尝试 / 改动时：router 已照撤回办法撤回，确认要关（记一条 decide）")
     s = sub.add_parser("absorb", help="把老票并进已有的业务票（设 parent；验收过的记一次历史尝试）")
     s.add_argument("ticket"); s.add_argument("olds", nargs="+")
+    s = sub.add_parser("merge", help="把业务票并进另一张业务票（同一业务目标 / 同一指标）：墙、证据、尝试挪过去，被并票标已并")
+    s.add_argument("target", help="留下的业务票"); s.add_argument("source", help="被并的业务票")
+    s.add_argument("--said", required=True, help="用户确认并票时的原话（进 answers.md）")
+    s.add_argument("--walls-first", action="store_true", help="被并票的墙排在目标票的墙前面（它的卡点在用户路径上更早）")
     s = sub.add_parser("migrate-apply", help="用户确认整份迁移清单后落 migrate 的产出（建业务票、并老票）")
     s.add_argument("run", help="migrate 的 run 编号（analyst_done 里的 run，如 migrate-1）")
     s.add_argument("--said", required=True, help="用户确认时的原话（进 answers.md）")
