@@ -41,7 +41,8 @@ SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # �
 QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch",
                "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next"}
+# assumption：核心假设被推翻的方向项（v2.1：方向归用户，router 不能 --as-router 代答）
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -486,7 +487,8 @@ def _draft_count(state) -> int:
 
 
 def router_owned(t: dict) -> bool:
-    """业务票且已授权：方向卡 / 走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。"""
+    """业务票且已授权：走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。
+    v2.1：方向卡不在内——业务票的方向卡也交用户确认；router 只上用户确认过的方案（card_confirmed_by=user）。"""
     return ticket_kind(t) == "business" and bool(t.get("authorized"))
 
 

@@ -465,14 +465,16 @@ class Run:
             t["stops"] += 1
             kind = "spend" if STOP_TAGS & set(last.get("affects", {}).get("tags", [])) else STOP_KIND[last["type"]]
             prefix = {"assumption_broken": "核心假设被推翻：", "overreach": "要越界："}.get(last["type"], "")
-            qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}")
+            # 核心假设被推翻 = 用户确认过的方向不成立了：方向归用户，router 不能代答（v2.1 第 1 条）
+            topic = "assumption" if kind == "direction" and last["type"] == "assumption_broken" else None
+            qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}", topic=topic)
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
         elif phase == "card_ready" and t["status"] == store.KICKOFF:
             t["card_ready_at"] = self.now
             t["waiting_for"] = "router 方向审中"
             self.res["cards_for_review"].append(tid)
         elif phase == "pr_opened" and not t.get("card_confirmed"):
-            # 🔴 方向卡没经用户确认就开了 PR：不进验收，更不会被合（方案确认归用户）
+            # 🔴 方向卡没经用户确认就开了 PR：不进验收，更不会被合（方案确认归用户，业务票也一样）
             qid = self.queue(tid, "direction", f"{tid}：方向卡还没确认就开了 PR，不会合；先确认或驳回方向卡")
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
         elif phase == "pr_opened":
@@ -749,7 +751,8 @@ class Run:
             return
         owned = store.router_owned(t)
         if owned:
-            store.set_status(self.state, tid, store.AWAIT_PROD, self.now, "已合 staging（票级授权，免走查）：等 router 上 prod")
+            store.set_status(self.state, tid, store.AWAIT_PROD, self.now,
+                             "已合 staging（票级授权，免走查）：等 router 按发版批次上 prod")
             self._prod_ready(tid, t)
         else:
             store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")

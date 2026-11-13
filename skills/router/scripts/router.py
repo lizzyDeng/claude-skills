@@ -34,9 +34,10 @@ ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revo
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
                "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact",
                "redirect", "close", "absorb", "migrate-apply"}
-# answer --as-router 只收这几类、且只收票级授权的业务票：花钱 / 撤不回 / 发商店包（spend）、判真、关票、
-# 有害 / 退回（harm、return）都归用户
-AS_ROUTER_KINDS = {"card", "direction", "stuck", "conflict"}
+# answer --as-router 只收这几类、且只收票级授权的业务票：方向卡（card）、花钱 / 撤不回 / 发商店包（spend）、判真、关票、
+# 有害 / 退回（harm、return）都归用户；方向项里问「要下一个方向吗」（next）和「核心假设被推翻」（assumption）也归用户（v2.1 第 1 条）
+AS_ROUTER_KINDS = {"direction", "stuck", "conflict"}
+USER_TOPICS = {"next", "assumption"}
 ROUTER_LABEL = "router 决定"
 ROUTER_RELAY = "router 转述 / 决定"           # tell --as-router：router 自己的话（转述 / 决定），不冒充用户原话
 USER_LABEL = "用户原话（逐字）"
@@ -158,8 +159,6 @@ def _resume_prompt(kind, text, inbox, as_router=False, relay=False):
                   *[f"- [{m.get('type')}] {m.get('summary', '')}（来自 {m.get('ticket', 'router')}）" for m in inbox], ""]
     if relay:
         hint = "照上面 router 转来的话继续当前阶段（这是 router 的话，不是用户原话）。"
-    elif as_router and kind == "card":
-        hint = "方向卡已确认（票级授权，router 代为确认）。进入 worker.md 第 2 段「执行」。"
     elif as_router:
         hint = f"照上面的{ROUTER_LABEL}继续当前阶段（票级授权，router 代为回答）。"
     else:
@@ -430,7 +429,10 @@ def _check_as_router(st, q, reject) -> None:
     if not t or not store.router_owned(t):
         raise Fail(f"{q['id']} 不是票级授权的业务票的项：只能由用户回（去掉 --as-router，照用户原话答）")
     if q["kind"] not in AS_ROUTER_KINDS:
-        raise Fail(f"{q['id']} 是 {q['kind']} 项：归用户定（花钱 / 撤不回 / 发商店包、判真、关票、有害、退回），不能代答")
+        raise Fail(f"{q['id']} 是 {q['kind']} 项：归用户定（方向卡、花钱 / 撤不回 / 发商店包、判真、关票、有害、退回），不能代答")
+    if q.get("topic") in USER_TOPICS:
+        raise Fail(f"{q['id']} 问的是方向（{q['topic']}）：方向归用户定，router 不能代答。要出新方向卡交用户："
+                   f"router.py redirect {q['ticket']} --new-card；用户给了方向：照原话 answer（不加 --as-router）")
 
 
 def cmd_answer(a, env):
@@ -475,10 +477,10 @@ def cmd_answer(a, env):
             said = f"{ROUTER_LABEL if as_router else USER_LABEL}：{a.text}"     # 回答的原话原样带给新 worker
             _requeue_business(env, st, t["id"], f"{q['next']}\n{said}" if q.get("next") else said, REQUEUE_WAIT)
             hint = "已重新排队，调度器派新 worker"
-        elif topic == "next":                            # 「要下一个方向吗」：回答 = 下一个方向（同 redirect）
+        elif topic == "next":                            # 「要下一个方向吗」：用户的回答 = 下一个方向（同 redirect --as-user）
             if not t:
                 raise Fail(f"{q['id']} 指向的票不在了")
-            extra = _redirect_core(env, st, t["id"], a.text, as_router, record_answer=False)
+            extra = _redirect_core(env, st, t["id"], a.text, "user", record_answer=False)
             extra.pop("ok", None)
             hint = "已换方向、重新排队，调度器派新 worker"
         elif q["kind"] == "postlaunch":
@@ -490,9 +492,11 @@ def cmd_answer(a, env):
             if kind == "card" and a.reject:
                 kind = "reject"
                 t["card_confirmed"] = False
+                t.pop("card_confirmed_by", None)
                 t["solution"]["source"] = re.sub(r"（.*?）$", "（被驳回）", t["solution"]["source"])
-            elif kind == "card":
+            elif kind == "card":                     # 方向卡只由用户确认（--as-router 在 _check_as_router 已拒）
                 t["card_confirmed"] = True
+                t["card_confirmed_by"] = "user"
                 t["solution"]["source"] = t["solution"]["source"].replace("待你确认", "已确认")
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
             how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"), as_router=as_router)
@@ -1038,11 +1042,19 @@ def _check_absorb(st, tid, olds) -> None:
             raise Fail(f"{oid} 已经并进了 {o['parent']}")
 
 
-def _redirect_core(env, st, tid, text, as_router, record_answer=True) -> dict:
-    """业务票换方向（redirect 和回答「要下一个方向吗」项共用）：新方向写进收件箱、票回 queued，调度器派新 worker
-    （读收件箱和尝试记录，出新方向卡）。不在原 worker 上 resume。清掉这张票的 harm / return / requeue / next 项。
+NEW_CARD_REFUSE = ("换方向归用户定（v2.1）：router 不能自己定方向。要换方向就出新方向卡交用户确认："
+                   "router.py redirect {t} --new-card（新 worker 照没拆的墙和已试方向提方向，卡交用户）；"
+                   "用户给了方向：router.py redirect {t} \"<原话>\" --as-user")
+
+
+def _redirect_core(env, st, tid, text, who, record_answer=True) -> dict:
+    """业务票换方向（redirect 和回答「要下一个方向吗」项共用）：话写进收件箱、票回 queued，调度器派新 worker
+    （读收件箱和尝试记录，出新方向卡，卡交用户确认）。不在原 worker 上 resume。清掉这张票的 harm / return / requeue / next 项。
     只看有没有在途尝试（已派、没 released，或上线了还没判完），不看上一次判了什么（终审 #3）。
-    退回用户（return 项没回）时只收用户定的方向（--as-user）；没用的连续计数只在用户定方向时归零（终审 #4）。"""
+    who：user = 用户定的方向（原话）；new_card = router 只要一张新方向卡，不定方向（v2.1 第 1 条：方向一律用户定）。
+    退回用户（return 项没回）时只收用户定的方向；没用的连续计数只在用户定方向时归零（终审 #4）。"""
+    if who not in ("user", "new_card"):
+        raise Fail(NEW_CARD_REFUSE.format(t=tid))
     t = env.ticket(st, tid)
     if store.ticket_kind(t) != "business":
         raise Fail(f"{tid} 不是业务票：redirect 只给业务票（老票用 tell / add 跟进票）")
@@ -1058,41 +1070,49 @@ def _redirect_core(env, st, tid, text, as_router, record_answer=True) -> dict:
     if last is None or verdict in (None, "pending_sample"):
         raise Fail(f"{tid} 有在途尝试：尝试 {(last or {}).get('n', '?')} 还在等 daily 判定（{verdict or '待判'}），判完再换方向")
     pending_return = [q["id"] for q in st["queue"] if q.get("ticket") == tid and q["kind"] == "return"]
-    if pending_return and as_router:
-        raise Fail(f"{tid} 已退回用户（{'、'.join(pending_return)} 还没回）：下一个方向由用户定，"
-                   "用 --as-user 记他的原话（router 不能代定）")
+    if pending_return and who != "user":
+        raise Fail(f"{tid} 已退回用户（{'、'.join(pending_return)} 还没回）：下一步由用户定（换方向 / 重新定义问题 / 关），"
+                   "他给了方向用 --as-user 记他的原话（router 不能出新卡绕过）")
     returned = t.get("waiting_for") == RETURN_WAIT or bool(pending_return)
-    label = ROUTER_LABEL if as_router else USER_LABEL
-    _requeue_business(env, st, tid,
-                      f"换方向（尝试 {last['n']} 判定 {verdict}）。{label}：{text}。"
-                      "先读尝试记录和没拆的墙，再从第 1 段写新方向卡。", REDIRECT_WAIT)
+    if who == "user":
+        msg = (f"换方向（尝试 {last['n']} 判定 {verdict}）。{USER_LABEL}：{text}。"
+               "先读尝试记录和没拆的墙，再从第 1 段照这个方向写新方向卡（卡交用户确认）。")
+    else:
+        msg = (f"出新方向卡（尝试 {last['n']} 判定 {verdict}）。router 没定方向：方向由你照没拆的墙和已试方向提，"
+               "方向卡交用户确认。先读尝试记录和没拆的墙，对准第一道没拆的墙从第 1 段写新方向卡，别在已试的原路上再试。")
+    _requeue_business(env, st, tid, msg, REDIRECT_WAIT)
     cleared = [q["id"] for q in st["queue"] if q.get("ticket") == tid
                and (q["kind"] in ("harm", "return") or q.get("topic") in ("requeue", "next"))]
     st["queue"] = [q for q in st["queue"] if q["id"] not in cleared]
-    if returned and not as_router:                    # 退回用户后由他定了新方向：没用的连续计数重新算
+    if returned and who == "user":                    # 退回用户后由他定了新方向：没用的连续计数重新算
         t["no_use_streak"] = 0
-    if record_answer and not as_router:
+    if record_answer and who == "user":
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | - | redirect | {tid} | {' '.join(text.splitlines())}")
     did = store.append_decision(
-        env.decisions, st, tid, f"换方向：{text}",
-        "票级授权：router 定下一个方向" if as_router else "用户定的方向（原话见 answers.md）",
+        env.decisions, st, tid, f"换方向：{text}" if who == "user" else "出新方向卡交用户（router 不定方向）",
+        "用户定的方向（原话见 answers.md）" if who == "user" else "v2.1：方向一律用户定，新方向卡交用户确认",
         f"尝试 {last['n']} 判定 {verdict}" + ("；连续没用已退回用户" if returned else ""), env.now())
     return {"ok": True, "ticket": tid, "status": store.QUEUED, "cleared": cleared, "decision": did}
 
 
 def cmd_redirect(a, env):
-    """业务票换方向（9b + 终审 #3/#4）：见 _redirect_core。"""
+    """业务票换方向（9b + 终审 #3/#4 + v2.1 第 1 条）：见 _redirect_core。
+    --as-user：用户定的方向（原话必填）；--new-card：router 只要一张新方向卡（不带方向）；--as-router 一律拒。"""
     text = (a.text or "").strip()
-    if not text:
-        raise Fail("新方向不能空")
+    if a.as_router:
+        raise Fail(NEW_CARD_REFUSE.format(t=a.ticket))
+    if a.new_card and text:
+        raise Fail("--new-card 不带方向：方向由新 worker 提、用户在方向卡上确认（router 不定方向）")
+    if a.as_user and not text:
+        raise Fail("--as-user 要写用户定的方向（原话，逐字）")
     with env.state() as st:
-        return _redirect_core(env, st, a.ticket, text, a.as_router)
+        return _redirect_core(env, st, a.ticket, text, "user" if a.as_user else "new_card")
 
 
 def _offer_next(env, st, tid, why):
     """空闲的业务票（已上线、当前尝试判了有用 / 墙拆了人没留住、没有别的待办项）有了新墙、或用户回「不关」：
-    推一条 topic=next 的方向项问「要下一个方向吗」（票级授权，router 定：redirect 或 answer --as-router）。
+    推一条 topic=next 的方向项问「要下一个方向吗」（v2.1：方向归用户；router 只能 redirect --new-card 出新卡交用户确认）。
     已经在问 / 有害 / 退回 / 卡住的票不推。→ 项号 | None。"""
     t = st["tickets"].get(tid)
     if not t or not store.router_owned(t) or t["status"] != store.POSTLAUNCH:
@@ -1103,9 +1123,9 @@ def _offer_next(env, st, tid, why):
     if any(q.get("ticket") == tid and (q["kind"] in ("harm", "return") or q.get("topic") in ("requeue", "next"))
            for q in st["queue"]):
         return None
-    qid = store.push_queue(st, tid, "direction", f"{tid}：{why}；没有在途尝试——要下一个方向吗（票级授权，router 定）",
-                           env.now(), topic="next")
-    t["waiting_for"] = f"{why}：等 router 定下一个方向（{qid}）"
+    qid = store.push_queue(st, tid, "direction", f"{tid}：{why}；没有在途尝试——要下一个方向吗（方向归用户：你回方向，"
+                           "或 router 出新方向卡交你确认）", env.now(), topic="next")
+    t["waiting_for"] = f"{why}：等下一个方向（{qid}：你回方向，或 router 出新方向卡交你确认）"
     return qid
 
 
@@ -1158,13 +1178,7 @@ def cmd_submit_card(a, env):
         launcher.stop_worker(env.ctx, t["worker"])      # 超时交卡：worker 还在写，先停，确认后续跑
         t["worker"]["pid"] = None
         t["worker"]["kickoff_rounds"] = a.rounds
-        if store.router_owned(t):                             # 票级授权：方向由 router 定，不交用户
-            t["card_confirmed"] = True
-            t["solution"]["source"] = f"方向卡 v{version}（已确认，票级授权）"
-            how = _resume(env, st, a.ticket, "card", "方向已确认（票级授权）", store.EXECUTING, as_router=True)
-            store.append_decision(env.decisions, st, a.ticket, "方向已确认（票级授权）", "业务票已授权，方向审由 router 先做完",
-                                  str(card), env.now(), key=f"card-auto:{a.ticket}:v{version}")   # resume 成功后才记；重试不重复
-            return {"ok": True, "queue": None, "version": version, "auto_confirmed": True, "worker": how}
+        # v2.1 第 1 条：业务票的方向卡也交用户确认（不再按票级授权自动确认）
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
                                f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
@@ -1391,7 +1405,7 @@ def cmd_walkthrough_done(a, env):
 
 # 发版批次（终审 #6 + 残留 #2/#3 + 残留 2）：上 prod = 合 main 发版，staging 上领先 main 的东西会一起上去
 PROD_STATE = {"ready": "可上", "approved": "已放行", "walkthrough": "待走查", "release": "待放行",
-              "unjudged": "上次尝试还没判"}
+              "unjudged": "上次尝试还没判", "unconfirmed": "方向卡没经你确认"}
 _PROD_OK = ("ready", "approved", "ride_ok")          # 不挡 router 自己上
 _PROD_SHIPS = ("ready", "approved")                   # 发完照常 released（进 router_ships）
 _PROD_GO = re.compile(r"^(?:放行|上\s*prod)" + _END, re.I)
@@ -1419,7 +1433,13 @@ def _prod_state(t):
         ok = bool(t.get("prod_ok"))
         return ("ride_ok" if ok else "ride"), f"{ride}，代码还在 staging 上·{'已放行' if ok else '要放行'}"
     if t["status"] == store.AWAIT_PROD and store.router_owned(t):
-        code = "unjudged" if store.attempt_inflight(t) else "ready"
+        # v2.1 第 1 条：router 只上用户确认过的方案；v2 时代 router 代确认的卡（没有 card_confirmed_by=user）要用户放行
+        if store.attempt_inflight(t):
+            code = "unjudged"
+        elif t.get("prod_ok"):
+            code = "approved"
+        else:
+            code = "ready" if t.get("card_confirmed_by") == "user" else "unconfirmed"
         return code, PROD_STATE[code]
     if t.get("prod_ok"):
         return "approved", PROD_STATE["approved"]
@@ -1762,7 +1782,8 @@ def _requeue_business(env, st, tid, text, wait) -> None:
         t.pop(k, None)
     events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
     t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
-    t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
+    t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（交用户确认）
+    t.pop("card_confirmed_by", None)
     store.set_status(st, tid, store.QUEUED, env.now(), wait)
 
 
@@ -2148,12 +2169,14 @@ def build_parser():
     s.add_argument("qid"); s.add_argument("text")
     s.add_argument("--reject", action="store_true", help="驳回方向卡：worker 回第 1 段重写")
     s.add_argument("--as-router", action="store_true",
-                   help="router 按票级授权代答（只收业务票的方向 / 卡住 / 冲突项）：标为 router 决定，不冒充用户原话")
-    s = sub.add_parser("redirect", help="业务票换方向：判了有害 / 没用后，新方向进收件箱、重新排队派新 worker")
-    s.add_argument("ticket"); s.add_argument("text")
+                   help="router 按票级授权代答（只收业务票的技术细节类方向项 / 卡住 / 冲突项；方向卡、下一个方向、"
+                        "核心假设被推翻归用户）：标为 router 决定，不冒充用户原话")
+    s = sub.add_parser("redirect", help="业务票换方向：用户定的方向（--as-user）或出新方向卡交用户（--new-card）；重新排队派新 worker")
+    s.add_argument("ticket"); s.add_argument("text", nargs="?", default="")
     g = s.add_mutually_exclusive_group(required=True)
-    g.add_argument("--as-router", action="store_true", help="router 按票级授权定的方向（不进用户原话存档）")
-    g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，进 answers.md）")
+    g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，必填；进 answers.md）")
+    g.add_argument("--new-card", action="store_true", help="router 只要一张新方向卡（不带方向）：新 worker 提方向，卡交用户确认")
+    g.add_argument("--as-router", action="store_true", help="v2.1 起一律拒：router 不定方向（用 --new-card）")
     s = sub.add_parser("close", help="用户说「关 Tn」：关业务票（收尾：关 issue、清 worktree）")
     s.add_argument("ticket"); s.add_argument("--reason")
     s.add_argument("--rolled-back", action="store_true",
@@ -2165,7 +2188,7 @@ def build_parser():
     s.add_argument("--said", required=True, help="用户确认时的原话（进 answers.md）")
     s.add_argument("--skip", help="用户不要的条目，逗号分隔：问题写 key，attach / walls 写业务票号")
     s.add_argument("--hold", help="用户说先放着的问题 key（只建票不 start），逗号分隔")
-    s = sub.add_parser("submit-card", help="方向卡进决定单")
+    s = sub.add_parser("submit-card", help="方向卡进决定单（全部票都交用户确认）")
     s.add_argument("ticket"); s.add_argument("--card", required=True)
     s.add_argument("--rounds", type=int, default=0); s.add_argument("--codex")
     s.add_argument("--overtime", action="store_true")

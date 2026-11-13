@@ -475,18 +475,14 @@ def _card(proj):
     return c
 
 
-def test_business_card_auto_confirmed(proj):
+def test_business_card_goes_to_user_like_legacy(proj):
+    """v2.1 第 1 条：业务票的方向卡不再自动确认，和老票一样进决定单交用户（细节见 test_v21）。"""
     _biz(proj, status="kickoff", card_confirmed=False)
     c = _card(proj)
     out = json.loads(proj.run("submit-card", "T1", "--card", str(c), "--rounds", "1").stdout)
     s = proj.state(); t = s["tickets"]["T1"]
-    assert out["ok"] and not [q for q in s["queue"] if q["kind"] == "card"]
-    assert t["card_confirmed"] is True and t["status"] == "executing"
-    assert "票级授权" in (proj.home / "decisions.md").read_text() and str(c) in (proj.home / "decisions.md").read_text()
-    wait_until(lambda: proj.claude())                          # worker 被叫醒
-    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
-    assert "票级授权" in prompt and "用户原话（逐字）" not in prompt and "不是用户原话" in prompt
-    assert (proj.home / "decisions.md").read_text().count("票级授权") == 1
+    assert out["ok"] and [q["kind"] for q in s["queue"]] == ["card"] and out["queue"] == s["queue"][0]["id"]
+    assert not t.get("card_confirmed") and t["status"] == "await_card" and proj.claude() == []
 
 
 def test_legacy_card_still_to_user(proj):
@@ -502,7 +498,7 @@ def test_prod_batch_separates_router_ships(proj):
     """终审 #6：老票 T1 待放行时，业务票 T2 不能被 router 自己带上 prod（合 main 会把 T1 一起带上去）：
     router_ships 为空，整批交用户，prod 项列出每张票的状态。"""
     seed(proj, T1=("await_prod", [], {"title": "老票"}),
-         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票"}))
+         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "card_confirmed_by": "user"}))
     out = json.loads(proj.run("prod-batch").stdout)
     s = proj.state()
     assert out["tickets"] == ["T1"] and out["router_ships"] == []
@@ -512,7 +508,7 @@ def test_prod_batch_separates_router_ships(proj):
 
 def test_prod_batch_only_business_makes_no_item(proj):
     push_main(proj.root)                                                     # staging 不领先 main：没有对不上的提交
-    seed(proj, T2=("await_prod", [], {"kind": "business", "authorized": True}))
+    seed(proj, T2=("await_prod", [], {"kind": "business", "authorized": True, "card_confirmed_by": "user"}))
     out = json.loads(proj.run("prod-batch").stdout)
     assert out["queue"] is None and out["tickets"] == [] and out["router_ships"] == ["T2"]
     assert not proj.state()["queue"]
@@ -527,13 +523,13 @@ def test_requeued_business_ticket_needs_new_card(proj):
     assert t["status"] == "queued" and t["card_confirmed"] is False       # 新一轮必须出新方向卡
     assert "card_ready_at" not in t
     assert t["worker"]["session_id"] is None                              # 9b round 2：重排队清掉旧会话
-    # 模拟调度器重派后 worker 交卡：自动确认（重派时 prepare_run 给新会话）
+    # 模拟调度器重派后 worker 交卡：交用户确认（v2.1 不再自动确认；重派时 prepare_run 给新会话）
     st = proj.state(); st["tickets"]["T1"]["status"] = "kickoff"
     st["tickets"]["T1"]["worker"].update(worktree=str(proj.tmp / "wt"), session_id="sid-new")
     (proj.home / "state.json").write_text(json.dumps(st))
     proj.run("submit-card", "T1", "--card", str(_card(proj)))
     t = proj.state()["tickets"]["T1"]
-    assert t["card_confirmed"] is True and t["status"] == "executing"
+    assert not t["card_confirmed"] and t["status"] == "await_card"
 
 
 def test_unauthorized_business_card_and_prod_batch_legacy(proj):
@@ -790,19 +786,20 @@ def _inbox_text(proj, tid="T1"):
     return json.dumps(json.loads(proj.run("inbox", "--ticket", tid).stdout), ensure_ascii=False)
 
 
-def test_redirect_after_harmful_requeues_as_router(proj):
+def test_redirect_after_harmful_requeues_new_card(proj):
+    """v2.1 第 1 条：撤回之后 router 不定方向，只出新方向卡（--new-card），卡交用户确认。"""
     _biz(proj, attempts=_A1)
     _verdict(proj, "harmful")
-    out = proj.out("redirect", "T1", "换成测试方向乙", "--as-router")
+    out = proj.out("redirect", "T1", "--new-card")
     s = proj.state(); t = s["tickets"]["T1"]
     assert out["ok"] and t["status"] == "queued" and t["card_confirmed"] is False
     assert not [q for q in s["queue"] if q["kind"] == "harm"]                  # harm 项清掉
     assert proj.claude() == []                                                  # 不 resume：交给调度器重新派
     inbox = _inbox_text(proj)
-    assert "router 决定" in inbox and "换成测试方向乙" in inbox and "用户原话" not in inbox
+    assert "出新方向卡" in inbox and "router 没定方向" in inbox and "用户原话" not in inbox
     dec = (proj.home / "decisions.md").read_text()
-    assert "换方向" in dec and "换成测试方向乙" in dec
-    assert not (proj.home / "answers.md").exists() or "换成测试方向乙" not in (proj.home / "answers.md").read_text()
+    assert "出新方向卡" in dec
+    assert not (proj.home / "answers.md").exists()
 
 
 def test_redirect_after_return_as_user_resets_streak(proj):
@@ -819,20 +816,21 @@ def test_redirect_after_return_as_user_resets_streak(proj):
 
 def test_redirect_refusals(proj):
     seed(proj, T1=("postlaunch", [], {"title": "老票"}))
-    r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+    r = proj.run("redirect", "T1", "x", "--as-user", check=False)
     assert r.returncode == 1 and "业务票" in json.loads(r.stdout)["error"]
     _biz(proj, status="executing", attempts=_A1)
-    r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+    r = proj.run("redirect", "T1", "--new-card", check=False)
     assert r.returncode == 1 and "postlaunch" in json.loads(r.stdout)["error"]
     for v in (None, "pending_sample"):                                          # 终审 #3：只拒在途（还在等判定）
         _biz(proj, attempts=[{**_A1[0], "verdict": v}])
-        r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+        r = proj.run("redirect", "T1", "x", "--as-user", check=False)
         assert r.returncode == 1, v
         assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
     _biz(proj, attempts=[{**_A1[0], "verdict": "harmful"}])
-    assert proj.run("redirect", "T1", "x", check=False).returncode == 2         # 来源必须写明：--as-router / --as-user
-    assert proj.run("redirect", "T1", "  ", "--as-router", check=False).returncode == 1
-    assert proj.run("redirect", "T1", "x", "--as-router", env={"ROUTER_TICKET": "T1"}, check=False).returncode == 2
+    assert proj.run("redirect", "T1", "x", check=False).returncode == 2         # 来源必须写明：--as-user / --new-card
+    assert proj.run("redirect", "T1", "  ", "--as-user", check=False).returncode == 1
+    assert proj.run("redirect", "T1", "x", "--as-router", check=False).returncode == 1     # v2.1：router 不定方向
+    assert proj.run("redirect", "T1", "--new-card", env={"ROUTER_TICKET": "T1"}, check=False).returncode == 2
 
 
 def test_redirect_refused_while_worker_alive(proj):
@@ -842,7 +840,7 @@ def test_redirect_refused_while_worker_alive(proj):
     try:
         st = proj.state(); st["tickets"]["T1"]["worker"]["pid"] = p.pid
         (proj.home / "state.json").write_text(json.dumps(st))
-        r = proj.run("redirect", "T1", "x", "--as-router", check=False)
+        r = proj.run("redirect", "T1", "x", "--as-user", check=False)
         assert r.returncode == 1 and "stop" in json.loads(r.stdout)["error"]
         assert proj.state()["tickets"]["T1"]["status"] == "postlaunch"
     finally:
@@ -1111,7 +1109,7 @@ def test_redirect_clears_requeue_stuck_item(proj):
     _verdict(proj)
     st = proj.state(); st["tickets"]["T1"].pop("dispatch")
     (proj.home / "state.json").write_text(json.dumps(st))
-    out = proj.out("redirect", "T1", "测试方向丁", "--as-router")
+    out = proj.out("redirect", "T1", "--new-card")
     s = proj.state()
     assert out["cleared"] and not [q for q in s["queue"] if q["ticket"] == "T1"]
 
@@ -1198,7 +1196,7 @@ def test_requeue_refuses_takeover(proj):
     r = proj.run("answer", q["id"], "重排", "--as-router", check=False)
     assert r.returncode == 1 and "接管" in json.loads(r.stdout)["error"]
     assert proj.state()["tickets"]["T1"]["status"] == "takeover"
-    assert proj.run("redirect", "T1", "x", "--as-router", check=False).returncode == 1
+    assert proj.run("redirect", "T1", "--new-card", check=False).returncode == 1
 
 
 def test_branch_suffix_counts_live_attempts_not_history(proj):

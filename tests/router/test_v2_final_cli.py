@@ -38,15 +38,15 @@ def test_closed_business_ticket_is_not_revived_by_verdict(proj):
 def test_redirect_accepts_any_final_verdict_without_inflight_attempt(proj):
     for v in ("useful", "wall_broken_not_retained", "no_entry", "harmful", "useless"):
         _biz(proj, attempts=[{**_A1[0], "verdict": v}])
-        out = proj.out("redirect", "T1", "合成方向", "--as-router")
+        out = proj.out("redirect", "T1", "--new-card")
         assert out["ok"] and proj.state()["tickets"]["T1"]["status"] == "queued", v
     for v in (None, "pending_sample"):                                         # 上一次尝试还在等判定 = 在途
         _biz(proj, attempts=[{**_A1[0], "verdict": v}])
-        r = proj.run("redirect", "T1", "合成方向", "--as-router", check=False)
+        r = proj.run("redirect", "T1", "合成方向", "--as-user", check=False)
         assert r.returncode == 1 and "在途" in json.loads(r.stdout)["error"], v
     for status in ("executing", "await_prod", "queued"):                       # 已派、没 released：在途
         _biz(proj, status=status, attempts=[{**_A1[0], "verdict": "useful"}])
-        r = proj.run("redirect", "T1", "合成方向", "--as-router", check=False)
+        r = proj.run("redirect", "T1", "--new-card", check=False)
         assert r.returncode == 1 and "在途" in json.loads(r.stdout)["error"], status
 
 
@@ -65,7 +65,7 @@ def test_new_wall_on_idle_business_offers_next_direction(proj):
     assert q["id"] in t["waiting_for"]
     _daily(proj, {"walls": [{"ticket": "T1", "text": "合成新墙乙"}]})            # 已经在问：不重复推
     assert len(_items(proj, topic="next")) == 1
-    out = proj.out("redirect", "T1", "合成下一个方向", "--as-router")          # router 定方向：清掉这一项、票回队列
+    out = proj.out("redirect", "T1", "--new-card")                             # router 出新方向卡（不定方向）：清掉这一项、票回队列
     t = proj.state()["tickets"]["T1"]
     assert q["id"] in out["cleared"] and t["status"] == "queued" and not _items(proj, topic="next")
 
@@ -78,14 +78,17 @@ def test_weekly_wall_on_idle_business_offers_next_direction(proj):
 
 
 def test_answer_next_direction_item_requeues_with_label(proj):
+    """v2.1 第 1 条：「要下一个方向吗」归用户——router 代答被拒；用户的回答原样（标用户原话）带给新 worker。"""
     _idle_after_last_wall(proj)
     _daily(proj, {"walls": [{"ticket": "T1", "text": "合成新墙甲"}]})
     (q,) = _items(proj, topic="next")
-    out = proj.out("answer", q["id"], "合成方向庚", "--as-router")
+    r = proj.run("answer", q["id"], "合成方向庚", "--as-router", check=False)
+    assert r.returncode == 1 and "--new-card" in json.loads(r.stdout)["error"]
+    out = proj.out("answer", q["id"], "合成方向庚")
     t = proj.state()["tickets"]["T1"]
     assert out["ok"] and t["status"] == "queued" and not _items(proj, topic="next")
     inbox = _inbox_text(proj)
-    assert "router 决定" in inbox and "合成方向庚" in inbox and "用户原话（逐字）" not in inbox
+    assert "用户原话（逐字）" in inbox and "合成方向庚" in inbox and "router 决定" not in inbox
     assert "合成方向庚" in (proj.home / "decisions.md").read_text()
 
 
@@ -126,7 +129,7 @@ def test_redirect_as_router_refused_while_return_unanswered(proj):
 def test_router_redirect_keeps_no_use_streak(proj):
     _biz(proj, attempts=[{**_A1[0], "verdict": "useless"}], streak=3,
          waiting_for="连续 3 次没用，退回用户定夺")                               # 退回项已回（「知道了」），没给方向
-    proj.out("redirect", "T1", "合成方向", "--as-router")
+    proj.out("redirect", "T1", "--new-card")
     assert proj.state()["tickets"]["T1"]["no_use_streak"] == 3
 
 
@@ -165,7 +168,7 @@ def test_prod_batch_holds_business_when_legacy_awaits_walkthrough(proj):
     push_main(proj.root)
     seed(proj, T1=("merged_staging", [], {"title": "老票", "merge_sha": "aaa"}),
          T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": [],
-                                "merge_sha": "bbb"}))
+                                "merge_sha": "bbb", "card_confirmed_by": "user"}))
     out = proj.out("prod-batch")
     assert out["router_ships"] == [] and out["queue"]
     assert {b["ticket"]: b["state"] for b in out["batch"]} == {"T1": "待走查", "T2": "可上"}
@@ -182,7 +185,8 @@ def test_prod_batch_holds_business_when_legacy_awaits_walkthrough(proj):
 def test_prod_batch_holds_business_when_legacy_awaits_release(proj):
     push_main(proj.root)
     seed(proj, T1=("await_prod", [], {"title": "老票", "merge_sha": "aaa"}),
-         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": []}))
+         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": [],
+                                "card_confirmed_by": "user"}))
     out = proj.out("prod-batch")
     assert out["router_ships"] == [] and out["tickets"] == ["T1"]
     assert {b["ticket"]: b["state"] for b in out["batch"]} == {"T1": "待放行", "T2": "可上"}

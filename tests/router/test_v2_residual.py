@@ -64,7 +64,7 @@ def _legacy_merged(**extra):
 
 def _biz_ready(**extra):
     return ("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": [],
-                               "merge_sha": "bbb", "pr": 42,
+                               "merge_sha": "bbb", "pr": 42, "card_confirmed_by": "user",   # v2.1：方向卡经用户确认才算可上
                                "history": [{"at": "2026-11-13T00:00:00Z", "status": "await_prod"}], **extra})
 
 

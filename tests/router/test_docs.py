@@ -295,12 +295,12 @@ def test_skill_v2_sections():
     assert -1 not in order and order == sorted(order), order
     for m in ANALYST_MODES:
         assert m in s3, m
-    # §4：业务票的方向卡照旧方向审，submit 后自动确认
+    # §4：业务票的方向卡照旧方向审，submit 后交用户确认（v2.1 起不再自动确认）
     s4 = _section(text, "4.")
-    assert "业务票" in s4 and "自动确认" in s4 and "票级授权" in s4
+    assert "业务票" in s4 and "不再自动确认" in s4 and "交用户确认" in s4
     # §5 谁定什么
     s5 = _section(text, "5.")
-    for w in ("判真", "票内换方向", "上 prod", "票级授权", "花钱", "撤不回", "商店包"):
+    for w in ("判真", "换方向", "上 prod", "票级授权", "花钱", "撤不回", "商店包"):
         assert w in s5, w
     # §6：判真 / 关票的五种回答
     s6 = _section(text, "6.")

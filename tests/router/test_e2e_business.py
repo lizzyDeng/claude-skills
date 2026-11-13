@@ -1,6 +1,6 @@
 """业务票全周期端到端（假 claude + 假 gh，真 git、真子进程、真 CLI）：
-建票 → 派发 → 方向卡自动确认 → PR 合 staging → await_prod（唤醒 prod_ready）→ router 上 prod → released
-→ daily 判 useful 拆墙 → 墙拆完 → 挂新墙 → 提示下一个方向 → redirect → 第二次尝试用新分支和新会话。
+建票 → 派发 → 方向卡交用户确认 → PR 合 staging → await_prod（唤醒 prod_ready）→ router 上 prod → released
+→ daily 判 useful 拆墙 → 墙拆完 → 挂新墙 → 提示下一个方向 → redirect --new-card → 第二次尝试用新分支和新会话。
 夹具全是合成文本，不含真实 uid 和原话。"""
 import json
 import os
@@ -128,10 +128,12 @@ def test_business_ticket_full_cycle(e2e, monkeypatch):
     first = p.state()["tickets"][tid]["worker"]
     assert first["branch"] == f"router/{tid}"
 
-    # 方向卡 → 方向审 → submit-card 自动确认（票级授权），worker 续跑开 PR
+    # 方向卡 → 方向审 → submit-card 交用户（v2.1 不自动确认）→ 用户回「同意」，worker 续跑开 PR
     until(p, lambda res: res["cards_for_review"] == [tid])
     sub = p.out("submit-card", tid, "--card", str(p.home / "cards" / f"{tid}.md"), "--rounds", "1")
-    assert sub["auto_confirmed"] is True and sub["queue"] is None
+    assert sub["queue"] and not sub.get("auto_confirmed")
+    assert p.state()["tickets"][tid]["status"] == "await_card"
+    assert p.out("answer", sub["queue"], "同意")["resumed"] == tid
 
     # CI 全绿 → 合 staging → await_prod，唤醒 router 去上 prod（#1）
     res = until(p, lambda res: res.get("prod_ready"))
@@ -159,8 +161,8 @@ def test_business_ticket_full_cycle(e2e, monkeypatch):
     (q,) = [q for q in p.state()["queue"] if q.get("topic") == "next"]
     assert q["ticket"] == tid and "下一个方向" in q["summary"]
 
-    # router 定方向 ⇒ redirect ⇒ 第二次尝试：新会话、新分支、新 worktree
-    red = p.out("redirect", tid, "合成方向二", "--as-router")
+    # router 不定方向 ⇒ redirect --new-card ⇒ 第二次尝试：新会话、新分支、新 worktree（新卡交用户确认）
+    red = p.out("redirect", tid, "--new-card")
     assert red["ok"] and q["id"] in red["cleared"]
     res = until(p, lambda res: res["dispatched"] == [tid])
     w = p.state()["tickets"][tid]["worker"]
