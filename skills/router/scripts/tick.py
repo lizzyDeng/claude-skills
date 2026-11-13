@@ -408,10 +408,21 @@ class Run:
             self.res["errors"].append(f"维护票 {' '.join(ids)} start 没成（留在 DRAFT，下一轮重试）：{str(e)[:200]}")
 
     # ---- 1 ----
+    def _router_checkouts(self):
+        """router 自己的分支和 worktree 路径（当前 worker、旧尝试、留着待人处理的旧 checkout）：discover 不当外部 session。"""
+        branches, paths = set(), set()
+        for t in self.state["tickets"].values():
+            w = t.get("worker") or {}
+            branches.add(w.get("branch")); paths.add(w.get("worktree"))
+            for x in (t.get("attempts") or []) + (t.get("stale_checkouts") or []):
+                branches.add(x.get("branch")); paths.add(x.get("worktree"))
+        return {b for b in branches if b}, {p for p in paths if p}
+
     def step1_external(self):
+        branches, paths = self._router_checkouts()
         ext = discover.scan(self.ctx, self.root, f"origin/{self.cfg.get('base_branch', 'staging')}", self.table,
-                            set(), self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24),
-                            self.cfg.get("repo"))
+                            branches, self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24),
+                            self.cfg.get("repo"), router_paths=paths)
         self.state["external"] = ext
         # 同一个冲突只报一次：答完之后外部 session 仍持有那块代码，也不再每分钟叫用户（反目标 5）
         current = {f"{wt}|{surf}|{tid}": (wt, surf, tid) for wt, surf, tid in discover.conflicts_with_router(self.state, ext)}

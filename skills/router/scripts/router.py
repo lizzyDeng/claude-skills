@@ -426,6 +426,8 @@ def _check_as_router(st, q, reject) -> None:
     if reject:
         raise Fail("--as-router 不能和 --reject 一起用")
     t = st["tickets"].get(q["ticket"] or "")
+    if q["kind"] == "conflict" and t and store.ticket_kind(t) == "maint":
+        return                                       # 维护票的代码面冲突项 router 也能回（v2.1 补充 B）
     if not t or not store.router_owned(t):
         raise Fail(f"{q['id']} 不是票级授权的业务票的项：只能由用户回（去掉 --as-router，照用户原话答）")
     if q["kind"] not in AS_ROUTER_KINDS:
@@ -433,6 +435,12 @@ def _check_as_router(st, q, reject) -> None:
     if q.get("topic") in USER_TOPICS:
         raise Fail(f"{q['id']} 问的是方向（{q['topic']}）：方向归用户定，router 不能代答。要出新方向卡交用户："
                    f"router.py redirect {q['ticket']} --new-card；用户给了方向：照原话 answer（不加 --as-router）")
+
+
+def _conflict_resumable(t) -> bool:
+    """代码面冲突项要续跑 worker 的前提：有 session、有 worktree，票还持着锁。"""
+    w = t.get("worker") or {}
+    return bool(w.get("session_id") and w.get("worktree")) and store.holds_lock(t)
 
 
 def cmd_answer(a, env):
@@ -487,6 +495,9 @@ def cmd_answer(a, env):
             hint, extra = _postlaunch_answered(env, st, t, q)
         elif t and t["status"] == store.TAKEOVER:
             hint = f"{t['id']} 在你接管中，回答已存档；还给 router 后再续跑"
+        elif t and q["kind"] == "conflict" and not _conflict_resumable(t):
+            # 冲突项落下时持锁的 worker 已经不在 / 票已不持锁（例如合 staging 后 worktree 删了）：只记回答，不续跑
+            hint = f"{t['id']} 已没有在跑的 worker（或不再持锁）：冲突项只记回答，不续跑"
         elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
             kind = q["kind"]
             if kind == "card" and a.reject:

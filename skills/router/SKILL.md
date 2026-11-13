@@ -20,7 +20,7 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 
 ## 1. 启动（每次 /router，包括压缩或重启之后）
 
-1. `router.py discover`：扫外部 worktree，认出用户自己开着的 session，登记它们锁着的代码面。
+1. `router.py discover`：扫外部 worktree，认出用户自己开着的 session，登记它们锁着的代码面。router 自己派的 worker worktree（分支 `router/…`、state 里任一票的分支 / worktree 路径、目录名 `router-T<n>`，含合 staging 后正在删、分支已脱离的那一刻）不算外部 session，不会对它报代码面冲突。
 2. `router.py tick`：跑一轮巡检，然后 `router.py status` 读出决定单和全部票。状态只以 `state.json` / `decisions.md` 为准，不靠你的记忆。`tick` 和每个 watch 的第一轮会把上次没处理完的方向卡、慢路径事件**再交一次**（压缩或重启后不会丢）；到期的上线验收（`postlaunch_due`）每一轮都交，直到结果记上。
 3. 看分析 agent 的状态（第 3 节）：
    - config 有没有 `analyst.brief`。没有 = 分析 agent 没启用：没有每日验证、没有每周问题清单。告诉用户一次。
@@ -112,7 +112,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 | 关业务票（分析 agent 提议结束） | **用户** |
 | 业务票：每次尝试的方向卡（含换方向：router 只能 `redirect <T> --new-card` 出新卡交用户，`--as-router` 一律拒）、上线节奏（开关什么时候开、开多少、「上线即开」这类）、成本 / 价格 / 额度 / 免费放量 | **用户**（v2.1：方向、上线节奏、成本一律用户定；router 原样交，不裁决） |
 | 业务票：合 staging（CI 绿）、用户确认过的方案在发版批次干净时上 prod 并照方案执行开关（见第 7 节发版批次）、判「有害」当天撤回、判「没入口」当天查入口、技术细节（验收口径、代码面分配） | **你**（**票级授权**：用户判真时一次授权整张票；每次记一条 decide。只覆盖这张票的范围，超出范围按新问题提给用户） |
-| 业务票 worker 停下来问的技术细节（`direction` 项，没带停点标签，问的是验收口径 / 实现细节 / 代码面） | **你**（票级授权）：`router.py answer <Qn> "<你的决定>" --as-router`（answers.md 和 worker 收到的都标为「router 决定」，不冒充用户原话；方向卡、topic=next / assumption 的方向项、花钱这类会被拒），再 `router.py decide …` 记一条。问的是方向 / 上线节奏 / 成本：交用户 |
+| 业务票 worker 停下来问的技术细节（`direction` 项，没带停点标签，问的是验收口径 / 实现细节 / 代码面） | **你**（票级授权）：`router.py answer <Qn> "<你的决定>" --as-router`（answers.md 和 worker 收到的都标为「router 决定」，不冒充用户原话；方向卡、topic=next / assumption 的方向项、花钱这类会被拒），再 `router.py decide …` 记一条。问的是方向 / 上线节奏 / 成本：交用户。代码面冲突项（`conflict`）业务票和维护票的都能 `--as-router` 回；持锁的 worker 已经不在（例如合 staging 后 worktree 已删）时只记回答、不续跑 |
 | 花钱放行：真 LLM 批量调用、生图、其他外部付费调用（先报调用数和金额，跑完报实际数） | **用户**（业务票也一样） |
 | 成本 / 收入改动：凡涉及计费、额度、价格、免费放量、会增加每条消息模型调用的方向 | **用户**（业务票也一样）：方向卡必须附「成本测算」——用 prod 调用日志的 token 量 × 实际单价，算每条消息 / 每用户每天的成本；价目表缺价的模型先补价，不许按 0 算。router 不裁决这类方向，原样交用户 |
 | 撤不回的改动（删数据、不可逆迁移）、发应用商店包 | **用户**（业务票也一样；worker 用 `emit decision` 带 `--tags spend` / `irreversible` / `store_release` 停下，进决定单的 `spend` 项） |

@@ -81,8 +81,22 @@ def _iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
 
 
+# router 自己派的 worker worktree 的目录名（launcher.create_worktree：router-T<n>，业务票后续尝试 router-T<n>-a<k>）
+_ROUTER_DIR = re.compile(r"^router-T\d+(?:-a\d+)?$")
+
+
+def router_owned_worktree(path, branch, router_branches=(), router_paths=()) -> bool:
+    """router 自己的 worker worktree，不是用户的外部 session：分支是 router/…、是 state 里某票（含旧尝试）的分支、
+    路径是 state 里某票的 worktree，或者目录名是 router-T<n>。合 staging 后删 worktree 的那一刻分支可能已经脱离
+    （detached），只看分支会把它认成外部 session、对它锁的代码面报冲突（v2.1 补充 B）。"""
+    if branch and (branch.startswith("router/") or branch in router_branches):
+        return True
+    p = str(path)
+    return p in {str(x) for x in router_paths if x} or bool(_ROUTER_DIR.match(Path(p).name))
+
+
 def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min: int,
-         lock_hours: int = 24, repo_slug: str = None) -> dict:
+         lock_hours: int = 24, repo_slug: str = None, router_paths=()) -> dict:
     out = ctx.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"]).stdout
     blocks = list(_worktrees(out))
     now = ctx.now().timestamp()
@@ -92,8 +106,8 @@ def scan(ctx, repo: Path, base_ref: str, table, router_branches: set, stale_min:
         branch = b.get("branch", "").removeprefix("refs/heads/")
         if i == 0 or not path or "prunable" in b or not Path(path).exists():
             continue                                  # 主仓 checkout / 已失效的 worktree
-        if branch.startswith("router/") or branch in router_branches:
-            continue
+        if router_owned_worktree(path, branch, router_branches, router_paths):
+            continue                                  # router 自己的 worker worktree（含正在删的）
         since_fork = set(ctx.run(["git", "-C", path, "diff", "--name-only", f"{base_ref}...HEAD"]).stdout.split())
         still_differs = set(ctx.run(["git", "-C", path, "diff", "--name-only", base_ref, "HEAD"]).stdout.split())
         files = since_fork & still_differs

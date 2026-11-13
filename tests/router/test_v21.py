@@ -584,3 +584,66 @@ def test_v21_8_skill_documents_go_reading():
     assert "Q332 放行。生图放行，用grok" in row and "先不放行" in row and "不放行" in row
     spend = next(l for l in s6.splitlines() if "「放行 Q4」" in l)
     assert "`go`" in spend and "原样转给 worker" in spend
+
+
+# ---- 补充 B：router 自己的 worker worktree 不算外部 session；这类 conflict 项不要求续跑 worker -------------------
+
+def test_v21_b_scan_skips_router_worktree_by_name_and_path(fake, tmp_path, table):
+    from discover import scan
+    main, own, custom, ext = (tmp_path / n for n in ("main", "router-T112", "wt-custom", "wt-ext"))
+    for d in (main, own, custom, ext):
+        d.mkdir()
+    porcelain = "\n".join([
+        f"worktree {main}", "HEAD 111", "branch refs/heads/main", "",
+        f"worktree {own}", "HEAD 222", "detached", "",                          # 合 staging 后正在删：分支已不在
+        f"worktree {custom}", "HEAD 333", "detached", "",                       # 不叫 router-T…，但 state 里是某票的 worktree
+        f"worktree {ext}", "HEAD 444", "branch refs/heads/feat/x", ""])
+    fake.script(["git", "-C", str(main), "worktree", "list", "--porcelain"], porcelain)
+    for d in (own, custom, ext):
+        fake.script(["git", "-C", str(d), "status", "--porcelain"], " M crates/persona-engine/src/prompt_builder.rs\n")
+    out = scan(fake, main, "origin/staging", table, set(), 45, router_paths={str(custom)})
+    assert sorted(out) == [str(ext)]
+
+
+def test_v21_b_discover_after_merge_no_conflict(proj):
+    """合 staging 后 router 自己的 worktree 还在磁盘上（分支已脱离）的那一轮：discover 不登记它、不出 conflict 项。"""
+    import subprocess
+    wt = proj.root / ".claude" / "worktrees" / "router-T1"
+    subprocess.run(["git", "-C", str(proj.root), "worktree", "add", "-q", "--detach", str(wt)], check=True,
+                   capture_output=True)
+    f = wt / "crates" / "persona-engine" / "src" / "prompt_builder.rs"
+    f.parent.mkdir(parents=True); f.write_text("// 合成改动\n")
+    seed(proj, T1=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "title": "业务票一",
+                                                        "attempts": [], "walls": [], "merge_sha": "abc",
+                                                        "worker": {"session_id": "s1", "worktree": None, "runs": 1}}),
+         T2=("executing", ["her-reply-prompt"], {"title": "老票二", "worker": {"session_id": "s2", "worktree": "/nope",
+                                                                             "runs": 1}}))
+    out = proj.out("discover")
+    assert str(wt) not in out["external"] and out["new_queue"] == []
+    assert not [q for q in proj.state()["queue"] if q["kind"] == "conflict"]
+
+
+def test_v21_b_conflict_answer_without_resumable_worker(proj):
+    seed(proj, T112=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "title": "业务票",
+                                                          "attempts": [], "walls": [],
+                                                          "worker": {"session_id": "s1", "worktree": None, "runs": 1}}),
+         T105=("await_card", ["her-reply-prompt"], {"kind": "maint", "title": "维护", "tasks": [],
+                                                    "worker": {"session_id": "s2", "worktree": None, "runs": 1}}))
+    q1 = _push_q(proj, "T112", "conflict", "外部 session router-T112 改了 T112 锁着的代码面 her-reply-prompt")
+    out = proj.out("answer", q1, "合成：是 router 自己的 worktree，忽略", "--as-router")
+    assert out["ok"] and out["resumed"] is None and out["delivered"] is None and proj.claude() == []
+    assert q1 not in [q["id"] for q in proj.state()["queue"]]
+    q2 = _push_q(proj, "T105", "conflict", "外部 session router-T112 改了 T105 锁着的代码面 her-reply-prompt")
+    out = proj.out("answer", q2, "合成：忽略", "--as-router")                      # 维护票的 conflict 项 router 也能回
+    assert out["ok"] and proj.claude() == []
+    q3 = _push_q(proj, "T105", "direction")
+    assert proj.run("answer", q3, "x", "--as-router", check=False).returncode == 1   # 维护票只放开 conflict 项
+
+
+def test_v21_b_skill_documents_own_worktrees_and_conflict_answers():
+    from test_docs import SKILL, _section
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s1 = _section(skill, "1.")
+    assert "router-T<n>" in s1 and "不算外部 session" in s1
+    row = next(l for l in _section(skill, "5.").splitlines() if "conflict" in l and "--as-router" in l)
+    assert "维护票" in row and "不续跑" in row
