@@ -32,7 +32,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
-               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst"}
+               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -528,6 +528,8 @@ def propose_from(env, st, data) -> dict:
     maint = data.get("maint", [])
     for i, p in enumerate(problems):
         _check_problem(i, p)
+    for i, m in enumerate(maint):
+        _check_maint(env, st, i, m)
     for w in walls:
         if w.get("ticket") not in st["tickets"] or store.ticket_kind(st["tickets"][w["ticket"]]) != "business":
             raise Fail(f"walls 里的票 {w.get('ticket')} 不是已有的业务票")
@@ -565,7 +567,100 @@ def propose_from(env, st, data) -> dict:
     for c in close:
         qid = store.push_queue(st, c["ticket"], "close", f"提议结束 {c['ticket']}：{c.get('reason', '')}", at)
         st["queue"][-1]["reason"] = c.get("reason", "")
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint_pending": maint}
+    mids = []
+    for m in maint:
+        tid = maint_add(env, st, m, start=False)
+        if tid not in mids:
+            mids.append(tid)
+    to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
+    if to_start:
+        _start_locked(env, st, to_start)              # 用户不判维护项（spec §4.2）：和判真一样当场 start
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids}
+
+
+def _check_maint(env, st, i, m) -> None:
+    if not isinstance(m, dict):
+        raise Fail(f"maint[{i}] 不是对象")
+    for k in ("title", "problem"):
+        if not isinstance(m.get(k), str) or not m[k].strip():
+            raise Fail(f"maint[{i}] 缺 {k}")
+    surf = m.get("surfaces")
+    if not isinstance(surf, list) or not all(isinstance(x, str) for x in surf):
+        raise Fail(f"maint[{i}] surfaces 须是代码面名字的列表")
+    _check_surfaces(env, surf)
+    unb = m.get("unblocks")
+    if unb and (not isinstance(unb, str) or unb not in st["tickets"]):
+        raise Fail(f"maint[{i}] unblocks 里的票 {unb} 不存在")
+
+
+def _iso_week(env) -> str:
+    y, w, _ = env.ctx.now().isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+_MAINT_CLOSED = set(store.SETTLED) | {store.SKIP}
+
+
+def maint_add(env, st, item, start=True) -> str:
+    """维护条目 → 票号。调用方持锁、已载入 st。
+    不带 unblocks：追加到本周维护票（没有就建）；带 unblocks：单独建一张，不受维护名额限制。
+    start=True 时新建 / 还没起的票当场 start（同判真的 _start_locked）；已在跑的本周票只追加 + 给 worker 递一行 inbox。"""
+    at = env.now()
+    surf = list(item.get("surfaces", []))
+    task = {"text": f"{item['title']}：{item['problem']}", "done": False, "at": at}
+    unb = item.get("unblocks")
+    if unb:
+        tid = store.new_ticket(
+            st, title=f"维护（解锁 {unb}）：{item['title']}", origin="analyst", kind="maint", unblocks=unb,
+            tasks=[task], surfaces=surf, weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+        st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
+    else:
+        title = f"维护 {_iso_week(env)}"
+        tid = next((x for x, t in st["tickets"].items() if store.ticket_kind(t) == "maint" and not t.get("unblocks")
+                    and t["title"] == title and t["status"] not in _MAINT_CLOSED), None)
+        if tid is None:
+            tid = store.new_ticket(st, title=title, origin="analyst", kind="maint", tasks=[task], surfaces=surf,
+                                   weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+            st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
+        else:
+            t = st["tickets"][tid]
+            t["tasks"].append(task)
+            t["surfaces"] = sorted(set(t["surfaces"]) | set(surf))
+            t["weight"] = surfaces.weight_for(set(t["surfaces"]), env.table)
+            t["problem"] = "；".join(x["text"] for x in t["tasks"])
+            if t["status"] in store.RUNNING and launcher.worker_alive(env.ctx, t["worker"]):
+                events.deliver(env.home, tid, {"ts": at, "ticket": "router", "type": "tell",
+                                               "summary": f"本周维护票新增一条：{task['text']}"})
+    if start and st["tickets"][tid]["status"] == store.DRAFT:
+        _start_locked(env, st, [tid])
+    return tid
+
+
+def cmd_maint(a, env):
+    surf = _csv(a.surfaces)
+    item = {"title": a.title, "problem": a.problem, "surfaces": surf, "unblocks": a.unblocks}
+    with env.locked():
+        st = store.load_state(env.state_path)
+        _check_maint(env, st, 0, item)
+        tid = maint_add(env, st, item)
+        store.save_state(env.state_path, st)
+        render_board(env, st)
+    return {"ok": True, "ticket": tid}
+
+
+def cmd_impact(a, env):
+    if not _unit(a.size) or not _unit(a.gap):
+        raise Fail("size 和 gap 须是 0~1 的数")
+    with env.state() as st:
+        t = env.ticket(st, a.ticket)
+        if store.ticket_kind(t) != "business":
+            raise Fail(f"{a.ticket} 不是业务票，没有影响分")
+        old = t.get("impact") or {}
+        t["impact"] = {"size": a.size, "gap": a.gap, "confidence": a.confidence}
+        did = store.append_decision(env.decisions, st, a.ticket, "调整影响分",
+                                    f"router 改 impact：size {a.size} gap {a.gap} confidence {a.confidence}",
+                                    f"原值 {json.dumps(old, ensure_ascii=False)}", env.now())
+    return {"ok": True, "ticket": a.ticket, "impact": t["impact"], "decision": did}
 
 
 def cmd_propose(a, env):
@@ -1321,6 +1416,15 @@ def build_parser():
     s.add_argument("--wall", action="append", default=[], help="墙，可多次")
     s = sub.add_parser("propose", help="分析 agent 的提议 → 决定单（verify_problem / close）；墙直接挂票")
     s.add_argument("--from", dest="source", required=True)
+    s = sub.add_parser("maint", help="维护票：add 追加到本周维护票（--unblocks 则单独建）")
+    msub = s.add_subparsers(dest="maint_cmd", required=True)
+    m = msub.add_parser("add")
+    m.add_argument("--title", required=True); m.add_argument("--problem", required=True)
+    m.add_argument("--surfaces", required=True); m.add_argument("--unblocks")
+    s = sub.add_parser("impact", help="改业务票的影响分（记一条决定）")
+    s.add_argument("ticket"); s.add_argument("--size", type=float, required=True)
+    s.add_argument("--gap", type=float, required=True)
+    s.add_argument("--confidence", required=True, choices=_CONF)
     s = sub.add_parser("start", help="用户说 start：建 issue、进队列、派")
     s.add_argument("--all", action="store_true")
     s.add_argument("tickets", nargs="*")

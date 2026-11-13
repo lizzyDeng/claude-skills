@@ -35,8 +35,9 @@ def test_propose_pushes_verify_items(proj):
     assert set(s["proposals"]) == {"P1", "P2"}
     vq = [q for q in s["queue"] if q["kind"] == "verify_problem"]
     assert [q["proposal"] for q in vq] == ["P1", "P2"]
-    assert out["maint_pending"][0]["title"] == "测试维护甲"      # R3：Task 7 才建维护票
-    assert not [t for t in s["tickets"].values() if t.get("kind") == "maint"]
+    assert "maint_pending" not in out and len(out["maint"]) == 1      # R3：维护条目建成票
+    mt = s["tickets"][out["maint"][0]]
+    assert mt["kind"] == "maint" and mt["tasks"][0]["text"] == "测试维护甲：测试问题" and mt["issue"]
 
 
 def test_propose_refused_before_calibration(proj):
@@ -106,7 +107,7 @@ def test_answer_true_creates_and_starts(proj):
 
 
 def test_answer_true_hold(proj):
-    propose(proj, load())
+    propose(proj, load(maint=[]))              # 维护条目会自动 start、建 issue，这里只看判真的「先放着」
     for sep in ("，", ","):
         qid = _first_q(proj)
         out = json.loads(_answer(proj, qid, f"真{sep}先放着").stdout)
@@ -546,3 +547,141 @@ def test_prod_item_blocks_excludes_router_owned(proj):
     proj.run("prod-batch")
     q = next(x for x in proj.out("status", "--json")["queue"] if x["kind"] == "prod")
     assert q["blocks"] == 1
+
+
+# ---- Task 7：维护票 + impact -------------------------------------------------
+
+import argparse
+import router
+import store as _store
+from datetime import datetime, timezone
+
+
+class _Clock:
+    def __init__(self, now):
+        self._now = now
+
+    def now(self):
+        return self._now
+
+
+def _env(proj, now=datetime(2026, 11, 12, 10, 0, tzinfo=timezone.utc)):
+    return router.Env(proj.root, _Clock(now))
+
+
+def _maint(proj, title="甲", problem="p", surfaces="llm-config", *extra, check=True):
+    return proj.run("maint", "add", "--title", title, "--problem", problem, "--surfaces", surfaces, *extra, check=check)
+
+
+def _maints(proj):
+    return [t for t in proj.state()["tickets"].values() if t.get("kind") == "maint"]
+
+
+def test_maint_add_appends_weekly(proj):
+    a = json.loads(_maint(proj, "甲", "p1", "llm-config").stdout)["ticket"]
+    b = json.loads(_maint(proj, "乙", "p2", "her-reply-prompt").stdout)["ticket"]
+    assert a == b and len(_maints(proj)) == 1
+    t = _maints(proj)[0]
+    assert [x["text"] for x in t["tasks"]] == ["甲：p1", "乙：p2"] and all(x["done"] is False for x in t["tasks"])
+    assert t["surfaces"] == ["her-reply-prompt", "llm-config"] and t["weight"] == "heavy"
+    assert t["title"].startswith("维护 20") and "-W" in t["title"]
+    assert t["issue"] and t["start_ok"] and t["status"] in ("queued", "kickoff")      # 自动 start
+
+
+def test_maint_unblocks_standalone(proj):
+    seed(proj, T3=("draft", []))
+    a = json.loads(_maint(proj, "甲", "p", "llm-config").stdout)["ticket"]
+    b = json.loads(_maint(proj, "解锁", "q", "llm-config", "--unblocks", "T3").stdout)["ticket"]
+    assert a != b and len(_maints(proj)) == 2
+    t = proj.state()["tickets"][b]
+    assert t["unblocks"] == "T3" and t["title"] == "维护（解锁 T3）：解锁" and t["status"] in ("queued", "kickoff")
+
+
+def test_maint_rejects_bad_input(proj):
+    for args in (("", "p", "llm-config"), ("甲", "  ", "llm-config"), ("甲", "p", "nope")):
+        r = _maint(proj, *args, check=False)
+        assert r.returncode == 1 and not json.loads(r.stdout)["ok"]
+    r = _maint(proj, "甲", "p", "llm-config", "--unblocks", "T99", check=False)
+    assert r.returncode == 1 and "T99" in json.loads(r.stdout)["error"]
+    assert not (proj.home / "state.json").exists() or not _maints(proj)
+
+
+def test_maint_new_week_new_ticket(proj, monkeypatch):
+    monkeypatch.setattr(router, "_start_locked", lambda env, st, sel: [_store.set_status(st, t, "queued", env.now()) for t in sel])
+    with _env(proj, datetime(2026, 11, 12, tzinfo=timezone.utc)).state() as st:
+        a = router.maint_add(_env(proj, datetime(2026, 11, 12, tzinfo=timezone.utc)), st, {"title": "甲", "problem": "p", "surfaces": []})
+        a2 = router.maint_add(_env(proj, datetime(2026, 11, 13, tzinfo=timezone.utc)), st, {"title": "乙", "problem": "p", "surfaces": []})
+        b = router.maint_add(_env(proj, datetime(2026, 11, 17, tzinfo=timezone.utc)), st, {"title": "丙", "problem": "p", "surfaces": []})
+    assert a == a2 and b != a
+    s = proj.state()
+    assert s["tickets"][a]["title"] == "维护 2026-W46" and s["tickets"][b]["title"] == "维护 2026-W47"
+
+
+def test_maint_running_ticket_gets_inbox_note(proj, monkeypatch):
+    import launcher
+    monkeypatch.setattr(router, "_start_locked", lambda env, st, sel: [_store.set_status(st, t, "executing", env.now()) for t in sel])
+    monkeypatch.setattr(launcher, "worker_alive", lambda ctx, w: True)
+    env = _env(proj)
+    with env.state() as st:
+        a = router.maint_add(env, st, {"title": "甲", "problem": "p", "surfaces": []})
+        b = router.maint_add(env, st, {"title": "乙", "problem": "q", "surfaces": []})
+    assert a == b
+    lines = [json.loads(l) for l in (proj.home / "inbox" / f"{a}.jsonl").read_text().splitlines()]
+    assert len(lines) == 1 and "乙：q" in lines[0]["summary"] and len(proj.state()["tickets"][a]["tasks"]) == 2
+
+
+def test_maint_router_only(proj):
+    for args in (("maint", "add", "--title", "x", "--problem", "p", "--surfaces", "llm-config"),
+                 ("impact", "T1", "--size", "0.1", "--gap", "0.1", "--confidence", "low")):
+        r = proj.run(*args, env={"ROUTER_TICKET": "T1"}, check=False)
+        assert r.returncode == 2
+
+
+def test_propose_maint_creates_tickets_and_validates(proj):
+    d = load()
+    d["maint"] = [{"title": "甲", "problem": "p", "surfaces": ["llm-config"]},
+                  {"title": "乙", "problem": "q", "surfaces": ["her-reply-prompt"]}]
+    out = json.loads(propose(proj, d).stdout)
+    assert len(out["maint"]) == 1 and len(_maints(proj)) == 1 and len(_maints(proj)[0]["tasks"]) == 2
+    for bad in ([{"title": "", "problem": "p", "surfaces": []}],
+                [{"title": "x", "problem": "p", "surfaces": ["nope"]}],
+                [{"title": "x", "problem": "p", "surfaces": "llm-config"}],
+                [{"title": "x", "problem": "p", "surfaces": [], "unblocks": "T99"}]):
+        n = len(proj.state()["proposals"])
+        r = propose(proj, load(maint=bad), check=False)
+        assert r.returncode == 1 and not json.loads(r.stdout)["ok"], bad
+        assert len(proj.state()["proposals"]) == n
+
+
+def test_propose_maint_leak_refused(proj):
+    (proj.runs / "2026-10-26" / "users.json").write_text(json.dumps({"deadbeef": {}}))
+    r = propose(proj, load(maint=[{"title": "x", "problem": "deadbeef 说", "surfaces": []}]), check=False)
+    assert r.returncode == 1 and "deadbeef" in r.stdout
+    assert not (proj.home / "state.json").exists() or (not _maints(proj) and not proj.state().get("proposals"))
+
+
+def _biz_state(proj):
+    propose(proj, load())
+    return json.loads(_answer(proj, _first_q(proj), "真，先放着").stdout)["ticket"]
+
+
+def test_impact_sets_and_records_decision(proj):
+    tid = _biz_state(proj)
+    out = proj.out("impact", tid, "--size", "0.6", "--gap", "0.5", "--confidence", "high")
+    assert out["ok"] and proj.state()["tickets"][tid]["impact"] == {"size": 0.6, "gap": 0.5, "confidence": "high"}
+    assert out["decision"] in (proj.home / "decisions.md").read_text()
+
+
+def test_impact_rejects_legacy_and_bad_values(proj):
+    tid = _biz_state(proj)
+    seed_state = proj.state()
+    seed_state["tickets"]["T9"] = {**seed_state["tickets"][tid], "id": "T9", "kind": None}
+    (proj.home / "state.json").write_text(json.dumps(seed_state))
+    r = proj.run("impact", "T9", "--size", "0.5", "--gap", "0.5", "--confidence", "mid", check=False)
+    assert r.returncode == 1 and "不是业务票" in json.loads(r.stdout)["error"]
+    for sz, gp in (("1.5", "0.5"), ("0.5", "-0.1")):
+        r = proj.run("impact", tid, "--size", sz, "--gap", gp, "--confidence", "mid", check=False)
+        assert r.returncode == 1 and "0~1" in json.loads(r.stdout)["error"]
+    r = proj.run("impact", tid, "--size", "0.5", "--gap", "0.5", "--confidence", "huge", check=False)
+    assert r.returncode == 2
+    assert proj.state()["tickets"][tid]["impact"] != {"size": 1.5, "gap": 0.5, "confidence": "mid"}

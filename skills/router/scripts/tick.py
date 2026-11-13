@@ -374,7 +374,7 @@ class Run:
             elif mode in ("weekly", "migrate"):
                 out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
                 result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
-                          "maint_pending": out["maint_pending"]}
+                          "maint": out["maint"]}
             else:
                 result = {}
                 run = self.state["analyst"]["runs"][rid]

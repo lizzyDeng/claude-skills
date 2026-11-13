@@ -14,7 +14,7 @@
      "impact": {"size": 0.2, "gap": 0.9, "confidence": "high"},
      "absorbs": [], "new_evidence": ""}
   ],
-  "maint": [{"title": "测试维护甲", "problem": "测试问题", "surfaces": ["llm-config"], "unblocks": "测试问题甲"}],
+  "maint": [{"title": "测试维护甲", "problem": "测试问题", "surfaces": ["llm-config"]}],
   "walls": [],
   "close": []
 }
