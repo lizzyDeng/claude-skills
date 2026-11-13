@@ -1372,6 +1372,22 @@ def _postlaunch_line(t, now) -> str:
     return "".join(f" · {x}" for x in parts)
 
 
+def _status_tickets(st) -> dict:
+    """status --json 的票视图：浅拷贝 + kind；业务票加 walls_open / last_verdict；维护票加 tasks_open。不改 state。"""
+    out = {}
+    for tid, t in st["tickets"].items():
+        v = dict(t)
+        v["kind"] = store.ticket_kind(t)
+        if v["kind"] == "business":
+            v["walls_open"] = sum(1 for w in t.get("walls", []) if w.get("status") == "open")
+            live = [x for x in t.get("attempts", []) if not x.get("historical")]
+            v["last_verdict"] = live[-1].get("verdict") if live else None
+        elif v["kind"] == "maint":
+            v["tasks_open"] = sum(1 for x in t.get("tasks", []) if not x.get("done"))
+        out[tid] = v
+    return out
+
+
 def cmd_status(a, env):
     with env.locked():
         st = store.load_state(env.state_path)
@@ -1379,7 +1395,7 @@ def cmd_status(a, env):
     slots = env.cfg.get("slots", {"heavy": 3, "light": 2})
     if a.json:
         return {"ok": True, "counts": counts, "slots": slots, "used": used, "queue": queue,
-                "tickets": st["tickets"], "external": st["external"], "batch": st["batch"]}
+                "tickets": _status_tickets(st), "external": st["external"], "batch": st["batch"]}
     lines = [f"批次 {st['batch']['id']}（{'已 start' if st['batch']['started'] else '未 start'}）"
              f" · 重票 {used['heavy']}/{slots.get('heavy')} · 轻票 {used['light']}/{slots.get('light')}",
              "决定单：" + ("" if queue else "（空）")]

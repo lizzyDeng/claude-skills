@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Router 看板</title>
+<style>
+:root{
+  --bg:#f6f5f1; --card:#fff; --ink:#1f2328; --soft:#5d6670; --faint:#8b939c; --line:#dcd8cf;
+  --you:#6639ba; --you-bg:#f3eefc; --run:#0969da; --run-bg:#e8f1fd; --q:#9a6700; --q-bg:#fdf5dc;
+  --ok:#1a7f37; --ok-bg:#e8f5eb; --off:#6e7781; --off-bg:#eef0f2; --accent:#c2410c;
+  --mono:"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15171b; --card:#1d2026; --ink:#e6e6e6; --soft:#a3abb4; --faint:#7d858e; --line:#323840;
+    --you:#b392f0; --you-bg:#241b36; --run:#58a6ff; --run-bg:#14243a; --q:#d4a72c; --q-bg:#2c2510;
+    --ok:#4ac26b; --ok-bg:#142619; --off:#8b949e; --off-bg:#22262c; --accent:#fb923c;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15171b; --card:#1d2026; --ink:#e6e6e6; --soft:#a3abb4; --faint:#7d858e; --line:#323840;
+  --you:#b392f0; --you-bg:#241b36; --run:#58a6ff; --run-bg:#14243a; --q:#d4a72c; --q-bg:#2c2510;
+  --ok:#4ac26b; --ok-bg:#142619; --off:#8b949e; --off-bg:#22262c; --accent:#fb923c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:28px 16px 64px}
+.mock{background:var(--q-bg);color:var(--q);border:1px dashed var(--q);border-radius:6px;
+  padding:6px 12px;font-size:13px;margin-bottom:16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 18px;margin-bottom:6px}
+h1{font-size:24px;margin:0}
+.meta{color:var(--faint);font-size:13px}
+.stats{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 6px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 14px;min-width:96px}
+.stat b{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}
+.stat span{font-size:12.5px;color:var(--soft)}
+.stat.you b{color:var(--you)} .stat.run b{color:var(--run)} .stat.q b{color:var(--q)} .stat.ok b{color:var(--ok)}
+.slots{font-size:13px;color:var(--soft);margin:4px 0 18px}
+.slots .bar{display:inline-flex;gap:3px;vertical-align:middle;margin:0 6px 0 4px}
+.slots .bar i{width:14px;height:10px;border-radius:2px;background:var(--off-bg);border:1px solid var(--line)}
+.slots .bar i.on{background:var(--run);border-color:var(--run)}
+h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-spacing:.02em}
+.decide{background:var(--you-bg);border:1px solid color-mix(in srgb,var(--you) 45%,transparent);
+  border-radius:10px;padding:14px 18px}
+.decide .row{display:flex;gap:12px;align-items:flex-start;padding:8px 0}
+.decide .row+.row{border-top:1px solid color-mix(in srgb,var(--you) 25%,transparent)}
+.decide .what{flex:1}
+.decide .what b{display:block}
+.decide .what small{color:var(--soft)}
+.say{font-family:var(--mono);font-size:12.5px;background:var(--card);border:1px solid var(--line);
+  border-radius:6px;padding:3px 8px;white-space:nowrap;color:var(--you)}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.tabs button{font:inherit;font-size:13px;background:var(--card);color:var(--soft);border:1px solid var(--line);
+  border-radius:16px;padding:3px 12px;cursor:pointer}
+.tabs button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.issue{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);
+  border-radius:10px;padding:14px 18px;margin:10px 0}
+.issue[data-g="you"]{border-left-color:var(--you)}
+.issue[data-g="run"]{border-left-color:var(--run)}
+.issue[data-g="q"]{border-left-color:var(--q)}
+.issue[data-g="ok"]{border-left-color:var(--ok)}
+.issue[data-g="off"]{border-left-color:var(--off)}
+.ih{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.ih .no{font-family:var(--mono);font-size:13px;color:var(--faint)}
+.ih .t{font-weight:700;font-size:16px}
+.pill{font-size:12px;font-weight:600;padding:1px 9px;border-radius:10px;white-space:nowrap}
+.p-you{background:var(--you-bg);color:var(--you)} .p-run{background:var(--run-bg);color:var(--run)}
+.p-q{background:var(--q-bg);color:var(--q)} .p-ok{background:var(--ok-bg);color:var(--ok)}
+.p-off{background:var(--off-bg);color:var(--off)}
+.tagw{font-size:12px;color:var(--faint);border:1px solid var(--line);border-radius:10px;padding:0 8px}
+.wait{font-size:13px;color:var(--soft);margin:4px 0 10px}
+.wait b{color:var(--ink);font-weight:600}
+.three{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media (max-width:820px){.three{grid-template-columns:1fr}}
+.cell{background:color-mix(in srgb,var(--line) 22%,transparent);border-radius:8px;padding:10px 12px}
+.cell h4{margin:0 0 4px;font-size:12.5px;color:var(--faint);font-weight:600;letter-spacing:.04em}
+.cell p{margin:0;font-size:14px}
+.cell .src{display:block;margin-top:6px;font-size:12px;color:var(--faint)}
+.cell.sol.pending{border:1px dashed var(--line);background:transparent}
+.foot{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:10px;font-size:12.5px;color:var(--faint)}
+.foot code,code{font-family:var(--mono);font-size:12px;background:color-mix(in srgb,var(--line) 40%,transparent);
+  padding:0 5px;border-radius:4px;word-break:break-all}
+.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 16px}
+.log .row{display:grid;grid-template-columns:44px 1fr auto;gap:10px;padding:8px 0;font-size:14px;align-items:baseline}
+.log .row+.row{border-top:1px solid var(--line)}
+.log .id{font-family:var(--mono);color:var(--faint);font-size:12.5px}
+.log small{color:var(--soft)}
+.hidden{display:none}
+.tl{margin:8px 0 0;padding:0;list-style:none;font-size:12.5px;color:var(--soft)}
+.tl li{padding:1px 0}
+.tl .ts{font-family:var(--mono);color:var(--faint);margin-right:6px}
+.p-review{background:var(--q-bg);color:var(--accent)}
+.revoked{text-decoration:line-through;color:var(--faint)}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Router 看板</h1>
+  <span class="meta">批次：—（未 start）· 更新于 11-02 10:00 UTC · 只读，30 秒自动刷新</span>
+</header>
+<div class="stats">
+  <div class="stat you"><b>1</b><span>等你</span></div>
+  <div class="stat run"><b>1</b><span>在跑</span></div>
+  <div class="stat q"><b>1</b><span>待 start / 排队</span></div>
+  <div class="stat ok"><b>1</b><span>已合 / 已改完</span></div>
+  <div class="stat run"><b>0</b><span>上线验收中</span></div>
+  <div class="stat"><b>0</b><span>暂缓</span></div>
+</div>
+<div class="slots">
+  重名额（编译 Rust）<span class="bar"><i></i><i></i><i></i></span>0/3
+  &nbsp;·&nbsp; 轻名额（数据 / 脚本 / 文案）<span class="bar"><i class="on"></i><i></i></span>1/2
+</div>
+<h2>等你</h2>
+<div class="decide"><div class="row"><div class="what"><b>示例摘要</b><small>Q1 · 方向卡 · 挡 2 张 · 11-02 09:00</small></div><span class="say">T1 同意 / T1 改：… / T1 驳回：…</span></div></div>
+<h2>全部 issue</h2>
+<div class="tabs" role="group" aria-label="筛选"><button aria-pressed="true" data-f="all">全部 3</button><button aria-pressed="false" data-f="you">等你 0</button><button aria-pressed="false" data-f="run">在跑 1</button><button aria-pressed="false" data-f="q">待 start / 排队 1</button><button aria-pressed="false" data-f="ok">已完成 1</button><button aria-pressed="false" data-f="off">暂缓 / 不派 0</button></div>
+<div id="list">
+<div class="issue" data-g="run">
+  <div class="ih"><span class="no">T1 · T1</span><span class="t">示例甲</span>
+    <span class="pill p-run">执行</span><span class="tagw">轻</span></div>
+  <div class="wait">在等：<b>执行中</b></div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p> · </p><span class="src"></span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>示例问题</p><span class="src"><code></code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>（无线索）</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：a</span><span>依赖：无</span><span>订阅：代码面 a</span></div>
+  
+</div><div class="issue" data-g="q">
+  <div class="ih"><span class="no">T2 · T2</span><span class="t">示例乙</span>
+    <span class="pill p-q">排队</span><span class="tagw">轻</span></div>
+  <div class="wait">&nbsp;</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p> · </p><span class="src"></span></div>
+    <div class="cell"><h4>解决什么问题</h4><p></p><span class="src"><code></code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>（无线索）</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：b</span><span>依赖：T1</span><span>订阅：代码面 b · 依赖 T1</span></div>
+  
+</div><div class="issue" data-g="ok">
+  <div class="ih"><span class="no">T3 · T3</span><span class="t">示例丙</span>
+    <span class="pill p-ok">完成</span><span class="tagw">轻</span></div>
+  <div class="wait">&nbsp;</div>
+  <div class="three">
+    <div class="cell"><h4>为什么派</h4><p> · </p><span class="src"></span></div>
+    <div class="cell"><h4>解决什么问题</h4><p></p><span class="src"><code></code></span></div>
+    <div class="cell sol pending"><h4>解法 · 方案待出</h4><p>（无线索）</p><span class="src">router 线索 · 非方案</span></div>
+  </div>
+  <div class="foot"><span>占用：无</span><span>依赖：无</span><span>订阅：无</span></div>
+  
+</div>
+</div>
+<h2>router 最近替你定的</h2>
+<div class="log"><div class="row"><span class="id">—</span><span><small>还没有替你做的决定。</small></span><span></span></div></div>
+</main>
+<script>
+(function(){
+  var btns=document.querySelectorAll('.tabs button');
+  var items=document.querySelectorAll('#list .issue');
+  btns.forEach(function(b){
+    b.addEventListener('click',function(){
+      var f=b.getAttribute('data-f');
+      btns.forEach(function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});
+      items.forEach(function(it){
+        var g=it.getAttribute('data-g');
+        it.classList.toggle('hidden', !(f==='all'||f===g));
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>
