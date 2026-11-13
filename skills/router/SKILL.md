@@ -99,7 +99,7 @@ worker 自身的 Claude 用量不算花钱（用户 11-02 已同意）。
 | 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支） |
 | 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
 | 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
-| 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2 [--t0 <ISO>]`（写进周报 releases.json；票进上线验收 postlaunch，不是完成）。零代码票先执行配置，`--t0` 写配置生效的时刻（带时区） |
+| 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2 [--t0 <ISO>] [--config-keys k1,k2]`（写进周报 releases.json，带 `at` = 生效时刻；票进上线验收 postlaunch，不是完成）。零代码票先执行配置，`--t0` 写配置生效的时刻（带时区）；改了配置键就写 `--config-keys`（周报按它认登记，缺了同窗判定会被封顶） |
 | 「Qn 知道了」/「Qn：…」（上线验收项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话调整。检查点都走完了 ⇒ 票完成 |
 | （检查点到期：`postlaunch_due`） | 跑完检查后 `router.py postlaunch-result <T> --check T+1 --type 增长型 --verdict … --summary "…" [--action "…"] [--behavior "…"]` |
 

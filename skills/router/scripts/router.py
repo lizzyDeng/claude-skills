@@ -682,7 +682,11 @@ def cmd_released(a, env):
         for tid in a.tickets:
             env.ticket(st, tid)
         lines = json.loads(rel.read_text(encoding="utf-8")) if rel.exists() else []
-        entry = {"date": env.ctx.now().strftime("%Y-%m-%d"), "what": a.what, "metrics": _csv(a.metrics)}
+        # at = 生效时刻：周报按它切窗；缺 at 会回落到 date 当天 00:00，窗口和批边界整体算歪。date 跟 at 走（本机时区）
+        local = datetime.strptime(t0, store.ISO).replace(tzinfo=timezone.utc).astimezone()
+        entry = {"date": local.strftime("%Y-%m-%d"), "at": t0, "what": a.what, "metrics": _csv(a.metrics)}
+        if a.config_keys:
+            entry["config_keys"] = _csv(a.config_keys)                   # 周报 registered() 按结构化键名认登记，不靠 what 里的短名
         store._atomic_write(rel, json.dumps(lines + [entry], ensure_ascii=False, indent=2) + "\n")
         plans = {}
         for tid in a.tickets:
@@ -945,6 +949,7 @@ def build_parser():
     s.add_argument("--tickets", nargs="+", required=True); s.add_argument("--what", required=True)
     s.add_argument("--metrics", required=True)
     s.add_argument("--t0", help="生效时刻（带时区的 ISO）；配置类上线的生效时刻和执行 released 的时刻不同时用，缺省 = 现在")
+    s.add_argument("--config-keys", help="配置类上线改了哪些键（逗号分隔，如 llm_config.timeouts）；周报据此认登记，缺了会把同窗判定封顶")
     s = sub.add_parser("postlaunch-result", help="记一次上线验收结论（T+1 / T+3 / T+7）")
     s.add_argument("ticket")
     s.add_argument("--check", required=True, choices=[c for c, _ in store.POSTLAUNCH_CHECKS])
