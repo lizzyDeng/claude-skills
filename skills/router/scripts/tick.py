@@ -1,19 +1,23 @@
 """一轮巡检。顺序写死（计划 Task 9），实现者不要改顺序：
 
-0 新周报 → triage_needed      1 扫外部 session，查抢锁      2 处理退出的 worker
+0 新周报 → 分析 agent weekly 跑（+ 转 release_sync.unlabeled）   0b 分析 agent：收尾退出的 run、每日起 daily
+1 扫外部 session，查抢锁      2 处理退出的 worker
 3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时；4b 上线验收到期
 5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       6 派发      7 看板 + Lark
 
 整轮持 <home>/.lock。每一步单独 try：一步出错不拖垮后面几步，错误进返回值。
 """
+import copy
+import json
 import os
 import shutil
 import string
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import analyst
 import board
 import discover
 import events
@@ -25,8 +29,8 @@ import store
 import surfaces
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
-             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user")
+WAKE_KEYS = ("new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
+             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled")
 # 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
 ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
@@ -61,7 +65,7 @@ def _ts(s):
 
 
 def _empty_res() -> dict:
-    return {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
+    return {"dispatched": [], "dispatch_failed": [], "new_queue": [],
             "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "postlaunch_due": [],
             "notified": False, "errors": []}
 
@@ -239,18 +243,143 @@ class Run:
         store.append_decision(self.home / "decisions.md", self.state, "-", what, AUTO_FIX_WHY, basis, self.now,
                               key=inc["key"])
 
-    # ---- 0 ----
+    # ---- 0：新周报 → 分析 agent weekly（替代 v1 分诊）----
     def step0_weekly(self):
-        runs = Path(os.path.expanduser(self.cfg.get("weekly_runs_dir", "")))
-        if not runs.is_dir():
+        latest = self._new_weekly()
+        if not latest:
             return
+        an = self.state.setdefault("analyst", {})
+        an["last_weekly"] = latest              # 先记：起不来也不每分钟重试（router 可手动 analyst run --mode weekly）
+        unlabeled = self._unlabeled(latest)
+        if unlabeled:                           # 原来由分诊转：现在巡检直接交给 router，由它转给用户
+            self.state.setdefault("wake", {})["releases_unlabeled"] = unlabeled
+        if not analyst.enabled(self.cfg):
+            self.res["errors"].append(f"新周报 {latest}：config 没配 analyst.brief，分析 agent 没跑 weekly")
+            return
+        try:
+            rid = analyst.start(self._env(), self.state, "weekly")
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"新周报 {latest}：分析 agent weekly 没起来（{str(e)[:160]}）；"
+                                      "修好后跑 router.py analyst run --mode weekly")
+            return
+        self.state["analyst"]["runs"][rid].setdefault("week", latest)
+
+    def _weekly_runs_dir(self) -> Path:
+        return Path(os.path.expanduser(self.cfg.get("weekly_runs_dir", "")))
+
+    def _new_weekly(self):
+        """最新一期已发出（有 sent）的周报，且 v1 没分诊过、分析 agent 也没跑过 → 期号；否则 None。"""
+        runs = self._weekly_runs_dir()
+        if not runs.is_dir():
+            return None
         weeks = sorted(d.name for d in runs.iterdir() if (d / "sent").exists())
         if not weeks:
-            return
+            return None
         latest = weeks[-1]
-        drafted = any(t["batch"] == latest for t in self.state["tickets"].values())
-        if latest != self.state["batch"]["id"] and not drafted:
-            self.res["triage_needed"] = latest
+        drafted = any(t.get("batch") == latest for t in self.state["tickets"].values())
+        seen = latest in (self.state["batch"]["id"], (self.state.get("analyst") or {}).get("last_weekly"))
+        return None if drafted or seen else latest
+
+    def _unlabeled(self, week) -> list:
+        p = self._weekly_runs_dir() / week / "summary.json"
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.res["errors"].append(f"新周报 {week}：summary.json 读不了（{str(e)[:120]}），release_sync.unlabeled 没转")
+            return []
+        rs = data.get("release_sync") if isinstance(data, dict) else None
+        u = rs.get("unlabeled") if isinstance(rs, dict) else None
+        return list(u) if isinstance(u, list) else []
+
+    def _env(self):
+        """propose_from / apply_daily / analyst.start 要的 router.Env，用这一轮的 cfg 和 home（cfg 不一定落了盘）。"""
+        import router
+        env = router.Env(self.root, self.ctx)
+        env.cfg, env.home, env.table = self.cfg, self.home, self.table
+        env.state_path, env.decisions = self.home / "state.json", self.home / "decisions.md"
+        return env
+
+    # ---- 0b：分析 agent ----
+    def step_analyst(self):
+        """先收尾退出的 run（每个只收一次），再看要不要起今天的 daily。"""
+        for rid, run in list(((self.state.get("analyst") or {}).get("runs") or {}).items()):
+            if analyst.finished(run):
+                continue
+            try:
+                self._analyst_collect(rid, run)
+            except Exception as e:  # noqa: BLE001 — 一个 run 出错不挡其它 run
+                self.res["errors"].append(f"分析 agent {rid}：收尾出错 {e!r}")
+        if analyst.enabled(self.cfg):
+            self._analyst_daily()
+
+    def _analyst_daily(self):
+        """UTC 过了 analyst.daily_at_utc、今天还没起过 ⇒ 起 daily。起不来也记 last_daily：当天不再试，次日才重跑。"""
+        now = self.ctx.now()
+        an = self.state.setdefault("analyst", {})
+        today = now.strftime("%Y-%m-%d")
+        if an.get("last_daily") == today or (now.hour, now.minute) < analyst.daily_at(self.cfg):
+            return
+        an["last_daily"] = today
+        try:
+            analyst.start(self._env(), self.state, "daily", (now - timedelta(days=1)).strftime("%Y-%m-%d"), today)
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"分析 agent daily 没起来（{str(e)[:160]}）：今天不再试")
+
+    def _analyst_collect(self, rid, run):
+        live = launcher.worker_liveness(self.ctx, run)
+        if live != "dead":                      # 还在跑（或认不出）：不动；跑太久才判失败
+            if _ts(self.now) - _ts(run.get("started_at")) >= analyst.STALE_S:
+                launcher.stop_worker(self.ctx, run)          # 身份对得上才停
+                how = "认不出进程，没停" if live == "unknown" else "已停掉"
+                self._analyst_fail(rid, f"跑了 {analyst.STALE_S // 3600} 小时还没退出（{how}）")
+            return
+        data, err = analyst.read_out(run["out"])
+        if err:
+            self._analyst_fail(rid, err)
+            return
+        self._analyst_ingest(rid, data)
+
+    def _analyst_fail(self, rid, why):
+        """报一次错、标 failed：不改别的状态，不自动重跑。"""
+        run = self.state["analyst"]["runs"][rid]
+        run.update(failed=True, error=why[:300], failed_at=self.now)
+        self.res["errors"].append(f"分析 agent {rid}（{run['mode']}）失败：{why}；不自动重跑"
+                                  f"（要重跑：router.py analyst run --mode {run['mode']}）")
+
+    def _analyst_ingest(self, rid, data):
+        """daily → apply_daily；weekly / migrate → propose_from（模式以 run 记录为准，产出自称什么不算）；
+        calibrate → 只叫醒 router（analyst_done），由它判过没过。期间直接推进决定单的项也进 new_queue。"""
+        import router
+        snap = copy.deepcopy(self.state)
+        before = {q["id"] for q in self.state["queue"]}
+        mode = self.state["analyst"]["runs"][rid]["mode"]
+        # 先标「收过」：收的过程中续跑 worker 会中途存盘，盘上必须已经是收过，崩了重启也不会再收一次
+        self.state["analyst"]["runs"][rid]["ingested"] = self.now
+        try:
+            if mode == "daily":
+                out = router.apply_daily(self._env(), self.state, data)
+                result = {"applied": len(out["applied"]), "errors": out["errors"]}
+                for e in out["errors"]:
+                    self.res["errors"].append(f"分析 agent {rid}：第 {e['index'] + 1} 条 {e['kind']}"
+                                              f"（{e.get('ticket') or '-'}）没落：{str(e['error'])[:160]}")
+            elif mode in ("weekly", "migrate"):
+                out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
+                result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
+                          "maint_pending": out["maint_pending"]}
+            else:
+                result = {}
+                run = self.state["analyst"]["runs"][rid]
+                self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+                    {"run": rid, "mode": mode, "out": run["out"]})
+        except Exception as e:  # noqa: BLE001 — 整份拒收（校准门 / 泄漏 / 格式）：状态复原，按失败报一次
+            self.state.clear()
+            self.state.update(snap)
+            self._analyst_fail(rid, f"产出没收进来：{str(e)[:200]}（产出在 {snap['analyst']['runs'][rid]['out']}）")
+            return
+        self.state["analyst"]["runs"][rid]["result"] = result
+        self.res["new_queue"] += [q["id"] for q in self.state["queue"] if q["id"] not in before]
 
     # ---- 1 ----
     def step1_external(self):
@@ -1026,15 +1155,17 @@ def run(ctx, root, cfg, resurface=False) -> dict:
     with store.locked(home):
         state = store.load_state(home / "state.json")
         r = Run(ctx, root, cfg, state)
-        for step in (r.step0_weekly, r.step1_external, r.step2_exits, r.step3_events, r.step4_patrol,
-                     r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
+        for step in (r.step0_weekly, r.step_analyst, r.step1_external, r.step2_exits, r.step3_events,
+                     r.step4_patrol, r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
             try:
                 step()
             except Exception as e:  # 一步出错不拖垮整轮；错误交给 router
                 r.res["errors"].append(f"{step.__name__}：{e!r}\n{traceback.format_exc(limit=3)}")
         if resurface:
             _resurface(r)
-        r.res.update(state.pop("wake", None) or {})          # verdict 留下的唤醒键（rollback_needed / no_entry）：弹出交给 router
+        # 唤醒键（verdict 的 rollback_needed / no_entry / return_to_user，分析 agent 的 analyst_done / releases_unlabeled）：
+        # 弹出交给 router
+        r.res.update(state.pop("wake", None) or {})
         store.save_state(home / "state.json", state)
     return r.res
 

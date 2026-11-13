@@ -6,9 +6,11 @@
   FAKE_CLAUDE_ARGV_LOG  把 argv 追加到这个文件（一行一个 JSON 数组）
   FAKE_CLAUDE_HOOK      退出前执行的脚本（python 文件），用来模拟 worker 写 progress / 事件
   FAKE_CLAUDE_NO_RESULT 设了就不写结果（模拟进程被杀、Mac 睡眠）
+  OUT_JSON              设了就把它的内容原样写到 prompt 里 `OUT=<路径>` 指的文件（模拟分析 agent 写产出）
 """
 import json
 import os
+import re
 import runpy
 import sys
 import time
@@ -24,6 +26,12 @@ if os.environ.get("FAKE_CLAUDE_ARGV_LOG"):
     with open(os.environ["FAKE_CLAUDE_ARGV_LOG"], "a") as f:
         f.write(json.dumps(argv, ensure_ascii=False) + "\n")
 time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))
+if "OUT_JSON" in os.environ:
+    m = re.search(r"OUT=(\S+)", opt("-p") or "")
+    if m:
+        os.makedirs(os.path.dirname(m.group(1)) or ".", exist_ok=True)
+        with open(m.group(1), "w", encoding="utf-8") as f:
+            f.write(os.environ["OUT_JSON"])
 if os.environ.get("FAKE_CLAUDE_HOOK"):
     sys.argv = [os.environ["FAKE_CLAUDE_HOOK"], *argv]
     runpy.run_path(os.environ["FAKE_CLAUDE_HOOK"], run_name="__main__")

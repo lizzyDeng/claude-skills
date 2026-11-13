@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import analyst  # noqa: E402
 import discover  # noqa: E402
 import events  # noqa: E402
 import github  # noqa: E402
@@ -31,7 +32,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
-               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily"}
+               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -1058,6 +1059,38 @@ def cmd_apply_daily(a, env):
         return apply_daily(env, st, data)
 
 
+def _day(s, name):
+    if s is None:
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise Fail(f"{name} 要 YYYY-MM-DD：{s!r}")
+    return s
+
+
+def cmd_analyst(a, env):
+    """analyst run：手动起一次分析 agent（同模式已有在跑的就不起第二个）；产出由下一轮巡检收。
+    analyst calibrated：router 对照项目 brief 的已知问题判校准过没过（weekly 的提议在此之前一律不收）。"""
+    if a.analyst_cmd == "calibrated":
+        with env.state() as st:
+            an = st.setdefault("analyst", {})
+            an.update(calibrated=bool(a.passed), calibrated_note=a.note, calibrated_at=env.now())
+        return {"ok": True, "calibrated": bool(a.passed), "note": a.note}
+    since, until = _day(a.since, "--since"), _day(a.until, "--until")
+    with env.state() as st:
+        before = analyst.active_run(env.ctx, st, a.mode)
+        try:
+            rid = analyst.start(env, st, a.mode, since, until)
+        except analyst.AnalystError as e:
+            raise Fail(str(e))
+        except OSError as e:                     # 起进程失败（找不到 claude_bin……）：什么都没起
+            raise Fail(f"分析 agent 起不来：{e}")
+        r = st["analyst"]["runs"][rid]
+    return {"ok": True, "run": rid, "mode": a.mode, "reused": rid == before, "since": r.get("since"),
+            "until": r.get("until"), "out": r["out"], "log": r["log"]}
+
+
 _BEHAVIOR = re.compile(r"^(?P<metric>[^=]+?)\s*=\s*(?P<before>.+?)\s*(?:→|->)\s*(?P<after>.+?)\s*[,，]\s*(?P<v>[a-z_]+)\s*$")
 
 
@@ -1323,6 +1356,17 @@ def build_parser():
     s.add_argument("--new-wall")
     s = sub.add_parser("apply-daily", help="daily 的判定 / 新墙逐条落（每条独立，坏的进 errors）")
     s.add_argument("--from", dest="source", required=True)
+    s = sub.add_parser("analyst", help="分析 agent（Fable）：手动起一次 / 记校准结果")
+    asub = s.add_subparsers(dest="analyst_cmd", required=True)
+    r = asub.add_parser("run", help="起一次分析 agent；产出由下一轮巡检收")
+    r.add_argument("--mode", required=True, choices=list(analyst.MODES))
+    r.add_argument("--since", help="YYYY-MM-DD（UTC）；缺省按模式往前推")
+    r.add_argument("--until", help="YYYY-MM-DD（UTC）；缺省今天")
+    c = asub.add_parser("calibrated", help="router 判校准过没过")
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true")
+    g.add_argument("--fail", dest="failed", action="store_true")
+    c.add_argument("--note", required=True, help="判定依据：找到了哪几个已知问题")
     s = sub.add_parser("postlaunch-result", help="记一次上线验收结论（T+1 / T+3 / T+7）")
     s.add_argument("ticket")
     s.add_argument("--check", required=True, choices=[c for c, _ in store.POSTLAUNCH_CHECKS])

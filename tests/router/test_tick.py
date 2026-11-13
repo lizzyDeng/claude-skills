@@ -249,15 +249,24 @@ def test_heavy_blocked_when_cargo_dir_too_big(proj):
     assert "CARGO_TARGET_DIR" in proj.state()["tickets"]["T1"]["waiting_for"]
 
 
-def test_new_weekly_run_sets_triage_needed_once(proj):
+def test_new_weekly_run_starts_weekly_analyst_once(proj):
+    """v2：新周报不再出 triage_needed，改为起分析 agent 的 weekly 跑（每期一次）。"""
+    (proj.tmp / "brief.md").write_text("合成 brief\n")
+    proj.cfg["analyst"] = {"brief": str(proj.tmp / "brief.md"), "daily_at_utc": "23:00"}   # 时钟 10:00Z：不触发 daily
+    weekly = lambda: [r for r in (proj.state().get("analyst") or {}).get("runs", {}).values() if r["mode"] == "weekly"]
     proj.put()
     (proj.runs / "2026-10-19").mkdir(); (proj.runs / "2026-10-19" / "sent").write_text("")
     (proj.runs / "2026-10-26").mkdir()                                     # 还没发出去
-    assert proj.run()["triage_needed"] == "2026-10-19"
+    res = proj.run()
+    assert "triage_needed" not in res and [r["week"] for r in weekly()] == ["2026-10-19"]
+    assert proj.run() and len(weekly()) == 1 and len(proj.ctx.spawned) == 1            # 同一期不再起
+    proj.ctx.alive.clear()
     (proj.runs / "2026-10-26" / "sent").write_text("")
-    assert proj.run()["triage_needed"] == "2026-10-26"
-    s = proj.state(); s["batch"]["id"] = "2026-10-26"; store.save_state(proj.home / "state.json", s)
-    assert proj.run()["triage_needed"] is None
+    proj.run()
+    assert [r["week"] for r in weekly()] == ["2026-10-19", "2026-10-26"]
+    assert proj.state()["analyst"]["last_weekly"] == "2026-10-26"
+    proj.run()
+    assert len(weekly()) == 2 and len(proj.ctx.spawned) == 2
 
 
 def test_notify_only_counts_and_ids(proj):
