@@ -31,7 +31,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
-               "ack-slow", "review-pack", "review-canary", "propose"}
+               "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -47,6 +47,7 @@ KIND_HINT = {
 
 
 # 续跑后「在等什么」（R5）：按续跑的原因写，不留空
+NO_WALL_WAIT = "墙已全部拆完，等分析 agent 提议结束"
 RESUME_WAIT = {"card": "执行中（方向卡已确认）", "reject": "按驳回重写方向卡", "spend": "照放行结论继续",
                "stuck": "按回答续跑", "conflict": "按回答处理代码面冲突", "offrepo_reject": "按你的意见改仓外改动",
                "handback": "你交还后继续"}
@@ -894,6 +895,13 @@ def cmd_released(a, env):
     with env.state() as st:
         for tid in a.tickets:
             env.ticket(st, tid)
+        biz = [tid for tid in a.tickets if store.ticket_kind(st["tickets"][tid]) == "business"]
+        for tid in biz:                                                  # 业务票：先验完再写 releases.json（拒收不留痕）
+            if not (a.rollback or "").strip():
+                raise Fail(f"{tid} 是业务票：released 必须带 --rollback \"<撤回办法>\"")
+            if any(x.get("verdict") in (None, "pending_sample") for x in st["tickets"][tid]["attempts"]
+                   if not x.get("historical")):
+                raise Fail(f"{tid} 上一次尝试还没判（判定为空或待样本）：先 verdict，再 released")
         lines = json.loads(rel.read_text(encoding="utf-8")) if rel.exists() else []
         # at = 生效时刻：周报按它切窗；缺 at 会回落到 date 当天 00:00，窗口和批边界整体算歪。date 跟 at 走（本机时区）
         local = datetime.strptime(t0, store.ISO).replace(tzinfo=timezone.utc).astimezone()
@@ -904,12 +912,118 @@ def cmd_released(a, env):
         plans = {}
         for tid in a.tickets:
             t = st["tickets"][tid]
+            if tid in biz:                                               # 验收交给 daily 的判定，不排 T+1/T+3/T+7
+                n = store.add_attempt(st, tid, a.what, t0, a.rollback.strip())
+                store.set_status(st, tid, store.POSTLAUNCH, env.now(), f"等 daily 判定尝试 {n}")
+                continue
             if t.get("postlaunch"):
                 t.setdefault("postlaunch_prev", []).append(t["postlaunch"])
             t["postlaunch"] = plans[tid] = store.postlaunch_plan(t0)
             store.set_status(st, tid, store.POSTLAUNCH, env.now(), store.postlaunch_wait(st, t, env.now()))
         _prod_item(env, st)
     return {"ok": True, "release": entry, "path": str(rel), "postlaunch": plans}
+
+
+# ---- 业务票：判定 / 尝试循环 ----------------------------------------------------
+
+def _guard(env):
+    try:
+        return github.load_guard(env.cfg.get("leak_guard_globs", []))
+    except github.GuardEmpty as e:
+        raise Fail(f"防泄漏闸失效，一条都没收：{e}")
+
+
+def _leaks(guard, *texts) -> list:
+    return sorted({h for tx in texts if tx for h in github.leak_hits(str(tx), guard)})
+
+
+def _wake(st, key, item) -> None:
+    """唤醒键：存进 state["wake"]，下一轮 tick 弹出、放进 tick 结果交给 router。"""
+    st.setdefault("wake", {}).setdefault(key, []).append(item)
+
+
+def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, note, new_wall=None) -> list:
+    t = env.ticket(st, tid)
+    if store.ticket_kind(t) != "business":
+        raise Fail(f"{tid} 不是业务票，没有尝试判定")
+    try:
+        actions = store.record_verdict(st, tid, n, verdict, env.now(), touched=touched, hit_wall=hit_wall,
+                                       continued=continued, note=note, new_wall=new_wall)["actions"]
+    except ValueError as e:
+        raise Fail(str(e))
+    att = next(x for x in t["attempts"] if x.get("n") == n)
+    for act in actions:
+        if act in ("next_wall", "change_direction"):
+            opens = [w for w in t["walls"] if w["status"] == "open"]
+            if act == "next_wall" and not opens:                         # 墙拆完了：不叫醒 worker，等分析 agent 提议结束
+                t["waiting_for"] = NO_WALL_WAIT
+                continue
+            text = (f"尝试 {n} 判定 {verdict}（{note}）。"
+                    + (f"下一堵墙：{opens[0]['text']}。" if act == "next_wall" else "换方向：别在原路上再试一遍。")
+                    + "请重新写方向卡再做。")
+            _resume(env, st, tid, "direction", text, store.EXECUTING)
+        elif act == "return_to_user":
+            store.push_queue(st, tid, "return", f"{tid} 连续 {t['no_use_streak']} 次没用，退回用户定夺", env.now())
+        elif act == "rollback":
+            store.push_queue(st, tid, "harm", f"{tid} 尝试 {n} 有害，需撤回：{att.get('rollback', '')}", env.now())
+            _wake(st, "rollback_needed", {"ticket": tid, "rollback": att.get("rollback", "")})
+        elif act == "check_entry":
+            _wake(st, "no_entry", {"ticket": tid, "attempt": n})
+    return actions
+
+
+def cmd_verdict(a, env):
+    guard = _guard(env)
+    if _leaks(guard, a.note, a.new_wall):
+        raise Fail("note / new-wall 里有 uid / 用户原话，拒收", hits=_leaks(guard, a.note, a.new_wall))
+    with env.state() as st:
+        actions = _verdict_core(env, st, a.ticket, a.attempt, a.verdict, touched=a.touched, hit_wall=a.hit_wall,
+                                continued=a.continued, note=a.note, new_wall=a.new_wall)
+    return {"ok": True, "actions": actions}
+
+
+def apply_daily(env, st, data) -> dict:
+    """daily 的判定 / 新墙逐条落（调用方持锁、负责存盘）。每条独立：非法 / 泄漏 / 找不到票 → errors，不拖垮其余。"""
+    guard = _guard(env)
+    applied, errors = [], []
+
+    def one(kind, i, item, fn):
+        snap = copy.deepcopy(st)
+        try:
+            fn()
+            applied.append({"kind": kind, "index": i, "ticket": item.get("ticket")})
+        except Exception as e:  # noqa: BLE001 — 单条失败：回滚这条的改动，记错，继续
+            st.clear(); st.update(snap)
+            errors.append({"kind": kind, "index": i, "ticket": item.get("ticket") if isinstance(item, dict) else None,
+                           "error": str(e)})
+
+    def do_verdict(v):
+        hits = _leaks(guard, v.get("note"), v.get("new_wall"))
+        if hits:
+            raise Fail(f"泄漏闸命中：{hits}")
+        _verdict_core(env, st, v["ticket"], v["attempt"], v["verdict"], touched=v["touched"], hit_wall=v["hit_wall"],
+                      continued=v["continued"], note=v.get("note", ""), new_wall=v.get("new_wall"))
+
+    def do_wall(w):
+        hits = _leaks(guard, w.get("text"))
+        if hits:
+            raise Fail(f"泄漏闸命中：{hits}")
+        t = env.ticket(st, w["ticket"])
+        if store.ticket_kind(t) != "business" or not str(w.get("text", "")).strip():
+            raise Fail(f"{w['ticket']} 不是业务票或墙文本为空")
+        store.attach_wall(st, w["ticket"], w["text"], "daily", env.now())
+
+    for i, v in enumerate(data.get("verdicts", [])):
+        one("verdict", i, v, lambda v=v: do_verdict(v))
+    for i, w in enumerate(data.get("walls", [])):
+        one("wall", i, w, lambda w=w: do_wall(w))
+    return {"ok": True, "applied": applied, "errors": errors, "notes": data.get("notes", "")}
+
+
+def cmd_apply_daily(a, env):
+    data = json.loads(Path(a.source).read_text(encoding="utf-8"))
+    with env.state() as st:
+        return apply_daily(env, st, data)
 
 
 _BEHAVIOR = re.compile(r"^(?P<metric>[^=]+?)\s*=\s*(?P<before>.+?)\s*(?:→|->)\s*(?P<after>.+?)\s*[,，]\s*(?P<v>[a-z_]+)\s*$")
@@ -1167,7 +1281,16 @@ def build_parser():
     s.add_argument("--tickets", nargs="+", required=True); s.add_argument("--what", required=True)
     s.add_argument("--metrics", required=True)
     s.add_argument("--t0", help="生效时刻（带时区的 ISO）；配置类上线的生效时刻和执行 released 的时刻不同时用，缺省 = 现在")
+    s.add_argument("--rollback", help="业务票必填：这次上线的撤回办法")
     s.add_argument("--config-keys", help="配置类上线改了哪些键（逗号分隔，如 llm_config.timeouts）；周报据此认登记，缺了会把同窗判定封顶")
+    s = sub.add_parser("verdict", help="业务票：记一次尝试的判定，按结果叫醒 worker / 推决定单")
+    s.add_argument("ticket"); s.add_argument("--attempt", type=int, required=True)
+    s.add_argument("--verdict", required=True, choices=list(store.BIZ_VERDICTS))
+    s.add_argument("--touched", type=int, required=True); s.add_argument("--hit-wall", type=int, required=True)
+    s.add_argument("--continued", type=int, required=True); s.add_argument("--note", required=True)
+    s.add_argument("--new-wall")
+    s = sub.add_parser("apply-daily", help="daily 的判定 / 新墙逐条落（每条独立，坏的进 errors）")
+    s.add_argument("--from", dest="source", required=True)
     s = sub.add_parser("postlaunch-result", help="记一次上线验收结论（T+1 / T+3 / T+7）")
     s.add_argument("ticket")
     s.add_argument("--check", required=True, choices=[c for c, _ in store.POSTLAUNCH_CHECKS])

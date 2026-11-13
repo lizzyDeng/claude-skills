@@ -1,7 +1,7 @@
 import json
 
 from conftest import FIX
-from test_router_cli import proj, seed  # noqa: F401  (proj 是 fixture)
+from test_router_cli import proj, seed, wait_until  # noqa: F401  (proj 是 fixture)
 
 
 def load(**over):
@@ -274,3 +274,139 @@ def test_propose_skips_key_already_pending(proj):
     out = json.loads(propose(proj, load()).stdout)
     assert out["proposals"] == [] and out["skipped"] == ["k1", "k2"]
     assert len([q for q in proj.state()["queue"] if q["kind"] == "verify_problem"]) == 2
+
+
+# ---- Task 4：上线 / 判定 / 尝试循环 ------------------------------------------
+
+def _biz(proj, status="postlaunch", attempts=None, walls=2, streak=0, **extra):
+    wt = proj.tmp / "wt"; wt.mkdir(exist_ok=True)
+    t = {"kind": "business", "authorized": True, "title": "测试业务票", "issue": 51, "card_confirmed": True,
+         "attempts": attempts or [], "no_use_streak": streak,
+         "walls": [{"id": f"W{i}", "text": f"墙{i}", "status": "open", "source": "analyst", "at": "2026-11-01T00:00:00Z"}
+                   for i in range(1, walls + 1)],
+         "worker": {"session_id": "sid-biz", "worktree": str(wt), "runs": 1}, **extra}
+    seed(proj, T1=(status, ["her-reply-prompt"], t))
+
+
+def _rel(proj, *extra, check=True):
+    return proj.run("released", "--tickets", "T1", "--what", "测试上线", "--metrics", "m1", *extra, check=check)
+
+
+def test_released_business_requires_rollback(proj):
+    _biz(proj, status="await_prod")
+    r = _rel(proj, check=False)
+    assert r.returncode == 1 and "--rollback" in json.loads(r.stdout)["error"]
+    assert proj.state()["tickets"]["T1"]["attempts"] == []
+    out = json.loads(_rel(proj, "--rollback", "关掉开关 x").stdout)
+    t = proj.state()["tickets"]["T1"]
+    assert out["ok"] and t["status"] == "postlaunch"
+    assert t["attempts"][0]["n"] == 1 and t["attempts"][0]["rollback"] == "关掉开关 x"
+    assert not t.get("postlaunch")                       # 不排 T+1/T+3/T+7
+
+
+def test_released_refuses_second_inflight(proj):
+    _biz(proj, status="await_prod", attempts=[{"n": 1, "direction": "d", "at": "x", "rollback": "r", "verdict": None}])
+    r = _rel(proj, "--rollback", "r2", check=False)
+    assert r.returncode == 1 and "上一次尝试还没判" in json.loads(r.stdout)["error"]
+    _biz(proj, status="await_prod", attempts=[{"n": 1, "direction": "d", "at": "x", "rollback": "r",
+                                               "verdict": "pending_sample"}])
+    assert _rel(proj, "--rollback", "r2", check=False).returncode == 1
+
+
+def test_released_inflight_ignores_historical(proj):
+    _biz(proj, status="await_prod", attempts=[{"n": 1, "direction": "d", "at": "x", "rollback": "", "verdict": None,
+                                               "historical": True}])
+    assert _rel(proj, "--rollback", "r2").returncode == 0
+
+
+def _verdict(proj, v="useless", n=1, *extra, check=True):
+    return proj.run("verdict", "T1", "--attempt", str(n), "--verdict", v, "--touched", "10", "--hit-wall", "5",
+                    "--continued", "2", "--note", "合成备注", *extra, check=check)
+
+
+_A1 = [{"n": 1, "direction": "d", "at": "2026-11-01T00:00:00Z", "rollback": "关开关 x", "verdict": None}]
+
+
+def test_verdict_useless_resumes_worker(proj):
+    _biz(proj, attempts=_A1)
+    out = json.loads(_verdict(proj).stdout)
+    assert "change_direction" in out["actions"]
+    assert proj.state()["tickets"]["T1"]["status"] == "executing"
+    wait_until(lambda: proj.claude())
+    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    assert "换方向" in prompt
+
+
+def test_verdict_useless_third_time_returns_to_user(proj):
+    _biz(proj, attempts=_A1, streak=2)
+    _verdict(proj)
+    assert [q["kind"] for q in proj.state()["queue"]] == ["return"]
+
+
+def test_verdict_harmful_queues_harm_and_wakes(proj):
+    _biz(proj, attempts=_A1)
+    _verdict(proj, "harmful")
+    s = proj.state()
+    assert [q["kind"] for q in s["queue"]] == ["harm"] and proj.claude() == []
+    res = proj.out("tick")
+    assert res["rollback_needed"] == [{"ticket": "T1", "rollback": "关开关 x"}]
+    assert "rollback_needed" not in proj.out("tick")        # 弹出后不再重复
+
+
+def test_verdict_no_entry_wakes(proj):
+    _biz(proj, attempts=_A1)
+    _verdict(proj, "no_entry")
+    assert proj.out("tick")["no_entry"] == [{"ticket": "T1", "attempt": 1}]
+
+
+def test_verdict_useful_next_wall_resumes(proj):
+    _biz(proj, attempts=_A1)
+    out = json.loads(_verdict(proj, "useful").stdout)
+    assert out["actions"] == ["next_wall"]
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "executing" and [w["status"] for w in t["walls"]] == ["broken", "open"]
+
+
+def test_verdict_next_wall_with_no_open_walls_does_not_resume(proj):
+    _biz(proj, attempts=_A1, walls=1)
+    _verdict(proj, "useful")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "postlaunch" and t["waiting_for"] == "墙已全部拆完，等分析 agent 提议结束"
+    assert proj.claude() == []
+
+
+def test_verdict_pending_sample_waits(proj):
+    _biz(proj, attempts=_A1)
+    assert json.loads(_verdict(proj, "pending_sample").stdout)["actions"] == ["wait"]
+    assert proj.state()["tickets"]["T1"]["status"] == "postlaunch" and proj.claude() == []
+
+
+def _daily(proj, data):
+    return json.loads(proj.run("apply-daily", "--from", put(proj, data, "d.json")).stdout)
+
+
+def test_apply_daily_attaches_wall_and_skips_leak(proj):
+    _biz(proj, attempts=_A1)
+    d = {"verdicts": [{"ticket": "T1", "attempt": 1, "verdict": "pending_sample", "touched": 3, "hit_wall": 1,
+                       "continued": 0, "note": "样本不足"},
+                      {"ticket": "T1", "attempt": 1, "verdict": "pending_sample", "touched": 3, "hit_wall": 1,
+                       "continued": 0, "note": "见用户 5eed0001"},
+                      {"ticket": "T9", "attempt": 1, "verdict": "useful", "touched": 1, "hit_wall": 1, "continued": 1,
+                       "note": "x"}],
+         "walls": [{"ticket": "T1", "text": "新墙：入口太深"}, {"ticket": "T1", "text": "用户 5eed0001 说的"}]}
+    out = _daily(proj, d)
+    t = proj.state()["tickets"]["T1"]
+    assert [w["text"] for w in t["walls"]][-1] == "新墙：入口太深" and len(t["walls"]) == 3
+    assert t["walls"][-1]["source"] == "daily"
+    assert t["attempts"][0]["note"] == "样本不足"
+    assert len(out["errors"]) == 3 and len(out["applied"]) == 2
+    assert "5eed0001" in json.dumps(out["errors"], ensure_ascii=False) or "泄漏" in json.dumps(out["errors"], ensure_ascii=False)
+
+
+def test_legacy_released_unchanged(proj):
+    wt = proj.tmp / "wt"; wt.mkdir(exist_ok=True)
+    seed(proj, T1=("await_prod", ["her-reply-prompt"], {"issue": 51, "card_confirmed": True,
+                                                        "worker": {"session_id": "s", "worktree": str(wt), "runs": 1}}))
+    proj.out("released", "--tickets", "T1", "--what", "x", "--metrics", "m")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "postlaunch" and len(t["postlaunch"]["checks"]) == 3

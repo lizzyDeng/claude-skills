@@ -1034,6 +1034,7 @@ def run(ctx, root, cfg, resurface=False) -> dict:
                 r.res["errors"].append(f"{step.__name__}：{e!r}\n{traceback.format_exc(limit=3)}")
         if resurface:
             _resurface(r)
+        r.res.update(state.pop("wake", None) or {})          # verdict 留下的唤醒键（rollback_needed / no_entry）：弹出交给 router
         store.save_state(home / "state.json", state)
     return r.res
 
