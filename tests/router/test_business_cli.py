@@ -100,7 +100,7 @@ def test_answer_true_creates_and_starts(proj):
     s = proj.state()
     t = s["tickets"][out["ticket"]]
     assert t["kind"] == "business" and t["authorized"] is True and t["origin"] == "analyst"
-    assert t["issue"] and t["start_ok"] and t["status"] != "draft"
+    assert t["issue"] and t["start_ok"] and t["status"] in ("queued", "kickoff")
     assert [c for c in proj.gh() if c[:2] == ["issue", "create"]]
     assert qid not in [q["id"] for q in s["queue"]]
 
@@ -132,6 +132,11 @@ def test_answer_garbage_rejected(proj):
     r = _answer(proj, _first_q(proj), "好的", check=False)
     out = json.loads(r.stdout)
     assert r.returncode == 1 and "真" in out["error"] and "先放着" in out["error"] and "不是：理由" in out["error"]
+    assert qid_in_queue(proj)
+
+
+def qid_in_queue(proj):
+    return any(q["kind"] == "verify_problem" for q in proj.state()["queue"])
 
 
 def test_weekly_walls_attach_and_close_queues(proj):
@@ -149,7 +154,10 @@ def test_weekly_walls_attach_and_close_queues(proj):
     r = _answer(proj, cq[0]["id"], "好", check=False)
     assert r.returncode == 1
     out = json.loads(_answer(proj, cq[0]["id"], "关").stdout)
-    assert proj.state()["tickets"][t1]["status"] == "done"
+    s = proj.state()
+    assert s["tickets"][t1]["status"] == "done"
+    assert s["tickets"][t1]["closeout"] == {"downstream": {}, "issue": "n/a", "worktree": "pending", "branch": "pending"}
+    assert "关闭业务票" in (proj.home / "decisions.md").read_text()
 
 
 def test_close_answer_keep(proj):
@@ -174,9 +182,9 @@ def test_absorbs_links_legacy(proj):
     s = proj.state()
     new = s["tickets"][out["ticket"]]
     assert s["tickets"]["T5"]["parent"] == out["ticket"] and s["tickets"]["T6"]["parent"] == out["ticket"]
-    assert new["attempts"] == [
-        {"n": 1, "direction": "老票五", "shipped_at": "2026-11-01T00:00:00Z", "verdict": "没用", "historical": True},
-        {"n": 2, "direction": "老票六", "shipped_at": None, "verdict": "legacy", "historical": True}]
+    assert new["attempts"] == [        # 只有已上线并验收过的老票算历史尝试；草稿 T6 只挂 parent
+        {"n": 1, "direction": "老票五", "shipped_at": "2026-11-01T00:00:00Z", "verdict": "legacy",
+         "legacy_verdict": "没用", "historical": True}]
 
 
 def test_add_business_is_user_verified(proj):
@@ -185,3 +193,84 @@ def test_add_business_is_user_verified(proj):
     t = proj.state()["tickets"][out["ticket"]]
     assert t["kind"] == "business" and t["origin"] == "user" and t["authorized"] is True
     assert [w["text"] for w in t["walls"]] == ["测试墙甲", "测试墙乙"] and t["status"] == "draft"
+
+
+def test_absorbs_unknown_id_rejects_whole_file(proj):
+    d = load()
+    d["problems"][0]["absorbs"] = ["T99"]
+    r = propose(proj, d, check=False)
+    assert r.returncode == 1 and "T99" in json.loads(r.stdout)["error"]
+
+
+def _biz_closeable(proj, **extra):
+    propose(proj, load())
+    t1 = json.loads(_answer(proj, _first_q(proj), "真，先放着").stdout)["ticket"]
+    if extra:
+        s = proj.state(); s["tickets"][t1].update(extra)
+        (proj.home / "state.json").write_text(json.dumps(s, ensure_ascii=False))
+    return t1
+
+
+def test_close_proposal_on_legacy_ticket_rejected(proj):
+    seed(proj, T1=("draft", [], {"title": "老票"}))
+    r = propose(proj, load(mode="migrate", problems=[], maint=[], close=[{"ticket": "T1", "reason": "r"}]), check=False)
+    assert r.returncode == 1 and "T1" in json.loads(r.stdout)["error"]
+    assert not proj.state()["queue"]
+
+
+def test_close_answer_refused_while_worker_alive(proj):
+    import subprocess, sys
+    t1 = _biz_closeable(proj)
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        s = proj.state(); s["tickets"][t1]["worker"]["pid"] = p.pid
+        (proj.home / "state.json").write_text(json.dumps(s))
+        propose(proj, load(mode="migrate", problems=[], maint=[], close=[{"ticket": t1, "reason": "r"}]))
+        cq = [q for q in proj.state()["queue"] if q["kind"] == "close"][0]["id"]
+        r = _answer(proj, cq, "关", check=False)
+        assert r.returncode == 1 and "stop" in json.loads(r.stdout)["error"]
+        s = proj.state()
+        assert s["tickets"][t1]["status"] == "draft" and cq in [q["id"] for q in s["queue"]]
+    finally:
+        p.kill(); p.wait()
+
+
+def test_answer_prefix_is_anchored(proj):
+    propose(proj, load(close=[]))
+    vq = _first_q(proj)
+    for bad in ("真的吗？", "真先放着吧", "不是理由", "不是：", "关于这个"):
+        r = _answer(proj, vq, bad, check=False)
+        out = json.loads(r.stdout)
+        assert r.returncode == 1 and "格式" in out["error"], bad
+        assert vq in [q["id"] for q in proj.state()["queue"]]
+    t1 = json.loads(_answer(proj, vq, "真，先放着。").stdout)["ticket"]
+    calibrate(proj)
+    propose(proj, load(mode="weekly", problems=[], maint=[], close=[{"ticket": t1, "reason": "r"}]))
+    cq = [q for q in proj.state()["queue"] if q["kind"] == "close"][0]["id"]
+    for bad in ("关于这个先不关", "关注一下", "不关闭"):
+        r = _answer(proj, cq, bad, check=False)
+        assert r.returncode == 1 and "格式" in json.loads(r.stdout)["error"], bad
+        assert cq in [q["id"] for q in proj.state()["queue"]]
+        assert proj.state()["tickets"][t1]["status"] == "draft"
+
+
+def test_propose_validates_metric_evidence_walls_strings(proj):
+    cases = [("metric", None), ("metric", {"now": "1"}), ("evidence", "测试证据甲"),
+             ("walls", "测试墙甲"), ("walls", []), ("title", " ")]
+    for field, bad in cases:
+        d = load()
+        if bad is None:
+            del d["problems"][1][field]
+        else:
+            d["problems"][1][field] = bad
+        r = propose(proj, d, check=False)
+        assert r.returncode == 1 and not json.loads(r.stdout)["ok"], (field, bad)
+    s = proj.state() if (proj.home / "state.json").exists() else {}
+    assert not s.get("proposals") and not s.get("queue")
+
+
+def test_propose_skips_key_already_pending(proj):
+    propose(proj, load())
+    out = json.loads(propose(proj, load()).stdout)
+    assert out["proposals"] == [] and out["skipped"] == ["k1", "k2"]
+    assert len([q for q in proj.state()["queue"] if q["kind"] == "verify_problem"]) == 2

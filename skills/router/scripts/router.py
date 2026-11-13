@@ -464,6 +464,11 @@ def cmd_answer(a, env):
 VERIFY_HINT = "格式：「真」/「真，先放着」/「不是：理由」"
 CLOSE_HINT = "格式：「关」/「不关」"
 _CONF = ("low", "mid", "high")
+_END = r"(?:[\s，,。.！!；;、]*)$"                       # 词后只许空白 / 标点
+_CLOSE = re.compile(r"^关" + _END)
+_NOT_CLOSE = re.compile(r"^不关" + _END)
+_TRUE = re.compile(r"^真(?:\s*[，,]\s*先放着)?" + _END)
+_NO = re.compile(r"^不是[：:]\s*(\S.*)$", re.S)
 
 
 def _unit(x) -> bool:
@@ -476,8 +481,16 @@ def _check_problem(i, p) -> None:
     for k in ("key", "title", "segment", "want"):
         if not isinstance(p.get(k), str) or not p[k].strip():
             raise Fail(f"problems[{i}] 缺 {k}")
-    if not isinstance(p.get("walls"), list) or not p["walls"]:
-        raise Fail(f"problems[{i}]（{p['key']}）walls 须是非空列表")
+    strs = lambda v: isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
+    if not strs(p.get("walls")) or not p["walls"]:
+        raise Fail(f"problems[{i}]（{p['key']}）walls 须是非空的字符串列表")
+    if not strs(p.get("evidence")):
+        raise Fail(f"problems[{i}]（{p['key']}）evidence 须是字符串列表")
+    m = p.get("metric")
+    if not isinstance(m, dict) or not isinstance(m.get("name"), str) or not m["name"].strip():
+        raise Fail(f"problems[{i}]（{p['key']}）metric 须是带 name 的对象")
+    if not isinstance(p.get("absorbs", []), list):
+        raise Fail(f"problems[{i}]（{p['key']}）absorbs 须是列表")
     imp = p.get("impact")
     if not isinstance(imp, dict) or imp.get("confidence") not in _CONF or not _unit(imp.get("size")) \
             or not _unit(imp.get("gap")):
@@ -513,8 +526,12 @@ def propose_from(env, st, data) -> dict:
         if w.get("ticket") not in st["tickets"] or store.ticket_kind(st["tickets"][w["ticket"]]) != "business":
             raise Fail(f"walls 里的票 {w.get('ticket')} 不是已有的业务票")
     for c in close:
-        if c.get("ticket") not in st["tickets"]:
-            raise Fail(f"close 里的票 {c.get('ticket')} 不存在")
+        if c.get("ticket") not in st["tickets"] or store.ticket_kind(st["tickets"][c["ticket"]]) != "business":
+            raise Fail(f"close 里的票 {c.get('ticket')} 不是已有的业务票")
+    for p in problems:
+        for oid in p.get("absorbs", []):
+            if oid not in st["tickets"]:
+                raise Fail(f"problems（{p['key']}）absorbs 里的票 {oid} 不存在")
     try:
         guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
     except github.GuardEmpty as e:
@@ -524,9 +541,11 @@ def propose_from(env, st, data) -> dict:
     if hits:
         raise Fail("提议里有 uid / 用户原话，整份拒收", hits=hits)
     rejected, at = _rejected_keys(env), env.now()
+    pending = {(st.get("proposals", {}).get(q.get("proposal") or "") or {}).get("key")
+               for q in st["queue"] if q["kind"] == "verify_problem"}
     out, skipped = [], []
     for p in problems:
-        if p["key"] in rejected and not (p.get("new_evidence") or "").strip():
+        if p["key"] in pending or (p["key"] in rejected and not (p.get("new_evidence") or "").strip()):
             skipped.append(p["key"])
             continue
         st["seq"]["proposal"] = st["seq"].get("proposal", 0) + 1
@@ -552,27 +571,36 @@ def cmd_propose(a, env):
 def _answer_business(env, st, q, text) -> dict:
     t = (text or "").strip()
     if q["kind"] == "close":
-        if t.startswith("不关"):
+        if _NOT_CLOSE.match(t):
             verb = "keep"
-        elif t.startswith("关"):
+        elif _CLOSE.match(t):
             verb = "close"
         else:
             raise Fail(f"回答不认识。{CLOSE_HINT}")
     else:
-        if t.startswith("真"):
+        m = _NO.match(t)
+        if m:
+            verb, reason = "no", m.group(1).strip()
+        elif _TRUE.match(t):
             verb = "hold" if "先放着" in t else "true"
         elif t.startswith("不是"):
-            m = re.match(r"^不是[：:]\s*(\S.*)$", t, re.S)
-            if not m:
-                raise Fail(f"「不是」后面必须带理由。{VERIFY_HINT}")
-            verb, reason = "no", m.group(1).strip()
+            raise Fail(f"「不是」后面必须带理由。{VERIFY_HINT}")
         else:
             raise Fail(f"回答不认识。{VERIFY_HINT}")
     _append_local(env.home / "answers.md",
                   f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(t.splitlines())}")
     if q["kind"] == "close":
         if verb == "close":
-            store.set_status(st, q["ticket"], store.DONE, env.now(), "")
+            ct = st["tickets"][q["ticket"]]
+            if store.ticket_kind(ct) != "business":
+                raise Fail(f"{q['ticket']} 不是业务票，不能这样关")
+            pid = ct["worker"].get("pid")
+            if pid and env.ctx.pid_alive(pid):
+                raise Fail(f"{q['ticket']} 的 worker 还在跑（pid {pid}）：先 stop {q['ticket']}，再回「关」")
+            ct["closeout"] = {"downstream": _closeout_targets(st, q["ticket"]),
+                              "issue": "pending" if ct.get("issue") else "n/a",
+                              "worktree": "pending", "branch": "pending"}
+            store.set_status(st, q["ticket"], store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
             store.append_decision(env.decisions, st, q["ticket"], "关闭业务票", q.get("reason", ""),
                                   f"用户回答 {q['id']}：{t}", env.now())
         return {"ok": True, "queue": q["id"], "kind": "close", "ticket": q["ticket"], "closed": verb == "close"}
@@ -596,10 +624,12 @@ def _answer_business(env, st, q, text) -> dict:
         if old is None:
             continue
         old["parent"] = tid
-        results = (old.get("postlaunch") or {}).get("results") or []
-        nt["attempts"].append({"n": len(nt["attempts"]) + 1, "direction": old["title"],
-                               "shipped_at": (old.get("postlaunch") or {}).get("t0"),
-                               "verdict": results[-1].get("verdict") if results else "legacy", "historical": True})
+        pl = old.get("postlaunch") or {}
+        results = pl.get("results") or []
+        if old["status"] in (store.POSTLAUNCH, store.DONE) and results:   # 只有真上线并验收过的老票才算一次历史尝试
+            nt["attempts"].append({"n": len(nt["attempts"]) + 1, "direction": old["title"],
+                                   "shipped_at": pl.get("t0"), "verdict": "legacy",
+                                   "legacy_verdict": results[-1].get("verdict"), "historical": True})
     res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
     if verb == "true":
         res["start"] = _start_locked(env, st, [tid])
