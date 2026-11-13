@@ -47,6 +47,7 @@ KIND_HINT = {
 
 
 # 续跑后「在等什么」（R5）：按续跑的原因写，不留空
+RETURN_WAIT = "连续 3 次没用，退回用户定夺"
 NO_WALL_WAIT = "墙已全部拆完，等分析 agent 提议结束"
 RESUME_WAIT = {"card": "执行中（方向卡已确认）", "reject": "按驳回重写方向卡", "spend": "照放行结论继续",
                "stuck": "按回答续跑", "conflict": "按回答处理代码面冲突", "offrepo_reject": "按你的意见改仓外改动",
@@ -946,12 +947,17 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
     t = env.ticket(st, tid)
     if store.ticket_kind(t) != "business":
         raise Fail(f"{tid} 不是业务票，没有尝试判定")
+    old = next((x for x in t["attempts"] if x.get("n") == n), None)
+    if old is not None and old.get("verdict") not in (None, "pending_sample"):
+        raise Fail(f"{tid} 尝试 {n} 已有最终判定（{old['verdict']}），不许重判")
     try:
         actions = store.record_verdict(st, tid, n, verdict, env.now(), touched=touched, hit_wall=hit_wall,
                                        continued=continued, note=note, new_wall=new_wall)["actions"]
     except ValueError as e:
         raise Fail(str(e))
     att = next(x for x in t["attempts"] if x.get("n") == n)
+    if "return_to_user" in actions:                                      # 连续没用：退回用户，不再叫醒 worker
+        actions = [x for x in actions if x != "change_direction"]
     for act in actions:
         if act in ("next_wall", "change_direction"):
             opens = [w for w in t["walls"] if w["status"] == "open"]
@@ -961,15 +967,33 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
             text = (f"尝试 {n} 判定 {verdict}（{note}）。"
                     + (f"下一堵墙：{opens[0]['text']}。" if act == "next_wall" else "换方向：别在原路上再试一遍。")
                     + "请重新写方向卡再做。")
-            _resume(env, st, tid, "direction", text, store.EXECUTING)
+            _follow_up(env, st, tid, t, text)
         elif act == "return_to_user":
+            t["waiting_for"] = RETURN_WAIT
             store.push_queue(st, tid, "return", f"{tid} 连续 {t['no_use_streak']} 次没用，退回用户定夺", env.now())
+            _wake(st, "return_to_user", {"ticket": tid, "attempt": n})
         elif act == "rollback":
+            t["waiting_for"] = "有害：等 router 按回滚办法撤回"
             store.push_queue(st, tid, "harm", f"{tid} 尝试 {n} 有害，需撤回：{att.get('rollback', '')}", env.now())
             _wake(st, "rollback_needed", {"ticket": tid, "rollback": att.get("rollback", "")})
         elif act == "check_entry":
+            t["waiting_for"] = "没有入口：等 router 查入口"
             _wake(st, "no_entry", {"ticket": tid, "attempt": n})
     return actions
+
+
+def _follow_up(env, st, tid, t, text) -> None:
+    """判定已落（调用方不依赖续跑成败）。没 worktree（合并后已清）：话写进收件箱 + 回 queued，调度器派新 worker；
+    其余 Fail：判定保留，推 stuck 项带原因。"""
+    w = t["worker"]
+    if not (w.get("worktree") and w.get("session_id")):
+        events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+        store.set_status(st, tid, store.QUEUED, env.now(), "判定已记，等调度器派新 worker 接着做（读收件箱和尝试记录）")
+        return
+    try:
+        _resume(env, st, tid, "direction", text, store.EXECUTING)
+    except Fail as e:
+        store.push_queue(st, tid, "stuck", f"{tid} 判定已记，但没能叫醒 worker：{e}", env.now())
 
 
 def cmd_verdict(a, env):
@@ -998,6 +1022,9 @@ def apply_daily(env, st, data) -> dict:
                            "error": str(e)})
 
     def do_verdict(v):
+        for k in ("attempt", "touched", "hit_wall", "continued"):
+            if type(v.get(k)) is not int:
+                raise Fail(f"{k} 必须是整数：{v.get(k)!r}")
         hits = _leaks(guard, v.get("note"), v.get("new_wall"))
         if hits:
             raise Fail(f"泄漏闸命中：{hits}")
@@ -1021,7 +1048,12 @@ def apply_daily(env, st, data) -> dict:
 
 
 def cmd_apply_daily(a, env):
-    data = json.loads(Path(a.source).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(a.source).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Fail(f"读不了 {a.source}：{e}")
+    if not isinstance(data, dict):
+        raise Fail("apply-daily 的输入顶层必须是对象")
     with env.state() as st:
         return apply_daily(env, st, data)
 

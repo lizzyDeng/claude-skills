@@ -340,7 +340,11 @@ def test_verdict_useless_resumes_worker(proj):
 def test_verdict_useless_third_time_returns_to_user(proj):
     _biz(proj, attempts=_A1, streak=2)
     _verdict(proj)
-    assert [q["kind"] for q in proj.state()["queue"]] == ["return"]
+    s = proj.state()
+    assert [q["kind"] for q in s["queue"]] == ["return"]
+    assert s["tickets"]["T1"]["status"] == "postlaunch" and s["tickets"]["T1"]["waiting_for"] == "连续 3 次没用，退回用户定夺"
+    assert proj.claude() == []
+    assert proj.out("tick")["return_to_user"] == [{"ticket": "T1", "attempt": 1}]
 
 
 def test_verdict_harmful_queues_harm_and_wakes(proj):
@@ -410,3 +414,51 @@ def test_legacy_released_unchanged(proj):
     proj.out("released", "--tickets", "T1", "--what", "x", "--metrics", "m")
     t = proj.state()["tickets"]["T1"]
     assert t["status"] == "postlaunch" and len(t["postlaunch"]["checks"]) == 3
+
+
+def test_verdict_useless_without_worktree_queues_and_tells(proj):
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["worker"]["worktree"] = None
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    t = proj.state()["tickets"]["T1"]
+    assert t["attempts"][0]["verdict"] == "useless" and t["status"] == "queued" and proj.claude() == []
+    inbox = json.loads(proj.run("inbox", "--ticket", "T1").stdout)
+    assert "换方向" in json.dumps(inbox, ensure_ascii=False)
+
+
+def test_verdict_resume_failure_keeps_verdict_and_pushes_stuck(proj):
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["worker"]["worktree"] = str(proj.tmp / "wt")
+    st["tickets"]["T1"]["dispatch"] = {"phase": "spawning", "unverified": "测试"}
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    s = proj.state()
+    assert s["tickets"]["T1"]["attempts"][0]["verdict"] == "useless"
+    assert "stuck" in [q["kind"] for q in s["queue"]]
+
+
+def test_verdict_refuses_rejudge(proj):
+    _biz(proj, attempts=[{**_A1[0], "verdict": "useful"}])
+    r = _verdict(proj, "harmful", check=False)
+    assert r.returncode == 1 and "不许重判" in json.loads(r.stdout)["error"]
+    out = _daily(proj, {"verdicts": [{"ticket": "T1", "attempt": 1, "verdict": "harmful", "touched": 1, "hit_wall": 1,
+                                      "continued": 1, "note": "x"}]})
+    assert len(out["errors"]) == 1 and proj.state()["tickets"]["T1"]["attempts"][0]["verdict"] == "useful"
+
+
+def test_apply_daily_bad_file_and_bad_ints(proj):
+    _biz(proj, attempts=_A1)
+    r = proj.run("apply-daily", "--from", str(proj.tmp / "nope.json"), check=False)
+    assert r.returncode == 1 and json.loads(r.stdout)["ok"] is False
+    (proj.tmp / "l.json").write_text("[1]")
+    assert proj.run("apply-daily", "--from", str(proj.tmp / "l.json"), check=False).returncode == 1
+    out = _daily(proj, {"verdicts": [{"ticket": "T1", "attempt": 1, "verdict": "useless", "touched": "x", "hit_wall": 1,
+                                      "continued": 1, "note": "n"}]})
+    assert len(out["errors"]) == 1 and proj.state()["tickets"]["T1"]["attempts"][0]["verdict"] is None
+
+
+def test_released_business_rejected_writes_no_release_file(proj):
+    _biz(proj, status="await_prod")
+    _rel(proj, check=False)
+    assert not (proj.tmp / "daily" / "state" / "releases.json").exists()

@@ -26,7 +26,7 @@ import surfaces
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
-             "postlaunch_due")
+             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user")
 # 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
 ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}

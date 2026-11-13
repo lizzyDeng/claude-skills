@@ -1464,6 +1464,18 @@ def test_watch_hands_postlaunch_due_every_round_until_recorded(proj, monkeypatch
     assert out["woke"] == ["max_minutes"] and out["postlaunch_due"] == []
 
 
+def test_watch_exits_on_pending_wake_keys(proj, monkeypatch):
+    proj.put(T1=_postlaunch())
+    st = proj.state()
+    st["wake"] = {"rollback_needed": [{"ticket": "T1", "rollback": "关开关"}]}
+    (proj.home / "state.json").write_text(json.dumps(st))
+    monkeypatch.setattr(tick.time, "sleep", lambda s: None)
+    env = SimpleNamespace(ctx=proj.ctx, root=proj.root, cfg=proj.cfg)
+    out = tick.cmd_watch(SimpleNamespace(interval=0, max_minutes=10), env)
+    assert out["woke"] == ["rollback_needed"] and out["rollback_needed"][0]["ticket"] == "T1"
+    assert "wake" not in proj.state()
+
+
 def test_zero_code_inrepo_impl_done_awaits_prod_not_stuck(proj):
     proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31),
              T2=("queued", ["her-reply-prompt"], {"start_ok": True, "blocked_by": ["T1"], "issue": 32}))
