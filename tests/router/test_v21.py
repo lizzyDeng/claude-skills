@@ -500,3 +500,34 @@ def test_v21_6_ops_issues_go_to_maint_without_asking():
     row = next(l for l in s8.splitlines() if "maint add" in l)
     for w in ("bug", "配置错位", "报错率", "只读", "影响面", "router.py maint add", "surfaces.json", "一行", "不问用户"):
         assert w in row, w
+
+
+# ---- 第 7 条：有东西要用户看就主动打开 ------------------------------------------------------------
+
+def test_v21_7_docs_gallery_open():
+    from test_docs import SKILL, _section
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    for w in ("cards/$ROUTER_TICKET.gallery/index.html", "emit finding", "--tags gallery", "占位素材", "要花多少钱"):
+        assert w in worker, w
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s8 = _section(skill, "8.")
+    row = next(l for l in s8.splitlines() if "gallery" in l)
+    for w in ("open", "看什么", "要回什么", "还没生成", "要花多少钱", "占位素材"):
+        assert w in row, w
+    slow = next(l for l in _section(skill, "2.").splitlines() if l.startswith("| `slow_path_events`"))
+    assert "gallery" in slow and "open" in slow
+
+
+def test_v21_7_gallery_finding_always_reaches_router(proj):
+    import events
+    from conftest import make_state
+    st = make_state(T1=("executing", ["her-reply-prompt"], {"title": "票一"}),
+                    T2=("executing", ["her-reply-prompt"], {"title": "票二"}))
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    events.emit(proj.home, "T1", "finding", "合成：样片 3 张，看人物一致性，回「好 / 不好」",
+                str(proj.home / "cards" / "T1.gallery" / "index.html"), surfaces=["her-reply-prompt"], tags=["gallery"])
+    events.emit(proj.home, "T1", "finding", "合成：普通事实", "合成", surfaces=["her-reply-prompt"])
+    res = proj.out("tick")
+    slow = [e["summary"] for e in res["slow_path_events"]]
+    assert slow == ["合成：样片 3 张，看人物一致性，回「好 / 不好」"]                  # 订阅方有人也交 router
+    assert "合成：样片 3 张" in _inbox(proj, "T2")                                    # 订阅方照常收到

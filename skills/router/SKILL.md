@@ -48,7 +48,7 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 | `cards_for_review` | 每张卡做方向审（第 4 节），审完 submit-card 交用户确认（业务票也一样，v2.1 起不再自动确认）。 |
 | `postlaunch_due` | 只有老票和维护票有（业务票的验证交 daily）。每项 `{ticket, check}` 跑一次上线验收（第 7 节）：派一个 **Opus** Agent，prompt = `templates/postlaunch.md` 全文 + config `postlaunch_brief` 指向的项目 brief 全文 + 派单 + 方向卡 + 之前的结论；拿它回的 JSON 跑 `router.py postlaunch-result <T> --check … --type … --verdict … --summary "…" [--action "…"] [--behavior "…"]`。没入口 / 没用 / 有害：当天就做动作（第 5 节）。没记结果之前每一轮都会再交。 |
 | `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。判真项（`verify_problem`）写：问题、人群、产品诊断（他想要什么 / 我们给了什么 / 哪里不值得）、卡在哪、影响分、证据路径（`state.json` 的 `proposals.<P>`），要他回「Qn 真」/「Qn 真，先放着」/「Qn 不是：理由」；提议结束（`close`）要他回「Qn 关」/「Qn 不关」；`harm` / `return` 见上面两行。业务票 worker 停下来问的 `direction` 项：只问技术细节（验收口径、实现细节、代码面）的你定（第 5 节）；问方向、上线节奏、成本的，和 topic=assumption（核心假设被推翻）的，交用户。topic=next 的方向项（「要下一个方向吗」：空闲的业务票挂了新墙，或用户回了「不关」）：方向归用户。你可以 `router.py redirect <T> --new-card`（清掉这一项、票回队列，新 worker 出方向卡交用户确认）并告诉用户；用户回了方向就照第 6 节记原话。 |
-| `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>" --as-router`（你的话，标「router 转述 / 决定」）；是 bug / 基建 ⇒ `router.py maint add …` 并进本周维护票；是新的用户问题 ⇒ 告诉用户，他回「真」才 `router.py add --business …`（你不自己判真）。处理完 `router.py ack-slow`。 |
+| `slow_path_events` | 没有订阅方的事件（带 `gallery` 标签的 finding 有订阅方也会交你）。带 `gallery` 的 = worker 生成的本地对照页：照第 8 节 `open` 给用户看。其余判断谁该知道：相关票用 `router.py tell <T> "<一句话>" --as-router`（你的话，标「router 转述 / 决定」）；是 bug / 基建 ⇒ `router.py maint add …` 并进本周维护票；是新的用户问题 ⇒ 告诉用户，他回「真」才 `router.py add --business …`（你不自己判真）。处理完 `router.py ack-slow`。 |
 | `external_deliveries` | 用户自己开的 session 的订阅投递。tick 已写进对方 worktree 的 `.claude/router-inbox.md`；再用 `ListAgents` 找到 cwd 对得上的 session，`SendMessage` 一句话提醒。**只转交信息，不给它们下指令。** |
 | `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。派发失败（第 2 次）、远端 base 缺失或指向认不出的 tip、改回 PR 失败（第 2 次）会自己进决定单，不用你搬；仓外票收尾失败第 1 次进 errors，之后只在看板票卡和 `status` 上显示（下一轮自动重试）。daily 某条判定 / 墙没落（泄漏、票号不对、待样本超 7 天）也在这里：原因修好后照它产出里的那条手动 `router.py verdict …`，不要自己编判定。 |
 
@@ -232,6 +232,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 - 每条 ≤ 100 字；决定单要列全，**按业务影响**排序（影响分 = 人群规模 × 缺口 × 把握；看板显示「影响 0.21」；没有影响分的项排后面，再按挡住几张票排）。
 - 叫用户只有这些理由：判真、关业务票、start（老票 / 草稿）、确认方向卡（全部票）、业务票的方向 / 上线节奏 / 成本、花钱 / 撤不回的改动 / 发商店包、上 prod（老票 / 维护票；业务票和待走查 / 待放行 / 方向卡没经用户确认的票同在一个发版批次时整批交用户）、真人动手、上线验收没过（老票 / 维护票：没入口 / 没用 / 有害）、业务票有害已撤回（告知）、业务票连续 3 次没用退回。其余你自己定并 `decide`。
 - 不复述 worker 和分析 agent 的长篇输出；给结论 + 卡 / 日志 / 产出路径。
+- **有东西要用户看就主动打开**：worker 产出图 / 视频 / 分镜 / 样片，会生成本地对照页（`cards/<T>.gallery/index.html`）并 `emit finding --tags gallery` 报路径；你收到（`slow_path_events`）就用 Bash `open <路径>` 在用户浏览器里打开，回复里写清看什么、要回什么。用户要看的东西还没生成：直接说「还没生成、要花多少钱」，不拿占位素材充样片。
 - **运维问题自动进维护票**：你顺带发现的 bug / 配置错位 / 报错率异常 ⇒ 只读查影响面（prod 只读）⇒ `router.py maint add --title … --problem "<坏在哪、影响面>" --surfaces …`（代码面名字表里没有就先加进 surfaces.json 登记，再 maint add；挡住业务票验证的加 `--unblocks`）⇒ 回复里一行告知。不问用户要不要查。
 
 ## 9. 红线

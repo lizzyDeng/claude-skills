@@ -62,6 +62,7 @@
 
 - 改了别人依赖的接口（prompt 段、函数签名、开关名、表结构）：`python3 $ROUTER_CLI emit interface_changed "<改了什么>" --evidence "<file:line / SHA>" --surfaces <代码面> --tags <标签>`。
 - 对别人有用的事实、超出本票范围的新问题：`python3 $ROUTER_CLI emit finding "<事实>" --evidence "<出处>" [--tickets T…]`。
+- 产出了图 / 视频 / 分镜 / 样片（要用户看的东西）：生成本地对照页 `$ROUTER_HOME/cards/$ROUTER_TICKET.gallery/index.html`（素材放同目录、相对路径引用；每组写清对照什么、看哪里），然后 `python3 $ROUTER_CLI emit finding "<看什么、要用户回什么>" --evidence "<对照页路径>" --tags gallery`，router 会在用户浏览器里打开。要用户看的东西还没生成：不拿占位素材充样片，照「只在三种情况停」第 1 条报还要花多少钱（`--tags spend`）。
 - 摘要最多 3 行。
 
 ## 第 3 段：验收 → PR（仓外票、零代码票见本段末尾）

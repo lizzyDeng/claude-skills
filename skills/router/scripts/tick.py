@@ -520,6 +520,8 @@ class Run:
                 if ev.get("type") not in events.TYPES or ev["type"] in ("decision", "overreach"):
                     continue                          # progress / 坏行不路由；decision / overreach 走第 2 步的决定单
                 hits, exts, fast = events.route(self.state, ev)
+                if ev["type"] == "finding" and "gallery" in (ev.get("affects") or {}).get("tags", []):
+                    fast = False                      # 对照页（v2.1 第 7 条）：有订阅方也交 router，由它 open 给用户看
                 for h in hits:
                     events.deliver(self.home, h, ev)
                 for x in exts:
