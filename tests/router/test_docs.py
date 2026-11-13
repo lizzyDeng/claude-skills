@@ -245,6 +245,8 @@ def test_analyst_weekly_method_impact_maint_and_rejected_memory():
     text = _analyst_tpl("weekly")
     for w in ("第一段对话", "第二天回来", "离开前", "漏斗", "墙还在不在"):   # spec §6 方法五条
         assert w in text, w
+    for name in ("weekly", "calibrate"):                                      # 校准 1 漏的两类：构成变化、改动没到人
+        assert "拆构成" in _analyst_tpl(name) and "到没到人" in _analyst_tpl(name), name
     assert "$home/analyst/rejected.jsonl" in text and "new_evidence" in text
     assert "size" in text and "gap" in text and "confidence" in text
     assert "`maint`" in text and "$home/surfaces.json" in text           # 维护项的代码面只能用 surfaces.json 里有的
