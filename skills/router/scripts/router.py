@@ -136,12 +136,15 @@ def _csv(s):
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def _resume_prompt(kind, text, inbox):
-    parts = ["【router】你之前停下等的事有了回答。", "", "用户原话（逐字）：", text, ""]
+def _resume_prompt(kind, text, inbox, as_router=False):
+    head = ["router 的说明（不是用户原话）：", text] if as_router else ["用户原话（逐字）：", text]
+    parts = ["【router】你之前停下等的事有了回答。", "", *head, ""]
     if inbox:
         parts += ["你停下期间收件箱收到的：",
                   *[f"- [{m.get('type')}] {m.get('summary', '')}（来自 {m.get('ticket', 'router')}）" for m in inbox], ""]
-    parts += [KIND_HINT.get(kind, KIND_HINT["direction"]), "先按 worker.md 读一次 inbox，再继续。"]
+    hint = ("方向卡已确认（票级授权，router 代为确认）。进入 worker.md 第 2 段「执行」。"
+            if as_router and kind == "card" else KIND_HINT.get(kind, KIND_HINT["direction"]))
+    parts += [hint, "先按 worker.md 读一次 inbox，再继续。"]
     return "\n".join(parts)
 
 
@@ -162,7 +165,7 @@ def _refuse_pending(t, tid, ctx=None) -> None:
                    "认不出是不是它：稍后再试")
 
 
-def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None):
+def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
     force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
     waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
@@ -181,7 +184,7 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None)
     inbox = events.read_inbox(env.home, st, tid)
     wait = waiting if waiting is not None else _resume_wait(kind, status)
     try:
-        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox), status,
+        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox, as_router), status,
                                     wait, env.now(), lambda: store.save_state(env.state_path, st))
     except launcher.IntentNotSaved as e:
         raise Fail(f"{tid} 没续跑：起进程前存盘失败（{e}）")
@@ -639,11 +642,6 @@ def _answer_business(env, st, q, text) -> dict:
     return res
 
 
-def _router_owned(t) -> bool:
-    """业务票且已授权：方向卡 / 走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。"""
-    return store.ticket_kind(t) == "business" and bool(t.get("authorized"))
-
-
 def cmd_submit_card(a, env):
     card = Path(a.card)
     if not card.exists():
@@ -662,13 +660,13 @@ def cmd_submit_card(a, env):
         launcher.stop_worker(env.ctx, t["worker"])      # 超时交卡：worker 还在写，先停，确认后续跑
         t["worker"]["pid"] = None
         t["worker"]["kickoff_rounds"] = a.rounds
-        if _router_owned(t):                             # 票级授权：方向由 router 定，不交用户
+        if store.router_owned(t):                             # 票级授权：方向由 router 定，不交用户
             t["card_confirmed"] = True
             t["solution"]["source"] = f"方向卡 v{version}（已确认，票级授权）"
+            how = _resume(env, st, a.ticket, "card", "方向已确认（票级授权）", store.EXECUTING, as_router=True)
             store.append_decision(env.decisions, st, a.ticket, "方向已确认（票级授权）", "业务票已授权，方向审由 router 先做完",
-                                  str(card), env.now())
-            _resume(env, st, a.ticket, "card", "方向已确认（票级授权）", store.EXECUTING)
-            return {"ok": True, "queue": None, "version": version, "auto_confirmed": True}
+                                  str(card), env.now(), key=f"card-auto:{a.ticket}:v{version}")   # resume 成功后才记；重试不重复
+            return {"ok": True, "queue": None, "version": version, "auto_confirmed": True, "worker": how}
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
                                f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
@@ -874,8 +872,8 @@ def _prod_item(env, st):
     st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
     waiting = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
                      key=lambda x: int(x[1:]))
-    ready = [tid for tid in waiting if not _router_owned(st["tickets"][tid])]
-    ships = [tid for tid in waiting if _router_owned(st["tickets"][tid])]
+    ready = [tid for tid in waiting if not store.router_owned(st["tickets"][tid])]
+    ships = [tid for tid in waiting if store.router_owned(st["tickets"][tid])]
     if ready:
         return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, ships
     return None, [], ships
@@ -1003,6 +1001,7 @@ def _follow_up(env, st, tid, t, text) -> None:
     w = t["worker"]
     if not (w.get("worktree") and w.get("session_id")):
         events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+        t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
         t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
         store.set_status(st, tid, store.QUEUED, env.now(), "判定已记，等调度器派新 worker 接着做（读收件箱和尝试记录）")
         return

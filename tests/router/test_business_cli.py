@@ -481,7 +481,9 @@ def test_business_card_auto_confirmed(proj):
     assert t["card_confirmed"] is True and t["status"] == "executing"
     assert "票级授权" in (proj.home / "decisions.md").read_text() and str(c) in (proj.home / "decisions.md").read_text()
     wait_until(lambda: proj.claude())                          # worker 被叫醒
-    assert "票级授权" in proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    prompt = proj.claude()[0][proj.claude()[0].index("-p") + 1]
+    assert "票级授权" in prompt and "用户原话（逐字）" not in prompt and "不是用户原话" in prompt
+    assert (proj.home / "decisions.md").read_text().count("票级授权") == 1
 
 
 def test_legacy_card_still_to_user(proj):
@@ -516,6 +518,7 @@ def test_requeued_business_ticket_needs_new_card(proj):
     _verdict(proj)
     t = proj.state()["tickets"]["T1"]
     assert t["status"] == "queued" and t["card_confirmed"] is False       # 新一轮必须出新方向卡
+    assert "card_ready_at" not in t
     # 模拟调度器重派后 worker 交卡：自动确认
     st = proj.state(); st["tickets"]["T1"]["status"] = "kickoff"
     st["tickets"]["T1"]["worker"]["worktree"] = str(proj.tmp / "wt")
@@ -523,3 +526,23 @@ def test_requeued_business_ticket_needs_new_card(proj):
     proj.run("submit-card", "T1", "--card", str(_card(proj)))
     t = proj.state()["tickets"]["T1"]
     assert t["card_confirmed"] is True and t["status"] == "executing"
+
+
+def test_unauthorized_business_card_and_prod_batch_legacy(proj):
+    seed(proj, T1=("kickoff", ["her-reply-prompt"], {"kind": "business", "authorized": False,
+                                                    "worker": {"session_id": "s", "worktree": str(proj.tmp), "runs": 1}}),
+         T2=("await_prod", [], {"kind": "business", "authorized": False}))
+    proj.run("submit-card", "T1", "--card", str(_card(proj)))
+    s = proj.state()
+    assert [q["kind"] for q in s["queue"]] == ["card"] and s["tickets"]["T1"]["status"] == "await_card"
+    out = json.loads(proj.run("prod-batch").stdout)
+    assert out["tickets"] == ["T2"] and out["router_ships"] == []
+    q = next(x for x in proj.out("status", "--json")["queue"] if x["kind"] == "prod")
+    assert q["blocks"] == 1
+
+
+def test_prod_item_blocks_excludes_router_owned(proj):
+    seed(proj, T1=("await_prod", [], {}), T2=("await_prod", [], {"kind": "business", "authorized": True}))
+    proj.run("prod-batch")
+    q = next(x for x in proj.out("status", "--json")["queue"] if x["kind"] == "prod")
+    assert q["blocks"] == 1

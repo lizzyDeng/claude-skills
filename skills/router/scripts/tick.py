@@ -727,7 +727,7 @@ class Run:
                                        f"备份 {self.home}/backups/{tid}/（满意说「{tid} 核对过了」；"
                                        f"不满意说「{tid} 不满意：…」）", topic="offrepo")
             return
-        owned = store.ticket_kind(t) == "business" and bool(t.get("authorized"))
+        owned = store.router_owned(t)
         if owned:
             store.set_status(self.state, tid, store.AWAIT_PROD, self.now, "已合 staging（票级授权，免走查）：等 router 上 prod")
         else:

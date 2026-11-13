@@ -1597,3 +1597,32 @@ def test_irreversible_tag_goes_to_user(proj):
     proj.run()
     q = proj.state()["queue"][0]
     assert (q["kind"], q["ticket"]) == ("spend", "T1")
+    assert proj.state()["tickets"]["T1"]["status"] == "paused"
+
+
+def test_store_release_tag_goes_to_user(proj):
+    proj.put(T1=running("executing", ["weekly-report"], log=log_with(proj, "T1", '{"type":"result","is_error":false}')))
+    events.emit(proj.home, "T1", "decision", "要发商店包", "x", tags=["store_release"], at="2026-11-02T10:01:00Z")
+    proj.run()
+    s = proj.state()
+    assert (s["queue"][0]["kind"], s["tickets"]["T1"]["status"]) == ("spend", "paused")
+
+
+def test_unauthorized_business_ticket_keeps_handson_after_merge(proj):
+    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41, "card_confirmed": True,
+                                                     "kind": "business", "authorized": False,
+                                                     "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}))
+    _pr_fake(proj)
+    proj.run()
+    s = proj.state()
+    assert s["tickets"]["T1"]["status"] == "merged_staging" and [q["kind"] for q in s["queue"]] == ["handson"]
+
+
+def test_requeued_attempt_can_overtime_again(proj):
+    # 重派后 card_ready_at 已清：新一轮 kickoff 超时检查能再触发
+    proj.put(T1=running("kickoff", ["a"], kickoff_at="2026-11-02T09:29:00Z"))
+    proj.ctx.alive.add(123)
+    assert proj.run()["cards_for_review"] == ["T1"]
+    s = proj.state(); s["tickets"]["T1"].pop("card_ready_at", None); s["tickets"]["T1"]["kickoff_at"] = "2026-11-02T09:28:00Z"   # 重派 = 新 kickoff_at
+    store.save_state(proj.home / "state.json", s)
+    assert proj.run()["cards_for_review"] == ["T1"]

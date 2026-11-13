@@ -423,6 +423,11 @@ def _draft_count(state) -> int:
                if t.get("batch") == batch and t.get("origin", "weekly") == "weekly" and t["status"] == DRAFT)
 
 
+def router_owned(t: dict) -> bool:
+    """业务票且已授权：方向卡 / 走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。"""
+    return ticket_kind(t) == "business" and bool(t.get("authorized"))
+
+
 def queue_blocks(state, q) -> int:
     """这一项挡住了几张票（读时现算，不存）。被挡的票按票号集合去重：同一张票可能既依赖本票、又共享代码面。
     - start：本批 weekly 草稿张数；prod：等上 prod 的张数；topic=base：还没走完的票数
@@ -432,7 +437,7 @@ def queue_blocks(state, q) -> int:
     if q.get("kind") == "start":
         return _draft_count(state)
     if q.get("kind") == "prod":
-        return sum(1 for t in tickets.values() if t["status"] == AWAIT_PROD)
+        return sum(1 for t in tickets.values() if t["status"] == AWAIT_PROD and not router_owned(t))
     if q.get("topic") == "base":
         return sum(1 for t in tickets.values() if t["status"] not in _BASE_FREE)
     t = tickets.get(q.get("ticket") or "")
