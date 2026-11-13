@@ -420,3 +420,27 @@ def test_v21_3_migrate_problem_product_optional(proj):
     for p in d["problems"]:
         p.pop("product", None)
     assert proj.out("propose", "--from", put(proj, d))["ok"]                       # 迁移清单（老票归并）不强制
+
+
+# ---- 第 4 条：成本 / 收入改动只能用户定，必须附成本测算 ---------------------------------------------------
+
+COST_SCOPE = ("计费", "额度", "价格", "免费放量", "每条消息")
+
+
+def test_v21_4_cost_estimate_required_and_users_call():
+    from test_docs import SKILL, _section
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s5 = _section(skill, "5.")
+    row = next(l for l in s5.splitlines() if "成本测算" in l)
+    for w in COST_SCOPE + ("token", "单价", "缺价", "按 0", "**用户**", "不裁决"):
+        assert w in row, w
+    assert "成本测算" in _section(skill, "4.")
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    tpl = re.search(r"^##[^\n]*方向卡模板[^\n]*\n(.*?)(?=^## )", worker, re.S | re.M).group(1)
+    seg = tpl[tpl.find("成本测算"):]
+    assert tpl.find("成本测算") >= 0
+    for w in COST_SCOPE + ("prod 调用日志", "token", "实际单价", "每用户每天", "补价", "不许按 0 算", "用户"):
+        assert w in seg, w
+    rev = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
+    seg = rev[rev.find("成本测算"):]
+    assert rev.find("成本测算") >= 0 and "缺价" in seg and "按 0" in seg and "挑战" in seg
