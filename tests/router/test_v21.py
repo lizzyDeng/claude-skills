@@ -1,5 +1,6 @@
 """router v2.1（用户 2026-11-13 确认的 8 条改动）。夹具全是合成文本，不含真实 uid 和原话。"""
 import json
+import re
 
 from test_business_cli import _A1, _biz, _card, _push_q, _verdict
 from test_router_cli import proj, push_main, seed, wait_until  # noqa: F401  (proj 是 fixture)
@@ -358,3 +359,64 @@ def test_v21_2_templates_one_goal_one_ticket_and_root_cause_walls():
     assert "按根归并" in _section(skill, "3.") and "router.py merge" in skill
     s6 = _section(skill, "6.")
     assert "router.py merge" in s6 and "--said" in s6
+
+
+# ---- 第 3 条：产品诊断先于代码墙 -----------------------------------------------------------------------
+
+PRODUCT_Q = ("他此刻想要什么", "我们给了什么", "哪里无聊", "值得他付钱或回来", "同类产品通常怎么做", "待查")
+PRODUCT_KEYS = {"want_now", "we_gave", "not_worth", "why_pay", "peers"}
+
+
+def test_v21_3_templates_product_diagnosis_before_walls():
+    from test_docs import SKILL
+    for mode in ("weekly", "calibrate", "daily"):
+        text = (SKILL / "templates" / f"analyst_{mode}.md").read_text(encoding="utf-8")
+        i = text.find("产品诊断")
+        assert i >= 0, mode
+        for q in PRODUCT_Q:
+            assert q in text, (mode, q)
+        assert i < text.find("技术卡点"), mode                                   # 先产品诊断，再技术卡点
+    for mode in ("weekly", "calibrate"):                                          # 每条问题带结构化的 product
+        text = (SKILL / "templates" / f"analyst_{mode}.md").read_text(encoding="utf-8")
+        blocks = re.findall(r"```json\n(.*?)\n```", text, re.S)
+        ex = json.loads(blocks[0])
+        assert all(set(p["product"]) == PRODUCT_KEYS for p in ex["problems"]), mode
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    tpl = re.search(r"^##[^\n]*方向卡模板[^\n]*\n(.*?)(?=^## )", worker, re.S | re.M).group(1)
+    j = tpl.find("产品诊断")
+    assert 0 <= j < tpl.find("1. 问题")
+    for q in PRODUCT_Q[:5]:
+        assert q in tpl, q
+    assert "产品 / 内容问题还是代码问题" in tpl
+    rev = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
+    assert "是不是在用代码修产品问题" in rev and "内容无聊" in rev and "付费墙" in rev
+
+
+def test_v21_3_weekly_problem_needs_product_and_reaches_ticket_brief(proj):
+    from test_business_cli import calibrate, load, put
+    calibrate(proj)
+    d = load(mode="weekly", maint=[])
+    del d["problems"][0]["product"]
+    r = proj.run("propose", "--from", put(proj, d), check=False)
+    assert r.returncode == 1 and "product" in json.loads(r.stdout)["error"]
+    d = load(mode="weekly", maint=[])
+    d["problems"][0]["product"]["peers"] = " "
+    assert proj.run("propose", "--from", put(proj, d), check=False).returncode == 1
+    out = proj.out("propose", "--from", put(proj, load(mode="weekly", maint=[])))
+    s = proj.state()
+    assert set(s["proposals"]["P1"]["product"]) == PRODUCT_KEYS
+    qid = [q for q in s["queue"] if q["kind"] == "verify_problem"][0]["id"]
+    tid = proj.out("answer", qid, "真")["ticket"]
+    t = proj.state()["tickets"][tid]
+    assert t["product"]["want_now"] == "合成：他想要甲"
+    wait_until(lambda: proj.claude())
+    prompt = proj.claude()[-1][proj.claude()[-1].index("-p") + 1]
+    assert "产品诊断" in prompt and "合成：他想要甲" in prompt
+
+
+def test_v21_3_migrate_problem_product_optional(proj):
+    from test_business_cli import load, put
+    d = load(maint=[])
+    for p in d["problems"]:
+        p.pop("product", None)
+    assert proj.out("propose", "--from", put(proj, d))["ok"]                       # 迁移清单（老票归并）不强制

@@ -31,6 +31,14 @@ OUT=$out
 
 一条 = 一个业务目标：一群人想要的一件东西，卡在哪几道墙。不要按机制、按卡点拆成几条。找到几条写几条，按影响从大到小排。
 
+每条问题先写**产品诊断**（`product`，五问都要答），再写技术卡点（`walls`）：
+- `want_now`：他此刻想要什么；
+- `we_gave`：我们给了什么；
+- `not_worth`：哪里无聊 / 不值得；
+- `why_pay`：凭什么值得他付钱或回来；
+- `peers`：同类产品通常怎么做（不知道就写「待查」）。
+内容无聊、付费墙后面没有他想要的东西，照实写成产品 / 内容问题，别硬写成代码墙。
+
 - `key`：这类问题的短名（英文小写加连字符）。
 - `title`：一句话的问题。
 - `segment`：哪群人。
@@ -50,7 +58,10 @@ OUT=$out
 ```json
 {"mode": "calibrate",
  "problems": [{"key": "example-segment-want", "title": "示例问题", "segment": "示例人群", "want": "示例想要",
-               "walls": ["示例墙"], "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"},
+               "product": {"want_now": "示例：他此刻想要的", "we_gave": "示例：我们给了的", "not_worth": "示例：哪里无聊",
+                           "why_pay": "示例：凭什么值得付钱或回来", "peers": "待查"},
+               "walls": ["示例墙（解释了多少：N 人 / P%；表象：…）"],
+               "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"},
                "evidence": ["示例：本地路径 + 聚合数"], "impact": {"size": 0.3, "gap": 0.5, "confidence": "mid"},
                "absorbs": [], "new_evidence": ""}],
  "notes": "示例：影响面小的问题、说不清根因的现象"}

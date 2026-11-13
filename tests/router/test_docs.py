@@ -194,10 +194,11 @@ def _json_example(text, mode):
 def _check_problems(mode, ex):
     import router
     assert ex.get("mode") == mode and ex["problems"], mode
+    keys = PROBLEM_KEYS | ({"product"} if mode in ("weekly", "calibrate") else set())   # v2.1 第 3 条：产品诊断
     for i, p in enumerate(ex["problems"]):
-        assert set(p) == PROBLEM_KEYS, (mode, set(p) ^ PROBLEM_KEYS)
+        assert set(p) == keys, (mode, set(p) ^ keys)
         assert set(p["metric"]) == {"name", "now", "direction"} and set(p["impact"]) == {"size", "gap", "confidence"}
-        router._check_problem(i, p)                     # 和 propose 的校验是同一个函数：示例照抄也收得进来
+        router._check_problem(i, p, need_product=mode == "weekly")   # 和 propose 的校验是同一个函数：示例照抄也收得进来
 
 
 def test_analyst_templates_contract():

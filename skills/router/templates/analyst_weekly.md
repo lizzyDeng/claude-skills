@@ -43,6 +43,14 @@ $state_summary
 
 ## problems 每条怎么写
 
+每条问题先写**产品诊断**（`product`，五问都要答），再写技术卡点（`walls`）：
+- `want_now`：他此刻想要什么；
+- `we_gave`：我们给了什么；
+- `not_worth`：哪里无聊 / 不值得；
+- `why_pay`：凭什么值得他付钱或回来；
+- `peers`：同类产品通常怎么做（不知道就写「待查」）。
+答完这五问，卡点才写成技术卡点；如果是内容无聊、付费墙后面没有他想要的东西，就照实写成产品 / 内容问题，别硬写成代码墙。
+
 - `key`：这类问题的稳定短名（英文小写加连字符）。同一类问题每周用同一个 key：被否的记忆和去重都按它认。
 - `title`：一句话的问题。
 - `segment`：哪群人（按 brief 的人群划分，或你新发现的划分）。
@@ -76,7 +84,10 @@ $state_summary
 ```json
 {"mode": "weekly",
  "problems": [{"key": "example-segment-want", "title": "示例问题", "segment": "示例人群", "want": "示例想要",
-               "walls": ["示例墙"], "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"},
+               "product": {"want_now": "示例：他此刻想要的", "we_gave": "示例：我们给了的", "not_worth": "示例：哪里无聊",
+                           "why_pay": "示例：凭什么值得付钱或回来", "peers": "待查"},
+               "walls": ["示例墙（解释了多少：N 人 / P%；表象：…）"],
+               "metric": {"name": "示例指标", "now": "示例现值", "direction": "up"},
                "evidence": ["示例：本地路径 + 聚合数"], "impact": {"size": 0.3, "gap": 0.5, "confidence": "mid"},
                "absorbs": [], "new_evidence": ""}],
  "maint": [{"title": "示例维护项", "problem": "示例：坏在哪", "surfaces": [], "unblocks": ""}],

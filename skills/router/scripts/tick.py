@@ -1123,8 +1123,10 @@ def _brief(run, tid):
     tpl = string.Template((SKILL_DIR / "templates" / "brief.md").read_text(encoding="utf-8"))
     biz = ""
     if kind == "business":
+        import router
+        prod = router._product_line(t.get("product")) or "（分析 agent 没写：方向卡上自己先写产品诊断五问）"
         biz = string.Template((SKILL_DIR / "templates" / "brief_business.md").read_text(encoding="utf-8")) \
-            .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"))
+            .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"), product=prod)
     return tpl.safe_substitute(
         ticket=tid, title=t["title"], kind=kind, business_section=biz,
         branch=t["worker"].get("branch") or f"router/{tid}",

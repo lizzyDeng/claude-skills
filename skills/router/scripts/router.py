@@ -541,7 +541,32 @@ def _unit(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and 0 <= x <= 1
 
 
-def _check_problem(i, p) -> None:
+# 产品诊断（v2.1 第 3 条）：每条问题先回答这五问，再写技术卡点（walls）
+PRODUCT_KEYS = {"want_now": "他此刻想要什么", "we_gave": "我们给了什么", "not_worth": "哪里无聊 / 不值得",
+                "why_pay": "凭什么值得他付钱或回来", "peers": "同类产品通常怎么做（可写「待查」）"}
+
+
+def _check_product(i, p, required) -> None:
+    prod = p.get("product")
+    if prod is None and not required:
+        return
+    if not isinstance(prod, dict):
+        bad = list(PRODUCT_KEYS)
+    else:
+        bad = [k for k in PRODUCT_KEYS if not isinstance(prod.get(k), str) or not prod[k].strip()]
+    if bad:
+        raise Fail(f"problems[{i}]（{p.get('key')}）product（产品诊断）缺 {'、'.join(bad)}："
+                   + "；".join(f"{k} = {v}" for k, v in PRODUCT_KEYS.items()))
+
+
+def _product_line(prod) -> str:
+    """产品诊断 → 一行（派单、判真项用）；没有 → 空串。"""
+    if not isinstance(prod, dict):
+        return ""
+    return "；".join(f"{v.split('（')[0]}：{prod[k]}" for k, v in PRODUCT_KEYS.items() if str(prod.get(k, "")).strip())
+
+
+def _check_problem(i, p, need_product=False) -> None:
     if not isinstance(p, dict):
         raise Fail(f"problems[{i}] 不是对象")
     for k in ("key", "title", "segment", "want"):
@@ -562,6 +587,7 @@ def _check_problem(i, p) -> None:
             or not _unit(imp.get("gap")):
         raise Fail(f"problems[{i}]（{p['key']}）impact 不合法：confidence 须是 {'/'.join(_CONF)}，"
                    f"size 和 gap 须是 0~1 的数")
+    _check_product(i, p, need_product)
 
 
 def _rejected_keys(env) -> set:
@@ -589,7 +615,7 @@ def propose_from(env, st, data) -> dict:
     if data.get("attach"):
         raise Fail("attach（老票并进已开的业务票）不经 propose：用户确认整份迁移清单后用 migrate-apply 落")
     for i, p in enumerate(problems):
-        _check_problem(i, p)
+        _check_problem(i, p, need_product=mode == "weekly")      # 每周的新问题必须先有产品诊断（v2.1 第 3 条）
     for i, m in enumerate(maint):
         _check_maint(env, st, i, m)
     for w in walls:
@@ -626,7 +652,9 @@ def propose_from(env, st, data) -> dict:
         st["seq"]["proposal"] = st["seq"].get("proposal", 0) + 1
         pid = f"P{st['seq']['proposal']}"
         st.setdefault("proposals", {})[pid] = {**p, "id": pid, "mode": mode, "at": at}
-        qid = store.push_queue(st, None, "verify_problem", f"判真：{p['title']}（{p['segment']}）", at)
+        prod = _product_line(p.get("product"))
+        qid = store.push_queue(st, None, "verify_problem",
+                               f"判真：{p['title']}（{p['segment']}）" + (f"｜产品诊断：{prod}" if prod else ""), at)
         st["queue"][-1]["proposal"] = pid
         out.append({"id": pid, "key": p["key"], "title": p["title"], "queue": qid})
     _flag_same_metric(st, [x["id"] for x in out])
@@ -893,6 +921,8 @@ def _ticket_from_problem(env, st, prop):
         metric=prop["metric"], evidence=prop.get("evidence", []), impact=prop["impact"], origin="analyst",
         absorbs=ok)
     nt = st["tickets"][tid]
+    if isinstance(prop.get("product"), dict):        # 产品诊断留在本机（派单里给 worker 看），不进 GitHub
+        nt["product"] = dict(prop["product"])
     _biz_issue_fields(nt)
     nt["history"].append({"at": env.now(), "status": store.DRAFT})
     for old_id in nt["absorbs"]:
