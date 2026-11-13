@@ -501,6 +501,8 @@ def cmd_answer(a, env):
             status = store.EXECUTING if t.get("card_confirmed") else store.KICKOFF
             how = _resume(env, st, t["id"], kind, a.text, status, force_restart=(kind == "stuck"), as_router=as_router)
             resumed, delivered = (t["id"], None) if how == "resumed" else (None, t["id"])
+            if kind == "spend":                      # 原话照样原样转给 worker；这里只报 router 怎么读的，供核对
+                extra = {"go": _said_go(a.text)}
         elif t and q["kind"] == "handson":
             if a.reject:
                 if t["status"] == store.MERGED:
@@ -1595,7 +1597,18 @@ PROD_STATE = {"ready": "可上", "approved": "已放行", "walkthrough": "待走
               "unjudged": "上次尝试还没判", "unconfirmed": "方向卡没经你确认"}
 _PROD_OK = ("ready", "approved", "ride_ok")          # 不挡 router 自己上
 _PROD_SHIPS = ("ready", "approved")                   # 发完照常 released（进 router_ships）
-_PROD_GO = re.compile(r"^(?:放行|上\s*prod)" + _END, re.I)
+# 「放行」读法（v2.1 第 8 条）：可带前缀「Q<数字>」、空格、全角标点和尾随说明（「Q332 放行。生图放行，用grok」= 整批放行）；
+# 关键词后面只能是结尾 / 空白 / 标点（可带「了 / 吧」；「放行吗」「放行不了」不算）；整句里有否定（「先不放行」「不放行」「先别」）一律不算
+_PROD_GO = re.compile(r"^(?:Q\d+[\s，,：:。.、]*)?(?:放行|上\s*prod)[了吧啦]?(?:$|[\s，,。.！!；;、：:])", re.I)
+_PROD_NO = re.compile(r"不放行|先别|别上|先不|暂缓|不要上|不能上|不上\s*prod", re.I)
+
+
+def _said_go(text):
+    """放行类回答（整批 prod 项、花钱项）→ "go"（放行）/ "no"（明确不放行）/ None（看不出来）。只有 go 才算放行。"""
+    t = (text or "").strip()
+    if _PROD_NO.search(t):
+        return "no"
+    return "go" if _PROD_GO.match(t) else None
 _KIND_ZH = {"business": "业务票", "maint": "维护票", "legacy": "老票"}
 _PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")             # squash 合并的默认标题：「<PR 标题> (#<PR 号>)」
 
@@ -1756,7 +1769,7 @@ def _prod_item(env, st, check=None):
 def _prod_answered(env, st, q, text):
     """用户回整批 prod 项：「放行」/「上 prod」⇒ 整批每张票、每个列出的提交都记已放行，router 照项目发版流程整批上；
     别的话只记原话（answers.md 已写），不放行。"""
-    if not _PROD_GO.match((text or "").strip()):
+    if _said_go(text) != "go":
         return "原话已记，没放行：整批照旧等你（再跑 prod-batch 会重推这一项）", {"approved": []}
     approved = []
     for tid in q.get("batch") or []:

@@ -531,3 +531,56 @@ def test_v21_7_gallery_finding_always_reaches_router(proj):
     slow = [e["summary"] for e in res["slow_path_events"]]
     assert slow == ["合成：样片 3 张，看人物一致性，回「好 / 不好」"]                  # 订阅方有人也交 router
     assert "合成：样片 3 张" in _inbox(proj, "T2")                                    # 订阅方照常收到
+
+
+# ---- 第 8 条：「Qn 放行」也认作放行；「先不放行」「不放行」不误判 ------------------------------------------
+
+GO = ("放行", "上 prod", "上prod", "Q332 放行。生图放行，用grok", "Q332放行", "Q4：放行", "放行 Q4", "放行，整批上",
+      "Q12 上 prod！", "放行。", "放行吧", "Q7 放行了")
+NOT_GO = ("先不放行", "不放行", "Q332 不放行", "Q3 先别放行", "放行吗？", "放行不了", "先别", "好的", "放行吗",
+          "上 prod 前先等我看一眼，先别上", "Q332 放行，T3 先不放行")
+
+
+def test_v21_8_go_reader():
+    import router
+    for t in GO:
+        assert router._said_go(t) == "go", t
+    for t in NOT_GO:
+        assert router._said_go(t) != "go", t
+    for t in ("先不放行", "不放行", "Q332 不放行", "先别"):
+        assert router._said_go(t) == "no", t
+    assert router._said_go("好的") is None
+
+
+def test_v21_8_prod_item_accepts_qn_prefix_and_trailing_notes(proj):
+    push_main(proj.root)
+    seed(proj, T1=("await_prod", [], {"title": "老票"}),
+         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票", "attempts": [],
+                                "card_confirmed_by": "user"}))
+    q = proj.out("prod-batch")["queue"]
+    out = proj.out("answer", q, "先不放行")
+    assert out["approved"] == [] and proj.out("prod-batch")["router_ships"] == []
+    q = proj.out("prod-batch")["queue"]
+    out = proj.out("answer", q, f"{q} 放行。生图放行，用grok")
+    assert out["approved"] == ["T1", "T2"] and proj.out("prod-batch")["router_ships"] == ["T1", "T2"]
+
+
+def test_v21_8_spend_answer_reading_and_verbatim(proj):
+    for text, go in (("Q9 放行。生图放行，用grok", "go"), ("先不放行", "no"), ("用便宜的模型跑", None)):
+        _biz(proj, status="paused")
+        qid = _push_q(proj, "T1", "spend", "T1：要花钱")
+        out = proj.out("answer", qid, text)
+        assert out["go"] == go, text
+    wait_until(lambda: proj.claude())
+    prompts = " ".join(a[a.index("-p") + 1] for a in proj.claude())
+    assert "Q9 放行。生图放行，用grok" in prompts                                   # 原话原样转给 worker
+
+
+
+def test_v21_8_skill_documents_go_reading():
+    from test_docs import SKILL, _section
+    s6 = _section((SKILL / "SKILL.md").read_text(encoding="utf-8"), "6.")
+    row = next(l for l in s6.splitlines() if l.startswith("| 「Qn 放行」"))
+    assert "Q332 放行。生图放行，用grok" in row and "先不放行" in row and "不放行" in row
+    spend = next(l for l in s6.splitlines() if "「放行 Q4」" in l)
+    assert "`go`" in spend and "原样转给 worker" in spend
