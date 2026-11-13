@@ -31,7 +31,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 # 只能由用户 / router session 跑的子命令：worker 进程（设了 ROUTER_TICKET）不许自己放行自己
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
-               "ack-slow", "review-pack", "review-canary"}
+               "ack-slow", "review-pack", "review-canary", "propose"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -261,7 +261,33 @@ def cmd_draft(a, env):
     return {"ok": True, "batch": batch, "tickets": created, "queue": qid, "unknown_depends": unknown}
 
 
+def _biz_issue_fields(t) -> None:
+    """业务票建 issue 时 issue_body 读 why / problem：从业务字段填上，不另造一套 body。"""
+    m = t.get("metric") or {}
+    t["why"] = {"metric": m.get("name", "") if isinstance(m, dict) else str(m),
+                "users": t.get("segment", ""), "evidence": "；".join(t.get("evidence") or [])}
+    t["problem"] = f"{t.get('segment', '')}：{t.get('want', '')}"
+    t["solution"] = {"kind": "clue", "text": "；".join(w["text"] for w in t.get("walls", [])),
+                     "source": "分析 agent 提议 / 用户判真（墙，非方案）"}
+
+
+def _cmd_add_business(a, env):
+    missing = [f for f, v in (("--segment", a.segment), ("--want", a.want), ("--wall", a.wall),
+                              ("--metric", a.metric)) if not v]
+    if missing:
+        raise Fail(f"add --business 缺 {' '.join(missing)}")
+    with env.state() as st:
+        tid = store.new_business_ticket(
+            st, title=a.title, segment=a.segment, want=a.want, walls=list(a.wall), metric={"name": a.metric},
+            evidence=[a.evidence] if a.evidence else [], impact={}, origin="user")   # 用户直接提 = 判过真
+        _biz_issue_fields(st["tickets"][tid])
+        st["tickets"][tid]["history"].append({"at": env.now(), "status": store.DRAFT})
+    return {"ok": True, "ticket": tid}
+
+
 def cmd_add(a, env):
+    if a.business:
+        return _cmd_add_business(a, env)
     surf = _csv(a.surfaces)
     _check_surfaces(env, surf)
     with env.state() as st:
@@ -277,12 +303,9 @@ def cmd_add(a, env):
 
 
 def cmd_start(a, env):
-    import tick
     bad = store.base_branch_problem(env.cfg)
     if bad:                                           # 在任何 GitHub 写入、任何 git 操作之前
         raise Fail(bad)
-    repo = env.cfg["repo"]
-    blocked, errors, warnings, started = [], [], [], []
     with env.locked():
         st = store.load_state(env.state_path)
         if a.all:
@@ -292,62 +315,73 @@ def cmd_start(a, env):
             sel = a.tickets
         if not sel:
             raise Fail("没有可 start 的票")
-        for tid in sel:
-            if env.ticket(st, tid)["status"] not in (store.DRAFT, store.HOLD):
-                raise Fail(f"{tid} 状态是 {st['tickets'][tid]['status']}，不能 start")
-        # 与其它 GitHub 写路径同一道闸（uid + 20 字原话窗口）；闸失效 ⇒ 什么都不做（fail-closed，RV I-3）
-        try:
-            guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
-        except github.GuardEmpty as e:
-            raise Fail(f"防泄漏闸失效，没有建任何 issue：{e}")
-        # 在任何 GitHub 写入（map / issue）之前先查远端 base：base 不对，一张 issue 都不建
-        run = tick.Run(env.ctx, env.root, env.cfg, st)
-        base = run.ensure_base()
-        if not base["ok"]:
-            if not base["transient"]:                    # 进了决定单：项先落盘，再 Fail
-                store.save_state(env.state_path, st)
-                render_board(env, st)
-            raise Fail(f"远端 {env.cfg.get('base_branch', 'staging')} 不可用，没有建任何 issue：{base['error']}",
-                       base_wait=base["wait"])
-        if not st.get("map"):
-            st["map"] = github.ensure_map(env.ctx, repo, env.cfg["map_title"])
+        return _start_locked(env, st, sel)
+
+
+def _start_locked(env, st, sel):
+    """start 的本体：调用方已持锁、已载入 st。cmd_start 和「判真后当场 start」共用（不复制逻辑）。"""
+    import tick
+    bad = store.base_branch_problem(env.cfg)
+    if bad:
+        raise Fail(bad)
+    repo = env.cfg["repo"]
+    blocked, errors, warnings, started = [], [], [], []
+    for tid in sel:
+        if env.ticket(st, tid)["status"] not in (store.DRAFT, store.HOLD):
+            raise Fail(f"{tid} 状态是 {st['tickets'][tid]['status']}，不能 start")
+    # 与其它 GitHub 写路径同一道闸（uid + 20 字原话窗口）；闸失效 ⇒ 什么都不做（fail-closed，RV I-3）
+    try:
+        guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
+    except github.GuardEmpty as e:
+        raise Fail(f"防泄漏闸失效，没有建任何 issue：{e}")
+    # 在任何 GitHub 写入（map / issue）之前先查远端 base：base 不对，一张 issue 都不建
+    run = tick.Run(env.ctx, env.root, env.cfg, st)
+    base = run.ensure_base()
+    if not base["ok"]:
+        if not base["transient"]:                    # 进了决定单：项先落盘，再 Fail
             store.save_state(env.state_path, st)
-        for tid in sorted(sel, key=lambda x: (st["tickets"][x]["priority"], int(x[1:]))):
-            t = st["tickets"][tid]
-            if t["issue"] is None:
+            render_board(env, st)
+        raise Fail(f"远端 {env.cfg.get('base_branch', 'staging')} 不可用，没有建任何 issue：{base['error']}",
+                   base_wait=base["wait"])
+    if not st.get("map"):
+        st["map"] = github.ensure_map(env.ctx, repo, env.cfg["map_title"])
+        store.save_state(env.state_path, st)
+    for tid in sorted(sel, key=lambda x: (st["tickets"][x]["priority"], int(x[1:]))):
+        t = st["tickets"][tid]
+        if t["issue"] is None:
+            try:
+                t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, guard)
+            except github.LeakBlocked as e:
+                blocked.append({"ticket": tid, "hits": e.hits})
+                continue
+            except github.GhError as e:
+                errors.append({"ticket": tid, "error": str(e)})
+                continue
+            store.save_state(env.state_path, st)          # 建一张存一次：中途崩了重跑不会重复建票
+        t["start_ok"] = True
+        store.set_status(st, tid, store.QUEUED, env.now())
+        started.append(tid)
+    for tid in started:
+        t = st["tickets"][tid]
+        for b in t["blocked_by"]:
+            bi = st["tickets"].get(b, {}).get("issue")
+            if bi and t["issue"]:
                 try:
-                    t["issue"] = github.create_ticket_issue(env.ctx, repo, st["map"], t, guard)
-                except github.LeakBlocked as e:
-                    blocked.append({"ticket": tid, "hits": e.hits})
-                    continue
+                    github.add_blocked_by(env.ctx, repo, t["issue"], bi)
                 except github.GhError as e:
-                    errors.append({"ticket": tid, "error": str(e)})
-                    continue
-                store.save_state(env.state_path, st)          # 建一张存一次：中途崩了重跑不会重复建票
-            t["start_ok"] = True
-            store.set_status(st, tid, store.QUEUED, env.now())
-            started.append(tid)
-        for tid in started:
-            t = st["tickets"][tid]
-            for b in t["blocked_by"]:
-                bi = st["tickets"].get(b, {}).get("issue")
-                if bi and t["issue"]:
-                    try:
-                        github.add_blocked_by(env.ctx, repo, t["issue"], bi)
-                    except github.GhError as e:
-                        warnings.append({"ticket": tid, "blocked_by": b, "error": str(e)})
-        if started:
-            st["batch"]["started"] = True
-            st["batch"]["started_at"] = st["batch"]["started_at"] or env.now()
-        if not any(t["batch"] == st["batch"]["id"] and t["origin"] == "weekly" and t["status"] == store.DRAFT
-                   for t in st["tickets"].values()):
-            st["queue"] = [q for q in st["queue"] if q["kind"] != "start"]
-        store.save_state(env.state_path, st)
-        dispatched, failed, other = dispatch(env, st, run)
-        errors += failed                                  # [{ticket, phase, error}]：哪张票、卡在哪一步
-        warnings += [{"ticket": None, "error": e} for e in other]
-        store.save_state(env.state_path, st)
-        render_board(env, st)
+                    warnings.append({"ticket": tid, "blocked_by": b, "error": str(e)})
+    if started:
+        st["batch"]["started"] = True
+        st["batch"]["started_at"] = st["batch"]["started_at"] or env.now()
+    if not any(t["batch"] == st["batch"]["id"] and t["origin"] == "weekly" and t["status"] == store.DRAFT
+               for t in st["tickets"].values()):
+        st["queue"] = [q for q in st["queue"] if q["kind"] != "start"]
+    store.save_state(env.state_path, st)
+    dispatched, failed, other = dispatch(env, st, run)
+    errors += failed                                  # [{ticket, phase, error}]：哪张票、卡在哪一步
+    warnings += [{"ticket": None, "error": e} for e in other]
+    store.save_state(env.state_path, st)
+    render_board(env, st)
     res = {"ok": not blocked and not errors, "started": started, "dispatched": dispatched,
            "issues": {tid: st["tickets"][tid]["issue"] for tid in started},
            "blocked": blocked, "errors": errors, "warnings": warnings}
@@ -362,6 +396,8 @@ def cmd_answer(a, env):
             q = store.pop_queue(st, a.qid)
         except KeyError:
             raise Fail(f"决定单里没有 {a.qid}")
+        if q["kind"] in ("verify_problem", "close"):      # 格式不对 ⇒ Fail，不存盘：项留在决定单里
+            return _answer_business(env, st, q, a.text)
         _append_local(env.home / "answers.md",
                       f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(a.text.splitlines())}")
         resumed, delivered, hint, extra = None, None, "", {}
@@ -421,6 +457,153 @@ def cmd_answer(a, env):
             hint = "按 aifriends 发版流程上 prod，发完用 released"
     return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint,
             **extra}
+
+
+# ---- 业务票：提议 → 判真 -----------------------------------------------------
+
+VERIFY_HINT = "格式：「真」/「真，先放着」/「不是：理由」"
+CLOSE_HINT = "格式：「关」/「不关」"
+_CONF = ("low", "mid", "high")
+
+
+def _unit(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and 0 <= x <= 1
+
+
+def _check_problem(i, p) -> None:
+    if not isinstance(p, dict):
+        raise Fail(f"problems[{i}] 不是对象")
+    for k in ("key", "title", "segment", "want"):
+        if not isinstance(p.get(k), str) or not p[k].strip():
+            raise Fail(f"problems[{i}] 缺 {k}")
+    if not isinstance(p.get("walls"), list) or not p["walls"]:
+        raise Fail(f"problems[{i}]（{p['key']}）walls 须是非空列表")
+    imp = p.get("impact")
+    if not isinstance(imp, dict) or imp.get("confidence") not in _CONF or not _unit(imp.get("size")) \
+            or not _unit(imp.get("gap")):
+        raise Fail(f"problems[{i}]（{p['key']}）impact 不合法：confidence 须是 {'/'.join(_CONF)}，"
+                   f"size 和 gap 须是 0~1 的数")
+
+
+def _rejected_keys(env) -> set:
+    path = env.home / "analyst" / "rejected.jsonl"
+    keys = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                keys.add(json.loads(line)["key"])
+            except (ValueError, KeyError, TypeError):
+                continue
+    return keys
+
+
+def propose_from(env, st, data) -> dict:
+    """分析 agent 的提议写进 st（调用方持锁、负责存盘）。整份拒收的三条（校准门 / 泄漏 / impact）都在写 st 之前跑完。
+    maint 不在这里建票（T7 接 maint_add），原样放进 maint_pending。"""
+    mode = data.get("mode")
+    if mode not in ("weekly", "migrate"):
+        raise Fail("mode 须是 weekly 或 migrate")
+    if mode == "weekly" and (st.get("analyst") or {}).get("calibrated") is not True:
+        raise Fail("校准未过：analyst 校准通过前，weekly 的提议一律不收（migrate 不受限）")
+    problems, walls, close = data.get("problems", []), data.get("walls", []), data.get("close", [])
+    maint = data.get("maint", [])
+    for i, p in enumerate(problems):
+        _check_problem(i, p)
+    for w in walls:
+        if w.get("ticket") not in st["tickets"] or store.ticket_kind(st["tickets"][w["ticket"]]) != "business":
+            raise Fail(f"walls 里的票 {w.get('ticket')} 不是已有的业务票")
+    for c in close:
+        if c.get("ticket") not in st["tickets"]:
+            raise Fail(f"close 里的票 {c.get('ticket')} 不存在")
+    try:
+        guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
+    except github.GuardEmpty as e:
+        raise Fail(f"防泄漏闸失效，提议一条都没收：{e}")
+    texts = [json.dumps(x, ensure_ascii=False) for x in (*problems, *maint, *walls, *close)]
+    hits = sorted({h for tx in texts for h in github.leak_hits(tx, guard)})
+    if hits:
+        raise Fail("提议里有 uid / 用户原话，整份拒收", hits=hits)
+    rejected, at = _rejected_keys(env), env.now()
+    out, skipped = [], []
+    for p in problems:
+        if p["key"] in rejected and not (p.get("new_evidence") or "").strip():
+            skipped.append(p["key"])
+            continue
+        st["seq"]["proposal"] = st["seq"].get("proposal", 0) + 1
+        pid = f"P{st['seq']['proposal']}"
+        st.setdefault("proposals", {})[pid] = {**p, "id": pid, "mode": mode, "at": at}
+        qid = store.push_queue(st, None, "verify_problem", f"判真：{p['title']}（{p['segment']}）", at)
+        st["queue"][-1]["proposal"] = pid
+        out.append({"id": pid, "key": p["key"], "title": p["title"], "queue": qid})
+    for w in walls:
+        store.attach_wall(st, w["ticket"], w["text"], "weekly", at)
+    for c in close:
+        qid = store.push_queue(st, c["ticket"], "close", f"提议结束 {c['ticket']}：{c.get('reason', '')}", at)
+        st["queue"][-1]["reason"] = c.get("reason", "")
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint_pending": maint}
+
+
+def cmd_propose(a, env):
+    data = json.loads(Path(a.source).read_text(encoding="utf-8"))
+    with env.state() as st:
+        return propose_from(env, st, data)
+
+
+def _answer_business(env, st, q, text) -> dict:
+    t = (text or "").strip()
+    if q["kind"] == "close":
+        if t.startswith("不关"):
+            verb = "keep"
+        elif t.startswith("关"):
+            verb = "close"
+        else:
+            raise Fail(f"回答不认识。{CLOSE_HINT}")
+    else:
+        if t.startswith("真"):
+            verb = "hold" if "先放着" in t else "true"
+        elif t.startswith("不是"):
+            m = re.match(r"^不是[：:]\s*(\S.*)$", t, re.S)
+            if not m:
+                raise Fail(f"「不是」后面必须带理由。{VERIFY_HINT}")
+            verb, reason = "no", m.group(1).strip()
+        else:
+            raise Fail(f"回答不认识。{VERIFY_HINT}")
+    _append_local(env.home / "answers.md",
+                  f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(t.splitlines())}")
+    if q["kind"] == "close":
+        if verb == "close":
+            store.set_status(st, q["ticket"], store.DONE, env.now(), "")
+            store.append_decision(env.decisions, st, q["ticket"], "关闭业务票", q.get("reason", ""),
+                                  f"用户回答 {q['id']}：{t}", env.now())
+        return {"ok": True, "queue": q["id"], "kind": "close", "ticket": q["ticket"], "closed": verb == "close"}
+    prop = st.get("proposals", {}).get(q.get("proposal") or "")
+    if prop is None:
+        raise Fail(f"{q['id']} 指向的提议 {q.get('proposal')} 不存在")
+    if verb == "no":
+        _append_local(env.home / "analyst" / "rejected.jsonl",
+                      json.dumps({"key": prop["key"], "title": prop["title"], "reason": reason, "at": env.now()},
+                                 ensure_ascii=False))
+        return {"ok": True, "queue": q["id"], "kind": "verify_problem", "rejected": prop["key"]}
+    tid = store.new_business_ticket(
+        st, title=prop["title"], segment=prop["segment"], want=prop["want"], walls=prop["walls"],
+        metric=prop["metric"], evidence=prop.get("evidence", []), impact=prop["impact"], origin="analyst",
+        absorbs=prop.get("absorbs", []))
+    nt = st["tickets"][tid]
+    _biz_issue_fields(nt)
+    nt["history"].append({"at": env.now(), "status": store.DRAFT})
+    for old_id in nt["absorbs"]:                      # R1：被吸收的老票计为一次已结束的历史尝试
+        old = st["tickets"].get(old_id)
+        if old is None:
+            continue
+        old["parent"] = tid
+        results = (old.get("postlaunch") or {}).get("results") or []
+        nt["attempts"].append({"n": len(nt["attempts"]) + 1, "direction": old["title"],
+                               "shipped_at": (old.get("postlaunch") or {}).get("t0"),
+                               "verdict": results[-1].get("verdict") if results else "legacy", "historical": True})
+    res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
+    if verb == "true":
+        res["start"] = _start_locked(env, st, [tid])
+    return res
 
 
 def cmd_submit_card(a, env):
@@ -910,6 +1093,11 @@ def build_parser():
         s.add_argument(f"--{k}")
     s.add_argument("--weight", choices=["heavy", "light"])
     s.add_argument("--priority", type=int, default=50)
+    s.add_argument("--business", action="store_true", help="业务票：用户直接提 = 判过真（需 --segment --want --wall --metric）")
+    s.add_argument("--segment"); s.add_argument("--want")
+    s.add_argument("--wall", action="append", default=[], help="墙，可多次")
+    s = sub.add_parser("propose", help="分析 agent 的提议 → 决定单（verify_problem / close）；墙直接挂票")
+    s.add_argument("--from", dest="source", required=True)
     s = sub.add_parser("start", help="用户说 start：建 issue、进队列、派")
     s.add_argument("--all", action="store_true")
     s.add_argument("tickets", nargs="*")

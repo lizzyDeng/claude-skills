@@ -1,0 +1,20 @@
+{
+  "mode": "migrate",
+  "problems": [
+    {"key": "k1", "title": "测试问题甲", "segment": "测试人群甲", "want": "测试想要甲",
+     "walls": ["测试墙甲", "测试墙乙"],
+     "metric": {"name": "测试指标甲", "now": "10%", "direction": "up"},
+     "evidence": ["测试证据甲"],
+     "impact": {"size": 0.4, "gap": 0.5, "confidence": "mid"},
+     "absorbs": [], "new_evidence": ""},
+    {"key": "k2", "title": "测试问题乙", "segment": "测试人群乙", "want": "测试想要乙",
+     "walls": ["测试墙丙"],
+     "metric": {"name": "测试指标乙", "now": "20%", "direction": "down"},
+     "evidence": ["测试证据乙"],
+     "impact": {"size": 0.2, "gap": 0.9, "confidence": "high"},
+     "absorbs": [], "new_evidence": ""}
+  ],
+  "maint": [{"title": "测试维护甲", "problem": "测试问题", "surfaces": ["llm-config"], "unblocks": "测试问题甲"}],
+  "walls": [],
+  "close": []
+}
