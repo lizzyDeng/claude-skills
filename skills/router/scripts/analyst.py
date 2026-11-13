@@ -75,7 +75,9 @@ def state_summary(st, mode) -> str:
     if mode == "calibrate":
         return ""
     lines = ["业务票（编号｜标题｜人群｜状态｜没拆的墙｜最近一次尝试）："]
-    biz = [(tid, t) for tid, t in st["tickets"].items() if store.ticket_kind(t) == "business"]
+    # 只列在途的业务票：已关（done / skip）的不判、不挂墙、不提议结束（终审 #2：关掉的票不复活）
+    biz = [(tid, t) for tid, t in st["tickets"].items()
+           if store.ticket_kind(t) == "business" and t.get("status") not in (store.DONE, store.SKIP)]
     for tid, t in biz:
         walls = "；".join(f"{w.get('id')} {w.get('text', '')}" for w in t.get("walls", [])
                          if w.get("status") == "open") or "无"

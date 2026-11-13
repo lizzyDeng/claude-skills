@@ -375,3 +375,45 @@ def test_skill_branch_suffix_not_promised_equal_to_attempt_n():
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     assert "n = 这次尝试的序号" not in text and "不算并进来的历史尝试" in text
     assert "stale_checkouts" in text                                             # 留着的 checkout 不删、记下来
+
+
+# ---- 终审修复：协议口令和代码对齐 -------------------------------------------------------------------
+
+def test_skill_final_fix_wording():
+    import tick
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s2 = _section(text, "2.")
+    pre = s2.split("| 返回字段 |")[0]
+    assert "`prod_ready`" in pre and "prod_ready" in tick.WAKE_KEYS                 # #1：只交一次的唤醒键
+    rows = {m.group(1): line for line in s2.splitlines() for m in [re.match(r"^\|\s*`([a-z_]+)`", line)] if m}
+    pr = rows["prod_ready"]
+    assert "router.py prod-batch" in pr and "router_ships" in pr and "放行" in pr and "released" in pr
+    assert "--as-user" in rows["return_to_user"] and "--as-router" in rows["return_to_user"]   # #4
+    assert "tell <T>" in rows["slow_path_events"] and "--as-router" in rows["slow_path_events"]  # #14
+    assert "topic=next" in rows["new_queue"] and "redirect" in rows["new_queue"]       # #3
+    s4 = _section(text, "4.")
+    assert '--resume --as-router' in s4 and "surfaces <T> --set" in s4                  # #14 方向审挑战 / #7 代码面
+    s6 = _section(text, "6.")
+    tell = next(l for l in s6.splitlines() if l.startswith("| 「告诉 A"))
+    assert 'tell <T> "<原话>"' in tell and "不加 `--as-router`" in tell                # 用户的话照旧用原话
+    assert "「Qn 放行」" in s6 and "topic=next" in s6 and "--surfaces" in s6
+    s7 = re.search(r"^### 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M).group(1)
+    for w in ("发版批次", "staging 领先 main", "待走查", "待放行", "router_ships", "batch", "已放行"):  # #6
+        assert w in s7, w
+    assert "核对过" in s7 and "不关票" in s7 and "router.py close" in s7                 # #5
+    assert "Refs #" in s7 and "Closes #" in s7                                         # #15
+    assert "已试" in s7 and "stale_checkouts" in s7 and "status" in s7 and "旧尝试" in s7  # #8 / #9
+    assert "没有在途尝试" in text and "满 7 天" in s7 and "no_entry" in s7               # #3 / #13
+    assert "已关的票不复活" in s7                                                       # #2
+
+
+def test_worker_and_brief_business_pr_refs_not_closes():
+    for doc in ("worker.md", "templates/brief_business.md"):
+        text = (SKILL / doc).read_text(encoding="utf-8")
+        sec = re.search(r"^## 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M).group(1)
+        assert "Refs #<issue>" in sec and "Closes #" in sec, doc                       # #15：业务票写 Refs，不写 Closes
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    assert "Refs #<issue>" in _section(worker, "第 3 段")
+    assert "router 转述 / 决定" in worker                                               # #14：worker 认得 router 的话
+    daily = (SKILL / "templates" / "analyst_daily.md").read_text(encoding="utf-8")
+    assert "满 7 天" in daily and "`hit_wall` = 0" in daily and "判 `no_entry`" in daily   # #13

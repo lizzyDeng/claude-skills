@@ -41,7 +41,7 @@ SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # �
 QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch",
                "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue"}
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -198,15 +198,24 @@ def _iso(s) -> datetime:
 
 
 def new_business_ticket(state: dict, *, title, segment, want, walls, metric, evidence, impact,
-                        origin, absorbs=()) -> str:
+                        origin, absorbs=(), surfaces=(), weight=None) -> str:
+    """surfaces 空 ⇒ 按重票（weight=heavy）：没声明代码面就不知道会不会编译 Rust，先占重名额、过磁盘闸；
+    方向卡给出代码面后 router 用 surfaces --set 改成实际的。"""
     at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    surfaces = list(surfaces)
     tid = new_ticket(state, title=title, origin=origin, kind="business", authorized=True,
+                     surfaces=surfaces, weight=weight or ("heavy" if not surfaces else "light"),
                      segment=segment, want=want, metric=metric, evidence=list(evidence),
                      impact=impact, absorbs=list(absorbs), parent=None, tasks=[], attempts=[],
                      no_use_streak=0,
                      walls=[{"id": f"W{i}", "text": w, "status": "open", "source": origin, "at": at}
                             for i, w in enumerate(walls, 1)])
     return tid
+
+
+def attempt_inflight(t: dict) -> bool:
+    """业务票有尝试已上线、还没判完（判定为空或待样本）：一次只验一个尝试（spec §4.4a）。历史尝试不算。"""
+    return any(a.get("verdict") in (None, "pending_sample") for a in t.get("attempts") or [] if not a.get("historical"))
 
 
 def current_attempt(t: dict):
@@ -280,7 +289,11 @@ def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touc
     if verdict == "pending_sample":
         since = a.get("pending_since")
         if since and _iso(at) - _iso(since) >= timedelta(days=PENDING_CAP_DAYS):
-            raise ValueError(f"待样本已满 {PENDING_CAP_DAYS} 天")
+            if hit_wall:                          # 有人走到墙：有几个按几个判，不许再待样本
+                raise ValueError(f"待样本已满 {PENDING_CAP_DAYS} 天：走到墙的有几个按几个判")
+            # 满 7 天、碰到改动的人里没人走到墙（含碰到 0 人）：按没入口判，走 no_entry（终审裁决 #13）
+            verdict = "no_entry"
+            note = f"{note}（待样本满 {PENDING_CAP_DAYS} 天，碰到 {touched} 人、没人走到墙：按没入口判）"
     a.update(verdict=verdict, verdict_at=at, touched=touched, hit_wall=hit_wall, continued=continued, note=note)
     if verdict == "pending_sample":
         a.setdefault("pending_since", at)
@@ -301,7 +314,7 @@ def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touc
         actions = ["change_direction"] + (["return_to_user"] if t["no_use_streak"] >= USELESS_RETURN_AT else [])
     elif verdict == "harmful":
         actions = ["rollback"]
-    return {"actions": actions}
+    return {"actions": actions, "verdict": verdict}
 
 
 def set_status(state: dict, tid: str, status: str, at: str, waiting_for: str = None) -> None:
@@ -335,16 +348,18 @@ CLOSEOUT_COLS = ("issue", "worktree", "branch")
 
 
 def closeout_open(co) -> dict:
-    """还没做完的栏 → {"downstream": [票号…], "cols": [栏名…]}；kept 不算没做完（要人处理，不再重试）。"""
+    """还没做完的栏 → {"downstream": [票号…], "cols": [栏名…], "old_branches": [分支…]}；kept 不算没做完
+    （要人处理，不再重试）。old_branches = 业务票旧尝试已合并的本地分支（关业务票时列出，老票没有这一栏）。"""
     if not isinstance(co, dict):
-        return {"downstream": [], "cols": []}
+        return {"downstream": [], "cols": [], "old_branches": []}
     down = [oid for oid, d in (co.get("downstream") or {}).items() if isinstance(d, dict) and d.get("state") == "pending"]
-    return {"downstream": down, "cols": [c for c in CLOSEOUT_COLS if co.get(c) == "pending"]}
+    old = [b for b, v in (co.get("old_branches") or {}).items() if v == "pending"]
+    return {"downstream": down, "cols": [c for c in CLOSEOUT_COLS if co.get(c) == "pending"], "old_branches": old}
 
 
 def closeout_pending(co) -> bool:
     o = closeout_open(co)
-    return bool(o["downstream"] or o["cols"])
+    return bool(o["downstream"] or o["cols"] or o["old_branches"])
 
 
 # ---- 上线验收（postlaunch）：released 之后 t0 + 1 / 3 / 7 天各查一次；票的终点是上线验收，不是 released ----

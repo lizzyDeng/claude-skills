@@ -33,7 +33,7 @@
 
 ## 第 2 段：执行（方向卡被确认后）
 
-- 叫醒你的消息里有用户原话（逐字）；业务票的方向卡和方向问题由 router 按票级授权代答，消息里标的是「router 决定（不是用户原话）」。原话里有修改，以修改为准。
+- 叫醒你的消息里有用户原话（逐字）；业务票的方向卡和方向问题由 router 按票级授权代答，消息里标的是「router 决定（不是用户原话）」；router 自己转来的话（方向审的挑战、转述）标「router 转述 / 决定（不是用户原话）」。原话里有修改，以修改为准。
 - **每个检查点**（每完成一个步骤、每次提交前）先读收件箱：`python3 $ROUTER_CLI inbox`。
   - `pause`：做完当前这一步就退出，不用发事件。
   - `interface_changed` / `assumption_broken`（来自别的票）：对照你的方向卡核心假设；没受影响就继续；你的核心假设也被推翻了，照下一节第 2 条停。
@@ -59,7 +59,7 @@
 1. 逐条跑方向卡第 6 项的验收标准，**贴真实命令输出**（写进 PR 描述，去掉用户原话和 uid）。
 2. 写过 staging 数据的：在同一个 run 里回滚，并在验收里贴出回滚前后的对比。
 3. 推分支：`git push -u origin <派单「环境」里的分支>`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
-4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。
+4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。业务票写 `Refs #<issue>`，不写 `Closes #`：业务票是长期票，`Closes` 会在第一次发版时把 issue 自动关掉。
 5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的）。
 
 **仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。
@@ -79,8 +79,9 @@
 
 - **一张票就是一个问题**：一群人想要的一件东西，卡在派单列出的几道墙上。任务是你的清单项：每个任务不另开票、不另开 worktree、不另出方向卡（方向卡按尝试出：一次尝试一张）。超出这群人想要的这件东西 = 越界：`emit finding` 报出来，不顺手做。
 - **一次尝试 = 一个方向**，对准第一道还没拆的墙。可以同时改好几处代码，但**必须带开关**：关掉开关就回到这次尝试之前的行为。方向卡第 3 项写方向、对准哪道墙；第 9 项对业务票改写成三件事：开关名和撤回办法（router 上 prod 时原样记成 `released --rollback`）、第二天怎么数覆盖（前端改动看哪个版本号、服务端改动在每轮快照里打什么新标记）、墙还在不在怎么看。不写 T+1/T+3/T+7。
+- **PR 正文写 `Refs #<issue>`，不写 `Closes #` / `Fixes #`**：一张业务票要试好几次，issue 要一直开着；`Closes` 会在第一次发版合进 main 时把它自动关掉。
 - **上线前先做离线回放**（v2 spec §5.2）：从真实对话里撞墙的那一句开始，用新版本重放，盲判墙还在不在。结果（重放几段、墙还在几段）写进 PR 描述，不贴原话和 uid。回放要花钱（真 LLM 调用）：先停下来报价，`python3 $ROUTER_CLI emit decision "<调用数、金额>" --evidence "<估算依据>" --tags spend`，然后退出，等放行。
-- **上线后等判定再做下一个方向**：报完 `pr_opened` 就退出，不用等。router 上 prod 后，第二天分析 agent 判这一次尝试（覆盖 → 读对话 → 判定）。判定出来后，下一个方向一律由调度器派一个**新 worker** 来做（新会话、新分支 `router/<T>-a<n>`，不会在你这个会话上续跑）：收件箱里有判定和下一步，「router 决定：…」是 router 按票级授权定的，「用户原话（逐字）：…」是用户定的。「下一堵墙：…」= 去拆下一道墙；「换方向」= 别在原路上再试。每次开工（包括被重新派来）先读 `python3 $ROUTER_CLI inbox`，再看尝试记录（`python3 $ROUTER_CLI status --json` 里这张票的 `attempts` 和 `walls`，只读），然后从第 1 段写新方向卡。
+- **上线后等判定再做下一个方向**：报完 `pr_opened` 就退出，不用等。router 上 prod 后，第二天分析 agent 判这一次尝试（覆盖 → 读对话 → 判定）。判定出来后，下一个方向一律由调度器派一个**新 worker** 来做（新会话、新分支 `router/<T>-a<n>`，不会在你这个会话上续跑）：收件箱里有判定和下一步，「router 决定：…」是 router 按票级授权定的，「用户原话（逐字）：…」是用户定的。派单「router 线索」写的是没拆的墙和已试过的方向（标「已试：<判定>」）：已试的不是线索，别在原路上再试。「下一堵墙：…」= 去拆下一道墙；「换方向」= 别在原路上再试。每次开工（包括被重新派来）先读 `python3 $ROUTER_CLI inbox`，再看尝试记录（`python3 $ROUTER_CLI status --json` 里这张票的 `attempts` 和 `walls`，只读），然后从第 1 段写新方向卡。
 - **零代码的尝试**（只改配置）：照第 3 段「零代码票」写 `config.md`，里面的回滚办法就是这次尝试的撤回办法；router 自己执行、上 prod，不等用户放行。
 - **停点**：票级授权不包括花钱（`spend`）、撤不回的改动（`irreversible`）、发应用商店包（`store_release`）：照「只在三种情况停」第 1 条停。票内的方向问题不用找用户：`emit decision`（不带这三个标签）由 router 定。
 

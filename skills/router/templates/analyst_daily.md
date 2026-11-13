@@ -30,11 +30,11 @@ $state_summary
 | `wall_broken_not_retained` | 墙没了，但他还是在门槛前走了 | `new_wall`：从他离开前的几句里找出下一道墙（她说了什么、他说了什么，改写成描述，不抄原话） |
 | `useless` | 墙还在 | note 写墙是怎么还在的 |
 | `harmful` | 有人明显被伤到，或者护栏指标变坏（护栏照 brief） | note 写伤到了什么、几个人；router 当天撤回 |
-| `no_entry` | 碰到 0 人（第 1 步） | note 写查了什么 |
+| `no_entry` | 碰到 0 人（第 1 步）；或待样本满 7 天、碰到的人里没人走到墙 | note 写查了什么、碰到几人 |
 | `pending_sample` | 走到墙的人不到 3 个 | note 写现在几个 |
 
 - 判定词只能用上表这六个。
-- 走到墙的人不到 3 个：判 `pending_sample`，每天重读，最长 7 天（从第一次判 `pending_sample` 算起，约上线后第 8 天）。满 7 天有几个按几个判，不许再判 `pending_sample`（router 会拒收）。
+- 走到墙的人不到 3 个：判 `pending_sample`，每天重读，最长 7 天（从第一次判 `pending_sample` 算起，约上线后第 8 天）。满 7 天有几个按几个判，不许再判 `pending_sample`（router 会拒收）。满 7 天、碰到了改动但一个走到墙的人都没有（`hit_wall` = 0）：判 `no_entry`（note 写碰到几人、没人走到墙），router 去查入口；你照写 `pending_sample` 的，router 也按 `no_entry` 落。
 - 几个人结果不一致：按多数判，同时在 note 里写少数人的情况。
 - 样本小也照样判，只数人头、不做统计检验；note 写清看了几个人、几段对话。
 - 两张业务票碰到同一群人：在 note 里注明重叠（哪张票、几个人）。

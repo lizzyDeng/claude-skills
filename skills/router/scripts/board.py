@@ -34,14 +34,18 @@ def _e(x) -> str:
 
 
 # 带 topic 的项：用户回的话按 topic 定（router.cmd_answer 按 topic 分派）
+# requeue / next：回「Tn 换成：…」= redirect（业务票没有在途尝试就收，不看上一次判了什么）
 SAY_TOPIC = {"base": "{qid} 好了", "retarget": "{qid} 改好了", "dispatch": "{qid} 重派",
-             "offrepo": "{t} 核对过了 / {t} 不满意：…", "requeue": "{qid} 重排 / {t} 换成：…"}
+             "offrepo": "{t} 核对过了 / {t} 不满意：…", "requeue": "{qid} 重排 / {t} 换成：…",
+             "next": "{qid}：<下一个方向> / {t} 换成：…"}
 
 
 def _say(q) -> str:
     t, qid = q.get("ticket") or "", q["id"]
     if q.get("topic") in SAY_TOPIC:
         return SAY_TOPIC[q["topic"]].format(t=t, qid=qid)
+    if q["kind"] == "prod" and q.get("batch"):                 # 整批项（有业务票等上 prod）
+        return f"{qid} 放行 / {qid}：…"
     return {"start": "start / start T1 T3",
             "card": f"{t} 同意 / {t} 改：… / {t} 驳回：…",
             "spend": f"放行 {qid} / 不放行 {qid}",
@@ -50,7 +54,11 @@ def _say(q) -> str:
             "stuck": f"{t} 续跑 / 我接管 {t}",
             "conflict": f"{qid}：按谁来",
             "direction": f"{qid}：…",
-            "postlaunch": f"{qid} 知道了 / {qid}：…"}.get(q["kind"], qid)
+            "postlaunch": f"{qid} 知道了 / {qid}：…",
+            "verify_problem": f"{qid} 真 / {qid} 真，先放着 / {qid} 不是：理由",
+            "close": f"{qid} 关 / {qid} 不关",
+            "harm": f"{qid} 知道了 / {qid}：…",
+            "return": f"{t} 换成：… / 关 {t} / {qid}：…"}.get(q["kind"], qid)
 
 
 def _hhmm(ts: str) -> str:
@@ -103,6 +111,9 @@ def _ticket_card(t, evs, now=None) -> str:
     if df:
         foot.append(f'<span>派发失败 {_e(df.get("count", 1))} 次（阶段 {_e(df.get("phase"))}）：{_e(str(df.get("error", ""))[:120])}</span>')
     foot += _closeout_spans(t.get("closeout"))
+    sc = t.get("stale_checkouts") or []
+    if sc:                                                      # 业务票重新排队时留下的旧 checkout：要人处理
+        foot.append(f'<span>旧 checkout {len(sc)} 条待你处理：{_e("、".join(str(x.get("worktree")) for x in sc))}</span>')
     if now is not None:
         foot += _postlaunch_spans(t, now)
     tl = "".join(f'<li><span class="ts">{_e(_hhmm(e.get("ts", "")))}</span>[{_e(e.get("phase") or e.get("type"))}] '
@@ -157,11 +168,14 @@ def _closeout_spans(co) -> list:
         return []
     o, out = store.closeout_open(co), []
     names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
-    todo = [f"下游 {oid}" for oid in o["downstream"]] + [names[c] for c in o["cols"]]
+    todo = [f"下游 {oid}" for oid in o["downstream"]] + [names[c] for c in o["cols"]] + \
+        [f"旧分支 {b}" for b in o["old_branches"]]
     if todo:
         out.append(f'<span>收尾未完成：{_e("、".join(todo))}</span>')
     kept = [f"{ {'worktree': 'worktree', 'branch': '分支'}[c]}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
             if str(co.get(c, "")).startswith("kept")]
+    kept += [f"旧分支 {b}（{str(v)[len('kept: '):]}）" for b, v in (co.get("old_branches") or {}).items()
+             if str(v).startswith("kept")]
     if kept:
         out.append(f'<span>保留：{_e("、".join(kept))}</span>')
     err = co.get("error") or {}

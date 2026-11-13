@@ -30,7 +30,8 @@ import surfaces
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 WAKE_KEYS = ("new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
-             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled")
+             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled",
+             "prod_ready")
 # 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
 ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
 STOP_TAGS = {"spend", "irreversible", "store_release"}    # 仍要用户批的三类（花钱 / 撤不回 / 发商店包）
@@ -484,6 +485,7 @@ class Run:
             t["fail_streak"] = {"step": "", "count": 0}
             store.set_status(self.state, tid, store.AWAIT_PROD, self.now, ZERO_CODE_WAIT)
             self._drop_zero_code_checkout(tid, t)
+            self._prod_ready(tid, t)
         elif pause:
             store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
         elif result and result.get("is_error"):
@@ -748,6 +750,7 @@ class Run:
         owned = store.router_owned(t)
         if owned:
             store.set_status(self.state, tid, store.AWAIT_PROD, self.now, "已合 staging（票级授权，免走查）：等 router 上 prod")
+            self._prod_ready(tid, t)
         else:
             store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
         try:
@@ -767,6 +770,12 @@ class Run:
                 w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
         if not owned:
             self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+
+    def _prod_ready(self, tid, t):
+        """票级授权的业务票进了 await_prod（合 staging / 零代码做完）：唤醒 router 跑 prod-batch（终审 #1）——
+        整批都可上 ⇒ router 自己上；还有待走查 / 待放行的票 ⇒ prod 项交用户。老票照 v1，不叫醒。"""
+        if store.router_owned(t):
+            self.state.setdefault("wake", {}).setdefault("prod_ready", []).append({"ticket": tid})
 
     # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
     def step5a_closeout(self):
@@ -812,12 +821,33 @@ class Run:
                 progressed = True
                 if v == "done":
                     w[col] = None             # 清了才清指针：看板不再给失效的接管命令
+        progressed |= self._closeout_old_branches(t, co, errs)
         if self._gh_open(co):
             if guard is None:
                 errs.append(guard_err or "收尾暂停：防泄漏闸失效")
             else:
                 progressed |= self._closeout_github(tid, t, co, guard, errs)
         self._closeout_note(tid, t, errs, progressed)
+
+    def _closeout_old_branches(self, t, co, errs) -> bool:
+        """业务票旧尝试的本地分支（关票时只列已合并的）：没有未推送提交才删；那次尝试的旧 checkout 还在
+        （stale_checkouts，交人处理）⇒ 不碰，记 kept。done / kept 不再重试，error 下一轮重试。"""
+        olds, progressed = co.get("old_branches") or {}, False
+        stale = {x.get("branch"): x.get("worktree") for x in t.get("stale_checkouts") or []}
+        for b, v in olds.items():
+            if v != "pending":
+                continue
+            if stale.get(b) and Path(stale[b]).exists():
+                olds[b] = "kept: 旧 checkout 还在（stale_checkouts，交人处理）"
+                progressed = True
+                continue
+            r = launcher.cleanup_ticket_checkout(self.ctx, self.root, None, b).get("branch") or "error: 没有结果"
+            if r.startswith("error"):
+                errs.append(f"旧分支 {b}：{r[len('error: '):]}")
+                continue
+            olds[b] = r
+            progressed = True
+        return progressed
 
     def _closeout_github(self, tid, t, co, guard, errs) -> bool:
         repo, progressed = self.cfg["repo"], False

@@ -26,7 +26,7 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
    - config 有没有 `analyst.brief`。没有 = 分析 agent 没启用：没有每日验证、没有每周问题清单。告诉用户一次。
    - `state.json` 的 `analyst.calibrated`：不是 `true` = 校准没过，weekly 的提议一律不收。还没校准过就先走第 3 节的校准流程；没过就看 `calibrated_note`，先修方法。
    - `analyst.runs` 里标了 `failed`、你还没处理过的（压缩或重启前的唤醒可能丢了）：照第 2 节 `analyst_done` 一行处理。daily 不用你起：tick 每天过了 `analyst.daily_at_utc` 自己起。
-4. 查挂着没办完的业务票动作（唤醒键只交一次，压缩或重启前交出的可能没办完）：`status` 决定单里的 `harm` 项、`return` 项，以及 waiting_for 是「有害：等 router 按回滚办法撤回」「没有入口：等 router 查入口」的业务票 ⇒ 照第 2 节 `rollback_needed` / `return_to_user` / `no_entry` 那几行办。撤回前先看 `decisions.md` 有没有记过这次撤回，别撤两次。
+4. 查挂着没办完的业务票动作（唤醒键只交一次，压缩或重启前交出的可能没办完）：`status` 决定单里的 `harm` 项、`return` 项、问「要下一个方向吗」的方向项（topic=next），waiting_for 是「有害：等 router 按回滚办法撤回」「没有入口：等 router 查入口」的业务票，以及停在 `await_prod` 的业务票 ⇒ 照第 2 节 `rollback_needed` / `return_to_user` / `no_entry` / `new_queue` / `prod_ready` 那几行办。撤回前先看 `decisions.md` 有没有记过这次撤回，别撤两次。
 5. 用 Bash **后台**跑 `router.py watch`（`run_in_background: true`）。它有事才退出：退出就是一个事件，你被通知。
 6. 每次 watch 退出：按下面第 2 节处理它返回的 JSON，**处理完再起一个新的 watch**。
 7. 告诉用户看板路径：`<项目根>/.claude/router/board.html`（只读，30 秒自动刷新）。
@@ -34,20 +34,21 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 ## 2. watch 退出后按顺序处理
 
 哪些只交一次、哪些会重投：
-- **只交一次**（tick 交出就清掉，处理不完也要先记下来——`decide` / 告诉用户——别指望下一轮再交；重启后照第 1 节第 4 步从 `status` 找回）：`rollback_needed`、`no_entry`、`return_to_user`、`analyst_done`、`releases_unlabeled`，以及 `new_queue`、`external_deliveries`（项本身留在决定单 / 对方的收件箱里）。
+- **只交一次**（tick 交出就清掉，处理不完也要先记下来——`decide` / 告诉用户——别指望下一轮再交；重启后照第 1 节第 4 步从 `status` 找回）：`rollback_needed`、`no_entry`、`return_to_user`、`analyst_done`、`releases_unlabeled`、`prod_ready`，以及 `new_queue`、`external_deliveries`（项本身留在决定单 / 对方的收件箱里）。
 - **会重投**：`cards_for_review`、`slow_path_events`（`tick` 和每个 watch 的第一轮再交，直到处理完 / `ack-slow`）；`postlaunch_due`（每一轮都交，直到结果记上）；`errors`（每轮的新错）。
 
 | 返回字段 | 你做什么 |
 |---|---|
 | `rollback_needed` | 业务票某次尝试被 daily 判了「有害」，每项 `{ticket, rollback}`。**当天照 rollback 文本撤回**（关开关 / 回配置，照项目发版流程；这属于票级授权，不用先问）；撤回后核实生效，`router.py decide --ticket <T> --decision "撤回尝试：<rollback>" --why "daily 判有害：<note>" --basis "<home>/analyst/out/<run>.json"`，**并告诉用户**（≤ 100 字：哪张票、伤到了什么、已撤回）。rollback 文本要删数据 / 不可逆 / 发商店包：不自己做，告诉用户等他批。撤回之后下一个方向由你定（票级授权）：`router.py redirect <T> "<下一个方向>" --as-router`——新方向进收件箱、票回队列、调度器派新 worker 出新方向卡，这张票的 `harm` 项一并清掉；记一条 decide。 |
 | `no_entry` | daily 判「没入口」：碰到新代码的是 0 人，每项 `{ticket, attempt}`。当天查开关、部署和覆盖（开关开了没、发版生效没、前端版本到没到新用户）。授权内能修的（开开关、补配置、补部署）修好后 `router.py released --tickets <T> --what "<同一方向，补了入口>" --metrics … --rollback "…" [--t0 <生效时刻>]` 记一次新尝试，第二天 daily 重判；要改代码才到得了（例如前端到不了新用户的第一段聊天）⇒ `router.py maint add --title … --problem … --surfaces … --unblocks <T>`（挡验证的维护项，单独一张、不占名额）。各记一条 `decide`。 |
-| `return_to_user` | 业务票连续 3 次判「没用」，每项 `{ticket, attempt}`。worker **不续跑**，票停在 postlaunch，决定单上有一条 `return` 项。告诉用户（≤ 100 字）：这几次各试了什么方向、判定是什么（`status --json` 里这张票的 `attempts`），问题本身可能要重新定义；等他回，照第 6 节办：他给了新方向 ⇒ `router.py redirect <T> "<原话>" --as-user`（`return` 项清掉、没用的连续计数归零）；他要重新定义问题 ⇒ 新问题 `router.py add --business …` 并 start，原票 `router.py close <T>`；他要关 ⇒ `router.py close <T>`。 |
+| `return_to_user` | 业务票连续 3 次判「没用」，每项 `{ticket, attempt}`。worker **不续跑**，票停在 postlaunch，决定单上有一条 `return` 项。告诉用户（≤ 100 字）：这几次各试了什么方向、判定是什么（`status --json` 里这张票的 `attempts`），问题本身可能要重新定义；等他回，照第 6 节办：他给了新方向 ⇒ `router.py redirect <T> "<原话>" --as-user`（`return` 项清掉、没用的连续计数归零）。`return` 项没回之前 `redirect --as-router` 一律被拒：下一个方向只能由用户定，没用的连续计数也只在用户定方向时归零。他要重新定义问题 ⇒ 新问题 `router.py add --business …` 并 start，原票 `router.py close <T>`；他要关 ⇒ `router.py close <T>`。 |
 | `analyst_done` | 分析 agent 跑完要你看的，每项 `{run, mode, out}` 或 `{run, mode, failed: true, error}`。`mode=calibrate` 且没失败 ⇒ 判校准（第 3 节）。`mode=migrate` 且没失败 ⇒ 产出没落：把整份迁移清单（每个问题和它 `absorbs` 的老票、`attach`、`walls`）交给用户确认，他确认后 `router.py migrate-apply <run> --said "<原话>" [--skip …] [--hold …]`（第 3 节）。`failed` ⇒ 读 `error` 和 `<home>/analyst/logs/<run>.log`：能修就修（config、claude 登录、brief 路径），修好 `router.py analyst run --mode <mode>` 重跑（daily 当天不会自动重跑）；「校准未过」拒收 weekly 是预期，不用修；被防泄漏闸整份拒收 ⇒ 重跑，不要手改它的产出再收；修不了告诉用户。daily / weekly 跑成功不进这里：判定、墙、提议 tick 已经落好（新项进 `new_queue`，单条没落的进 `errors`）。 |
 | `releases_unlabeled` | 新周报的 `release_sync.unlabeled`：自动发现、还没标 metrics 的上线（原来由分诊转，现在巡检直接交你）。转给用户：一条 ≤ 100 字，列出清单，请他补标 metrics（周报的上线对账，不在 router 内）。 |
+| `prod_ready` | 票级授权的业务票合进 staging（或零代码做完）进了 `await_prod`，每项 `{ticket}`。跑 `router.py prod-batch`，按第 7 节的发版批次规则办：`router_ships` 非空 ⇒ 整批都能由你上，照项目发版流程上 prod，发完照 `router_ships` 逐张 `released`（业务票带 `--rollback`），各记一条 decide；`router_ships` 为空 ⇒ staging 上还有待走查 / 待放行的票，合 main 会把它们一起带上去，不能自己上：prod-batch 已推一条整批 prod 项（`batch` 里每张票的状态），告诉用户（≤ 100 字）：哪几张在等、各卡在走查还是放行，要他回「Qn 放行」或先走查。之后每次 `walkthrough-done` / `released` 改了批次，都再跑一次 `prod-batch`。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节）。业务票审完 submit 即自动确认；老票和维护票的卡交用户。 |
 | `postlaunch_due` | 只有老票和维护票有（业务票的验证交 daily）。每项 `{ticket, check}` 跑一次上线验收（第 7 节）：派一个 **Opus** Agent，prompt = `templates/postlaunch.md` 全文 + config `postlaunch_brief` 指向的项目 brief 全文 + 派单 + 方向卡 + 之前的结论；拿它回的 JSON 跑 `router.py postlaunch-result <T> --check … --type … --verdict … --summary "…" [--action "…"] [--behavior "…"]`。没入口 / 没用 / 有害：当天就做动作（第 5 节）。没记结果之前每一轮都会再交。 |
-| `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。判真项（`verify_problem`）写：问题、人群、卡在哪、影响分、证据路径（`state.json` 的 `proposals.<P>`），要他回「Qn 真」/「Qn 真，先放着」/「Qn 不是：理由」；提议结束（`close`）要他回「Qn 关」/「Qn 不关」；`harm` / `return` 见上面两行。业务票 worker 停下来问的方向（`direction` 项）不交用户，你定（第 5 节）。 |
-| `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>"`；是 bug / 基建 ⇒ `router.py maint add …` 并进本周维护票；是新的用户问题 ⇒ 告诉用户，他回「真」才 `router.py add --business …`（你不自己判真）。处理完 `router.py ack-slow`。 |
+| `new_queue` | 把新进决定单的事告诉用户：一条一行，≤ 100 字，写清要他回的话（看板「等你」一栏的 `say`）。判真项（`verify_problem`）写：问题、人群、卡在哪、影响分、证据路径（`state.json` 的 `proposals.<P>`），要他回「Qn 真」/「Qn 真，先放着」/「Qn 不是：理由」；提议结束（`close`）要他回「Qn 关」/「Qn 不关」；`harm` / `return` 见上面两行。业务票 worker 停下来问的方向（`direction` 项）不交用户，你定（第 5 节）。topic=next 的方向项（「要下一个方向吗」：空闲的业务票挂了新墙，或用户回了「不关」）也是你定：`router.py redirect <T> "<下一个方向>" --as-router`（清掉这一项、票回队列），记一条 decide。 |
+| `slow_path_events` | 没有订阅方的事件。判断谁该知道：相关票用 `router.py tell <T> "<一句话>" --as-router`（你的话，标「router 转述 / 决定」）；是 bug / 基建 ⇒ `router.py maint add …` 并进本周维护票；是新的用户问题 ⇒ 告诉用户，他回「真」才 `router.py add --business …`（你不自己判真）。处理完 `router.py ack-slow`。 |
 | `external_deliveries` | 用户自己开的 session 的订阅投递。tick 已写进对方 worktree 的 `.claude/router-inbox.md`；再用 `ListAgents` 找到 cwd 对得上的 session，`SendMessage` 一句话提醒。**只转交信息，不给它们下指令。** |
 | `errors` | 连续 3 轮报错才会因为它退出。读错误，能修就修（网络、gh 登录），修不了告诉用户。派发失败（第 2 次）、远端 base 缺失或指向认不出的 tip、改回 PR 失败（第 2 次）会自己进决定单，不用你搬；仓外票收尾失败第 1 次进 errors，之后只在看板票卡和 `status` 上显示（下一轮自动重试）。daily 某条判定 / 墙没落（泄漏、票号不对、待样本超 7 天）也在这里：原因修好后照它产出里的那条手动 `router.py verdict …`，不要自己编判定。 |
 
@@ -87,11 +88,11 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
      - 仍然 `ok: false`（boundary / canary_stale / canary_failed / leak / guard …）⇒ 本轮不跑 codex，`router.py decide --ticket <T> --decision "codex 跳过：<reason>" --why "<error 原文>" --basis "review-pack 输出"`，只用 Opus 审。
      - review-canary 报 `canary_inconclusive`（模型没真执行命令、只是复述，或超时）不是定论：下一张卡的 review-pack 会再报 canary_stale、再补跑一次。
      - review-canary 报 `canary_leak`（金丝雀读出了被拒路径的假数据）⇒ 另外**告诉用户**「codex 读边界失效」：这是安全事件，人要知道；只有这种情况 review-pack 才会一直报 canary_failed、跳过 codex，直到用户查过 codex 版本和配置。
-2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume`，worker 改卡后会再次 `progress card_ready`，回到这里。
+2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume --as-router`（你自己的话：worker 收到的标「router 转述 / 决定」，不冒充用户原话），worker 改卡后会再次 `progress card_ready`，回到这里。
 3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime]`。codex 与 Opus 有分歧：由你裁决，在卡末尾追加 `## router 裁决` 一段写明，再交。
 4. 超时（`waiting_for` 里有「超时」）照样交，加 `--overtime`，卡上注明哪部分没完成、为什么。
 
-**业务票的方向卡**（票级授权）：方向审照旧做完（Opus + codex，上面 1–4），另外多看四件事：这个方向是不是对准票上第一道没拆的墙；是不是只塞了一个机制就想交差；有没有开关能一键撤回（撤回办法要写在卡上，上 prod 时原样记成 `--rollback`）；上线前的离线回放怎么做、要不要花钱。这四件事写进给 Opus 的 prompt 一起审，有问题照上面第 2 步打回。方向超出这张票的范围（不是同一群人想要的同一件东西）：照第 2 步打回，让它收回到本票范围；超出的那部分当新问题告诉用户，他回「真」才开票。审完 `submit-card` 即**自动确认**：不进决定单，记一条 decide「方向已确认（票级授权）」，续跑 worker 的那段话标为「router 决定」，不冒充用户原话。
+**业务票的方向卡**（票级授权）：方向审照旧做完（Opus + codex，上面 1–4），另外多看四件事：这个方向是不是对准票上第一道没拆的墙；是不是只塞了一个机制就想交差；有没有开关能一键撤回（撤回办法要写在卡上，上 prod 时原样记成 `--rollback`）；上线前的离线回放怎么做、要不要花钱。这四件事写进给 Opus 的 prompt 一起审，有问题照上面第 2 步打回。方向超出这张票的范围（不是同一群人想要的同一件东西）：照第 2 步打回，让它收回到本票范围；超出的那部分当新问题告诉用户，他回「真」才开票。审完 `submit-card` 即**自动确认**：不进决定单，记一条 decide「方向已确认（票级授权）」，续跑 worker 的那段话标为「router 决定」，不冒充用户原话。**交卡前先定代码面**：业务票和维护票没声明代码面时按重票算（占重名额、派发前过磁盘闸），卡上第 7 项给出代码面后用 `router.py surfaces <T> --set a,b --why "方向卡第 7 项"` 设成实际的，之后按实际代码面算锁和轻重（下一次尝试照用，方向变了再设）。
 
 **老票和维护票的方向卡由用户确认。** 用户回「A 同意」「C 改：…」时：`router.py answer <Qn> "<用户原话，逐字>"`，原话会原样转给 worker。用户回「A 驳回：…」「根因不对，重查」时：`router.py answer <Qn> "<原话>" --reject`，worker 回第 1 段重写卡，不会开始实现。
 
@@ -103,7 +104,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 |---|---|
 | 判真：分析 agent 提的问题是不是真问题（回「真」= 开票并 start） | **用户** |
 | 关业务票（分析 agent 提议结束） | **用户** |
-| 业务票：票内换方向（`router.py redirect <T> "…" --as-router`）、确认方向卡、合 staging 后上 prod、判「有害」当天撤回、判「没入口」当天查修入口 | **你**（**票级授权**：用户判真时一次授权整张票；每次记一条 decide。只覆盖这张票的范围，超出范围按新问题提给用户） |
+| 业务票：票内换方向（`router.py redirect <T> "…" --as-router`；没有在途尝试就收，不看上一次判了什么；退回用户的 `return` 项没回时只能用户定）、确认方向卡、合 staging 后上 prod（只在整批都能上时，见第 7 节发版批次）、判「有害」当天撤回、判「没入口」当天查修入口 | **你**（**票级授权**：用户判真时一次授权整张票；每次记一条 decide。只覆盖这张票的范围，超出范围按新问题提给用户） |
 | 业务票 worker 停下来问的方向（`direction` 项，没带停点标签） | **你**（票级授权）：`router.py answer <Qn> "<你的决定>" --as-router`（answers.md 和 worker 收到的都标为「router 决定」，不冒充用户原话；只收业务票的方向 / 卡住 / 冲突项，花钱这类会被拒），再 `router.py decide …` 记一条 |
 | 花钱放行：真 LLM 批量调用、生图、其他外部付费调用（先报调用数和金额，跑完报实际数） | **用户**（业务票也一样） |
 | 撤不回的改动（删数据、不可逆迁移）、发应用商店包 | **用户**（业务票也一样；worker 用 `emit decision` 带 `--tags spend` / `irreversible` / `store_release` 停下，进决定单的 `spend` 项） |
@@ -132,13 +133,14 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「Qn 关」 | `router.py answer <Qn> "关"`：业务票收尾（下一轮巡检关 issue、清 worktree）。worker 还在跑会被拒：先 `router.py stop <T>` 再执行 |
 | 「Qn 不关」 | `router.py answer <Qn> "不关"`：票照旧 |
 | 「Qn 知道了」/「Qn：…」（`harm` / `return` 项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话办（换方向、关票、重新定义问题见下面几行） |
-| 「T3 换成：…」/「T3 换个方向：…」（判了有害 / 没用、或连续没用退回之后） | `router.py redirect <T> "<原话>" --as-user`：新方向进收件箱、票回队列派新 worker；清掉这张票的 `harm` / `return` 项 |
+| 「T3 换成：…」/「T3 换个方向：…」（业务票没有在途尝试时：判了有害 / 没用 / 有用之后、连续没用退回之后、墙拆完又挂了新墙） | `router.py redirect <T> "<原话>" --as-user`：新方向进收件箱、票回队列派新 worker；清掉这张票的 `harm` / `return` / 卡住重排 / 问下一个方向的项。有在途尝试（已派还没 released，或上线了还没判完）会被拒：等判完 |
 | 「关 T3」 | `router.py close <T> [--reason "<原话里的理由>"]`：业务票收尾（同「Qn 关」）。worker 还在跑会被拒：先 `router.py stop <T>` |
 | 「把 T5 并进 T7」 | `router.py absorb T7 T5`：老票挂到业务票下（验收过的记一次历史尝试，还在做的出了验收结论再记） |
 | 「迁移清单可以」/「迁移可以，k3 不要，k2 先放着」 | `router.py migrate-apply <run> --said "<原话>" [--skip k3] [--hold k2]`（`<run>` 是 `analyst_done` 里 migrate 那次的编号） |
-| 「Qn 重排」（判定后没排上队的卡住项，topic=requeue） | `router.py answer <Qn> "<原话>"`：再排一次队，派新 worker（不在旧 worker 上续跑）；router 自己处理时加 `--as-router` |
+| 「Qn 重排」（判定后没排上队的卡住项，topic=requeue） | `router.py answer <Qn> "<原话>"`：再排一次队，派新 worker（不在旧 worker 上续跑）；判定后的下一步和他的原话（标「用户原话（逐字）」）一起进收件箱；router 自己处理时加 `--as-router` |
+| 「Qn：<方向>」（问「要下一个方向吗」的项，topic=next） | `router.py answer <Qn> "<原话>"`（= `redirect --as-user`）；你自己定就 `router.py redirect <T> "<方向>" --as-router` |
 | 「这个问题要重新定义：…」 | 他说的新问题等于判过真：`router.py add --business …` 再 `router.py start <T>`；原票 `router.py close <T>` |
-| 「加个问题：…」（某群人要的某件东西没拿到） | `router.py add --business --title … --segment … --want … --wall … [--wall …] --metric … [--evidence …]`（用户直接提 = 判过真），再 `router.py start <T>`（他说先放着就不 start）；影响分缺省 0，用 `router.py impact` 补 |
+| 「加个问题：…」（某群人要的某件东西没拿到） | `router.py add --business --title … --segment … --want … --wall … [--wall …] --metric … [--evidence …] [--surfaces a,b]`（用户直接提 = 判过真；不知道代码面就不写，按重票算，方向卡出来再 `surfaces --set`），再 `router.py start <T>`（他说先放着就不 start）；影响分缺省 0，用 `router.py impact` 补 |
 | 「加个需求：…」（纯 bug / 合规 / 基建 / 工具） | `router.py maint add --title … --problem … --surfaces a,b [--unblocks <T>]`：并进本周维护票（挡住业务票验证或覆盖的加 `--unblocks`，单独一张） |
 | 「start T1 T3」/「start 周报 角色」 | 把名字对到票号，`router.py start T1 T3`。「start」/「start 全部」= `router.py start --all`（只含 v1 留下的本批周报草稿；v2 不再出周报草稿） |
 | 「A 同意」/「C 改：…」/「放行 Q4」 | `router.py answer <Qn> "<原话>"` |
@@ -146,14 +148,15 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「先停 A」 | `router.py pause <T>`（做完当前这一步停） |
 | 「立刻停 A」 | `router.py stop <T>`（直接停进程，worktree 和进度保留） |
 | 「B 插队」/「C 往后放」 | `router.py prioritize <T> <n>`（越小越先），记一条 decide |
-| 「告诉 A：…」 | `router.py tell <T> "<原话>"`；A 已停下就加 `--resume` |
+| 「告诉 A：…」 | `router.py tell <T> "<原话>"`（用户原话，不加 `--as-router`）；A 已停下就加 `--resume`。你自己要转告 worker 的话（方向审挑战、转述）才加 `--as-router` |
 | 「推翻 Dn」 | `router.py revoke <Dn> --reason "<原话>"` |
 | 「我接管 A」 | `router.py takeover <T>`，把它打印的命令给用户；之后不再调度 A |
 | 「还给 router」 | `router.py handback <T>` |
 | 「看板」/「现在什么情况」 | `router.py status`，只说要点 + 看板路径 |
-| 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支） |
+| 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支）；仓外的**业务票**不关票：核对过 = 这次尝试上线，记一次尝试（撤回办法 = 从 `backups/<T>/` 恢复），进 postlaunch 等 daily 判定 |
 | 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
 | 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
+| 「Qn 放行」/「Qn 上 prod」（整批 prod 项，列了每张票的状态） | `router.py answer <Qn> "<原话>"`：整批每张票记「已放行」；照项目发版流程整批上 prod，发完逐张 `released`（业务票带 `--rollback`）。别的回答只记原话、不放行 |
 | 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2 [--t0 <ISO>] [--config-keys k1,k2]`（写进周报 releases.json，带 `at` = 生效时刻；票进上线验收 postlaunch，不是完成）。零代码票先执行配置，`--t0` 写配置生效的时刻（带时区）；改了配置键就写 `--config-keys`（周报按它认登记，缺了同窗判定会被封顶）。业务票不等这句话，见第 7 节 |
 | 「Qn 知道了」/「Qn：…」（上线验收项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话调整。检查点都走完了 ⇒ 票完成 |
 | （检查点到期：`postlaunch_due`） | 跑完检查后 `router.py postlaunch-result <T> --check T+1 --type 增长型 --verdict … --summary "…" [--action "…"] [--behavior "…"]` |
@@ -185,28 +188,37 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 
 快速尝试、快速验证：不做 A/B，不算显著性，只看碰到改动的人的真实对话。
 
-- **上 prod**：业务票合 staging 后不走查，直接进 `await_prod`。`router.py prod-batch` 返回两组：`tickets`（老票、维护票）进决定单等用户「上 prod」；`router_ships`（票级授权的业务票）**你自己**照项目发版流程上 prod，每次都带开关，发完 `router.py released --tickets <T> --what "<这次尝试的方向>" --metrics … --rollback "<撤回办法：关哪个开关 / 回哪个配置>" [--t0 <生效时刻>] [--config-keys …]`（撤回办法照方向卡上写的；记一条 decide）。要发应用商店包的不在授权里：交用户。
-- **每次新尝试 = 新 worker**：判定之后（有用拆下一道墙 / 没用换方向）和 `redirect` 都是把票重新排队，调度器派一个新 worker：新会话、新分支 `router/<T>-a<n>`（从 base_branch 切；n = 这张票自己的第几次尝试，不算并进来的历史尝试，所以可能和尝试记录里的序号不同——每次上线时这次的分支、PR、合并 sha 记在那条尝试上），不在旧 worker、旧分支上接着做。上一次的 checkout 还在：干净的删掉（不强删）；有未提交改动或有意保留的原样留着，记进票上的 `stale_checkouts` 交人处理。接管中的票不重新排队。排不上队（例如派单待核实）⇒ 判定照记，决定单上一条 topic=requeue 的卡住项，回它就再排一次。
+- **上 prod**：业务票合 staging（或零代码做完）后不走查，直接进 `await_prod`，tick 交 `prod_ready` 叫醒你跑 `router.py prod-batch`。
+- **发版批次**：上 prod = 合 main 发版，staging 领先 main 的票会**一起**上去。所以你自己上 prod 只限于：staging 领先 main 的每一张票（`merged_staging` / `await_prod`）都满足两条之一——是票级授权的业务票、而且已经可以上（上一次尝试判完了）；或用户已经放行上 prod。prod-batch 按这条算：
+  - 整批都满足 ⇒ `router_ships` = 整批，**你自己**照项目发版流程上 prod，每次都带开关，发完逐张 `router.py released --tickets <T> --what "<这次尝试的方向>" --metrics … --rollback "<撤回办法：关哪个开关 / 回哪个配置>" [--t0 <生效时刻>] [--config-keys …]`（业务票的撤回办法照方向卡上写的；用户放行过的老票照 v1 不带 `--rollback`；各记一条 decide）。
+  - 还有待走查、待放行（或上一次尝试还没判）的票 ⇒ `router_ships` 为空，决定单上一条整批 prod 项，列出整批每张票的状态（输出的 `batch`）。告诉用户，等他走查完、或回「Qn 放行」（整批每张记已放行，你再整批上）。
+  - 没有业务票等上 prod 时照 v1：`tickets`（老票、维护票）攒成一条「上 prod：…」等用户。
+  - 要发应用商店包的不在授权里：交用户。
+- **仓外改动的业务票**：没有 staging 隔离层，改完就是真身。用户核对过（「T 核对过了」）= 这次尝试上线：记一次尝试（撤回办法 = 从 `<home>/backups/<T>/` 恢复），票进 postlaunch 等 daily 判定，**不关票**。关业务票只走 `router.py close` 或判真流程里的「关」。
+- **PR 写 `Refs #<issue>`**：业务票是长期票，PR 正文写 `Closes #` 会在第一次发版时把 issue 自动关掉。
+- **每次新尝试 = 新 worker**：判定之后（有用拆下一道墙 / 没用换方向）和 `redirect` 都是把票重新排队，调度器派一个新 worker：新会话、新分支 `router/<T>-a<n>`（从 base_branch 切；n = 这张票自己的第几次尝试，不算并进来的历史尝试，所以可能和尝试记录里的序号不同——每次上线时这次的分支、PR、合并 sha 记在那条尝试上），不在旧 worker、旧分支上接着做。新 worker 的派单里，「router 线索」换成没拆的墙 + 已试过的方向（标「已试：<判定>」，不是线索）。上一次的 checkout 还在：干净的删掉（不强删）；有未提交改动或有意保留的原样留着，记进票上的 `stale_checkouts` 交人处理（看板票卡和 `status` 上显示条数和路径）。关业务票时收尾顺带删掉旧尝试已合并的本地分支（没有未推送提交才删；那次的旧 checkout 还在就不碰）。接管中的票不重新排队。排不上队（例如派单待核实）⇒ 判定照记，决定单上一条 topic=requeue 的卡住项，回它就再排一次。
 - **当前尝试**：最后一条非历史的尝试。并进来的老票记成历史尝试（排在 live 尝试之前），不参与判定，不挡 released。
 - **一次只验一个尝试**：同一张票上一次尝试还没判完（判定为空或待样本），`released` 会拒收：等 daily 判完再上下一个。
 - **每日判定**（daily 三步：覆盖 → 读对话 → 判定；分母只算走到墙的人）由 tick 自动落到票上并执行动作：
 
 | 判定 | 自动动作 | 你做什么 |
 |---|---|---|
-| 有用（`useful`） | 拆掉当前这道墙，票回队列，派新 worker 拆下一道（第一道没拆的墙） | 无；墙都拆完了 ⇒ 等分析 agent 提议结束 |
+| 有用（`useful`） | 拆掉当前这道墙，票回队列，派新 worker 拆下一道（第一道没拆的墙） | 无；墙都拆完了 ⇒ 等分析 agent 提议结束；之后又挂了新墙（或用户回「不关」）⇒ 决定单上一条 topic=next 的方向项问「要下一个方向吗」，你定：`redirect --as-router` |
 | 墙拆了、人没留住（`wall_broken_not_retained`） | 拆掉当前这道墙；从他离开前几句找出的新墙挂到墙列表**末尾**；下一次尝试照常对准第一道没拆的墙（前面还有没拆的，先拆前面的） | 无 |
 | 没用（`useless`） | 票回队列，派新 worker 换方向；连续 3 次 ⇒ 不再排队，`return_to_user` | 第 2 节 `return_to_user` |
 | 有害（`harmful`） | 推 `harm` 项，`rollback_needed`；不自动换方向 | 当天照 rollback 文本撤回，并告诉用户；再 `redirect` 换方向（第 2 节） |
 | 没入口（`no_entry`） | `no_entry` | 当天查开关、部署和覆盖（第 2 节） |
-| 待样本（`pending_sample`） | 等；daily 每天重读，最长 7 天 | 无 |
+| 待样本（`pending_sample`） | 等；daily 每天重读，最长 7 天；满 7 天碰到改动的人里没人走到墙 ⇒ 按没入口（`no_entry`）判 | 无（满 7 天转成没入口时照 `no_entry` 办） |
 
 - 新挂的墙（daily / weekly 写的）不用用户判真，看板上看得到。
+- **换方向**：`redirect` 只看有没有在途尝试（已派还没 released，或上线了还没判完），不看上一次判了什么；退回用户的 `return` 项没回时只收 `--as-user`。
+- **已关的票不复活**：`done` / `skip` 的业务票，daily / `verdict` 的判定一律拒收，daily 的票况也不列它们。
 - **结束**：分析 agent 每周在两条同时满足时提议（票上的墙都判了有用；这群人的业务指标连续两周向好）⇒ `close` 项，用户回「关」才关。
 
 ## 8. 回复用户的规矩
 
 - 每条 ≤ 100 字；决定单要列全，**按业务影响**排序（影响分 = 人群规模 × 缺口 × 把握；看板显示「影响 0.21」；没有影响分的项排后面，再按挡住几张票排）。
-- 叫用户只有这些理由：判真、关业务票、start（老票 / 草稿）、确认方向卡（老票 / 维护票）、花钱 / 撤不回的改动 / 发商店包、上 prod（老票 / 维护票）、真人动手、上线验收没过（老票 / 维护票：没入口 / 没用 / 有害）、业务票有害已撤回（告知）、业务票连续 3 次没用退回。其余你自己定并 `decide`。
+- 叫用户只有这些理由：判真、关业务票、start（老票 / 草稿）、确认方向卡（老票 / 维护票）、花钱 / 撤不回的改动 / 发商店包、上 prod（老票 / 维护票；业务票和待走查 / 待放行的票同在一个发版批次时整批交用户）、真人动手、上线验收没过（老票 / 维护票：没入口 / 没用 / 有害）、业务票有害已撤回（告知）、业务票连续 3 次没用退回。其余你自己定并 `decide`。
 - 不复述 worker 和分析 agent 的长篇输出；给结论 + 卡 / 日志 / 产出路径。
 
 ## 9. 红线

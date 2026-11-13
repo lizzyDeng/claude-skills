@@ -38,6 +38,10 @@ ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revo
 # 有害 / 退回（harm、return）都归用户
 AS_ROUTER_KINDS = {"card", "direction", "stuck", "conflict"}
 ROUTER_LABEL = "router 决定"
+ROUTER_RELAY = "router 转述 / 决定"           # tell --as-router：router 自己的话（转述 / 决定），不冒充用户原话
+USER_LABEL = "用户原话（逐字）"
+VERDICT_ZH = {"useful": "有用", "wall_broken_not_retained": "墙拆了、人没留住", "useless": "没用", "harmful": "有害",
+              "no_entry": "没入口", "pending_sample": "待样本"}
 KIND_HINT = {
     "card": "方向卡已确认（用户原话里如有修改，以修改为准）。进入 worker.md 第 2 段「执行」。",
     "reject": "方向卡被用户驳回（原话见上）。回到第 1 段：按原话重新查根因、重写方向卡到同一路径，"
@@ -143,13 +147,18 @@ def _csv(s):
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def _resume_prompt(kind, text, inbox, as_router=False):
-    head = [f"{ROUTER_LABEL}（不是用户原话）：", text] if as_router else ["用户原话（逐字）：", text]
+def _resume_prompt(kind, text, inbox, as_router=False, relay=False):
+    if relay:
+        head = [f"{ROUTER_RELAY}（不是用户原话）：", text]
+    else:
+        head = [f"{ROUTER_LABEL}（不是用户原话）：", text] if as_router else [f"{USER_LABEL}：", text]
     parts = ["【router】你之前停下等的事有了回答。", "", *head, ""]
     if inbox:
         parts += ["你停下期间收件箱收到的：",
                   *[f"- [{m.get('type')}] {m.get('summary', '')}（来自 {m.get('ticket', 'router')}）" for m in inbox], ""]
-    if as_router and kind == "card":
+    if relay:
+        hint = "照上面 router 转来的话继续当前阶段（这是 router 的话，不是用户原话）。"
+    elif as_router and kind == "card":
         hint = "方向卡已确认（票级授权，router 代为确认）。进入 worker.md 第 2 段「执行」。"
     elif as_router:
         hint = f"照上面的{ROUTER_LABEL}继续当前阶段（票级授权，router 代为回答）。"
@@ -176,7 +185,7 @@ def _refuse_pending(t, tid, ctx=None) -> None:
                    "认不出是不是它：稍后再试")
 
 
-def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False):
+def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False, relay=False):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
     force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
     waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
@@ -189,14 +198,16 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None,
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
         if not force_restart:
-            said = f"{ROUTER_LABEL}（不是用户原话）：{text}" if as_router else text
+            said = (f"{ROUTER_RELAY}（不是用户原话）：{text}" if relay else
+                    f"{ROUTER_LABEL}（不是用户原话）：{text}" if as_router else text)
             events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": said})
             return "delivered"
         launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
     wait = waiting if waiting is not None else _resume_wait(kind, status)
     try:
-        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox, as_router), status,
+        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox, as_router, relay),
+                                    status,
                                     wait, env.now(), lambda: store.save_state(env.state_path, st))
     except launcher.IntentNotSaved as e:
         raise Fail(f"{tid} 没续跑：起进程前存盘失败（{e}）")
@@ -294,10 +305,13 @@ def _cmd_add_business(a, env):
                               ("--metric", a.metric)) if not v]
     if missing:
         raise Fail(f"add --business 缺 {' '.join(missing)}")
+    surf = _csv(a.surfaces)
+    _check_surfaces(env, surf)
     with env.state() as st:
         tid = store.new_business_ticket(
             st, title=a.title, segment=a.segment, want=a.want, walls=list(a.wall), metric={"name": a.metric},
-            evidence=[a.evidence] if a.evidence else [], impact={}, origin="user")   # 用户直接提 = 判过真
+            evidence=[a.evidence] if a.evidence else [], impact={}, origin="user",   # 用户直接提 = 判过真
+            surfaces=surf, weight=surfaces.ticket_weight("business", surf, env.table))
         _biz_issue_fields(st["tickets"][tid])
         st["tickets"][tid]["history"].append({"at": env.now(), "status": store.DRAFT})
     return {"ok": True, "ticket": tid}
@@ -458,8 +472,15 @@ def cmd_answer(a, env):
         elif topic == "requeue":                         # 判定后没排上队：再排一次（不在旧 worker 上续跑）
             if not t:
                 raise Fail(f"{q['id']} 指向的票不在了")
-            _requeue_business(env, st, t["id"], q.get("next") or a.text, REQUEUE_WAIT)
+            said = f"{ROUTER_LABEL if as_router else USER_LABEL}：{a.text}"     # 回答的原话原样带给新 worker
+            _requeue_business(env, st, t["id"], f"{q['next']}\n{said}" if q.get("next") else said, REQUEUE_WAIT)
             hint = "已重新排队，调度器派新 worker"
+        elif topic == "next":                            # 「要下一个方向吗」：回答 = 下一个方向（同 redirect）
+            if not t:
+                raise Fail(f"{q['id']} 指向的票不在了")
+            extra = _redirect_core(env, st, t["id"], a.text, as_router, record_answer=False)
+            extra.pop("ok", None)
+            hint = "已换方向、重新排队，调度器派新 worker"
         elif q["kind"] == "postlaunch":
             hint, extra = _postlaunch_answered(env, st, t, q)
         elif t and t["status"] == store.TAKEOVER:
@@ -492,6 +513,8 @@ def cmd_answer(a, env):
                 hint = extra.pop("hint", "")
         elif q["kind"] == "start":
             hint = "派发单要用 start 子命令"
+        elif q["kind"] == "prod" and q.get("batch"):   # 整批项（有业务票等上 prod）：放行 = 整批一起上
+            hint, extra = _prod_answered(env, st, q, a.text)
         elif q["kind"] == "prod":
             hint = "按 aifriends 发版流程上 prod，发完用 released"
     return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint,
@@ -571,10 +594,19 @@ def propose_from(env, st, data) -> dict:
     for c in close:
         if c.get("ticket") not in st["tickets"] or store.ticket_kind(st["tickets"][c["ticket"]]) != "business":
             raise Fail(f"close 里的票 {c.get('ticket')} 不是已有的业务票")
-    for p in problems:
+    olds = []
+    for p in problems:                                # 和 migrate_check 一样严：只收存在、没并过的老票，一张只并一处
         for oid in p.get("absorbs", []):
-            if oid not in st["tickets"]:
+            o = st["tickets"].get(oid) if isinstance(oid, str) else None
+            if o is None:
                 raise Fail(f"problems（{p['key']}）absorbs 里的票 {oid} 不存在")
+            if store.ticket_kind(o) != "legacy" or o.get("parent"):
+                why = f"已并进 {o['parent']}" if o.get("parent") else f"kind={store.ticket_kind(o)}"
+                raise Fail(f"problems（{p['key']}）absorbs 里的 {oid} 不是没并过的老票（{why}）：不改挂")
+            olds.append(oid)
+    dup = sorted({o for o in olds if olds.count(o) > 1})
+    if dup:
+        raise Fail(f"同一张老票只能并进一个问题：{dup}")
     _refuse_leaks(env, (*problems, *maint, *walls, *close))
     rejected, at = _rejected_keys(env), env.now()
     pending = {(st.get("proposals", {}).get(q.get("proposal") or "") or {}).get("key")
@@ -590,8 +622,9 @@ def propose_from(env, st, data) -> dict:
         qid = store.push_queue(st, None, "verify_problem", f"判真：{p['title']}（{p['segment']}）", at)
         st["queue"][-1]["proposal"] = pid
         out.append({"id": pid, "key": p["key"], "title": p["title"], "queue": qid})
+    offered = []
     for w in walls:
-        store.attach_wall(st, w["ticket"], w["text"], "weekly", at)
+        offered.append(_add_wall(env, st, w["ticket"], w["text"], "weekly")[1])
     for c in close:
         qid = store.push_queue(st, c["ticket"], "close", f"提议结束 {c['ticket']}：{c.get('reason', '')}", at)
         st["queue"][-1]["reason"] = c.get("reason", "")
@@ -602,7 +635,8 @@ def propose_from(env, st, data) -> dict:
             mids.append(tid)
     # 只建 / 追加 DRAFT，不在这里 start：start 会建 issue、起 worker、中途落盘，不能放进可回滚的收产出里
     to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start}
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start,
+            "next_items": [q for q in offered if q]}
 
 
 def _refuse_leaks(env, items) -> None:
@@ -685,14 +719,14 @@ def maint_add(env, st, item) -> str:
         if tid is None:
             tid = store.new_ticket(
                 st, title=title, origin="analyst", kind="maint", unblocks=unb, tasks=[task], surfaces=surf,
-                weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+                weight=surfaces.ticket_weight("maint", surf, env.table), problem=task["text"])
             st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
         return tid
     title = f"维护 {_iso_week(env)}"
     tid = next((x for x, t in st["tickets"].items() if live(t) and not t.get("unblocks") and t["title"] == title), None)
     if tid is None:
         tid = store.new_ticket(st, title=title, origin="analyst", kind="maint", tasks=[task], surfaces=surf,
-                               weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+                               weight=surfaces.ticket_weight("maint", surf, env.table), problem=task["text"])
         st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
         return tid
     t = st["tickets"][tid]
@@ -700,7 +734,7 @@ def maint_add(env, st, item) -> str:
         return tid
     t["tasks"].append(task)
     t["surfaces"] = sorted(set(t["surfaces"]) | set(surf))
-    t["weight"] = surfaces.weight_for(set(t["surfaces"]), env.table)
+    t["weight"] = surfaces.ticket_weight("maint", t["surfaces"], env.table)
     t["problem"] = "；".join(x["text"] for x in t["tasks"])
     if t["status"] in store.RUNNING:
         # worker 活着就是即时通知；已死则这条留在 inbox，续跑时 _resume 读 inbox 一并带给它
@@ -786,9 +820,14 @@ def _answer_business(env, st, q, text) -> dict:
     _append_local(env.home / "answers.md",
                   f"- {env.now()} | {q['id']} | {q['kind']} | {q['ticket'] or '-'} | {' '.join(t.splitlines())}")
     if q["kind"] == "close":
+        res = {"ok": True, "queue": q["id"], "kind": "close", "ticket": q["ticket"], "closed": verb == "close"}
         if verb == "close":
             _close_business(env, st, q["ticket"], q.get("reason", ""), f"用户回答 {q['id']}：{t}")
-        return {"ok": True, "queue": q["id"], "kind": "close", "ticket": q["ticket"], "closed": verb == "close"}
+        else:                                         # 不关：空闲的票要有下一个方向（终审 #3）
+            nq = _offer_next(env, st, q["ticket"], "用户回「不关」")
+            if nq:
+                res["next_item"] = nq
+        return res
     prop = st.get("proposals", {}).get(q.get("proposal") or "")
     if prop is None:
         raise Fail(f"{q['id']} 指向的提议 {q.get('proposal')} 不存在")
@@ -797,26 +836,33 @@ def _answer_business(env, st, q, text) -> dict:
                       json.dumps({"key": prop["key"], "title": prop["title"], "reason": reason, "at": env.now()},
                                  ensure_ascii=False))
         return {"ok": True, "queue": q["id"], "kind": "verify_problem", "rejected": prop["key"]}
-    tid = _ticket_from_problem(env, st, prop)
+    tid, skipped = _ticket_from_problem(env, st, prop)
     res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
+    if skipped:                                       # 提议之后被并进了别处：不改挂，报出来
+        res["absorb_skipped"] = skipped
     if verb == "true":
         res["start"] = _start_locked(env, st, [tid])
     return res
 
 
-def _ticket_from_problem(env, st, prop) -> str:
-    """判真 / 确认迁移清单之后：提议 → 业务票（DRAFT）；absorbs 里的老票并进来（R1：验收过的记历史尝试）。"""
+def _ticket_from_problem(env, st, prop):
+    """判真 / 确认迁移清单之后：提议 → 业务票（DRAFT）；absorbs 里的老票并进来（R1：验收过的记历史尝试）。
+    → (票号, 没并的老票)。提议之后已并进别处 / 不是老票 / 不在了的不改挂（终审 #11），由调用方报出来。"""
+    ok, skipped = [], []
+    for oid in prop.get("absorbs", []):
+        o = st["tickets"].get(oid) if isinstance(oid, str) else None
+        good = o is not None and store.ticket_kind(o) == "legacy" and not o.get("parent") and oid not in ok
+        (ok if good else skipped).append(oid)
     tid = store.new_business_ticket(
         st, title=prop["title"], segment=prop["segment"], want=prop["want"], walls=prop["walls"],
         metric=prop["metric"], evidence=prop.get("evidence", []), impact=prop["impact"], origin="analyst",
-        absorbs=prop.get("absorbs", []))
+        absorbs=ok)
     nt = st["tickets"][tid]
     _biz_issue_fields(nt)
     nt["history"].append({"at": env.now(), "status": store.DRAFT})
     for old_id in nt["absorbs"]:
-        if old_id in st["tickets"]:
-            _link_legacy(st, tid, old_id)
-    return tid
+        _link_legacy(st, tid, old_id)
+    return tid, skipped
 
 
 def cmd_migrate_apply(a, env):
@@ -855,14 +901,14 @@ def cmd_migrate_apply(a, env):
         migrate_check(env, st, data)
         at = env.now()
         _append_local(env.home / "answers.md", f"- {at} | - | migrate-apply | {a.run} | {' '.join(said.splitlines())}")
-        created = [(_ticket_from_problem(env, st, p), p["key"]) for p in data["problems"]]
+        created = [(_ticket_from_problem(env, st, p)[0], p["key"]) for p in data["problems"]]
         attached = {}
         for x in data["attach"]:
             for oid in x["absorbs"]:
                 _link_legacy(st, x["ticket"], oid)
             attached.setdefault(x["ticket"], []).extend(x["absorbs"])
         for w in data["walls"]:
-            store.attach_wall(st, w["ticket"], w["text"], "migrate", at)
+            _add_wall(env, st, w["ticket"], w["text"], "migrate")
         did = store.append_decision(
             env.decisions, st, "-",
             f"迁移清单已落（{a.run}）：新业务票 {' '.join(t for t, _ in created) or '无'}"
@@ -897,6 +943,13 @@ def _close_business(env, st, tid, why, basis) -> None:
     ct["closeout"] = {"downstream": _closeout_targets(st, tid),
                       "issue": "pending" if ct.get("issue") else "n/a",
                       "worktree": "pending", "branch": "pending"}
+    cur, olds = ct["worker"].get("branch"), []
+    for x in ct.get("attempts") or []:               # 旧尝试的本地分支：只删已合并的（尝试上记着 merge_sha）
+        b = x.get("branch")
+        if b and x.get("merge_sha") and not x.get("historical") and b != cur and b not in olds:
+            olds.append(b)
+    if olds:
+        ct["closeout"]["old_branches"] = {b: "pending" for b in olds}
     st["queue"] = [q for q in st["queue"] if q.get("ticket") != tid]
     store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
     store.append_decision(env.decisions, st, tid, "关闭业务票", why, basis, env.now())
@@ -953,41 +1006,81 @@ def _check_absorb(st, tid, olds) -> None:
             raise Fail(f"{oid} 已经并进了 {o['parent']}")
 
 
+def _redirect_core(env, st, tid, text, as_router, record_answer=True) -> dict:
+    """业务票换方向（redirect 和回答「要下一个方向吗」项共用）：新方向写进收件箱、票回 queued，调度器派新 worker
+    （读收件箱和尝试记录，出新方向卡）。不在原 worker 上 resume。清掉这张票的 harm / return / requeue / next 项。
+    只看有没有在途尝试（已派、没 released，或上线了还没判完），不看上一次判了什么（终审 #3）。
+    退回用户（return 项没回）时只收用户定的方向（--as-user）；没用的连续计数只在用户定方向时归零（终审 #4）。"""
+    t = env.ticket(st, tid)
+    if store.ticket_kind(t) != "business":
+        raise Fail(f"{tid} 不是业务票：redirect 只给业务票（老票用 tell / add 跟进票）")
+    if t["status"] in (store.DONE, store.SKIP):
+        raise Fail(f"{tid} 已关（{t['status']}）：关掉的票不再换方向")
+    if t["status"] in (store.DRAFT, store.HOLD):
+        raise Fail(f"{tid} 还没 start（{t['status']}）：先 start，派出去的 worker 照墙出方向卡")
+    if t["status"] != store.POSTLAUNCH:
+        raise Fail(f"{tid} 状态是 {t['status']}：有在途尝试（已派、还没 released）。redirect 只收已上线（postlaunch）、"
+                   "当前尝试已判完的业务票")
+    last = store.current_attempt(t)
+    verdict = (last or {}).get("verdict")
+    if last is None or verdict in (None, "pending_sample"):
+        raise Fail(f"{tid} 有在途尝试：尝试 {(last or {}).get('n', '?')} 还在等 daily 判定（{verdict or '待判'}），判完再换方向")
+    pending_return = [q["id"] for q in st["queue"] if q.get("ticket") == tid and q["kind"] == "return"]
+    if pending_return and as_router:
+        raise Fail(f"{tid} 已退回用户（{'、'.join(pending_return)} 还没回）：下一个方向由用户定，"
+                   "用 --as-user 记他的原话（router 不能代定）")
+    returned = t.get("waiting_for") == RETURN_WAIT or bool(pending_return)
+    label = ROUTER_LABEL if as_router else USER_LABEL
+    _requeue_business(env, st, tid,
+                      f"换方向（尝试 {last['n']} 判定 {verdict}）。{label}：{text}。"
+                      "先读尝试记录和没拆的墙，再从第 1 段写新方向卡。", REDIRECT_WAIT)
+    cleared = [q["id"] for q in st["queue"] if q.get("ticket") == tid
+               and (q["kind"] in ("harm", "return") or q.get("topic") in ("requeue", "next"))]
+    st["queue"] = [q for q in st["queue"] if q["id"] not in cleared]
+    if returned and not as_router:                    # 退回用户后由他定了新方向：没用的连续计数重新算
+        t["no_use_streak"] = 0
+    if record_answer and not as_router:
+        _append_local(env.home / "answers.md",
+                      f"- {env.now()} | - | redirect | {tid} | {' '.join(text.splitlines())}")
+    did = store.append_decision(
+        env.decisions, st, tid, f"换方向：{text}",
+        "票级授权：router 定下一个方向" if as_router else "用户定的方向（原话见 answers.md）",
+        f"尝试 {last['n']} 判定 {verdict}" + ("；连续没用已退回用户" if returned else ""), env.now())
+    return {"ok": True, "ticket": tid, "status": store.QUEUED, "cleared": cleared, "decision": did}
+
+
 def cmd_redirect(a, env):
-    """业务票换方向（9b）：判了有害 / 没用（含连续 3 次没用退回用户）之后，新方向写进收件箱、票回 queued，
-    调度器派新 worker（读收件箱和尝试记录，出新方向卡）。不在原 worker 上 resume。清掉这张票的 harm / return 项。"""
+    """业务票换方向（9b + 终审 #3/#4）：见 _redirect_core。"""
     text = (a.text or "").strip()
     if not text:
         raise Fail("新方向不能空")
     with env.state() as st:
-        t = env.ticket(st, a.ticket)
-        if store.ticket_kind(t) != "business":
-            raise Fail(f"{a.ticket} 不是业务票：redirect 只给业务票（老票用 tell / add 跟进票）")
-        if t["status"] != store.POSTLAUNCH:
-            raise Fail(f"{a.ticket} 状态是 {t['status']}：只有 postlaunch 里判了有害 / 没用的业务票才用 redirect 换方向")
-        last = store.current_attempt(t)
-        verdict = (last or {}).get("verdict")
-        if verdict not in ("harmful", "useless"):
-            raise Fail(f"{a.ticket} 最近一次尝试的判定是 {verdict or '待判'}：只有判了有害 / 没用（含连续没用退回）才换方向")
-        returned = t.get("waiting_for") == RETURN_WAIT or any(
-            q.get("ticket") == a.ticket and q["kind"] == "return" for q in st["queue"])
-        label = ROUTER_LABEL if a.as_router else "用户原话（逐字）"
-        _requeue_business(env, st, a.ticket,
-                          f"换方向（尝试 {last['n']} 判定 {verdict}）。{label}：{text}。"
-                          "先读尝试记录，再从第 1 段写新方向卡。", REDIRECT_WAIT)
-        cleared = [q["id"] for q in st["queue"] if q.get("ticket") == a.ticket
-                   and (q["kind"] in ("harm", "return") or q.get("topic") == "requeue")]
-        st["queue"] = [q for q in st["queue"] if q["id"] not in cleared]
-        if returned:                                  # 退回用户后由他定了新方向：没用的连续计数重新算
-            t["no_use_streak"] = 0
-        if not a.as_router:
-            _append_local(env.home / "answers.md",
-                          f"- {env.now()} | - | redirect | {a.ticket} | {' '.join(text.splitlines())}")
-        did = store.append_decision(
-            env.decisions, st, a.ticket, f"换方向：{text}",
-            "票级授权：router 定下一个方向" if a.as_router else "用户定的方向（原话见 answers.md）",
-            f"尝试 {last['n']} 判定 {verdict}" + ("；连续没用已退回用户" if returned else ""), env.now())
-    return {"ok": True, "ticket": a.ticket, "status": store.QUEUED, "cleared": cleared, "decision": did}
+        return _redirect_core(env, st, a.ticket, text, a.as_router)
+
+
+def _offer_next(env, st, tid, why):
+    """空闲的业务票（已上线、当前尝试判了有用 / 墙拆了人没留住、没有别的待办项）有了新墙、或用户回「不关」：
+    推一条 topic=next 的方向项问「要下一个方向吗」（票级授权，router 定：redirect 或 answer --as-router）。
+    已经在问 / 有害 / 退回 / 卡住的票不推。→ 项号 | None。"""
+    t = st["tickets"].get(tid)
+    if not t or not store.router_owned(t) or t["status"] != store.POSTLAUNCH:
+        return None
+    cur = store.current_attempt(t)
+    if not cur or cur.get("verdict") not in ("useful", "wall_broken_not_retained"):
+        return None
+    if any(q.get("ticket") == tid and (q["kind"] in ("harm", "return") or q.get("topic") in ("requeue", "next"))
+           for q in st["queue"]):
+        return None
+    qid = store.push_queue(st, tid, "direction", f"{tid}：{why}；没有在途尝试——要下一个方向吗（票级授权，router 定）",
+                           env.now(), topic="next")
+    t["waiting_for"] = f"{why}：等 router 定下一个方向（{qid}）"
+    return qid
+
+
+def _add_wall(env, st, tid, text, source):
+    """挂墙（daily / weekly / migrate 共用）；挂到空闲的业务票上 ⇒ 顺手问下一个方向。→ (墙号, 方向项号 | None)。"""
+    wid = store.attach_wall(st, tid, text, source, env.now())
+    return wid, _offer_next(env, st, tid, f"新墙 {wid}「{' '.join(str(text).split())[:40]}」待拆")
 
 
 def cmd_close(a, env):
@@ -1069,6 +1162,9 @@ def cmd_revoke(a, env):
 
 
 def cmd_tell(a, env):
+    """--as-router：router 自己的话（方向审的挑战、转述），标「router 转述 / 决定」，不冒充用户原话；
+    用户说「告诉 A：…」照旧不加（原话）。"""
+    relay = bool(getattr(a, "as_router", False))
     with env.state() as st:
         t = env.ticket(st, a.ticket)
         if t["status"] == store.TAKEOVER and a.resume:
@@ -1077,10 +1173,11 @@ def cmd_tell(a, env):
             _refuse_pending(t, a.ticket, env.ctx)     # 先拒再投递：不然重试会投两份
         alive = launcher.worker_alive(env.ctx, t["worker"])
         if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
-            events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": a.text})
+            said = f"{ROUTER_RELAY}（不是用户原话）：{a.text}" if relay else a.text
+            events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": said})
         resumed = None
         if a.resume and _resume(env, st, a.ticket, "direction", a.text,
-                                t["status"] if t["status"] in store.RUNNING else store.KICKOFF) == "resumed":
+                                t["status"] if t["status"] in store.RUNNING else store.KICKOFF, relay=relay) == "resumed":
             resumed = a.ticket
         elif not a.resume:
             pass
@@ -1149,7 +1246,7 @@ def cmd_surfaces(a, env):
         if held and not a.force:
             raise Fail(f"这些代码面被别人锁着：{held}；等它们放锁，或确认后加 --force", held=held)
         old = t["surfaces"]
-        t["surfaces"], t["weight"] = names, surfaces.weight_for(set(names), env.table)
+        t["surfaces"], t["weight"] = names, surfaces.ticket_weight(store.ticket_kind(t), names, env.table)
         did = store.append_decision(env.decisions, st, a.ticket, f"代码面 {old} → {names}", a.why,
                                     "router.py surfaces", env.now())
     return {"ok": True, "surfaces": names, "weight": t["weight"], "decision": did}
@@ -1221,6 +1318,10 @@ def _checked(env, st, t) -> dict:
         store.set_status(st, tid, store.AWAIT_PROD, env.now(), "等上 prod")
         st["queue"] = drop_handson()
         return {"status": store.AWAIT_PROD}
+    if status == store.AWAIT_CHECK and store.ticket_kind(t) == "business":
+        res = _offrepo_attempt(env, st, t)
+        st["queue"] = drop_handson()
+        return res
     if status == store.AWAIT_CHECK:
         t["closeout"] = {"downstream": _closeout_targets(st, tid), "issue": "pending" if t.get("issue") else "n/a",
                          "worktree": "pending", "branch": "pending"}
@@ -1235,27 +1336,94 @@ def _checked(env, st, t) -> dict:
     raise Fail(f"{tid} 还没合进 staging，也不在等你核对（{status}）")
 
 
+def _offrepo_attempt(env, st, t) -> dict:
+    """仓外改动的业务票，用户核对过（终审 #5）：仓外没有 staging 隔离层，改完就是真身 ⇒ 这次尝试算上线，记一次尝试、
+    进 postlaunch 等 daily 判定（撤回办法 = 从备份恢复）。不关票：关业务票只走 close / 判真流程里的「关」。"""
+    tid = t["id"]
+    if store.attempt_inflight(t):
+        raise Fail(f"{tid} 上一次尝试还没判（判定为空或待样本）：先等 daily 判完")
+    sol = t.get("solution") or {}
+    what = " ".join(sol["text"].split())[:300] if sol.get("kind") == "card" and sol.get("text") else t["title"]
+    rollback = f"从 {env.home}/backups/{tid}/ 恢复仓外改动（改了什么见 {env.home}/cards/{tid}.diff）"
+    n = store.add_attempt(st, tid, f"仓外改动：{what}", env.now(), rollback)
+    next(x for x in t["attempts"] if x.get("n") == n).update(branch=t["worker"].get("branch"), offrepo=True)
+    store.set_status(st, tid, store.POSTLAUNCH, env.now(), f"等 daily 判定尝试 {n}（仓外改动，已核对）")
+    return {"status": store.POSTLAUNCH, "attempt": n, "hint": "仓外改动已核对：记为一次尝试，等 daily 判定（不关票）"}
+
+
 def cmd_walkthrough_done(a, env):
     with env.state() as st:
         res = _checked(env, st, env.ticket(st, a.ticket))
     return {"ok": True, **res}
 
 
+# 发版批次（终审 #6）：上 prod = 合 main 发版，staging 上领先 main 的票会一起上去
+PROD_STATE = {"ready": "可上", "approved": "已放行", "walkthrough": "待走查", "release": "待放行",
+              "unjudged": "上次尝试还没判"}
+_PROD_OK = ("ready", "approved")
+_PROD_GO = re.compile(r"^(?:放行|上\s*prod)" + _END, re.I)
+_KIND_ZH = {"business": "业务票", "maint": "维护票", "legacy": "老票"}
+
+
+def _prod_state(t) -> str:
+    """staging 领先 main 的一张票（merged_staging / await_prod）能不能由 router 带上 prod。"""
+    if t["status"] == store.AWAIT_PROD and store.router_owned(t):
+        return "unjudged" if store.attempt_inflight(t) else "ready"
+    if t.get("prod_ok"):
+        return "approved"
+    return "walkthrough" if t["status"] == store.MERGED else "release"
+
+
 def _prod_item(env, st):
+    """→ (prod 项号 | None, tickets, router_ships, batch | None)。
+    没有业务票等上 prod：照 v1（老票 / 维护票攒成一条「上 prod：…」交用户），batch=None。
+    有：整批 = staging 上领先 main 的每一张票（merged_staging / await_prod）。每一张都是可上的票级授权业务票、
+    或用户已放行 ⇒ router_ships = 整批，router 自己上；否则 router_ships 为空，推一条用户 prod 项列出整批和每张的状态。"""
     st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
-    waiting = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
-                     key=lambda x: int(x[1:]))
-    ready = [tid for tid in waiting if not store.router_owned(st["tickets"][tid])]
-    ships = [tid for tid in waiting if store.router_owned(st["tickets"][tid])]
-    if ready:
-        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, ships
-    return None, [], ships
+    tk, num = st["tickets"], (lambda x: int(x[1:]))
+    waiting = sorted((tid for tid, t in tk.items() if t["status"] == store.AWAIT_PROD), key=num)
+    ready = [tid for tid in waiting if not store.router_owned(tk[tid])]
+    if not any(store.router_owned(tk[tid]) for tid in waiting):
+        if ready:
+            return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, [], None
+        return None, [], [], None
+    rows = []
+    for tid in sorted((x for x, t in tk.items() if t["status"] in (store.MERGED, store.AWAIT_PROD)), key=num):
+        code = _prod_state(tk[tid])
+        rows.append({"ticket": tid, "kind": store.ticket_kind(tk[tid]), "status": tk[tid]["status"],
+                     "state": PROD_STATE[code], "ok": code in _PROD_OK})
+    batch = [{k: v for k, v in r.items() if k != "ok"} for r in rows]
+    if all(r["ok"] for r in rows):
+        return None, [], [r["ticket"] for r in rows], batch
+    summary = ("上 prod（整批：合 main 会把 staging 上这些票一起带上去，回「放行」= 整批一起上）："
+               + "；".join(f"{r['ticket']} {_KIND_ZH.get(r['kind'], r['kind'])}·{r['state']}" for r in rows))
+    qid = store.push_queue(st, None, "prod", summary, env.now())
+    st["queue"][-1]["batch"] = [r["ticket"] for r in rows]
+    return qid, ready, [], batch
+
+
+def _prod_answered(env, st, q, text):
+    """用户回整批 prod 项：「放行」/「上 prod」⇒ 整批每张票记已放行（prod_ok），router 照项目发版流程整批上；
+    别的话只记原话（answers.md 已写），不放行。"""
+    if not _PROD_GO.match((text or "").strip()):
+        return "原话已记，没放行：整批照旧等你（再跑 prod-batch 会重推这一项）", {"approved": []}
+    approved = []
+    for tid in q.get("batch") or []:
+        t = st["tickets"].get(tid)
+        if t and t["status"] in (store.MERGED, store.AWAIT_PROD):
+            t["prod_ok"] = env.now()
+            approved.append(tid)
+    return ("用户放行整批：照项目发版流程上 prod（整批一起），发完逐张 released（业务票带 --rollback）",
+            {"approved": approved})
 
 
 def cmd_prod_batch(a, env):
     with env.state() as st:
-        qid, ready, ships = _prod_item(env, st)
-    return {"ok": True, "queue": qid, "tickets": ready, "router_ships": ships}
+        qid, ready, ships, batch = _prod_item(env, st)
+    out = {"ok": True, "queue": qid, "tickets": ready, "router_ships": ships}
+    if batch is not None:                             # 有业务票等上 prod：整批和每张的状态（老票单独时不出这一栏）
+        out["batch"] = batch
+    return out
 
 
 def _parse_t0(s) -> str:
@@ -1268,6 +1436,9 @@ def _parse_t0(s) -> str:
     if dt.tzinfo is None:
         raise Fail(f"--t0 要带时区（Z 或 +08:00）：{s!r}")
     return dt.astimezone(timezone.utc).strftime(store.ISO)
+
+
+_BIZ_RELEASABLE = {store.AWAIT_PROD, store.POSTLAUNCH, store.MERGED}
 
 
 def cmd_released(a, env):
@@ -1284,6 +1455,10 @@ def cmd_released(a, env):
             env.ticket(st, tid)
         biz = [tid for tid in a.tickets if store.ticket_kind(st["tickets"][tid]) == "business"]
         for tid in biz:                                                  # 业务票：先验完再写 releases.json（拒收不留痕）
+            status = st["tickets"][tid]["status"]
+            if status not in _BIZ_RELEASABLE:                            # 终审 #16：草稿 / 已关 / 还在做的不收
+                raise Fail(f"{tid} 是业务票、状态是 {status}：released 只收在途的票（等上 prod，或已上线、补了入口重上），"
+                           "草稿、已关、还在做的一律拒")
             if not (a.rollback or "").strip():
                 raise Fail(f"{tid} 是业务票：released 必须带 --rollback \"<撤回办法>\"")
             if any(x.get("verdict") in (None, "pending_sample") for x in st["tickets"][tid]["attempts"]
@@ -1336,6 +1511,8 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
     t = env.ticket(st, tid)
     if store.ticket_kind(t) != "business":
         raise Fail(f"{tid} 不是业务票，没有尝试判定")
+    if t["status"] in (store.DONE, store.SKIP):       # 终审 #2：关掉的票不复活（不记判定、不重新排队）
+        raise Fail(f"{tid} 已关（{t['status']}）：不再记判定")
     old = next((x for x in t["attempts"] if x.get("n") == n), None)
     if old is not None and old.get("verdict") not in (None, "pending_sample"):
         raise Fail(f"{tid} 尝试 {n} 已有最终判定（{old['verdict']}），不许重判")
@@ -1386,6 +1563,8 @@ def _requeue_business(env, st, tid, text, wait) -> None:
         if why != "done":                             # 原样留着，记进 stale_checkouts 交人处理，不挡排队
             t.setdefault("stale_checkouts", []).append({"worktree": w["worktree"], "branch": w.get("branch"),
                                                         "why": str(why)[:200], "at": env.now()})
+    # 派单「router 线索」换成没拆的墙 + 已试方向（终审 #8）：上一次方向卡判过了，不再当线索
+    t["solution"] = {"kind": "clue", "text": _requeue_clue(t), "source": "router 重新排队：没拆的墙 + 已试方向（非方案）"}
     # 新一次尝试 = 新会话 + 新分支（router/<T>-a<k>，从 base 切；k = 这张票自己的第几次尝试，不算并进来的历史尝试）：
     # 旧 session id 会被 claude 拒（already in use）；旧分支已 squash 合进 base，接着用会把合过的提交又带进新 PR
     k = sum(1 for x in t.get("attempts") or [] if not x.get("historical")) + 1
@@ -1401,6 +1580,21 @@ def _requeue_business(env, st, tid, text, wait) -> None:
     t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
     t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
     store.set_status(st, tid, store.QUEUED, env.now(), wait)
+
+
+def _requeue_clue(t) -> str:
+    """重新排队后派单的「router 线索」：没拆的墙（下一次对准第一道）+ 已试过的方向（标判定，不是线索）。"""
+    opens = [f"{w.get('id')} {w.get('text', '')}" for w in t.get("walls", []) if w.get("status") == "open"]
+    lines = ["没拆的墙（下一次尝试对准第一道）：" + ("；".join(opens) if opens else "无（下一个方向见收件箱）")]
+    prev, cur = t.get("solution") or {}, store.current_attempt(t) or {}
+    if prev.get("kind") == "card" and prev.get("text"):
+        lines.append(f"上一次方向卡（已试：{VERDICT_ZH.get(cur.get('verdict'), '待判')}；不是线索，别在原路上再试）："
+                     f"{' '.join(prev['text'].split())[:300]}")
+    tried = [f"尝试 {x.get('n')}「{x.get('direction', '')}」{VERDICT_ZH.get(x.get('verdict'), x.get('verdict') or '待判')}"
+             for x in t.get("attempts") or [] if not x.get("historical")]
+    if tried:
+        lines.append("已试（不是线索）：" + "；".join(tried))
+    return "\n".join(lines)
 
 
 def _follow_up(env, st, tid, t, text) -> None:
@@ -1426,7 +1620,7 @@ def cmd_verdict(a, env):
 def apply_daily(env, st, data) -> dict:
     """daily 的判定 / 新墙逐条落（调用方持锁、负责存盘）。每条独立：非法 / 泄漏 / 找不到票 → errors，不拖垮其余。"""
     guard = _guard(env)
-    applied, errors = [], []
+    applied, errors, offered = [], [], []
 
     def one(kind, i, item, fn):
         snap = copy.deepcopy(st)
@@ -1455,13 +1649,14 @@ def apply_daily(env, st, data) -> dict:
         t = env.ticket(st, w["ticket"])
         if store.ticket_kind(t) != "business" or not str(w.get("text", "")).strip():
             raise Fail(f"{w['ticket']} 不是业务票或墙文本为空")
-        store.attach_wall(st, w["ticket"], w["text"], "daily", env.now())
+        offered.append(_add_wall(env, st, w["ticket"], w["text"], "daily")[1])
 
     for i, v in enumerate(data.get("verdicts", [])):
         one("verdict", i, v, lambda v=v: do_verdict(v))
     for i, w in enumerate(data.get("walls", [])):
         one("wall", i, w, lambda w=w: do_wall(w))
-    return {"ok": True, "applied": applied, "errors": errors, "notes": data.get("notes", "")}
+    return {"ok": True, "applied": applied, "errors": errors, "notes": data.get("notes", ""),
+            "next_items": [q for q in offered if q and store.in_queue(st, q)]}
 
 
 def cmd_apply_daily(a, env):
@@ -1626,17 +1821,28 @@ def _closeout_line(co) -> str:
     o = store.closeout_open(co)
     names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
     parts = []
-    todo = [f"下游 {x}" for x in o["downstream"]] + [names[c] for c in o["cols"]]
+    todo = [f"下游 {x}" for x in o["downstream"]] + [names[c] for c in o["cols"]] + \
+        [f"旧分支 {b}" for b in o["old_branches"]]
     if todo:
         parts.append("收尾未完成：" + "、".join(todo))
     kept = [f"{c}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
             if isinstance(co, dict) and str(co.get(c, "")).startswith("kept")]
+    olds = (co.get("old_branches") or {}) if isinstance(co, dict) else {}
+    kept += [f"旧分支 {b}（{str(v)[len('kept: '):]}）" for b, v in olds.items() if str(v).startswith("kept")]
     if kept:
         parts.append("保留：" + "、".join(kept))
     err = (co or {}).get("error") if isinstance(co, dict) else None
     if todo and err:
         parts.append(f"出错：{str(err.get('msg', ''))[:120]}")
     return "".join(f" · {x}" for x in parts)
+
+
+def _stale_line(t) -> str:
+    """业务票重新排队时留下的旧 checkout（有未提交改动 / 有意保留）：条数和路径，要人处理。"""
+    sc = t.get("stale_checkouts") or []
+    if not sc:
+        return ""
+    return f" · 旧 checkout {len(sc)} 条待你处理：" + "、".join(str(x.get("worktree")) for x in sc)
 
 
 def _postlaunch_line(t, now) -> str:
@@ -1690,7 +1896,7 @@ def cmd_status(a, env):
         issue = f" #{t['issue']}" if t["issue"] else ""
         wait = f" · 等：{t['waiting_for']}" if t["waiting_for"] else ""
         lines.append(f"  {tid}{issue} [{t['status']}] {t['title']}{wait}{_closeout_line(t.get('closeout'))}"
-                     f"{_postlaunch_line(t, env.now())}")
+                     f"{_postlaunch_line(t, env.now())}{_stale_line(t)}")
     print("\n".join(lines))
     return None
 
@@ -1784,6 +1990,8 @@ def build_parser():
     s.add_argument("did"); s.add_argument("--reason", required=True)
     s = sub.add_parser("tell", help="写进 worker 收件箱")
     s.add_argument("ticket"); s.add_argument("text"); s.add_argument("--resume", action="store_true")
+    s.add_argument("--as-router", action="store_true",
+                   help="router 自己的话（方向审挑战、转述）：标「router 转述 / 决定」，不冒充用户原话")
     for name, h in (("pause", "先停：做完当前这一步"), ("stop", "立刻停"), ("takeover", "我接管"),
                     ("handback", "还给 router"), ("walkthrough-done", "staging 走查过了 / 仓外改动核对过了")):
         sub.add_parser(name, help=h).add_argument("ticket")

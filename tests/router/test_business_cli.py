@@ -499,12 +499,15 @@ def test_legacy_card_still_to_user(proj):
 
 
 def test_prod_batch_separates_router_ships(proj):
+    """终审 #6：老票 T1 待放行时，业务票 T2 不能被 router 自己带上 prod（合 main 会把 T1 一起带上去）：
+    router_ships 为空，整批交用户，prod 项列出每张票的状态。"""
     seed(proj, T1=("await_prod", [], {"title": "老票"}),
          T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票"}))
     out = json.loads(proj.run("prod-batch").stdout)
     s = proj.state()
-    assert out["tickets"] == ["T1"] and out["router_ships"] == ["T2"]
-    assert [q["summary"] for q in s["queue"] if q["kind"] == "prod"] == ["上 prod：T1"]
+    assert out["tickets"] == ["T1"] and out["router_ships"] == []
+    (summary,) = [q["summary"] for q in s["queue"] if q["kind"] == "prod"]
+    assert summary.startswith("上 prod（整批") and "T1 老票·待放行" in summary and "T2 业务票·可上" in summary
 
 
 def test_prod_batch_only_business_makes_no_item(proj):
@@ -820,7 +823,7 @@ def test_redirect_refusals(proj):
     _biz(proj, status="executing", attempts=_A1)
     r = proj.run("redirect", "T1", "x", "--as-router", check=False)
     assert r.returncode == 1 and "postlaunch" in json.loads(r.stdout)["error"]
-    for v in (None, "pending_sample", "useful", "no_entry"):                    # 只收有害 / 没用（含连续没用退回）
+    for v in (None, "pending_sample"):                                          # 终审 #3：只拒在途（还在等判定）
         _biz(proj, attempts=[{**_A1[0], "verdict": v}])
         r = proj.run("redirect", "T1", "x", "--as-router", check=False)
         assert r.returncode == 1, v

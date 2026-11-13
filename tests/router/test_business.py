@@ -102,9 +102,11 @@ def test_pending_sample_capped_7_days():
     r = record_verdict(s, tid, n, "pending_sample", T0, **kw)
     assert r["actions"] == ["wait"]
     later = (datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(days=7, seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with pytest.raises(ValueError, match="待样本已满 7 天"):
-        record_verdict(s, tid, n, "pending_sample", later, **kw)
+    with pytest.raises(ValueError, match="待样本已满 7 天"):                    # 有人走到墙：有几个按几个判
+        record_verdict(s, tid, n, "pending_sample", later, **{**kw, "touched": 3, "hit_wall": 1})
     assert s["tickets"][tid]["attempts"][0]["pending_since"] == T0
+    r = record_verdict(s, tid, n, "pending_sample", later, **kw)                 # 没人走到墙：按没入口判（终审 #13）
+    assert r == {"actions": ["check_entry"], "verdict": "no_entry"}
 
 
 def test_verdict_refuses_historical_attempt():
