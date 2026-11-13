@@ -1301,6 +1301,9 @@ def cmd_released(a, env):
             t = st["tickets"][tid]
             if tid in biz:                                               # 验收交给 daily 的判定，不排 T+1/T+3/T+7
                 n = store.add_attempt(st, tid, a.what, t0, a.rollback.strip())
+                att = next(x for x in t["attempts"] if x.get("n") == n)   # 这次上线的 PR / 合并 sha / 分支记在尝试上：
+                att.update(pr=t.get("pr"), merge_sha=t.get("merge_sha"),  # 下次重排队会清掉票上的这几项
+                           branch=t["worker"].get("branch"))
                 store.set_status(st, tid, store.POSTLAUNCH, env.now(), f"等 daily 判定尝试 {n}")
                 continue
             if t.get("postlaunch"):
@@ -1372,21 +1375,22 @@ def _requeue_business(env, st, tid, text, wait) -> None:
     """业务票的下一次尝试：话写进收件箱 + 回 queued，调度器派新 worker（新 worker 读收件箱和尝试记录，从第 1 段出新卡）。
     不在原 worker 上 resume，也不看 worktree 在不在（9b：一条路径）。认不出可能在跑的 worker ⇒ Fail（_refuse_pending）。"""
     t = st["tickets"][tid]
+    if t["status"] == store.TAKEOVER:
+        raise Fail(f"{tid} 在你接管中：不重新排队，还给 router（handback）后再说")
     _refuse_pending(t, tid, env.ctx)
     w = t["worker"]
     if launcher.worker_alive(env.ctx, w):
         raise Fail(f"{tid} 的 worker 还在跑（pid {w.get('pid')}）：先 stop {tid} 再换方向")
-    if w.get("worktree") and Path(w["worktree"]).is_dir():   # 上一次的 worktree 还在（删失败过）：尽量删，删不掉记下来不挡排队
-        try:
-            launcher.remove_worktree(env.ctx, env.root, w["worktree"])
-        except Exception as e:  # noqa: BLE001
+    if w.get("worktree"):                             # 上一次的 checkout 还在：干净才删（不 --force）；有意保留 / 有改动 / 删不掉
+        why = t.get("checkout_kept") or launcher.cleanup_ticket_checkout(env.ctx, env.root, w["worktree"], None)["worktree"]
+        if why != "done":                             # 原样留着，记进 stale_checkouts 交人处理，不挡排队
             t.setdefault("stale_checkouts", []).append({"worktree": w["worktree"], "branch": w.get("branch"),
-                                                        "error": str(e)[:200], "at": env.now()})
-    # 新一次尝试 = 新会话 + 新分支（router/<T>-a<n>，从 base 切）：旧 session id 会被 claude 拒（already in use），
-    # 旧分支已 squash 合进 base，接着用会把合过的提交又带进新 PR
-    n = max((x.get("n", 0) for x in t.get("attempts") or []), default=0) + 1
+                                                        "why": str(why)[:200], "at": env.now()})
+    # 新一次尝试 = 新会话 + 新分支（router/<T>-a<k>，从 base 切；k = 这张票自己的第几次尝试，不算并进来的历史尝试）：
+    # 旧 session id 会被 claude 拒（already in use）；旧分支已 squash 合进 base，接着用会把合过的提交又带进新 PR
+    k = sum(1 for x in t.get("attempts") or [] if not x.get("historical")) + 1
     w.update(session_id=None, pid=None, pid_start=None, log=None, started_at=None, worktree=None,
-             branch=f"router/{tid}-a{n}")
+             branch=f"router/{tid}-a{k}")
     w.pop("exit", None)
     t["pr"] = None                                    # 上一次的 PR 已合：留着会让新 worker 一报 pr_opened 就被当成已合
     t["fail_streak"] = {"step": "", "count": 0}

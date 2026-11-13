@@ -369,3 +369,9 @@ def test_skill_9b_round2_migrate_confirm_and_branch_per_attempt():
     worker = (SKILL / "worker.md").read_text(encoding="utf-8")
     assert "router/$ROUTER_TICKET" not in worker                                 # 分支以派单为准（业务票每次尝试一条新分支）
     assert "$branch" in (SKILL / "templates" / "brief.md").read_text(encoding="utf-8")
+
+
+def test_skill_branch_suffix_not_promised_equal_to_attempt_n():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "n = 这次尝试的序号" not in text and "不算并进来的历史尝试" in text
+    assert "stale_checkouts" in text                                             # 留着的 checkout 不删、记下来

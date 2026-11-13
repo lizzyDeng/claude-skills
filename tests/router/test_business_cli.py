@@ -1133,3 +1133,74 @@ def test_answer_as_router_to_live_worker_labels_inbox(proj):
         assert "router 决定" in inbox and "测试决定戊" in inbox and "用户原话（逐字）" not in inbox
     finally:
         p.kill(); p.wait()
+
+
+# ---- 9b round 3：重排队不丢东西（留着的 worktree、上一次的 PR）、不碰接管中的票、分支后缀 ---------------------
+
+def _git(proj, *args, cwd=None):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=cwd or proj.root, check=True, capture_output=True, text=True).stdout
+
+
+def test_requeue_keeps_dirty_or_kept_worktree(proj):
+    """有未提交改动的 / 有意保留的 checkout：重排队不删（不 --force），记进 stale_checkouts，照样排队。"""
+    wt = proj.root / ".claude" / "worktrees" / "router-T1"
+    _git(proj, "worktree", "add", "-q", "-b", "router/T1", str(wt))
+    (wt / "kept.md").write_text("合成：留给人看的未提交改动\n")
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["worker"].update(worktree=str(wt), branch="router/T1")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    t = proj.state()["tickets"]["T1"]
+    assert (wt / "kept.md").exists() and t["status"] == "queued"
+    (sc,) = t["stale_checkouts"]
+    assert sc["worktree"] == str(wt) and "未提交" in sc["why"]
+    # 干净、但标了 checkout_kept 的：也不动
+    (wt / "kept.md").unlink()
+    _biz(proj, attempts=_A1, checkout_kept="worktree：有意保留")
+    st = proj.state(); st["tickets"]["T1"]["worker"].update(worktree=str(wt), branch="router/T1")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    t = proj.state()["tickets"]["T1"]
+    assert wt.is_dir() and t["status"] == "queued" and "有意保留" in t["stale_checkouts"][0]["why"]
+    # 干净、没标保留的：照常删（不用 --force）
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["worker"].update(worktree=str(wt), branch="router/T1")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    assert not wt.exists() and not proj.state()["tickets"]["T1"].get("stale_checkouts")
+
+
+def test_attempt_keeps_its_pr_and_merge_sha_after_requeue(proj):
+    _biz(proj, status="await_prod", pr=77, merge_sha="abc")
+    st = proj.state(); st["tickets"]["T1"]["worker"]["branch"] = "router/T1"
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _rel(proj, "--rollback", "关开关 x")
+    _verdict(proj)                                                              # 没用 ⇒ 第 2 次尝试开始（重排队）
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "queued" and t.get("pr") is None
+    a1 = t["attempts"][0]
+    assert a1["pr"] == 77 and a1["merge_sha"] == "abc" and a1["branch"] == "router/T1"
+
+
+def test_requeue_refuses_takeover(proj):
+    _biz(proj, status="takeover", attempts=_A1, takeover_from="postlaunch")
+    _verdict(proj)                                                              # 判定照记，排队被拒：票原样留在接管中
+    s = proj.state(); t = s["tickets"]["T1"]
+    assert t["attempts"][0]["verdict"] == "useless" and t["status"] == "takeover"
+    assert t["worker"]["session_id"] == "sid-biz" and t["worker"]["worktree"] == str(proj.tmp / "wt")
+    (q,) = [q for q in s["queue"] if q.get("topic") == "requeue"]
+    assert "接管" in q["summary"]
+    r = proj.run("answer", q["id"], "重排", "--as-router", check=False)
+    assert r.returncode == 1 and "接管" in json.loads(r.stdout)["error"]
+    assert proj.state()["tickets"]["T1"]["status"] == "takeover"
+    assert proj.run("redirect", "T1", "x", "--as-router", check=False).returncode == 1
+
+
+def test_branch_suffix_counts_live_attempts_not_history(proj):
+    """并进来的历史尝试不改变分支后缀：a<k> = 这张票自己的第 k 次尝试；尝试记录里记着它用的分支。"""
+    hist = {"n": 2, "direction": "老票", "shipped_at": "x", "verdict": "legacy", "legacy_verdict": "没用",
+            "historical": True}
+    _biz(proj, attempts=[hist, {**_A1[0]}])
+    _verdict(proj)
+    assert proj.state()["tickets"]["T1"]["worker"]["branch"] == "router/T1-a2"
