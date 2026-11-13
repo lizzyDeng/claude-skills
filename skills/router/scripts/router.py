@@ -1380,8 +1380,9 @@ def _status_tickets(st) -> dict:
         v["kind"] = store.ticket_kind(t)
         if v["kind"] == "business":
             v["walls_open"] = sum(1 for w in t.get("walls", []) if w.get("status") == "open")
-            live = [x for x in t.get("attempts", []) if not x.get("historical")]
-            v["last_verdict"] = live[-1].get("verdict") if live else None
+            atts = t.get("attempts", [])
+            last = atts[-1] if atts else None          # 与看板一致：历史尝试也算，报 legacy_verdict
+            v["last_verdict"] = (last.get("legacy_verdict") if last.get("historical") else last.get("verdict")) if last else None
         elif v["kind"] == "maint":
             v["tasks_open"] = sum(1 for x in t.get("tasks", []) if not x.get("done"))
         out[tid] = v

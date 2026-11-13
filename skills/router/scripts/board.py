@@ -135,8 +135,8 @@ def _biz_cells(t) -> str:
     mtxt = " · ".join(str(m[k]) for k in ("name", "now", "direction") if m.get(k) not in (None, ""))
     walls = "".join(f'<li>{"<s>" + _e(w.get("text")) + "</s>" if w.get("status") == "broken" else "<b>" + _e(w.get("text")) + "</b>"}'
                     f'</li>' for w in t.get("walls", [])) or "<li>（无）</li>"
-    att = "".join(f'<li>#{_e(a.get("n"))} {_e(a.get("direction"))} · 上线 {_e(str(a.get("at") or "")[:10])}'
-                  f' · 判定 {_e(a.get("verdict") or "待判")}</li>' for a in t.get("attempts", [])[-3:]) or "<li>（还没有尝试）</li>"
+    att = "".join(f'<li>#{_e(a.get("n"))} {_e(a.get("direction"))} · 上线 {_e(str(a.get("at") or a.get("shipped_at") or "")[:10])}'
+                  f' · 判定 {_e((a.get("legacy_verdict") if a.get("verdict") == "legacy" else a.get("verdict")) or "待判")}</li>' for a in t.get("attempts", [])[-3:]) or "<li>（还没有尝试）</li>"
     return f"""<div class="three">
     <div class="cell"><h4>人群 · 想要什么</h4><p>{_e(t.get("segment"))} · {_e(t.get("want"))}</p><span class="src">指标：{_e(mtxt)}</span></div>
     <div class="cell"><h4>墙</h4><ul>{walls}</ul></div>

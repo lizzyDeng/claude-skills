@@ -167,6 +167,14 @@ def test_business_card_shows_walls_and_attempts():
     assert "影响 0.17" in html
 
 
+def test_business_card_shows_historical_attempt_with_legacy_verdict():
+    st = make_state()
+    _biz(st, attempts=[{"n": 1, "direction": "旧票方向", "shipped_at": "2026-10-20T00:00:00Z",
+                        "verdict": "legacy", "legacy_verdict": "flat", "historical": True}])
+    html = render(st, [], {}, NOW)
+    assert "旧票方向" in html and "2026-10-20" in html and "判定 flat" in html and "判定 legacy" not in html
+
+
 def test_queue_row_shows_impact_for_business():
     st = make_state()
     _biz(st, impact={"size": 0.7, "gap": 0.6, "confidence": "high"})

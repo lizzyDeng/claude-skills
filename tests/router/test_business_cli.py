@@ -752,12 +752,13 @@ def test_status_json_adds_kind_and_business_fields(tmp_path):
     b = store._ticket_defaults()
     b.update(id="T2", kind="business", walls=[{"id": "W1", "text": "x", "status": "open"},
                                               {"id": "W2", "text": "y", "status": "broken"}],
-             attempts=[{"n": 1, "verdict": "useful", "at": "t"}, {"n": 2, "verdict": "harmful", "historical": True, "at": "t"}])
+             attempts=[{"n": 1, "verdict": "useful", "at": "t"}, {"n": 2, "verdict": "legacy", "legacy_verdict": "flat", "historical": True,
+                                                                                    "shipped_at": "2026-10-20T00:00:00Z"}])
     m = store._ticket_defaults()
     m.update(id="T3", kind="maint", tasks=[{"text": "a", "done": True}, {"text": "b", "done": False}])
     st["tickets"].update(T2=b, T3=m)
     out = router._status_tickets(st)
     assert out["T1"]["kind"] == "legacy" and "walls_open" not in out["T1"]
-    assert out["T2"]["kind"] == "business" and out["T2"]["walls_open"] == 1 and out["T2"]["last_verdict"] == "useful"
+    assert out["T2"]["kind"] == "business" and out["T2"]["walls_open"] == 1 and out["T2"]["last_verdict"] == "flat"
     assert out["T3"]["kind"] == "maint" and out["T3"]["tasks_open"] == 1
     assert "kind" not in st["tickets"]["T1"]
