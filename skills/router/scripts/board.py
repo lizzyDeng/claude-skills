@@ -35,7 +35,7 @@ def _e(x) -> str:
 
 # 带 topic 的项：用户回的话按 topic 定（router.cmd_answer 按 topic 分派）
 SAY_TOPIC = {"base": "{qid} 好了", "retarget": "{qid} 改好了", "dispatch": "{qid} 重派",
-             "offrepo": "{t} 核对过了 / {t} 不满意：…"}
+             "offrepo": "{t} 核对过了 / {t} 不满意：…", "requeue": "{qid} 重排 / {t} 换成：…"}
 
 
 def _say(q) -> str:

@@ -30,7 +30,8 @@ def test_docs_reference_only_existing_subcommands():
     # 协议依赖的关键子命令都要在文档里出现过（v2：分诊 draft 退场，分析 agent / 判定 / 维护 / 影响分进场）
     assert {"discover", "tick", "watch", "start", "answer", "submit-card", "decide", "tell",
             "emit", "progress", "inbox", "status",
-            "analyst", "verdict", "maint", "impact", "released", "prod-batch", "redirect", "close", "absorb"} <= used
+            "analyst", "verdict", "maint", "impact", "released", "prod-batch", "redirect", "close", "absorb",
+            "migrate-apply"} <= used
     assert not (SKILL / "templates" / "triage.md").exists(), "v1 分诊模板应已删除（由分析 agent 模板替代）"
 
 
@@ -352,3 +353,19 @@ def test_skill_9b_commands_and_wording():
     assert "第一道没拆的墙" in text
     mig = (SKILL / "templates" / "analyst_migrate.md").read_text(encoding="utf-8")
     assert "absorb" in mig and "做完算一次" not in mig and "做完算一次" not in text
+
+
+def test_skill_9b_round2_migrate_confirm_and_branch_per_attempt():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s3 = _section(text, "3.")
+    assert "router.py migrate-apply" in s3 and "--said" in s3 and "--skip" in s3 and "--hold" in s3
+    assert "propose --from <out>`（weekly）" in s3                               # migrate 不再走 propose
+    rows = {m.group(1): line for line in _section(text, "2.").splitlines()
+            for m in [re.match(r"^\|\s*`([a-z_]+)`", line)] if m}
+    assert "migrate-apply" in rows["analyst_done"]
+    assert "router/<T>-a<n>" in text and "重排" in _section(text, "6.")
+    mig = (SKILL / "templates" / "analyst_migrate.md").read_text(encoding="utf-8")
+    assert "逐条判真" not in mig and "确认" in mig
+    worker = (SKILL / "worker.md").read_text(encoding="utf-8")
+    assert "router/$ROUTER_TICKET" not in worker                                 # 分支以派单为准（业务票每次尝试一条新分支）
+    assert "$branch" in (SKILL / "templates" / "brief.md").read_text(encoding="utf-8")

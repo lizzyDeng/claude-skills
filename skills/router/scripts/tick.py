@@ -371,10 +371,16 @@ class Run:
                 for e in out["errors"]:
                     self.res["errors"].append(f"分析 agent {rid}：第 {e['index'] + 1} 条 {e['kind']}"
                                               f"（{e.get('ticket') or '-'}）没落：{str(e['error'])[:160]}")
-            elif mode in ("weekly", "migrate"):
+            elif mode == "weekly":
                 out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
                 result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
-                          "maint": out["maint"], "attached": out.get("attached", {})}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
+                          "maint": out["maint"]}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
+            elif mode == "migrate":                # 不自动落：整份清单交用户确认，router 再 migrate-apply（controller 裁决）
+                router.migrate_check(self._env(), copy.deepcopy(self.state), data)       # 先验一遍：坏清单不交给用户
+                result = {"awaiting_confirm": True}
+                run = self.state["analyst"]["runs"][rid]
+                self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+                    {"run": rid, "mode": mode, "out": run["out"]})
             else:
                 result = {}
                 run = self.state["analyst"]["runs"][rid]
@@ -926,7 +932,8 @@ class Run:
         w = t["worker"]
         try:
             wt, branch = launcher.create_worktree(self.ctx, self.root, self.cfg.get("base_branch", "staging"),
-                                                  self.cfg.get("worktree_dir", ".claude/worktrees"), tid)
+                                                  self.cfg.get("worktree_dir", ".claude/worktrees"), tid,
+                                                  branch=w.get("branch"))
         except Exception as e:  # noqa: BLE001
             self._fail(tid, "worktree", e)
             return "failed"
@@ -1082,6 +1089,7 @@ def _brief(run, tid):
             .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"))
     return tpl.safe_substitute(
         ticket=tid, title=t["title"], kind=kind, business_section=biz,
+        branch=t["worker"].get("branch") or f"router/{tid}",
         issue_line=f"GitHub：{run.cfg['repo']}#{t['issue']}" if t.get("issue") else "（没有 issue）",
         worker_md=str(SKILL_DIR / "worker.md"),
         why_metric=why.get("metric", ""), why_users=why.get("users", ""), why_evidence=why.get("evidence", ""),
@@ -1096,7 +1104,7 @@ def _brief(run, tid):
                 f"{run.home}/backups/{tid}/（cp -a，保留目录结构）；改完把 `diff -ru <备份> <现状>` 写到 "
                 f"{run.home}/cards/{tid}.diff，跑验收，然后 progress impl_done 退出。")
         if run._offrepo(t) else
-        (f"改完照 worker.md 第 3 段：推 router/{tid}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
+        (f"改完照 worker.md 第 3 段：推 {t['worker'].get('branch') or f'router/{tid}'}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
          "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"
          "方向卡确认的方案只改配置、不改仓库代码（零代码票）：不开 PR，照 worker.md 第 3 段「零代码票」做，"
          "然后 progress impl_done 退出。"))

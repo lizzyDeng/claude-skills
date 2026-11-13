@@ -390,6 +390,46 @@ def test_calibrate_done_wakes_router(ap):
     assert "analyst_done" not in ap.run()
 
 
+def test_migrate_done_not_auto_applied(ap):
+    """9b round 2（controller 裁决）：migrate 产出不在 analyst_done 时自动落；只叫醒 router，等用户确认后 migrate-apply。"""
+    ap.put(T5=("postlaunch", [], {"title": "老票五"}), T7=biz("业务七"))
+    st = ap.state()
+    env = SimpleNamespace(cfg=ap.cfg, home=ap.home, ctx=ap.ctx)
+    rid = analyst.start(env, st, "migrate")
+    store.save_state(ap.home / "state.json", st)
+    d = json.loads((FIX / "proposals.json").read_text())
+    d.update(maint=[], attach=[{"ticket": "T7", "absorbs": ["T5"]}])
+    finish(ap, rid, d)
+    res = ap.run()
+    assert res["analyst_done"] == [{"run": rid, "mode": "migrate", "out": runs(ap)[rid]["out"]}]
+    st = ap.state()
+    assert st["queue"] == [] and not st.get("proposals") and st["tickets"]["T5"].get("parent") is None
+    assert st["analyst"]["runs"][rid]["ingested"] and not st["analyst"]["runs"][rid].get("applied")
+    assert "new_queue" not in res or res["new_queue"] == []
+
+
+def test_migrate_bad_output_fails_once(ap):
+    ap.put()
+    st = ap.state()
+    env = SimpleNamespace(cfg=ap.cfg, home=ap.home, ctx=ap.ctx)
+    rid = analyst.start(env, st, "migrate")
+    store.save_state(ap.home / "state.json", st)
+    finish(ap, rid, {"mode": "migrate", "problems": [{"key": "k"}]})            # 缺字段：预检不过
+    res = ap.run()
+    assert [x["run"] for x in res["analyst_done"] if x.get("failed")] == [rid]
+    assert ap.state()["analyst"]["runs"][rid]["failed"]
+
+
+def test_state_summary_shows_current_not_historical(ap):
+    """9b round 2：「最近一次尝试」= 最后一条非历史的尝试（历史尝试排在 live 之后也不能盖住它）。"""
+    s = make_state(T1=biz("业务一", attempts=[
+        {"n": 1, "direction": "测试方向甲", "at": "2026-11-10T00:00:00Z", "rollback": "r", "verdict": None},
+        {"n": 2, "direction": "老票五", "shipped_at": "2026-11-01T00:00:00Z", "verdict": "legacy",
+         "legacy_verdict": "没用", "historical": True}]))
+    text = analyst.state_summary(s, "daily")
+    assert "尝试 1「测试方向甲」" in text and "待判" in text and "尝试 2「老票五」" not in text
+
+
 def test_stale_out_file_not_taken_as_new_output(ap):
     """state 重建后编号复用：同名旧产出要先清掉，不能冒充这一次的结果。"""
     out = ap.home / "analyst" / "out" / "calibrate-1.json"

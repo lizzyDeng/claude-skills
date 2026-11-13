@@ -33,7 +33,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
                "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact",
-               "redirect", "close", "absorb"}
+               "redirect", "close", "absorb", "migrate-apply"}
 # answer --as-router 只收这几类、且只收票级授权的业务票：花钱 / 撤不回 / 发商店包（spend）、判真、关票、
 # 有害 / 退回（harm、return）都归用户
 AS_ROUTER_KINDS = {"card", "direction", "stuck", "conflict"}
@@ -189,7 +189,8 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None,
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
         if not force_restart:
-            events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+            said = f"{ROUTER_LABEL}（不是用户原话）：{text}" if as_router else text
+            events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": said})
             return "delivered"
         launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
@@ -454,6 +455,11 @@ def cmd_answer(a, env):
             if t:
                 t.pop("dispatch_fail", None)
             hint = "下一轮重派"
+        elif topic == "requeue":                         # 判定后没排上队：再排一次（不在旧 worker 上续跑）
+            if not t:
+                raise Fail(f"{q['id']} 指向的票不在了")
+            _requeue_business(env, st, t["id"], q.get("next") or a.text, REQUEUE_WAIT)
+            hint = "已重新排队，调度器派新 worker"
         elif q["kind"] == "postlaunch":
             hint, extra = _postlaunch_answered(env, st, t, q)
         elif t and t["status"] == store.TAKEOVER:
@@ -552,19 +558,9 @@ def propose_from(env, st, data) -> dict:
     if mode == "weekly" and (st.get("analyst") or {}).get("calibrated") is not True:
         raise Fail("校准未过：analyst 校准通过前，weekly 的提议一律不收（migrate 不受限）")
     problems, walls, close = data.get("problems", []), data.get("walls", []), data.get("close", [])
-    maint, attach = data.get("maint", []), data.get("attach", [])
-    if attach and mode != "migrate":
-        raise Fail("attach（老票挂到已开的业务票）只收 migrate 的产出")
-    if not isinstance(attach, list):
-        raise Fail("attach 须是列表")
-    for i, x in enumerate(attach):
-        if not isinstance(x, dict):
-            raise Fail(f"attach[{i}] 不是对象")
-        _check_absorb(st, x.get("ticket"), x.get("absorbs"))
-    attached_ids = [oid for x in attach for oid in x["absorbs"]]
-    both = sorted(set(attached_ids) & {oid for p in problems if isinstance(p, dict) for oid in p.get("absorbs", [])})
-    if both or len(attached_ids) != len(set(attached_ids)):
-        raise Fail(f"同一张老票只能并进一个问题：{both or attached_ids}")
+    maint = data.get("maint", [])
+    if data.get("attach"):
+        raise Fail("attach（老票并进已开的业务票）不经 propose：用户确认整份迁移清单后用 migrate-apply 落")
     for i, p in enumerate(problems):
         _check_problem(i, p)
     for i, m in enumerate(maint):
@@ -579,14 +575,7 @@ def propose_from(env, st, data) -> dict:
         for oid in p.get("absorbs", []):
             if oid not in st["tickets"]:
                 raise Fail(f"problems（{p['key']}）absorbs 里的票 {oid} 不存在")
-    try:
-        guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
-    except github.GuardEmpty as e:
-        raise Fail(f"防泄漏闸失效，提议一条都没收：{e}")
-    texts = [json.dumps(x, ensure_ascii=False) for x in (*problems, *maint, *walls, *close, *attach)]
-    hits = sorted({h for tx in texts for h in github.leak_hits(tx, guard)})
-    if hits:
-        raise Fail("提议里有 uid / 用户原话，整份拒收", hits=hits)
+    _refuse_leaks(env, (*problems, *maint, *walls, *close))
     rejected, at = _rejected_keys(env), env.now()
     pending = {(st.get("proposals", {}).get(q.get("proposal") or "") or {}).get("key")
                for q in st["queue"] if q["kind"] == "verify_problem"}
@@ -611,18 +600,50 @@ def propose_from(env, st, data) -> dict:
         tid = maint_add(env, st, m)
         if tid not in mids:
             mids.append(tid)
-    attached = {}
-    for x in attach:                                  # 问题已判过真（已开的业务票）：挂老票不用再判，记一条决定
-        for oid in x["absorbs"]:
-            _link_legacy(st, x["ticket"], oid)
-        attached.setdefault(x["ticket"], []).extend(x["absorbs"])
-    for tid, olds in attached.items():
-        store.append_decision(env.decisions, st, tid, f"并入老票 {' '.join(olds)}",
-                              "migrate：同一群人想要的同一件东西（spec §4.7）", "分析 agent migrate 产出（attach）", at)
     # 只建 / 追加 DRAFT，不在这里 start：start 会建 issue、起 worker、中途落盘，不能放进可回滚的收产出里
     to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start,
-            "attached": attached}
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start}
+
+
+def _refuse_leaks(env, items) -> None:
+    """要进 GitHub 的提议文本过防泄漏闸：闸失效或命中 ⇒ 整份拒收。"""
+    try:
+        guard = github.load_guard(env.cfg.get("leak_guard_globs", []))
+    except github.GuardEmpty as e:
+        raise Fail(f"防泄漏闸失效，提议一条都没收：{e}")
+    texts = [json.dumps(x, ensure_ascii=False) for x in items]
+    hits = sorted({h for tx in texts for h in github.leak_hits(tx, guard)})
+    if hits:
+        raise Fail("提议里有 uid / 用户原话，整份拒收", hits=hits)
+
+
+def migrate_check(env, st, data) -> None:
+    """迁移清单（migrate 产出）整份校验，一条不合规就整份拒：problems 照判真提议的校验；absorbs / attach 里的
+    都是存在、没并进别处的老票，一张老票只出现一次；attach / walls 的目标是已开的业务票；文本过防泄漏闸。不改 st。"""
+    problems, attach, walls = data.get("problems", []), data.get("attach", []), data.get("walls", [])
+    for name, v in (("problems", problems), ("attach", attach), ("walls", walls)):
+        if not isinstance(v, list):
+            raise Fail(f"{name} 须是列表")
+    for i, p in enumerate(problems):
+        _check_problem(i, p)
+    for i, x in enumerate(attach):
+        if not isinstance(x, dict):
+            raise Fail(f"attach[{i}] 不是对象")
+        _check_absorb(st, x.get("ticket"), x.get("absorbs"))
+    for p in problems:
+        for oid in p.get("absorbs", []):
+            o = st["tickets"].get(oid)
+            if o is None or store.ticket_kind(o) != "legacy" or o.get("parent"):
+                raise Fail(f"problems（{p['key']}）absorbs 里的 {oid} 不是没并过的老票")
+    olds = [oid for p in problems for oid in p.get("absorbs", [])] + [oid for x in attach for oid in x["absorbs"]]
+    dup = sorted({o for o in olds if olds.count(o) > 1})
+    if dup:
+        raise Fail(f"同一张老票只能并进一个问题：{dup}")
+    for w in walls:
+        if not isinstance(w, dict) or w.get("ticket") not in st["tickets"] \
+                or store.ticket_kind(st["tickets"][w["ticket"]]) != "business" or not str(w.get("text", "")).strip():
+            raise Fail(f"walls 里的票 {w.get('ticket') if isinstance(w, dict) else w} 不是已有的业务票，或墙文本为空")
+    _refuse_leaks(env, (*problems, *attach, *walls))
 
 
 def _check_maint(env, st, i, m) -> None:
@@ -776,6 +797,15 @@ def _answer_business(env, st, q, text) -> dict:
                       json.dumps({"key": prop["key"], "title": prop["title"], "reason": reason, "at": env.now()},
                                  ensure_ascii=False))
         return {"ok": True, "queue": q["id"], "kind": "verify_problem", "rejected": prop["key"]}
+    tid = _ticket_from_problem(env, st, prop)
+    res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
+    if verb == "true":
+        res["start"] = _start_locked(env, st, [tid])
+    return res
+
+
+def _ticket_from_problem(env, st, prop) -> str:
+    """判真 / 确认迁移清单之后：提议 → 业务票（DRAFT）；absorbs 里的老票并进来（R1：验收过的记历史尝试）。"""
     tid = store.new_business_ticket(
         st, title=prop["title"], segment=prop["segment"], want=prop["want"], walls=prop["walls"],
         metric=prop["metric"], evidence=prop.get("evidence", []), impact=prop["impact"], origin="analyst",
@@ -783,12 +813,73 @@ def _answer_business(env, st, q, text) -> dict:
     nt = st["tickets"][tid]
     _biz_issue_fields(nt)
     nt["history"].append({"at": env.now(), "status": store.DRAFT})
-    for old_id in nt["absorbs"]:                      # R1：被吸收的老票计为一次已结束的历史尝试
+    for old_id in nt["absorbs"]:
         if old_id in st["tickets"]:
             _link_legacy(st, tid, old_id)
-    res = {"ok": True, "queue": q["id"], "kind": "verify_problem", "ticket": tid, "held": verb == "hold"}
-    if verb == "true":
-        res["start"] = _start_locked(env, st, [tid])
+    return tid
+
+
+def cmd_migrate_apply(a, env):
+    """用户确认整份迁移清单之后落它（controller 裁决：migrate 产出不自动落）。
+    问题 → 业务票（确认 = 判真，默认 start；--hold 的只建票）；absorbs / attach 并老票；walls 挂到已开的业务票。
+    --skip 去掉用户不要的条目（问题写 key，attach / walls 写业务票号）。整份校验过才落；一份 run 只落一次。"""
+    said = (a.said or "").strip()
+    if not said:
+        raise Fail("--said 要写用户确认迁移清单时的原话")
+    skip, hold = set(_csv(a.skip)), set(_csv(a.hold))
+    with env.state() as st:
+        run = ((st.get("analyst") or {}).get("runs") or {}).get(a.run)
+        if run is None:
+            raise Fail(f"没有分析 agent 的 run {a.run}")
+        if run.get("mode") != "migrate":
+            raise Fail(f"{a.run} 是 {run.get('mode')}：migrate-apply 只收 migrate 的产出")
+        if run.get("failed"):
+            raise Fail(f"{a.run} 失败了（{run.get('error', '')}）：先重跑 migrate")
+        if run.get("applied"):
+            raise Fail(f"{a.run} 已在 {run['applied']} 落过，不重复落")
+        data, err = analyst.read_out(run["out"])
+        if err:
+            raise Fail(err)
+        ignored = [k for k in ("maint", "close") if data.get(k)]   # 迁移不收维护项、不提议结束：报忽略了
+        lists = {k: data.get(k, []) for k in ("problems", "attach", "walls")}
+        bad = [k for k, v in lists.items() if not isinstance(v, list)]
+        if bad:
+            raise Fail(f"产出里 {'、'.join(bad)} 不是列表：整份不落，重跑 migrate")
+        field = {"problems": "key", "attach": "ticket", "walls": "ticket"}
+        named = {k: {x.get(field[k]) for x in v if isinstance(x, dict)} for k, v in lists.items()}
+        unknown = sorted((skip - named["problems"] - named["attach"] - named["walls"]) | (hold - named["problems"]))
+        if unknown:
+            raise Fail(f"--skip / --hold 里有清单上没有的：{unknown}（问题写 key；--skip 还可写 attach / walls 的业务票号）")
+        # 用户去掉的条目先拿掉，剩下的（坏条目原样留着，让校验拒）整份校验
+        data = {k: [x for x in v if not (isinstance(x, dict) and x.get(field[k]) in skip)] for k, v in lists.items()}
+        migrate_check(env, st, data)
+        at = env.now()
+        _append_local(env.home / "answers.md", f"- {at} | - | migrate-apply | {a.run} | {' '.join(said.splitlines())}")
+        created = [(_ticket_from_problem(env, st, p), p["key"]) for p in data["problems"]]
+        attached = {}
+        for x in data["attach"]:
+            for oid in x["absorbs"]:
+                _link_legacy(st, x["ticket"], oid)
+            attached.setdefault(x["ticket"], []).extend(x["absorbs"])
+        for w in data["walls"]:
+            store.attach_wall(st, w["ticket"], w["text"], "migrate", at)
+        did = store.append_decision(
+            env.decisions, st, "-",
+            f"迁移清单已落（{a.run}）：新业务票 {' '.join(t for t, _ in created) or '无'}"
+            + "".join(f"；{olds} 并进 {t}" for t, olds in attached.items()),
+            "用户确认了整份迁移清单（spec §4.7）" + (f"；去掉 {'、'.join(sorted(skip))}" if skip else ""),
+            "用户原话见 answers.md（migrate-apply）", at)
+        run["applied"] = at
+        to_start = [t for t, k in created if k not in hold]
+    res = {"ok": True, "run": a.run, "tickets": [t for t, _ in created], "held": [t for t, k in created if k in hold],
+           "attached": attached, "decision": did, "ignored": ignored}
+    if to_start:                                      # 先存再 start：start 建 issue、起 worker，失败不丢已落的清单
+        try:
+            with env.locked():
+                res["start"] = start_maint(env, to_start)
+        except Exception as e:  # noqa: BLE001
+            raise Fail(f"迁移已落，{' '.join(to_start)} 存为草稿、start 没成：{e}；修好后 router.py start {' '.join(to_start)}",
+                       **res)
     return res
 
 
@@ -799,6 +890,7 @@ def _close_business(env, st, tid, why, basis) -> None:
         raise Fail(f"{tid} 不是业务票，不能这样关")
     if ct["status"] == store.DONE:
         raise Fail(f"{tid} 已经关了")
+    _refuse_pending(ct, tid, env.ctx)                 # 派单待核实 / 认不出的 worker：可能正在起，不关
     pid = ct["worker"].get("pid")
     if pid and env.ctx.pid_alive(pid):
         raise Fail(f"{tid} 的 worker 还在跑（pid {pid}）：先 stop {tid}，再关")
@@ -826,7 +918,8 @@ def _legacy_attempt(st, tid, old) -> None:
         cur.update(rec)
         return
     n = max((x.get("n", 0) for x in nt["attempts"]), default=0) + 1
-    nt["attempts"].append({"n": n, **rec})
+    live = next((i for i, x in enumerate(nt["attempts"]) if not x.get("historical")), len(nt["attempts"]))
+    nt["attempts"].insert(live, {"n": n, **rec})     # 历史尝试排在所有 live 尝试之前：列表最后一条永远是当前尝试
     old["parent_attempt"] = n
 
 
@@ -872,7 +965,7 @@ def cmd_redirect(a, env):
             raise Fail(f"{a.ticket} 不是业务票：redirect 只给业务票（老票用 tell / add 跟进票）")
         if t["status"] != store.POSTLAUNCH:
             raise Fail(f"{a.ticket} 状态是 {t['status']}：只有 postlaunch 里判了有害 / 没用的业务票才用 redirect 换方向")
-        last = next((x for x in reversed(t.get("attempts") or []) if not x.get("historical")), None)
+        last = store.current_attempt(t)
         verdict = (last or {}).get("verdict")
         if verdict not in ("harmful", "useless"):
             raise Fail(f"{a.ticket} 最近一次尝试的判定是 {verdict or '待判'}：只有判了有害 / 没用（含连续没用退回）才换方向")
@@ -882,7 +975,8 @@ def cmd_redirect(a, env):
         _requeue_business(env, st, a.ticket,
                           f"换方向（尝试 {last['n']} 判定 {verdict}）。{label}：{text}。"
                           "先读尝试记录，再从第 1 段写新方向卡。", REDIRECT_WAIT)
-        cleared = [q["id"] for q in st["queue"] if q.get("ticket") == a.ticket and q["kind"] in ("harm", "return")]
+        cleared = [q["id"] for q in st["queue"] if q.get("ticket") == a.ticket
+                   and (q["kind"] in ("harm", "return") or q.get("topic") == "requeue")]
         st["queue"] = [q for q in st["queue"] if q["id"] not in cleared]
         if returned:                                  # 退回用户后由他定了新方向：没用的连续计数重新算
             t["no_use_streak"] = 0
@@ -1279,9 +1373,26 @@ def _requeue_business(env, st, tid, text, wait) -> None:
     不在原 worker 上 resume，也不看 worktree 在不在（9b：一条路径）。认不出可能在跑的 worker ⇒ Fail（_refuse_pending）。"""
     t = st["tickets"][tid]
     _refuse_pending(t, tid, env.ctx)
-    if launcher.worker_alive(env.ctx, t["worker"]):
-        raise Fail(f"{tid} 的 worker 还在跑（pid {t['worker'].get('pid')}）：先 stop {tid} 再换方向")
-    t["worker"]["pid"] = None
+    w = t["worker"]
+    if launcher.worker_alive(env.ctx, w):
+        raise Fail(f"{tid} 的 worker 还在跑（pid {w.get('pid')}）：先 stop {tid} 再换方向")
+    if w.get("worktree") and Path(w["worktree"]).is_dir():   # 上一次的 worktree 还在（删失败过）：尽量删，删不掉记下来不挡排队
+        try:
+            launcher.remove_worktree(env.ctx, env.root, w["worktree"])
+        except Exception as e:  # noqa: BLE001
+            t.setdefault("stale_checkouts", []).append({"worktree": w["worktree"], "branch": w.get("branch"),
+                                                        "error": str(e)[:200], "at": env.now()})
+    # 新一次尝试 = 新会话 + 新分支（router/<T>-a<n>，从 base 切）：旧 session id 会被 claude 拒（already in use），
+    # 旧分支已 squash 合进 base，接着用会把合过的提交又带进新 PR
+    n = max((x.get("n", 0) for x in t.get("attempts") or []), default=0) + 1
+    w.update(session_id=None, pid=None, pid_start=None, log=None, started_at=None, worktree=None,
+             branch=f"router/{tid}-a{n}")
+    w.pop("exit", None)
+    t["pr"] = None                                    # 上一次的 PR 已合：留着会让新 worker 一报 pr_opened 就被当成已合
+    t["fail_streak"] = {"step": "", "count": 0}
+    for k in ("merge_sha", "verifying_at", "checkout_kept", "unconfirmed_reported", "no_pr_reported", "no_ci_reported",
+              "leak_reported", "wrong_base_reported", "retarget_fail"):
+        t.pop(k, None)
     events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
     t.pop("card_ready_at", None)                    # 上一轮的交卡时间：不清会让新一轮的超时检查 / 重浮卡都认错
     t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
@@ -1293,8 +1404,9 @@ def _follow_up(env, st, tid, t, text) -> None:
     判定保留，推 stuck 项带原因。"""
     try:
         _requeue_business(env, st, tid, text, REQUEUE_WAIT)
-    except Fail as e:
-        store.push_queue(st, tid, "stuck", f"{tid} 判定已记，但没能重新排队：{e}", env.now())
+    except Fail as e:                                 # 回答这一项 = 再排一次（不续跑旧 worker）；redirect 也会清掉它
+        store.push_queue(st, tid, "stuck", f"{tid} 判定已记，但没能重新排队：{e}", env.now(), topic="requeue")
+        st["queue"][-1]["next"] = text
 
 
 def cmd_verdict(a, env):
@@ -1548,8 +1660,7 @@ def _status_tickets(st) -> dict:
         v["kind"] = store.ticket_kind(t)
         if v["kind"] == "business":
             v["walls_open"] = sum(1 for w in t.get("walls", []) if w.get("status") == "open")
-            atts = t.get("attempts", [])
-            last = atts[-1] if atts else None          # 与看板一致：历史尝试也算，报 legacy_verdict
+            last = store.shown_attempt(t)              # 当前尝试（最后一条非历史的）；只有历史尝试时报 legacy_verdict
             v["last_verdict"] = (last.get("legacy_verdict") if last.get("historical") else last.get("verdict")) if last else None
         elif v["kind"] == "maint":
             v["tasks_open"] = sum(1 for x in t.get("tasks", []) if not x.get("done"))
@@ -1653,6 +1764,11 @@ def build_parser():
     s.add_argument("ticket"); s.add_argument("--reason")
     s = sub.add_parser("absorb", help="把老票并进已有的业务票（设 parent；验收过的记一次历史尝试）")
     s.add_argument("ticket"); s.add_argument("olds", nargs="+")
+    s = sub.add_parser("migrate-apply", help="用户确认整份迁移清单后落 migrate 的产出（建业务票、并老票）")
+    s.add_argument("run", help="migrate 的 run 编号（analyst_done 里的 run，如 migrate-1）")
+    s.add_argument("--said", required=True, help="用户确认时的原话（进 answers.md）")
+    s.add_argument("--skip", help="用户不要的条目，逗号分隔：问题写 key，attach / walls 写业务票号")
+    s.add_argument("--hold", help="用户说先放着的问题 key（只建票不 start），逗号分隔")
     s = sub.add_parser("submit-card", help="方向卡进决定单")
     s.add_argument("ticket"); s.add_argument("--card", required=True)
     s.add_argument("--rounds", type=int, default=0); s.add_argument("--codex")

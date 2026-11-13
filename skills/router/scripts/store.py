@@ -41,7 +41,7 @@ SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # �
 QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch",
                "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo"}
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -207,6 +207,18 @@ def new_business_ticket(state: dict, *, title, segment, want, walls, metric, evi
                      walls=[{"id": f"W{i}", "text": w, "status": "open", "source": origin, "at": at}
                             for i, w in enumerate(walls, 1)])
     return tid
+
+
+def current_attempt(t: dict):
+    """业务票的「当前尝试」= 最后一条非历史的尝试（历史尝试是并进来的老票，不参与判定）；没有 → None。
+    daily 的票况、verdict、released 的在途检查、看板 / status 的最近判定都按它。"""
+    return next((a for a in reversed(t.get("attempts") or []) if not a.get("historical")), None)
+
+
+def shown_attempt(t: dict):
+    """给人看的「最近一次」：有当前尝试就是它；只有历史尝试时取最后一条历史的；都没有 → None。"""
+    atts = t.get("attempts") or []
+    return current_attempt(t) or (atts[-1] if atts else None)
 
 
 def impact_score(t: dict) -> float:

@@ -43,7 +43,7 @@ $business_section
 $finish
 
 ## 环境
-- 分支：router/$ticket；PR 的 base 分支：$base_branch
+- 分支：$branch（只推这一条）；PR 的 base 分支：$base_branch
 - ROUTER_TICKET=$ticket，ROUTER_HOME=$router_home
 - CLI：python3 $router_cli <子命令>（emit / progress / inbox）
 - 方向卡写到：$card_path

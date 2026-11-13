@@ -79,8 +79,11 @@ def state_summary(st, mode) -> str:
     for tid, t in biz:
         walls = "；".join(f"{w.get('id')} {w.get('text', '')}" for w in t.get("walls", [])
                          if w.get("status") == "open") or "无"
-        atts = t.get("attempts") or []
-        last = _attempt_line(atts[-1]) if atts else "还没有尝试"
+        cur = store.current_attempt(t)                # 当前尝试 = 最后一条非历史的（历史尝试排在哪都不能盖住它）
+        hist = sum(1 for a in t.get("attempts") or [] if a.get("historical"))
+        last = _attempt_line(cur) if cur else "还没有尝试"
+        if hist:
+            last += f"（另有 {hist} 条老票的历史尝试，不用判）"
         lines.append(f"- {tid}｜{t.get('title', '')}｜{t.get('segment', '')}｜{t.get('status')}｜墙：{walls}｜{last}")
     if not biz:
         lines.append("（无）")

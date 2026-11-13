@@ -522,9 +522,10 @@ def test_requeued_business_ticket_needs_new_card(proj):
     t = proj.state()["tickets"]["T1"]
     assert t["status"] == "queued" and t["card_confirmed"] is False       # 新一轮必须出新方向卡
     assert "card_ready_at" not in t
-    # 模拟调度器重派后 worker 交卡：自动确认
+    assert t["worker"]["session_id"] is None                              # 9b round 2：重排队清掉旧会话
+    # 模拟调度器重派后 worker 交卡：自动确认（重派时 prepare_run 给新会话）
     st = proj.state(); st["tickets"]["T1"]["status"] = "kickoff"
-    st["tickets"]["T1"]["worker"]["worktree"] = str(proj.tmp / "wt")
+    st["tickets"]["T1"]["worker"].update(worktree=str(proj.tmp / "wt"), session_id="sid-new")
     (proj.home / "state.json").write_text(json.dumps(st))
     proj.run("submit-card", "T1", "--card", str(_card(proj)))
     t = proj.state()["tickets"]["T1"]
@@ -761,7 +762,10 @@ def test_status_json_adds_kind_and_business_fields(tmp_path):
     st["tickets"].update(T2=b, T3=m)
     out = router._status_tickets(st)
     assert out["T1"]["kind"] == "legacy" and "walls_open" not in out["T1"]
-    assert out["T2"]["kind"] == "business" and out["T2"]["walls_open"] == 1 and out["T2"]["last_verdict"] == "flat"
+    assert out["T2"]["kind"] == "business" and out["T2"]["walls_open"] == 1
+    assert out["T2"]["last_verdict"] == "useful"          # 9b round 2：当前尝试 = 最后一条非历史的；没有才看历史
+    b["attempts"] = b["attempts"][1:]
+    assert router._status_tickets(st)["T2"]["last_verdict"] == "flat"
     assert out["T3"]["kind"] == "maint" and out["T3"]["tasks_open"] == 1
     assert "kind" not in st["tickets"]["T1"]
 
@@ -964,39 +968,168 @@ def test_parented_legacy_postlaunch_result_records_parent_attempt(proj):
     assert proj.state()["tickets"]["T1"]["status"] == "done"
 
 
-def _seed_attach(proj):
+def _seed_migrate(proj, data, **more):
+    """老票 T5（验收过）、T6（在做）、业务票 T7；一次跑完、收过的 migrate run，产出 = data。"""
     from conftest import make_state
-    s = make_state(T5=("postlaunch", [], {"title": "老票五", "postlaunch": {
-                       "t0": "2026-11-01T00:00:00Z", "checks": [], "results": [{"check": "T+1", "verdict": "没用"}]}}),
-                   T6=("executing", [], {"title": "老票六"}),
-                   T7=("executing", [], {"kind": "business", "authorized": True, "title": "业务七", "attempts": [],
-                                         "walls": [], "absorbs": []}))
-    (proj.home / "state.json").write_text(json.dumps(s, ensure_ascii=False))
+    st = make_state(T5=("postlaunch", [], {"title": "老票五", "postlaunch": {
+                        "t0": "2026-11-01T00:00:00Z", "checks": [], "results": [{"check": "T+1", "verdict": "没用"}]}}),
+                    T6=("executing", [], {"title": "老票六"}),
+                    T7=("executing", [], {"kind": "business", "authorized": True, "title": "业务七", "attempts": [],
+                                          "walls": [], "absorbs": []}), **more)
+    out = proj.home / "analyst" / "out" / "migrate-1.json"; out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False))
+    st["analyst"] = {"runs": {"migrate-1": {"mode": "migrate", "out": str(out), "ingested": "x"}}}
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
 
 
-def test_migrate_attach_links_legacy_to_existing_business(proj):
-    """9b（finding 9）：migrate 能把老票挂到已开的业务票上（同 absorb），不用再判真。"""
-    _seed_attach(proj)
-    out = json.loads(propose(proj, load(mode="migrate", problems=[], maint=[],
-                                        attach=[{"ticket": "T7", "absorbs": ["T5", "T6"]}])).stdout)
+def _mig(**over):
+    d = load(mode="migrate", maint=[], attach=[{"ticket": "T7", "absorbs": ["T6"]}])
+    d["problems"][0]["absorbs"] = ["T5"]
+    d.update(over)
+    return d
+
+
+def test_migrate_apply_after_user_confirms(proj):
+    """9b round 2：migrate 产出由 router 交用户确认整份清单后，migrate-apply 一次落：问题建业务票（默认 start），
+    absorbs / attach 并老票；先放着的只建票。"""
+    _seed_migrate(proj, _mig())
+    out = proj.out("migrate-apply", "migrate-1", "--said", "合成：迁移清单可以，k2 先放着", "--hold", "k2")
     s = proj.state()
-    assert out["ok"] and out["attached"] == {"T7": ["T5", "T6"]}
-    assert s["tickets"]["T5"]["parent"] == "T7" and s["tickets"]["T6"]["parent"] == "T7"
-    assert s["tickets"]["T7"]["attempts"] == [{**_HIST5}] and s["tickets"]["T7"]["absorbs"] == ["T5", "T6"]
-    assert not [q for q in s["queue"] if q["kind"] == "verify_problem"]
-    assert "并入老票" in (proj.home / "decisions.md").read_text()
+    new = {s["tickets"][t]["title"]: t for t in out["tickets"]}
+    t1, t2 = new["测试问题甲"], new["测试问题乙"]
+    assert s["tickets"][t1]["kind"] == "business" and s["tickets"][t1]["start_ok"] and s["tickets"][t1]["issue"]
+    assert s["tickets"][t2]["status"] == "draft" and s["tickets"][t2]["issue"] is None
+    assert s["tickets"]["T5"]["parent"] == t1 and s["tickets"][t1]["attempts"][0]["legacy_verdict"] == "没用"
+    assert s["tickets"]["T6"]["parent"] == "T7" and s["tickets"]["T7"]["absorbs"] == ["T6"]
+    assert not [q for q in s["queue"] if q["kind"] == "verify_problem"]          # 用户已整份确认：不再逐条判真
+    assert s["analyst"]["runs"]["migrate-1"]["applied"]
+    assert "合成：迁移清单可以" in (proj.home / "answers.md").read_text()
+    assert "迁移清单" in (proj.home / "decisions.md").read_text()
+    r = proj.run("migrate-apply", "migrate-1", "--said", "再来一次", check=False)   # 一份清单只落一次
+    assert r.returncode == 1 and "已" in json.loads(r.stdout)["error"]
 
 
-def test_attach_refused_outside_migrate_or_bad_target(proj):
-    _seed_attach(proj)
-    calibrate(proj)
-    for data in (load(mode="weekly", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": ["T5"]}]),
-                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T6", "absorbs": ["T5"]}]),
-                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": ["T99"]}]),
-                 load(mode="migrate", problems=[], maint=[], attach=[{"ticket": "T7", "absorbs": []}])):
-        r = propose(proj, data, check=False)
-        assert r.returncode == 1, data["attach"]
-    d = load(mode="migrate", maint=[], attach=[{"ticket": "T7", "absorbs": ["T5"]}])
-    d["problems"][0]["absorbs"] = ["T5"]                                        # 同一张老票不能两头并
-    assert propose(proj, d, check=False).returncode == 1
-    assert proj.state()["tickets"]["T5"].get("parent") is None
+def test_migrate_apply_skip_and_refusals(proj):
+    _seed_migrate(proj, _mig())
+    r = proj.run("migrate-apply", "migrate-1", "--said", "x", "--skip", "nope", check=False)
+    assert r.returncode == 1 and "nope" in json.loads(r.stdout)["error"]
+    assert proj.run("migrate-apply", "migrate-9", "--said", "x", check=False).returncode == 1
+    assert proj.run("migrate-apply", "migrate-1", check=False).returncode == 2              # 用户原话必填
+    assert proj.run("migrate-apply", "migrate-1", "--said", "x", env={"ROUTER_TICKET": "T1"},
+                    check=False).returncode == 2
+    out = proj.out("migrate-apply", "migrate-1", "--said", "合成：k2 和 T7 那条不要", "--skip", "k2,T7", "--hold", "k1")
+    s = proj.state()
+    assert [s["tickets"][t]["title"] for t in out["tickets"]] == ["测试问题甲"]
+    assert s["tickets"]["T6"].get("parent") is None and s["tickets"]["T5"]["parent"] == out["tickets"][0]
+
+
+def test_migrate_apply_refuses_bad_list_whole(proj):
+    for bad in (_mig(attach=[{"ticket": "T6", "absorbs": ["T5"]}]),                 # 目标不是业务票
+                _mig(attach=[{"ticket": "T7", "absorbs": ["T5"]}]),                 # 同一张老票两头并
+                _mig(attach=[{"ticket": "T7", "absorbs": ["T99"]}])):
+        _seed_migrate(proj, bad)
+        r = proj.run("migrate-apply", "migrate-1", "--said", "x", check=False)
+        assert r.returncode == 1, bad["attach"]
+        s = proj.state()
+        assert s["tickets"]["T5"].get("parent") is None and len(s["tickets"]) == 3
+    st = proj.state(); st["analyst"]["runs"]["w-1"] = {**st["analyst"]["runs"]["migrate-1"], "mode": "weekly"}
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    assert proj.run("migrate-apply", "w-1", "--said", "x", check=False).returncode == 1  # 只收 migrate 的 run
+
+
+def test_propose_refuses_attach(proj):
+    _seed_migrate(proj, _mig())
+    r = propose(proj, _mig(problems=[]), check=False)
+    assert r.returncode == 1 and "migrate-apply" in json.loads(r.stdout)["error"]
+
+
+# ---- 9b round 2：重排队拿新会话、新分支；当前尝试不被历史尝试盖住；卡住项重排；close 查派单待核实；代答进 inbox 带标 ----
+
+def test_requeued_dispatch_gets_fresh_session_and_branch(proj):
+    _biz(proj, attempts=_A1, start_ok=True, pr=77, merge_sha="abc", verifying_at="x")
+    _verdict(proj)                                                              # 没用 ⇒ 重新排队
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "queued" and t["worker"]["session_id"] is None and t.get("pr") is None
+    assert t["worker"]["branch"] == "router/T1-a2" and not t.get("merge_sha")
+    proj.out("tick")
+    t = proj.state()["tickets"]["T1"]
+    wait_until(lambda: proj.claude())
+    argv = proj.claude()[-1]
+    sid = argv[argv.index("--session-id") + 1]
+    assert t["status"] == "kickoff" and sid != "sid-biz" and sid == t["worker"]["session_id"] and "--resume" not in argv
+    assert t["worker"]["worktree"].endswith("router-T1-a2") and t["worker"]["branch"] == "router/T1-a2"
+    assert "router/T1-a2" in argv[argv.index("-p") + 1]                          # 派单写的是这次的分支
+    import subprocess
+    head = subprocess.run(["git", "-C", t["worker"]["worktree"], "rev-parse", "--abbrev-ref", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    assert head == "router/T1-a2"
+
+
+def test_historical_attempt_inserted_before_live_one(proj):
+    from conftest import make_state
+    _biz(proj, status="postlaunch", attempts=list(_A1))
+    st = proj.state()
+    st["tickets"]["T5"] = make_state(T5=("postlaunch", [], {"title": "老票五", "postlaunch": {
+        "t0": "2026-11-01T00:00:00Z", "checks": [], "results": [{"check": "T+1", "verdict": "没用"}]}}))["tickets"]["T5"]
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    proj.out("absorb", "T1", "T5")
+    atts = proj.state()["tickets"]["T1"]["attempts"]
+    assert [a.get("historical", False) for a in atts] == [True, False] and atts[-1]["n"] == 1
+    import analyst, router
+    assert "尝试 1「d」" in analyst.state_summary(proj.state(), "daily")
+    assert router._status_tickets(proj.state())["T1"]["last_verdict"] is None    # 当前尝试还待判
+    r = _rel(proj, "--rollback", "r2", check=False)
+    assert r.returncode == 1                                                     # 当前尝试没判：照样拒
+    _verdict(proj, "pending_sample")                                             # daily 能判到它
+    assert proj.state()["tickets"]["T1"]["attempts"][-1]["verdict"] == "pending_sample"
+
+
+def test_failed_requeue_stuck_item_requeues_when_answered(proj):
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["dispatch"] = {"phase": "spawning", "unverified": "测试"}
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    s = proj.state()
+    (q,) = [q for q in s["queue"] if q["kind"] == "stuck"]
+    assert q.get("topic") == "requeue" and s["tickets"]["T1"]["status"] == "postlaunch"
+    st = proj.state(); st["tickets"]["T1"].pop("dispatch")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    proj.out("answer", q["id"], "重排", "--as-router")
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "queued" and t["card_confirmed"] is False and proj.claude() == []
+    assert "换方向" in _inbox_text(proj)                                         # 判定后的下一步照样带到
+
+
+def test_redirect_clears_requeue_stuck_item(proj):
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["dispatch"] = {"phase": "spawning", "unverified": "测试"}
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    st = proj.state(); st["tickets"]["T1"].pop("dispatch")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    out = proj.out("redirect", "T1", "测试方向丁", "--as-router")
+    s = proj.state()
+    assert out["cleared"] and not [q for q in s["queue"] if q["ticket"] == "T1"]
+
+
+def test_close_refused_while_dispatch_unverified(proj):
+    t1 = _biz_closeable(proj, dispatch={"phase": "spawning", "unverified": "测试"})
+    r = proj.run("close", t1, check=False)
+    assert r.returncode == 1 and "派单待核实" in json.loads(r.stdout)["error"]
+    assert proj.state()["tickets"][t1]["status"] == "draft"
+
+
+def test_answer_as_router_to_live_worker_labels_inbox(proj):
+    import subprocess, sys
+    _biz(proj, status="executing")
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        st = proj.state(); st["tickets"]["T1"]["worker"]["pid"] = p.pid
+        (proj.home / "state.json").write_text(json.dumps(st))
+        qid = _push_q(proj, "T1", "direction")
+        out = proj.out("answer", qid, "测试决定戊", "--as-router")
+        assert out["delivered"] == "T1"
+        inbox = _inbox_text(proj)
+        assert "router 决定" in inbox and "测试决定戊" in inbox and "用户原话（逐字）" not in inbox
+    finally:
+        p.kill(); p.wait()
