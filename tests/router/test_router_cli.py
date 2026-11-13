@@ -1523,7 +1523,7 @@ def test_released_enters_postlaunch_with_t0_and_three_checks(proj):
     assert pl["checks"] == [{"label": l, "at": _plus(pl["t0"], d)} for l, d in (("T+1", 1), ("T+3", 3), ("T+7", 7))]
     assert pl["results"] == []
     rel = json.loads((proj.tmp / "daily" / "state" / "releases.json").read_text())
-    assert rel[-1] == {"date": out["release"]["date"], "what": "付费页改价", "metrics": ["pay_conv"]}   # releases.json 照旧
+    assert rel[-1] == {"date": out["release"]["date"], "at": pl["t0"], "what": "付费页改价", "metrics": ["pay_conv"]}   # at = 生效时刻（周报按它切窗）
 
 
 def test_released_t0_option_sets_checks_from_effective_time(proj):
@@ -1531,6 +1531,28 @@ def test_released_t0_option_sets_checks_from_effective_time(proj):
     pl = proj.state()["tickets"]["T1"]["postlaunch"]
     assert pl["t0"] == "2026-11-10T08:30:00Z"
     assert [c["at"] for c in pl["checks"]] == ["2026-11-11T08:30:00Z", "2026-11-13T08:30:00Z", "2026-11-17T08:30:00Z"]
+
+
+def test_released_writes_at_from_t0_for_weekly_windows(proj):
+    # 周报 releases.json 缺 at 会回落到当天 00:00，批边界和窗口整体算歪（11-12 八行实例）
+    _released(proj, t0="2026-11-10T12:00:00Z")
+    rel = json.loads((proj.tmp / "daily" / "state" / "releases.json").read_text())
+    assert rel[-1]["at"] == "2026-11-10T12:00:00Z"
+    assert rel[-1]["date"] == "2026-11-10"                                       # date 跟着生效时刻走，不是执行命令那天
+
+
+def test_released_config_keys_written_structured(proj):
+    seed(proj, T1=("await_prod", ["her-reply-prompt"]))
+    r = proj.run("released", "--tickets", "T1", "--what", "暧昧线 20→10", "--metrics", "deep",
+                 "--t0", "2026-11-12T08:20:37Z", "--config-keys", "feature_flags.her_relationship_stage, llm_config.callers")
+    rel = json.loads((proj.tmp / "daily" / "state" / "releases.json").read_text())
+    assert rel[-1]["config_keys"] == ["feature_flags.her_relationship_stage", "llm_config.callers"]
+
+
+def test_released_without_config_keys_has_no_config_keys_field(proj):
+    _released(proj)
+    rel = json.loads((proj.tmp / "daily" / "state" / "releases.json").read_text())
+    assert "config_keys" not in rel[-1]
 
 
 def test_released_rejects_t0_without_timezone(proj):
