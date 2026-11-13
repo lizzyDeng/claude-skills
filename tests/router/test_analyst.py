@@ -490,3 +490,34 @@ def test_cli_analyst_calibrated(cli):
     rc, out = cli.run("analyst", "calibrated", "--fail", "--note", "测试：只找到一个")
     an = cli.state()["analyst"]
     assert rc == 0 and an["calibrated"] is False and an["calibrated_note"] == "测试：只找到一个"
+
+
+def test_maint_start_failure_does_not_revert_ingest(ap, monkeypatch):
+    """收产出成功后 start 维护票失败：提议 / 决定单项保留，维护票留 DRAFT，只报一条错；下一轮自动 start。"""
+    import router
+    d = json.loads((FIX / "proposals.json").read_text())
+    d.update(mode="weekly", maint=[{"title": "甲", "problem": "p", "surfaces": ["llm-config"]}])
+    s = make_state()
+    s["analyst"] = {"calibrated": True}
+    store.save_state(ap.home / "state.json", s)
+    weekly_dir(ap)
+    ap.run()
+    rid, _ = only_run(ap)
+    finish(ap, rid, d)
+
+    def boom(env, st, sel):
+        raise router.Fail("模拟 start 失败")
+    monkeypatch.setattr(router, "_start_locked", boom)
+    res = ap.run()
+    st = ap.state()
+    assert len(res["errors"]) == 1 and "DRAFT" in res["errors"][0]
+    assert len(st["proposals"]) == 2 and len([q for q in st["queue"] if q["kind"] == "verify_problem"]) == 2
+    assert st["analyst"]["runs"][rid]["ingested"] and "failed" not in st["analyst"]["runs"][rid]
+    (mt,) = [t for t in st["tickets"].values() if t.get("kind") == "maint"]
+    assert mt["status"] == "draft" and len(mt["tasks"]) == 1
+    started = []
+    monkeypatch.setattr(router, "_start_locked",
+                        lambda env, st, sel: [started.append(t) or store.set_status(st, t, "queued", env.now()) for t in sel])
+    res = ap.run()
+    assert not res["errors"] and started == [mt["id"]]
+    assert ap.state()["tickets"][mt["id"]]["status"] == "queued" and len(ap.state()["proposals"]) == 2

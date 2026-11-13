@@ -374,7 +374,7 @@ class Run:
             elif mode in ("weekly", "migrate"):
                 out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
                 result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
-                          "maint": out["maint"]}
+                          "maint": out["maint"]}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
             else:
                 result = {}
                 run = self.state["analyst"]["runs"][rid]
@@ -387,6 +387,18 @@ class Run:
             return
         self.state["analyst"]["runs"][rid]["result"] = result
         self.res["new_queue"] += [q["id"] for q in self.state["queue"] if q["id"] not in before]
+
+    def step_maint_start(self):
+        """DRAFT 的维护票（收产出 / maint add 留下的）：start。失败只记一条错、票留 DRAFT，下一轮重试；不回滚任何东西。"""
+        import router
+        ids = [tid for tid, t in self.state["tickets"].items()
+               if store.ticket_kind(t) == "maint" and t["status"] == store.DRAFT]
+        if not ids:
+            return
+        try:
+            router._start_locked(self._env(), self.state, ids)
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"维护票 {' '.join(ids)} start 没成（留在 DRAFT，下一轮重试）：{str(e)[:200]}")
 
     # ---- 1 ----
     def step1_external(self):
@@ -1167,7 +1179,7 @@ def run(ctx, root, cfg, resurface=False) -> dict:
     with store.locked(home):
         state = store.load_state(home / "state.json")
         r = Run(ctx, root, cfg, state)
-        for step in (r.step0_weekly, r.step_analyst, r.step1_external, r.step2_exits, r.step3_events,
+        for step in (r.step0_weekly, r.step_analyst, r.step_maint_start, r.step1_external, r.step2_exits, r.step3_events,
                      r.step4_patrol, r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
             try:
                 step()

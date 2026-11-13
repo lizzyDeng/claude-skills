@@ -607,7 +607,6 @@ def test_maint_rejects_bad_input(proj):
 
 
 def test_maint_new_week_new_ticket(proj, monkeypatch):
-    monkeypatch.setattr(router, "_start_locked", lambda env, st, sel: [_store.set_status(st, t, "queued", env.now()) for t in sel])
     with _env(proj, datetime(2026, 11, 12, tzinfo=timezone.utc)).state() as st:
         a = router.maint_add(_env(proj, datetime(2026, 11, 12, tzinfo=timezone.utc)), st, {"title": "甲", "problem": "p", "surfaces": []})
         a2 = router.maint_add(_env(proj, datetime(2026, 11, 13, tzinfo=timezone.utc)), st, {"title": "乙", "problem": "p", "surfaces": []})
@@ -619,15 +618,73 @@ def test_maint_new_week_new_ticket(proj, monkeypatch):
 
 def test_maint_running_ticket_gets_inbox_note(proj, monkeypatch):
     import launcher
-    monkeypatch.setattr(router, "_start_locked", lambda env, st, sel: [_store.set_status(st, t, "executing", env.now()) for t in sel])
-    monkeypatch.setattr(launcher, "worker_alive", lambda ctx, w: True)
     env = _env(proj)
     with env.state() as st:
         a = router.maint_add(env, st, {"title": "甲", "problem": "p", "surfaces": []})
-        b = router.maint_add(env, st, {"title": "乙", "problem": "q", "surfaces": []})
-    assert a == b
+        assert st["tickets"][a]["status"] == "draft"                  # maint_add 永不 start
+        _store.set_status(st, a, "executing", env.now())
+    for alive in (True, False):                                       # worker 死了也记：续跑时读 inbox
+        monkeypatch.setattr(launcher, "worker_alive", lambda ctx, w, v=alive: v)
+        with env.state() as st:
+            b = router.maint_add(env, st, {"title": f"乙{alive}", "problem": "q", "surfaces": []})
+        assert a == b
     lines = [json.loads(l) for l in (proj.home / "inbox" / f"{a}.jsonl").read_text().splitlines()]
-    assert len(lines) == 1 and "乙：q" in lines[0]["summary"] and len(proj.state()["tickets"][a]["tasks"]) == 2
+    assert len(lines) == 2 and "乙True：q" in lines[0]["summary"] and len(proj.state()["tickets"][a]["tasks"]) == 3
+
+
+def test_maint_add_idempotent(proj, monkeypatch):
+    seed(proj, T3=("draft", []))
+    env = _env(proj)
+    item = {"title": "甲", "problem": "p", "surfaces": ["llm-config"]}
+    with env.state() as st:
+        a = router.maint_add(env, st, item)
+        assert router.maint_add(env, st, item) == a and len(st["tickets"][a]["tasks"]) == 1
+        u = router.maint_add(env, st, {**item, "unblocks": "T3"})
+        assert router.maint_add(env, st, {**item, "unblocks": "T3"}) == u and u != a
+    assert len([t for t in proj.state()["tickets"].values() if t.get("kind") == "maint"]) == 2
+
+
+def _fail_start(monkeypatch):
+    def boom(env, st, sel):
+        raise router.Fail("模拟 start 失败")
+    monkeypatch.setattr(router, "_start_locked", boom)
+
+
+def test_cli_propose_start_failure_keeps_proposals_no_dupes(proj, monkeypatch):
+    # 子进程里没法 monkeypatch：用 gh 报错模拟 start 失败（建 issue 失败）
+    canned = proj.tmp / "canned.json"
+    canned.write_text(json.dumps({"issue create": {"rc": 1, "err": "boom"}, "api": {"rc": 1, "err": "boom"}}))
+    d = load()
+    d["maint"] = [{"title": "甲", "problem": "p", "surfaces": ["llm-config"]}]
+    r = proj.run("propose", "--from", put(proj, d), env={"GH_CANNED": str(canned)}, check=False)
+    assert r.stdout, r.stderr
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and "DRAFT" in out["error"] and "重试" in out["error"]
+    s = proj.state()
+    assert len(s["proposals"]) == 2 and len([q for q in s["queue"] if q["kind"] == "verify_problem"]) == 2
+    (mt,) = _maints(proj)
+    assert mt["status"] == "draft" and len(mt["tasks"]) == 1
+    # 重跑同一份：提议被「待判」去重跳过，维护条目不重复追加
+    r = proj.run("propose", "--from", put(proj, d), env={"GH_CANNED": str(canned)}, check=False)
+    s = proj.state()
+    assert len(s["proposals"]) == 2 and len(_maints(proj)) == 1 and len(_maints(proj)[0]["tasks"]) == 1
+    # gh 好了再跑：同一张票被 start
+    out = json.loads(propose(proj, d).stdout)
+    (mt,) = _maints(proj)
+    assert mt["issue"] and mt["status"] in ("queued", "kickoff") and len(mt["tasks"]) == 1
+
+
+def test_maint_add_cli_start_failure_saved_as_draft(proj):
+    canned = proj.tmp / "canned.json"
+    canned.write_text(json.dumps({"issue create": {"rc": 1, "err": "boom"}, "api": {"rc": 1, "err": "boom"}}))
+    r = proj.run("maint", "add", "--title", "甲", "--problem", "p", "--surfaces", "llm-config",
+                 env={"GH_CANNED": str(canned)}, check=False)
+    assert r.returncode == 1 and "DRAFT" in json.loads(r.stdout)["error"]
+    (mt,) = _maints(proj)
+    assert mt["status"] == "draft"
+    _maint(proj, "甲", "p", "llm-config")
+    (mt,) = _maints(proj)
+    assert len(mt["tasks"]) == 1 and mt["issue"]
 
 
 def test_maint_router_only(proj):

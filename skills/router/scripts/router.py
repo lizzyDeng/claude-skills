@@ -569,13 +569,12 @@ def propose_from(env, st, data) -> dict:
         st["queue"][-1]["reason"] = c.get("reason", "")
     mids = []
     for m in maint:
-        tid = maint_add(env, st, m, start=False)
+        tid = maint_add(env, st, m)
         if tid not in mids:
             mids.append(tid)
+    # 只建 / 追加 DRAFT，不在这里 start：start 会建 issue、起 worker、中途落盘，不能放进可回滚的收产出里
     to_start = [t for t in mids if st["tickets"][t]["status"] == store.DRAFT]
-    if to_start:
-        _start_locked(env, st, to_start)              # 用户不判维护项（spec §4.2）：和判真一样当场 start
-    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids}
+    return {"ok": True, "proposals": out, "skipped": skipped, "maint": mids, "to_start": to_start}
 
 
 def _check_maint(env, st, i, m) -> None:
@@ -601,50 +600,68 @@ def _iso_week(env) -> str:
 _MAINT_CLOSED = set(store.SETTLED) | {store.SKIP}
 
 
-def maint_add(env, st, item, start=True) -> str:
-    """维护条目 → 票号。调用方持锁、已载入 st。
+def maint_add(env, st, item) -> str:
+    """维护条目 → 票号。调用方持锁、已载入 st；只建 / 追加（DRAFT），永不 start（start 由调用方在存盘之后另做）。
     不带 unblocks：追加到本周维护票（没有就建）；带 unblocks：单独建一张，不受维护名额限制。
-    start=True 时新建 / 还没起的票当场 start（同判真的 _start_locked）；已在跑的本周票只追加 + 给 worker 递一行 inbox。"""
+    幂等：同 title+problem 的条目不重复追加；同 unblocks+同 title 的未结束票复用。"""
     at = env.now()
     surf = list(item.get("surfaces", []))
     task = {"text": f"{item['title']}：{item['problem']}", "done": False, "at": at}
     unb = item.get("unblocks")
+    live = lambda t: store.ticket_kind(t) == "maint" and t["status"] not in _MAINT_CLOSED
     if unb:
-        tid = store.new_ticket(
-            st, title=f"维护（解锁 {unb}）：{item['title']}", origin="analyst", kind="maint", unblocks=unb,
-            tasks=[task], surfaces=surf, weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
-        st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
-    else:
-        title = f"维护 {_iso_week(env)}"
-        tid = next((x for x, t in st["tickets"].items() if store.ticket_kind(t) == "maint" and not t.get("unblocks")
-                    and t["title"] == title and t["status"] not in _MAINT_CLOSED), None)
+        title = f"维护（解锁 {unb}）：{item['title']}"
+        tid = next((x for x, t in st["tickets"].items() if live(t) and t.get("unblocks") == unb
+                    and t["title"] == title), None)
         if tid is None:
-            tid = store.new_ticket(st, title=title, origin="analyst", kind="maint", tasks=[task], surfaces=surf,
-                                   weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+            tid = store.new_ticket(
+                st, title=title, origin="analyst", kind="maint", unblocks=unb, tasks=[task], surfaces=surf,
+                weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
             st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
-        else:
-            t = st["tickets"][tid]
-            t["tasks"].append(task)
-            t["surfaces"] = sorted(set(t["surfaces"]) | set(surf))
-            t["weight"] = surfaces.weight_for(set(t["surfaces"]), env.table)
-            t["problem"] = "；".join(x["text"] for x in t["tasks"])
-            if t["status"] in store.RUNNING and launcher.worker_alive(env.ctx, t["worker"]):
-                events.deliver(env.home, tid, {"ts": at, "ticket": "router", "type": "tell",
-                                               "summary": f"本周维护票新增一条：{task['text']}"})
-    if start and st["tickets"][tid]["status"] == store.DRAFT:
-        _start_locked(env, st, [tid])
+        return tid
+    title = f"维护 {_iso_week(env)}"
+    tid = next((x for x, t in st["tickets"].items() if live(t) and not t.get("unblocks") and t["title"] == title), None)
+    if tid is None:
+        tid = store.new_ticket(st, title=title, origin="analyst", kind="maint", tasks=[task], surfaces=surf,
+                               weight=surfaces.weight_for(set(surf), env.table), problem=task["text"])
+        st["tickets"][tid]["history"].append({"at": at, "status": store.DRAFT})
+        return tid
+    t = st["tickets"][tid]
+    if any(x["text"] == task["text"] for x in t["tasks"]):
+        return tid
+    t["tasks"].append(task)
+    t["surfaces"] = sorted(set(t["surfaces"]) | set(surf))
+    t["weight"] = surfaces.weight_for(set(t["surfaces"]), env.table)
+    t["problem"] = "；".join(x["text"] for x in t["tasks"])
+    if t["status"] in store.RUNNING:
+        # worker 活着就是即时通知；已死则这条留在 inbox，续跑时 _resume 读 inbox 一并带给它
+        events.deliver(env.home, tid, {"ts": at, "ticket": "router", "type": "tell",
+                                       "summary": f"本周维护票新增一条：{task['text']}"})
     return tid
 
 
+def start_maint(env, ids) -> dict:
+    """存盘之后再 start 维护票（调用方持锁）：失败时票仍是 DRAFT，下一轮巡检重试。"""
+    with_st = store.load_state(env.state_path)
+    ids = [t for t in ids if with_st["tickets"].get(t, {}).get("status") == store.DRAFT]
+    if not ids:
+        return {"started": []}
+    return _start_locked(env, with_st, ids)
+
+
 def cmd_maint(a, env):
-    surf = _csv(a.surfaces)
-    item = {"title": a.title, "problem": a.problem, "surfaces": surf, "unblocks": a.unblocks}
-    with env.locked():
-        st = store.load_state(env.state_path)
+    item = {"title": a.title, "problem": a.problem, "surfaces": _csv(a.surfaces), "unblocks": a.unblocks}
+    with env.state() as st:
         _check_maint(env, st, 0, item)
         tid = maint_add(env, st, item)
-        store.save_state(env.state_path, st)
-        render_board(env, st)
+        pending = st["tickets"][tid]["status"] == store.DRAFT
+    if pending:
+        try:
+            with env.locked():
+                start_maint(env, [tid])
+        except Exception as e:  # noqa: BLE001 — Fail / GhError 都算 start 没成
+            raise Fail(f"维护条目已存为 DRAFT（{tid}），start 没成：{e}；下一轮巡检会重试", ticket=tid,
+                       **(e.extra if isinstance(e, Fail) else {}))
     return {"ok": True, "ticket": tid}
 
 
@@ -666,7 +683,16 @@ def cmd_impact(a, env):
 def cmd_propose(a, env):
     data = json.loads(Path(a.source).read_text(encoding="utf-8"))
     with env.state() as st:
-        return propose_from(env, st, data)
+        res = propose_from(env, st, data)
+    if res["to_start"]:                               # 提议已存盘；start 另做，失败不丢提议
+        try:
+            with env.locked():
+                start_maint(env, res["to_start"])
+        except Exception as e:  # noqa: BLE001 — Fail / GhError 都算 start 没成
+            raise Fail(f"提议已存盘，维护票 {' '.join(res['to_start'])} 存为 DRAFT、start 没成：{e}；下一轮巡检会重试",
+                       **{**(e.extra if isinstance(e, Fail) else {}), "proposals": res["proposals"],
+                          "maint": res["maint"]})
+    return res
 
 
 def _answer_business(env, st, q, text) -> dict:
