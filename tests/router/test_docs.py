@@ -428,3 +428,19 @@ def test_skill_residual_close_gate_and_batch_attribution():
     for w in ("还没 released", "stop / takeover / close", "git fetch", "origin/<main_branch>..origin/<base_branch>",
               "merge_sha", "(#<PR 号>)", "单个父提交", "对不上", "核对不了", "Q 号"):        # 残留 2 / 3：批次成员、对账规则
         assert w in s7, w
+
+
+def test_skill_residual2_close_gate_sync_merges_staging_sha():
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    s6 = _section(text, "6.")
+    close = next(l for l in s6.splitlines() if l.startswith("| 「关 T3」"))
+    assert "stop / takeover" in close and "这次在途" in close                       # 残留 2 #1 / #4：闸看改动在不在
+    rel = next(l for l in s6.splitlines() if l.startswith("| 「上 prod」"))
+    assert "shipped_at" in rel and "跳过" in rel                                     # #3：released 对停 / 接管 / 关前已撤回
+    s7 = re.search(r"^### 业务票[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M).group(1)
+    for w in ("sync_merges", "非首父提交", "staging_sha", "钉在", "不在它之后另取 staging 最新",
+              "已停 / 接管 / 关前已撤回", "shipped_at"):
+        assert w in s7, w
+    assert "release 回合的 merge 提交" not in s7                                    # 回合并提交不再算对不上
+    pr = next(l for l in _section(text, "2.").splitlines() if l.startswith("| `prod_ready`"))
+    assert "staging_sha" in pr

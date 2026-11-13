@@ -218,22 +218,39 @@ def attempt_inflight(t: dict) -> bool:
     return any(a.get("verdict") in (None, "pending_sample") for a in t.get("attempts") or [] if not a.get("historical"))
 
 
+def record_shipped(state: dict, tid: str, at: str, t0: str) -> None:
+    """改动随这次发版上了 prod，但票不进上线验收（停 / 接管 / 关前已撤回）：history 记一条 shipped_at，不改状态。
+    这一条不带 status（不是状态变化，按状态读 history 的地方照旧）；staging_pending / offrepo_pending 看到它就算这次改动已出 staging。"""
+    state["tickets"][tid]["history"].append({"at": at, "shipped_at": t0, "note": "随发版上 prod（状态不变、不进上线验收）"})
+
+
 def staging_pending(t: dict) -> bool:
     """这张票的改动合进了 staging、之后还没 released（合 main 发版会把它一起带上去）。不看票现在的状态：
     stop / takeover / close 都不会让它离开发版批次（终审残留 #2a）。
-    依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch。
+    依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch，
+    也没有 shipped_at（停 / 接管 / 关前已撤回的票随别的票发版上去时，released 只记这一条，残留 2 #3）。
     老票、维护票之后直接是 done 的也算 released（老版 released 直接记 done）；业务票之后是 done = 关了票，代码还在 staging。
     没有 history（手写的 state）就按状态算。"""
     if not t.get("merge_sha"):
         return False
-    h = [x.get("status") for x in t.get("history") or []]
-    marks = [i for i, s in enumerate(h) if s in (MERGED, AWAIT_PROD)]
+    return _pending_since(t, (MERGED, AWAIT_PROD), done_releases=ticket_kind(t) != "business")
+
+
+def offrepo_pending(t: dict) -> bool:
+    """仓外改动还在真身上、这次还没上线判定：最后一次进 await_check 之后没有 postlaunch（业务票核对过 = 记成尝试进
+    postlaunch）/ shipped_at。和 staging_pending 一样不看现在的状态：stop / takeover 都不会让改动消失（残留 2 #1）。"""
+    return _pending_since(t, (AWAIT_CHECK,), done_releases=ticket_kind(t) != "business")
+
+
+def _pending_since(t: dict, marks_of: tuple, done_releases: bool) -> bool:
+    hist = t.get("history") or []
+    marks = [i for i, x in enumerate(hist) if x.get("status") in marks_of]
     if not marks:
-        return t.get("status") in (MERGED, AWAIT_PROD)
-    after = h[marks[-1] + 1:]
-    if POSTLAUNCH in after:
+        return t.get("status") in marks_of
+    after = hist[marks[-1] + 1:]
+    if any(x.get("status") == POSTLAUNCH or x.get("shipped_at") for x in after):
         return False
-    return not (DONE in after and ticket_kind(t) != "business")
+    return not (done_releases and any(x.get("status") == DONE for x in after))
 
 
 def current_attempt(t: dict):
