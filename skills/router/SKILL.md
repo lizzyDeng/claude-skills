@@ -91,8 +91,8 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
      - review-canary 报 `canary_inconclusive`（模型没真执行命令、只是复述，或超时）不是定论：下一张卡的 review-pack 会再报 canary_stale、再补跑一次。
      - review-canary 报 `canary_leak`（金丝雀读出了被拒路径的假数据）⇒ 另外**告诉用户**「codex 读边界失效」：这是安全事件，人要知道；只有这种情况 review-pack 才会一直报 canary_failed、跳过 codex，直到用户查过 codex 版本和配置。
 2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume --as-router`（你自己的话：worker 收到的标「router 转述 / 决定」，不冒充用户原话），worker 改卡后会再次 `progress card_ready`，回到这里。
-3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime]`。codex 与 Opus 有分歧：由你裁决，在卡末尾追加 `## router 裁决` 一段写明，再交。
-4. 超时（`waiting_for` 里有「超时」）照样交，加 `--overtime`，卡上注明哪部分没完成、为什么。
+3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime] [--unresolved]`，卡交用户确认。codex 与 Opus 有分歧：只有验收口径和实现细节由你裁决，在卡末尾追加 `## router 裁决` 一段写明——这一段只能写验收口径和实现细节，不能改方向、上线节奏（例如「上线即开」）、成本；分歧落在这三样上的，原样写进 `## 未解决的挑战` 交用户。
+4. 超时（25 分钟 / 2 轮）没谈拢 ⇒ 卡连同未解决的挑战一起交用户确认（不是 router 裁决后自动确认）：卡末尾追加 `## 未解决的挑战`（逐条：挑战、worker 的回应、卡在哪），注明哪部分没完成、为什么，`submit-card … --overtime --unresolved`（卡上有这一段而没加 `--unresolved` 也会被认出来；加了却没有这一段会被拒）。决定单的卡项会标「含未解决的挑战」，用户看完挑战再回「同意 / 改 / 驳回」。
 
 **方向卡先看产品诊断**（v2.1）：卡上第 1 项前有没有「产品诊断」五问，方向有没有先回答「这是产品 / 内容问题还是代码问题」。是在用代码修产品问题（他本来就不想要：内容无聊、付费墙后面没有他想要的东西）：照第 2 步打回。
 
@@ -120,7 +120,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 | 方案确认（= 确认方向卡：老票、维护票、业务票） | **用户** |
 | 上 prod（老票、维护票）：合 main 发版、写 prod 库 | **用户** |
 | 真人动手：staging 走查（老票、维护票）、登录、扫码（决定单「待你动手」） | **用户** |
-| 方向取舍、codex 分歧、优先级、依赖、何时派、合 staging（CI 绿后）、产品口径、影响分的修正 | **你** |
+| 方向审的挑战（打回让 worker 改卡）、codex 分歧里的验收口径和实现细节、优先级、依赖、何时派、合 staging（CI 绿后）、影响分的修正 | **你**（方向、上线节奏、成本上的分歧不裁决：写进卡末尾「未解决的挑战」交用户） |
 | 远端 base 被删时从 main 重建、改回被 GitHub 自动改指到 main 的 router PR | **router 自动**（用户 11-02 长期授权；tick 自己做，各记一条 decide） |
 | 上线验收的当天动作（老票、维护票）：关开关、改配置 | **你**照授权执行（用户给过的授权范围内直接做，记一条 decide；超出授权的写 prod 仍归用户，进决定单） |
 | 上线验收的当天动作（老票、维护票）：要改代码 | 开修复票：`router.py add …`（写清是哪张票的哪个检查点、什么结论），等用户 start |

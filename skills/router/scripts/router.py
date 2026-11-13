@@ -1353,8 +1353,12 @@ def cmd_submit_card(a, env):
         _refuse_pending(t, a.ticket, env.ctx)         # 认不出可能在跑的那个 worker：停不了它
         st["queue"] = [q for q in st["queue"] if not (q["kind"] == "card" and q["ticket"] == a.ticket)]   # 旧版本作废
         version = t.get("card", {}).get("version", 0) + 1
+        # 方向审没谈拢的挑战（v2.1 第 5 条）：卡末尾「## 未解决的挑战」一段，连同卡一起交用户确认
+        unresolved = bool(re.search(r"^##\s*未解决的挑战", card.read_text(encoding="utf-8"), re.M))
+        if a.unresolved and not unresolved:
+            raise Fail(f"--unresolved 要求卡末尾有「## 未解决的挑战」一段（逐条：挑战、worker 的回应、卡在哪）：{card}")
         t["card"] = {"path": str(card), "rounds": a.rounds, "codex": a.codex, "overtime": a.overtime,
-                     "version": version, "submitted_at": env.now()}
+                     "version": version, "submitted_at": env.now(), "unresolved": unresolved}
         t["solution"] = {"kind": "card", "text": _card_direction(card.read_text(encoding="utf-8")),
                          "source": f"方向卡 v{version}（待你确认）"}
         launcher.stop_worker(env.ctx, t["worker"])      # 超时交卡：worker 还在写，先停，确认后续跑
@@ -1363,7 +1367,8 @@ def cmd_submit_card(a, env):
         # v2.1 第 1 条：业务票的方向卡也交用户确认（不再按票级授权自动确认）
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
-                               f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
+                               f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}"
+                               f"{'（含未解决的挑战，见卡末尾「未解决的挑战」）' if unresolved else ''}：{t['title']}",
                                env.now())
     return {"ok": True, "queue": qid, "version": version}
 
@@ -2396,6 +2401,8 @@ def build_parser():
     s.add_argument("ticket"); s.add_argument("--card", required=True)
     s.add_argument("--rounds", type=int, default=0); s.add_argument("--codex")
     s.add_argument("--overtime", action="store_true")
+    s.add_argument("--unresolved", action="store_true",
+                   help="方向审没谈拢：卡末尾有「## 未解决的挑战」，连同卡一起交用户（router 不裁决）")
     s = sub.add_parser("decide", help="router 替用户做的决定，记进 decisions.md")
     for k in ("ticket", "decision", "why", "basis"):
         s.add_argument(f"--{k}", required=True)

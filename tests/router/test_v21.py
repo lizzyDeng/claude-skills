@@ -143,7 +143,7 @@ def test_v21_1_docs_card_and_scope():
     from test_docs import SKILL, _section
     text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
     s4, s5 = _section(text, "4."), _section(text, "5.")
-    assert "自动确认" not in text.replace("不再自动确认", "")                      # 只剩「不再自动确认」的说明
+    assert "自动确认" not in text.replace("不再自动确认", "").replace("不是 router 裁决后自动确认", "")   # 只剩否定说明
     assert "不再自动确认" in s4 and "交用户确认" in s4
     user_rows = [l for l in s5.splitlines() if l.startswith("|") and l.rstrip().endswith("**用户**")
                  or "| **用户**" in l]
@@ -444,3 +444,49 @@ def test_v21_4_cost_estimate_required_and_users_call():
     rev = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
     seg = rev[rev.find("成本测算"):]
     assert rev.find("成本测算") >= 0 and "缺价" in seg and "按 0" in seg and "挑战" in seg
+
+
+# ---- 第 5 条：router 裁决限范围；超时没谈拢 ⇒ 卡连同未解决的挑战交用户 ----------------------------------
+
+def test_v21_5_skill_timeout_and_ruling_scope():
+    from test_docs import SKILL, _section
+    s4 = _section((SKILL / "SKILL.md").read_text(encoding="utf-8"), "4.")
+    assert "## 未解决的挑战" in s4 and "--unresolved" in s4 and "25 分钟" in s4 and "2 轮" in s4
+    ruling = s4[s4.find("## router 裁决"):]
+    for w in ("验收口径", "实现细节", "不能改方向", "上线节奏", "上线即开", "成本"):
+        assert w in ruling, w
+    assert "自动确认" not in s4.replace("不再自动确认", "").replace("不是 router 裁决后自动确认", "")
+
+
+def test_v21_5_submit_card_unresolved_challenges(proj):
+    from conftest import make_state
+    st = make_state(T1=("kickoff", ["her-reply-prompt"], {"title": "老票", "worker": {"session_id": "s", "worktree":
+                                                                                       str(proj.tmp), "runs": 1}}))
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    c = _card(proj)
+    r = proj.run("submit-card", "T1", "--card", str(c), "--overtime", "--unresolved", check=False)
+    assert r.returncode == 1 and "未解决的挑战" in json.loads(r.stdout)["error"]       # 卡上还没写挑战
+    c.write_text(c.read_text() + "\n## 未解决的挑战\n- 合成挑战甲：worker 回应乙\n")
+    out = proj.out("submit-card", "T1", "--card", str(c), "--overtime", "--unresolved")
+    (q,) = [q for q in proj.state()["queue"] if q["kind"] == "card"]
+    assert q["id"] == out["queue"] and "未解决的挑战" in q["summary"]
+    assert proj.state()["tickets"]["T1"]["card"]["unresolved"] is True
+
+
+def test_v21_5_card_with_challenge_section_flags_even_without_flag(proj):
+    from conftest import make_state
+    st = make_state(T1=("kickoff", [], {"title": "老票", "worker": {"session_id": "s", "worktree": str(proj.tmp), "runs": 1}}))
+    (proj.home / "state.json").write_text(json.dumps(st, ensure_ascii=False))
+    c = _card(proj)
+    c.write_text(c.read_text() + "\n## 未解决的挑战\n- 合成挑战\n")
+    proj.out("submit-card", "T1", "--card", str(c))
+    (q,) = [q for q in proj.state()["queue"] if q["kind"] == "card"]
+    assert "未解决的挑战" in q["summary"]
+
+
+def test_v21_5_skill_section5_no_router_direction_rulings():
+    from test_docs import SKILL, _section
+    s5 = _section((SKILL / "SKILL.md").read_text(encoding="utf-8"), "5.")
+    assert "方向取舍" not in s5 and "产品口径" not in s5
+    row = next(l for l in s5.splitlines() if "codex 分歧" in l)
+    assert "验收口径" in row and "实现细节" in row and "未解决的挑战" in row
