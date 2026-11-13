@@ -178,6 +178,104 @@ def new_ticket(state: dict, **fields) -> str:
     return tid
 
 
+# ---- 业务票（v2）：一张票 = 一个用户行为问题；墙 / 尝试 / 判定 / 影响分 ----
+KINDS = ("legacy", "business", "maint")
+BIZ_VERDICTS = ("no_entry", "pending_sample", "useful", "wall_broken_not_retained", "useless", "harmful")
+_CONFIDENCE = {"low": 0.5, "mid": 0.75, "high": 1.0}
+PENDING_CAP_DAYS = 7
+USELESS_RETURN_AT = 3
+
+
+def ticket_kind(t: dict) -> str:
+    """缺字段 ⇒ legacy（老 state 不迁移）。"""
+    return t.get("kind") or "legacy"
+
+
+def _iso(s) -> datetime:
+    d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def new_business_ticket(state: dict, *, title, segment, want, walls, metric, evidence, impact,
+                        origin, absorbs=()) -> str:
+    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tid = new_ticket(state, title=title, origin=origin, kind="business", authorized=True,
+                     segment=segment, want=want, metric=metric, evidence=list(evidence),
+                     impact=impact, absorbs=list(absorbs), parent=None, tasks=[], attempts=[],
+                     no_use_streak=0,
+                     walls=[{"id": f"W{i}", "text": w, "status": "open", "source": origin, "at": at}
+                            for i, w in enumerate(walls, 1)])
+    return tid
+
+
+def impact_score(t: dict) -> float:
+    if ticket_kind(t) != "business":
+        return 0.0
+    imp = t.get("impact") or {}
+    return float(imp.get("size", 0)) * float(imp.get("gap", 0)) * _CONFIDENCE.get(imp.get("confidence"), 0.5)
+
+
+def attach_wall(state: dict, tid: str, text: str, source: str, at: str) -> str:
+    walls = state["tickets"][tid]["walls"]
+    nums = [int(w["id"][1:]) for w in walls if str(w.get("id", "")).startswith("W") and w["id"][1:].isdigit()]
+    wid = f"W{max(nums, default=0) + 1}"
+    walls.append({"id": wid, "text": text, "status": "open", "source": source, "at": at})
+    return wid
+
+
+def add_attempt(state: dict, tid: str, direction: str, at: str, rollback: str) -> int:
+    attempts = state["tickets"][tid]["attempts"]
+    n = max((a.get("n", 0) for a in attempts), default=0) + 1
+    attempts.append({"n": n, "direction": direction, "at": at, "rollback": rollback, "verdict": None})
+    return n
+
+
+def _break_first_open(t: dict) -> None:
+    for w in t["walls"]:
+        if w["status"] == "open":
+            w["status"] = "broken"
+            return
+
+
+def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touched: int,
+                   hit_wall: int, continued: int, note: str, new_wall: str = None) -> dict:
+    if verdict not in BIZ_VERDICTS:
+        raise ValueError(f"未知判定 {verdict}")
+    t = state["tickets"][tid]
+    a = next((x for x in t["attempts"] if x.get("n") == n), None)
+    if a is None:
+        raise ValueError(f"{tid} 没有尝试 {n}")
+    if a.get("historical"):
+        raise ValueError(f"尝试 {n} 是历史记录，不能记判定")
+    if verdict == "wall_broken_not_retained" and not new_wall:
+        raise ValueError("wall_broken_not_retained 必须给 new_wall")
+    if verdict == "pending_sample":
+        since = a.get("pending_since")
+        if since and _iso(at) - _iso(since) >= timedelta(days=PENDING_CAP_DAYS):
+            raise ValueError(f"待样本已满 {PENDING_CAP_DAYS} 天")
+    a.update(verdict=verdict, verdict_at=at, touched=touched, hit_wall=hit_wall, continued=continued, note=note)
+    if verdict == "pending_sample":
+        a.setdefault("pending_since", at)
+    else:
+        a.pop("pending_since", None)
+    actions = []
+    if verdict == "no_entry":
+        actions = ["check_entry"]
+    elif verdict == "pending_sample":
+        actions = ["wait"]
+    elif verdict == "useful":
+        _break_first_open(t); t["no_use_streak"] = 0; actions = ["next_wall"]
+    elif verdict == "wall_broken_not_retained":
+        _break_first_open(t); t["no_use_streak"] = 0
+        attach_wall(state, tid, new_wall, "verdict", at); actions = ["next_wall"]
+    elif verdict == "useless":
+        t["no_use_streak"] += 1
+        actions = ["change_direction"] + (["return_to_user"] if t["no_use_streak"] >= USELESS_RETURN_AT else [])
+    elif verdict == "harmful":
+        actions = ["rollback"]
+    return {"actions": actions}
+
+
 def set_status(state: dict, tid: str, status: str, at: str, waiting_for: str = None) -> None:
     """waiting_for 不传（None）⇒ 按状态取 DEFAULT_WAIT；显式传 "" 仍可清空。"""
     if status not in STATUSES:
