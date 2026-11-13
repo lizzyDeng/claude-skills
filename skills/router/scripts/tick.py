@@ -33,6 +33,7 @@ WAKE_KEYS = ("new_queue", "slow_path_events", "external_deliveries", "cards_for_
              "postlaunch_due", "rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled")
 # 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
 ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
+STOP_TAGS = {"spend", "irreversible", "store_release"}    # 仍要用户批的三类（花钱 / 撤不回 / 发商店包）
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
 # 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
 # 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
@@ -443,7 +444,7 @@ class Run:
         phase = last.get("phase") if last else None
         if last and last.get("stop"):
             t["stops"] += 1
-            kind = "spend" if "spend" in last.get("affects", {}).get("tags", []) else STOP_KIND[last["type"]]
+            kind = "spend" if STOP_TAGS & set(last.get("affects", {}).get("tags", [])) else STOP_KIND[last["type"]]
             prefix = {"assumption_broken": "核心假设被推翻：", "overreach": "要越界："}.get(last["type"], "")
             qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}")
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
@@ -726,7 +727,11 @@ class Run:
                                        f"备份 {self.home}/backups/{tid}/（满意说「{tid} 核对过了」；"
                                        f"不满意说「{tid} 不满意：…」）", topic="offrepo")
             return
-        store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
+        owned = store.ticket_kind(t) == "business" and bool(t.get("authorized"))
+        if owned:
+            store.set_status(self.state, tid, store.AWAIT_PROD, self.now, "已合 staging（票级授权，免走查）：等 router 上 prod")
+        else:
+            store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
         except github.GuardEmpty as e:
@@ -742,7 +747,8 @@ class Run:
                 self.res["errors"].append(f"删 worktree {tid}：{e}")      # 删失败：保留指针，接管命令仍可用
             else:
                 w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
-        self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+        if not owned:
+            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
 
     # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
     def step5a_closeout(self):

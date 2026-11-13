@@ -1578,3 +1578,22 @@ def test_zero_code_git_failure_retries_next_round(proj, tmp_path):
     proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=0)   # 锁没了
     proj.run()                                                                     # 下一轮重试成功
     assert proj.state()["tickets"]["T1"]["worker"]["worktree"] is None
+
+
+def test_business_no_handson_after_merge(proj):
+    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41, "card_confirmed": True,
+                                                     "kind": "business", "authorized": True,
+                                                     "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}))
+    _pr_fake(proj)
+    proj.run()
+    s = proj.state()
+    assert s["tickets"]["T1"]["status"] == "await_prod" and s["tickets"]["T1"]["merge_sha"] == "deadbeef"
+    assert not [q for q in s["queue"] if q["kind"] == "handson"]
+
+
+def test_irreversible_tag_goes_to_user(proj):
+    proj.put(T1=running("executing", ["weekly-report"], log=log_with(proj, "T1", '{"type":"result","is_error":false}')))
+    events.emit(proj.home, "T1", "decision", "要删一张表", "x", tags=["irreversible"], at="2026-11-02T10:01:00Z")
+    proj.run()
+    q = proj.state()["queue"][0]
+    assert (q["kind"], q["ticket"]) == ("spend", "T1")

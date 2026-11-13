@@ -639,6 +639,11 @@ def _answer_business(env, st, q, text) -> dict:
     return res
 
 
+def _router_owned(t) -> bool:
+    """业务票且已授权：方向卡 / 走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。"""
+    return store.ticket_kind(t) == "business" and bool(t.get("authorized"))
+
+
 def cmd_submit_card(a, env):
     card = Path(a.card)
     if not card.exists():
@@ -657,6 +662,13 @@ def cmd_submit_card(a, env):
         launcher.stop_worker(env.ctx, t["worker"])      # 超时交卡：worker 还在写，先停，确认后续跑
         t["worker"]["pid"] = None
         t["worker"]["kickoff_rounds"] = a.rounds
+        if _router_owned(t):                             # 票级授权：方向由 router 定，不交用户
+            t["card_confirmed"] = True
+            t["solution"]["source"] = f"方向卡 v{version}（已确认，票级授权）"
+            store.append_decision(env.decisions, st, a.ticket, "方向已确认（票级授权）", "业务票已授权，方向审由 router 先做完",
+                                  str(card), env.now())
+            _resume(env, st, a.ticket, "card", "方向已确认（票级授权）", store.EXECUTING)
+            return {"ok": True, "queue": None, "version": version, "auto_confirmed": True}
         store.set_status(st, a.ticket, store.AWAIT_CARD, env.now(), "等你确认方向卡")
         qid = store.push_queue(st, a.ticket, "card",
                                f"{a.ticket} 方向卡 v{version}{'（超时，见卡上未完成项）' if a.overtime else ''}：{t['title']}",
@@ -860,17 +872,19 @@ def cmd_walkthrough_done(a, env):
 
 def _prod_item(env, st):
     st["queue"] = [q for q in st["queue"] if q["kind"] != "prod"]
-    ready = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
-                   key=lambda x: int(x[1:]))
+    waiting = sorted((tid for tid, t in st["tickets"].items() if t["status"] == store.AWAIT_PROD),
+                     key=lambda x: int(x[1:]))
+    ready = [tid for tid in waiting if not _router_owned(st["tickets"][tid])]
+    ships = [tid for tid in waiting if _router_owned(st["tickets"][tid])]
     if ready:
-        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready
-    return None, []
+        return store.push_queue(st, None, "prod", f"上 prod：{' '.join(ready)}", env.now()), ready, ships
+    return None, [], ships
 
 
 def cmd_prod_batch(a, env):
     with env.state() as st:
-        qid, ready = _prod_item(env, st)
-    return {"ok": True, "queue": qid, "tickets": ready}
+        qid, ready, ships = _prod_item(env, st)
+    return {"ok": True, "queue": qid, "tickets": ready, "router_ships": ships}
 
 
 def _parse_t0(s) -> str:
@@ -989,6 +1003,7 @@ def _follow_up(env, st, tid, t, text) -> None:
     w = t["worker"]
     if not (w.get("worktree") and w.get("session_id")):
         events.deliver(env.home, tid, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": text})
+        t["card_confirmed"] = False                     # 新一轮尝试：必须出新方向卡（业务票交卡即自动确认）
         store.set_status(st, tid, store.QUEUED, env.now(), "判定已记，等调度器派新 worker 接着做（读收件箱和尝试记录）")
         return
     try:

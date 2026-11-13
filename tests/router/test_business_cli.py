@@ -462,3 +462,64 @@ def test_released_business_rejected_writes_no_release_file(proj):
     _biz(proj, status="await_prod")
     _rel(proj, check=False)
     assert not (proj.tmp / "daily" / "state" / "releases.json").exists()
+
+
+_CARD = "## 方向卡\n**3. 方案方向**\n- 改一处\n**4. 为什么不选另一种做法**\ny\n"
+
+
+def _card(proj):
+    c = proj.home / "cards" / "T1.md"; c.parent.mkdir(exist_ok=True); c.write_text(_CARD)
+    return c
+
+
+def test_business_card_auto_confirmed(proj):
+    _biz(proj, status="kickoff", card_confirmed=False)
+    c = _card(proj)
+    out = json.loads(proj.run("submit-card", "T1", "--card", str(c), "--rounds", "1").stdout)
+    s = proj.state(); t = s["tickets"]["T1"]
+    assert out["ok"] and not [q for q in s["queue"] if q["kind"] == "card"]
+    assert t["card_confirmed"] is True and t["status"] == "executing"
+    assert "票级授权" in (proj.home / "decisions.md").read_text() and str(c) in (proj.home / "decisions.md").read_text()
+    wait_until(lambda: proj.claude())                          # worker 被叫醒
+    assert "票级授权" in proj.claude()[0][proj.claude()[0].index("-p") + 1]
+
+
+def test_legacy_card_still_to_user(proj):
+    seed(proj, T1=("kickoff", ["her-reply-prompt"], {"worker": {"session_id": "s", "worktree": str(proj.tmp), "runs": 1}}))
+    c = _card(proj)
+    proj.run("submit-card", "T1", "--card", str(c))
+    s = proj.state()
+    assert [q["kind"] for q in s["queue"]] == ["card"] and s["tickets"]["T1"]["status"] == "await_card"
+    assert not s["tickets"]["T1"].get("card_confirmed")
+
+
+def test_prod_batch_separates_router_ships(proj):
+    seed(proj, T1=("await_prod", [], {"title": "老票"}),
+         T2=("await_prod", [], {"kind": "business", "authorized": True, "title": "业务票"}))
+    out = json.loads(proj.run("prod-batch").stdout)
+    s = proj.state()
+    assert out["tickets"] == ["T1"] and out["router_ships"] == ["T2"]
+    assert [q["summary"] for q in s["queue"] if q["kind"] == "prod"] == ["上 prod：T1"]
+
+
+def test_prod_batch_only_business_makes_no_item(proj):
+    seed(proj, T2=("await_prod", [], {"kind": "business", "authorized": True}))
+    out = json.loads(proj.run("prod-batch").stdout)
+    assert out["queue"] is None and out["tickets"] == [] and out["router_ships"] == ["T2"]
+    assert not proj.state()["queue"]
+
+
+def test_requeued_business_ticket_needs_new_card(proj):
+    _biz(proj, attempts=_A1)
+    st = proj.state(); st["tickets"]["T1"]["worker"]["worktree"] = None
+    (proj.home / "state.json").write_text(json.dumps(st))
+    _verdict(proj)
+    t = proj.state()["tickets"]["T1"]
+    assert t["status"] == "queued" and t["card_confirmed"] is False       # 新一轮必须出新方向卡
+    # 模拟调度器重派后 worker 交卡：自动确认
+    st = proj.state(); st["tickets"]["T1"]["status"] = "kickoff"
+    st["tickets"]["T1"]["worker"]["worktree"] = str(proj.tmp / "wt")
+    (proj.home / "state.json").write_text(json.dumps(st))
+    proj.run("submit-card", "T1", "--card", str(_card(proj)))
+    t = proj.state()["tickets"]["T1"]
+    assert t["card_confirmed"] is True and t["status"] == "executing"
