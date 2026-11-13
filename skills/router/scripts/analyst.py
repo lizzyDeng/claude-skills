@@ -4,13 +4,15 @@
 - 不在 worktree 里跑：cwd = router home；日志 <home>/analyst/logs/<run>.log；产出 <home>/analyst/out/<run>.json
   （路径写在 prompt 的 `OUT=` 行里，它把 JSON 写到那里）；
 - 不开票、不派活：产出只经 tick 收尾交给 apply_daily（daily）/ propose_from（weekly、migrate），calibrate 只叫醒 router；
-- 环境里 ROUTER_TICKET=analyst：router.py 的 router-only 子命令（add / propose / verdict / analyst …）对它一律拒绝。
+- 环境里 ROUTER_TICKET=analyst：router.py 的 router-only 子命令（add / propose / verdict / analyst …）对它一律拒绝；
+- calibrate 要盲跑：cwd 是项目外新建的空临时目录，环境里去掉 ROUTER_HOME（OUT / 日志仍是 router home 下的绝对路径）。
 
 没配 config `analyst.brief`（项目取数入口）= 没启用：tick 不自动起，`analyst run` 也拒绝。
 """
 import json
 import os
 import string
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 
@@ -137,15 +139,19 @@ def start(env, st, mode, since=None, until=None) -> str:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.unlink(missing_ok=True)                  # 编号复用（state 重建过）时，旧产出不能冒充这一次的
     cmd = build_cmd(env.cfg, render(env, mode, since, until, out, st=st))
-    pid = env.ctx.spawn_detached(cmd, Path(env.home), log,
-                                 env={"ROUTER_HOME": str(env.home), "ROUTER_TICKET": ANALYST_ENV})
+    if mode == "calibrate":                      # 盲跑：不在 router 状态目录里起，也不告诉它在哪（None = 连继承的一起去掉）
+        cwd, penv = Path(tempfile.mkdtemp(prefix="router-calibrate-")), {"ROUTER_HOME": None, "ROUTER_TICKET": ANALYST_ENV}
+    else:
+        cwd, penv = Path(env.home), {"ROUTER_HOME": str(env.home), "ROUTER_TICKET": ANALYST_ENV}
+    pid = env.ctx.spawn_detached(cmd, cwd, log, env=penv)
     try:
         pid_start = env.ctx.proc_start(pid)
     except Exception:  # noqa: BLE001 — 进程已经起了：查不到启动时间只影响认身份
         pid_start = None
     an.setdefault("runs", {})[rid] = {"mode": mode, "pid": pid, "pid_start": pid_start,
                                       "started_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                      "out": str(out), "log": str(log), "since": since, "until": until}
+                                      "out": str(out), "log": str(log), "since": since, "until": until,
+                                      "cwd": str(cwd)}
     return rid
 
 

@@ -269,6 +269,22 @@ def test_new_weekly_run_starts_weekly_analyst_once(proj):
     assert len(weekly()) == 2 and len(proj.ctx.spawned) == 2
 
 
+@pytest.mark.parametrize("how", ["batch_id", "drafted"])
+def test_weekly_already_triaged_by_v1_not_rerun(proj, how):
+    """v1 已经分诊过的那一期（batch.id 就是它，或已有票的 batch 是它）：不再起 weekly。"""
+    (proj.tmp / "brief.md").write_text("合成 brief\n")
+    proj.cfg["analyst"] = {"brief": str(proj.tmp / "brief.md"), "daily_at_utc": "23:00"}
+    s = proj.put(T1=("draft", [], {"batch": "2026-10-26" if how == "drafted" else None}))
+    if how == "batch_id":
+        s["batch"]["id"] = "2026-10-26"
+        store.save_state(proj.home / "state.json", s)
+    (proj.runs / "2026-10-26").mkdir(); (proj.runs / "2026-10-26" / "sent").write_text("")
+    res = proj.run()
+    assert proj.ctx.spawned == [] and "analyst_done" not in res and res["errors"] == []
+    assert not (proj.state().get("analyst") or {}).get("runs")
+    assert "last_weekly" not in (proj.state().get("analyst") or {})
+
+
 def test_notify_only_counts_and_ids(proj):
     (proj.tmp / "lark.json").write_text(json.dumps({"webhook_url": "https://lark/x", "sign_secret": "sec"}))
     proj.put(T1=running("executing", ["a"], log=log_with(proj, "T1", "nothing"),

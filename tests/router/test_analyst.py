@@ -23,6 +23,16 @@ FAKE = Path(__file__).resolve().parent / "fake_claude.py"
 CLI = SCRIPTS / "router.py"
 
 
+@pytest.fixture(autouse=True)
+def _calibrate_tmp(tmp_path, monkeypatch):
+    """calibrate 的空 cwd 建在本测试的 tmp 下（别往系统临时目录里留目录）；仍在项目根之外。"""
+    import tempfile
+    sys_tmp = tmp_path / "systmp"
+    sys_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(sys_tmp))
+    monkeypatch.setenv("TMPDIR", str(sys_tmp))                          # 子进程（CLI 用例）也照此
+
+
 def at(d, h, m, month=11):
     return datetime(2026, month, d, h, m, tzinfo=timezone.utc)
 
@@ -194,6 +204,7 @@ def test_daily_failure_no_respawn(real, monkeypatch, out_json):
     after = real.state()
     assert len(res["errors"]) == 1 and rid in res["errors"][0]
     assert after["analyst"]["runs"][rid]["failed"] is True
+    assert res["analyst_done"] == [{"run": rid, "mode": "daily", "failed": True, "error": res["errors"][0]}]
     rest_before, rest_after = copy.deepcopy(before), copy.deepcopy(after)
     for s in (rest_before, rest_after):
         s["analyst"]["runs"].pop(rid)
@@ -201,6 +212,7 @@ def test_daily_failure_no_respawn(real, monkeypatch, out_json):
     assert set(after["analyst"]["runs"][rid]) - set(before["analyst"]["runs"][rid]) <= {"failed", "error", "failed_at"}
     res = real.run()
     assert len(real.ctx.spawned) == 1 and res["errors"] == []          # 当天不重起，也不再报
+    assert "analyst_done" not in res
 
 
 def test_daily_output_lands_verdicts_and_new_queue(ap):
@@ -228,10 +240,11 @@ def test_daily_item_errors_reported(ap):
     rid, _ = only_run(ap)
     finish(ap, rid, {"verdicts": [{"ticket": "T9", "attempt": 1, "verdict": "useful", "touched": 1, "hit_wall": 1,
                                    "continued": 1, "note": "n"}],
-                     "walls": [{"ticket": "T1", "text": "测试新墙"}]})
+                     "walls": [{"ticket": "T1", "text": "测试新墙"}], "notes": "测试备注"})
     res = ap.run()
     st = ap.state()
     assert [w["text"] for w in st["tickets"]["T1"]["walls"]] == ["测试墙一", "测试新墙"]
+    assert st["analyst"]["runs"][rid]["result"]["notes"] == "测试备注" and "analyst_done" not in res
     assert len(res["errors"]) == 1 and "T9" in res["errors"][0]
     assert st["analyst"]["runs"][rid]["ingested"] and not st["analyst"]["runs"][rid].get("failed")
 
@@ -249,6 +262,7 @@ def test_stale_run_times_out(ap, monkeypatch):
     ap.ctx.advance(2)
     res = ap.run()
     assert runs(ap)[rid]["failed"] is True and len(res["errors"]) == 1 and rid in res["errors"][0]
+    assert [x["run"] for x in res["analyst_done"] if x["failed"]] == [rid]
     assert stopped == [r["pid"]]
     ap.ctx.advance(60)
     assert ap.run()["errors"] == [] and len(ap.ctx.spawned) == 1
@@ -310,6 +324,7 @@ def test_weekly_mode_comes_from_run_not_output(ap):
     res = ap.run()
     st = ap.state()
     assert len(res["errors"]) == 1 and "校准未过" in res["errors"][0]
+    assert res["analyst_done"] == [{"run": rid, "mode": "weekly", "failed": True, "error": res["errors"][0]}]
     assert st["analyst"]["runs"][rid]["failed"] is True and not st.get("proposals") and st["queue"] == []
     assert st["tickets"] == before["tickets"]
 
@@ -321,8 +336,9 @@ def test_weekly_not_configured_still_forwards_unlabeled(proj):
     res = proj.run()
     assert proj.ctx.spawned == [] and res["releases_unlabeled"] == ["x"]
     assert len(res["errors"]) == 1 and "analyst.brief" in res["errors"][0]
+    assert res["analyst_done"] == [{"run": None, "mode": "weekly", "failed": True, "error": res["errors"][0]}]
     res = proj.run()
-    assert res["errors"] == [] and proj.ctx.spawned == []
+    assert res["errors"] == [] and proj.ctx.spawned == [] and "analyst_done" not in res
     with pytest.raises(analyst.AnalystError):
         analyst.start(SimpleNamespace(cfg=proj.cfg, home=proj.home, ctx=proj.ctx), proj.state(), "calibrate")
 
@@ -353,6 +369,69 @@ def test_stale_out_file_not_taken_as_new_output(ap):
     st = ap.state()
     rid = analyst.start(SimpleNamespace(cfg=ap.cfg, home=ap.home, ctx=ap.ctx), st, "calibrate")
     assert rid == "calibrate-1" and not out.exists()
+
+
+def test_failed_run_wakes_watch(ap, monkeypatch):
+    """失败只进 errors 的话，watch 要连错 3 轮才醒：失败也发 analyst_done（failed=True）。"""
+    ap.put()
+    ap.ctx.clock = at(13, 1, 31)
+    ap.run()
+    rid, _ = only_run(ap)
+    ap.ctx.alive.clear()                                               # 退出了，没写产出
+    monkeypatch.setattr(tick.time, "sleep", lambda s: None)
+    env = SimpleNamespace(ctx=ap.ctx, root=ap.root, cfg=ap.cfg)
+    out = tick.cmd_watch(SimpleNamespace(interval=0, max_minutes=10), env)
+    assert "analyst_done" in out["woke"]
+    (item,) = out["analyst_done"]
+    assert item["run"] == rid and item["mode"] == "daily" and item["failed"] is True and rid in item["error"]
+
+
+def test_calibrate_spawns_blind(ap):
+    """calibrate：cwd 是项目外的空临时目录，环境里没有 ROUTER_HOME；OUT / 日志仍是 router home 下的绝对路径。"""
+    import shutil
+    ap.put()
+    st = ap.state()
+    env = SimpleNamespace(cfg=ap.cfg, home=ap.home, ctx=ap.ctx)
+    rid = analyst.start(env, st, "calibrate")
+    sp = ap.ctx.spawned[0]
+    cwd = Path(sp["cwd"])
+    try:
+        assert cwd.is_dir() and list(cwd.iterdir()) == [] and cwd.name.startswith("router-calibrate-")
+        assert ap.root.resolve() not in cwd.resolve().parents and cwd.resolve() != ap.root.resolve()
+        assert sp["env"].get("ROUTER_HOME") is None and sp["env"]["ROUTER_TICKET"] == "analyst"
+        r = st["analyst"]["runs"][rid]
+        assert Path(r["out"]).is_absolute() and Path(r["out"]).parent == ap.home / "analyst" / "out"
+        assert Path(sp["log"]).is_absolute() and Path(sp["log"]).parent == ap.home / "analyst" / "logs"
+        assert f"OUT={r['out']}" in sp["cmd"][sp["cmd"].index("-p") + 1]
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
+    rid2 = analyst.start(env, st, "migrate")                            # 其余模式照旧：cwd = router home
+    assert ap.ctx.spawned[1]["cwd"] == str(ap.home) and ap.ctx.spawned[1]["env"]["ROUTER_HOME"] == str(ap.home)
+    assert rid2 != rid
+
+
+def test_calibrate_real_process_has_no_router_home(real, monkeypatch):
+    """真进程：router 自己环境里有 ROUTER_HOME，calibrate 子进程里也必须没有。"""
+    import shutil
+    probe = real.tmp / "probe.json"
+    hook = real.tmp / "probe_hook.py"
+    hook.write_text("import json, os\n"
+                    f"open({str(probe)!r}, 'w').write(json.dumps({{'cwd': os.getcwd(), "
+                    "'home': os.environ.get('ROUTER_HOME'), 'ticket': os.environ.get('ROUTER_TICKET')}))\n")
+    monkeypatch.setenv("FAKE_CLAUDE_HOOK", str(hook))
+    monkeypatch.setenv("ROUTER_HOME", str(real.home))
+    real.put()
+    st = real.state()
+    rid = analyst.start(SimpleNamespace(cfg=real.cfg, home=real.home, ctx=real.ctx), st, "calibrate")
+    store.save_state(real.home / "state.json", st)
+    wait_exit(real, rid)
+    got = json.loads(probe.read_text())
+    try:
+        assert got["home"] is None and got["ticket"] == "analyst"
+        assert real.root.resolve() not in Path(got["cwd"]).resolve().parents
+        assert Path(got["cwd"]).resolve() == Path(st["analyst"]["runs"][rid]["cwd"]).resolve()
+    finally:
+        shutil.rmtree(st["analyst"]["runs"][rid]["cwd"], ignore_errors=True)
 
 
 # ---- CLI -------------------------------------------------------------------------

@@ -254,13 +254,13 @@ class Run:
         if unlabeled:                           # 原来由分诊转：现在巡检直接交给 router，由它转给用户
             self.state.setdefault("wake", {})["releases_unlabeled"] = unlabeled
         if not analyst.enabled(self.cfg):
-            self.res["errors"].append(f"新周报 {latest}：config 没配 analyst.brief，分析 agent 没跑 weekly")
+            self._analyst_failed(None, "weekly", f"新周报 {latest}：config 没配 analyst.brief，分析 agent 没跑 weekly")
             return
         try:
             rid = analyst.start(self._env(), self.state, "weekly")
         except Exception as e:  # noqa: BLE001
-            self.res["errors"].append(f"新周报 {latest}：分析 agent weekly 没起来（{str(e)[:160]}）；"
-                                      "修好后跑 router.py analyst run --mode weekly")
+            self._analyst_failed(None, "weekly", f"新周报 {latest}：分析 agent weekly 没起来（{str(e)[:160]}）；"
+                                                 "修好后跑 router.py analyst run --mode weekly")
             return
         self.state["analyst"]["runs"][rid].setdefault("week", latest)
 
@@ -325,7 +325,7 @@ class Run:
         try:
             analyst.start(self._env(), self.state, "daily", (now - timedelta(days=1)).strftime("%Y-%m-%d"), today)
         except Exception as e:  # noqa: BLE001
-            self.res["errors"].append(f"分析 agent daily 没起来（{str(e)[:160]}）：今天不再试")
+            self._analyst_failed(None, "daily", f"分析 agent daily 没起来（{str(e)[:160]}）：今天不再试")
 
     def _analyst_collect(self, rid, run):
         live = launcher.worker_liveness(self.ctx, run)
@@ -342,11 +342,17 @@ class Run:
         self._analyst_ingest(rid, data)
 
     def _analyst_fail(self, rid, why):
-        """报一次错、标 failed：不改别的状态，不自动重跑。"""
+        """标 failed、报一次错并叫醒 router：不改别的状态，不自动重跑。"""
         run = self.state["analyst"]["runs"][rid]
         run.update(failed=True, error=why[:300], failed_at=self.now)
-        self.res["errors"].append(f"分析 agent {rid}（{run['mode']}）失败：{why}；不自动重跑"
-                                  f"（要重跑：router.py analyst run --mode {run['mode']}）")
+        self._analyst_failed(rid, run["mode"], f"分析 agent {rid}（{run['mode']}）失败：{why}；不自动重跑"
+                                               f"（要重跑：router.py analyst run --mode {run['mode']}）")
+
+    def _analyst_failed(self, rid, mode, text):
+        """分析 agent 没跑成：errors 一条 + 唤醒键 analyst_done（failed）。只进 errors 的话 watch 要连错 3 轮才醒。"""
+        self.res["errors"].append(text)
+        self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+            {"run": rid, "mode": mode, "failed": True, "error": text})
 
     def _analyst_ingest(self, rid, data):
         """daily → apply_daily；weekly / migrate → propose_from（模式以 run 记录为准，产出自称什么不算）；
@@ -360,7 +366,7 @@ class Run:
         try:
             if mode == "daily":
                 out = router.apply_daily(self._env(), self.state, data)
-                result = {"applied": len(out["applied"]), "errors": out["errors"]}
+                result = {"applied": len(out["applied"]), "errors": out["errors"], "notes": out.get("notes", "")}
                 for e in out["errors"]:
                     self.res["errors"].append(f"分析 agent {rid}：第 {e['index'] + 1} 条 {e['kind']}"
                                               f"（{e.get('ticket') or '-'}）没落：{str(e['error'])[:160]}")
