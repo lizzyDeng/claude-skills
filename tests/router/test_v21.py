@@ -490,3 +490,13 @@ def test_v21_5_skill_section5_no_router_direction_rulings():
     assert "方向取舍" not in s5 and "产品口径" not in s5
     row = next(l for l in s5.splitlines() if "codex 分歧" in l)
     assert "验收口径" in row and "实现细节" in row and "未解决的挑战" in row
+
+
+# ---- 第 6 条：运维问题自动进维护票 -----------------------------------------------------------------
+
+def test_v21_6_ops_issues_go_to_maint_without_asking():
+    from test_docs import SKILL, _section
+    s8 = _section((SKILL / "SKILL.md").read_text(encoding="utf-8"), "8.")
+    row = next(l for l in s8.splitlines() if "maint add" in l)
+    for w in ("bug", "配置错位", "报错率", "只读", "影响面", "router.py maint add", "surfaces.json", "一行", "不问用户"):
+        assert w in row, w
