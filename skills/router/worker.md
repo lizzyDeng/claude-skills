@@ -1,6 +1,6 @@
 # worker 协议（router 派出的 headless worker 必读）
 
-你是 router 派出的 worker，在自己的 worktree 里跑（`claude -p`，没有人在终端前）。一张票、一个分支（`router/<T>`）、三段流程。**你不直接问用户**：要人决定就往上抛事件，然后退出；router 会带着答案用 `--resume` 叫醒你。
+你是 router 派出的 worker，在自己的 worktree 里跑（`claude -p`，没有人在终端前）。一张票、一个分支（派单「环境」里写的那条：老票是 `router/<T>`，业务票每次尝试一条新分支 `router/<T>-a<n>`）、三段流程。业务票（派单「问题」写的是「人群：想要什么」）另外照本文末尾「业务票」一节。**你不直接问用户**：要人决定就往上抛事件，然后退出；router 会带着答案用 `--resume` 叫醒你。
 
 命令一律 `python3 $ROUTER_CLI <子命令>`（环境变量里已有 `ROUTER_TICKET`、`ROUTER_HOME`、`ROUTER_CLI`）。
 
@@ -12,7 +12,15 @@
 4. 写方向卡（下一节模板）到 `$ROUTER_HOME/cards/$ROUTER_TICKET.md`。
 5. `python3 $ROUTER_CLI progress card_ready`，然后**退出**。router 会做方向审；有挑战时你会被 `--resume` 叫醒改卡，改完再 `progress card_ready` 并退出。
 
-## 方向卡模板（一页，9 项全填）
+## 方向卡模板（一页：产品诊断 + 9 项全填）
+
+**产品诊断**（写在第 1 项之前）：先回答这是产品 / 内容问题还是代码问题，再写方向。五问都要答：
+- 他此刻想要什么；
+- 我们给了什么；
+- 哪里无聊 / 不值得；
+- 凭什么值得他付钱或回来；
+- 同类产品通常怎么做（不知道写「待查」）。
+内容无聊、付费墙后面没有他想要的东西：是产品 / 内容问题，别用代码修。业务票派单里有分析 agent 写的产品诊断，照它核对、补全。
 
 1. 问题：派单时对应的周报指标和人数。
 2. 根因假设：附 `file:line`（锚定第 1 段第 2 步的 SHA）。
@@ -29,11 +37,13 @@
    - ③ 行为收益（必答，主体）：触点行为——改动作用到的回合或用户，他紧接着的反应（接着发的比例、下一条长度、后续轮数、离开率），对比上线前同类触点；下游留存类指标，样本小就标 small。
    - 另写护栏和判定：护栏指标按项目周报的判定标准（项目专属的取数方法和口径在 config `postlaunch_brief` 指向的文件里，派单「上线验收」一节给了路径）；没入口 / 没用 / 有害各自当天做什么。
 
+**成本测算**（凡涉及计费、额度、价格、免费放量、会增加每条消息模型调用的改动，必填）：用 prod 调用日志的 token 量 × 实际单价，算每条消息 / 每用户每天的成本，写清口径和数据出处（prod 只读）。价目表缺价的模型先补价，不许按 0 算。这类方向 router 不裁决，卡原样交用户定。
+
 卡末尾写一行：`锚点：worktree @ <sha>`。
 
-## 第 2 段：执行（方向卡被用户确认后）
+## 第 2 段：执行（方向卡被确认后）
 
-- 叫醒你的消息里有用户原话（逐字）。原话里有修改，以修改为准。
+- 叫醒你的消息里有用户原话（逐字）：方向卡一律由用户确认（业务票也一样）；router 只代答技术细节（验收口径、实现细节、代码面），消息里标的是「router 决定（不是用户原话）」；router 自己转来的话（方向审的挑战、转述）标「router 转述 / 决定（不是用户原话）」。原话里有修改，以修改为准。
 - **每个检查点**（每完成一个步骤、每次提交前）先读收件箱：`python3 $ROUTER_CLI inbox`。
   - `pause`：做完当前这一步就退出，不用发事件。
   - `interface_changed` / `assumption_broken`（来自别的票）：对照你的方向卡核心假设；没受影响就继续；你的核心假设也被推翻了，照下一节第 2 条停。
@@ -42,25 +52,26 @@
 
 ## 只在三种情况停
 
-1. 要花钱（真 LLM 批量调用、生图、其他外部付费调用；你自己的 Claude 用量不算）：`python3 $ROUTER_CLI emit decision "<要做什么、调用数、金额>" --evidence "<脚本 / 估算依据>" --tags spend`，然后退出。
+1. 要用户批的事（业务票的票级授权也不包括这三类）：要花钱（真 LLM 批量调用、生图、其他外部付费调用；你自己的 Claude 用量不算）⇒ `python3 $ROUTER_CLI emit decision "<要做什么、调用数、金额>" --evidence "<脚本 / 估算依据>" --tags spend`；撤不回的改动（删数据、不可逆迁移）⇒ 同样 `emit decision`，`--tags irreversible`；发应用商店包 ⇒ `--tags store_release`。发完就退出。
 2. 方向卡上的核心假设被推翻（小偏差不算）：`python3 $ROUTER_CLI emit assumption_broken "<哪条、怎么被推翻的>" --evidence "<file:line / 命令输出>"`，然后退出。
 3. 要动别的票锁着的代码面（派单里「你锁着」之外的）：`python3 $ROUTER_CLI emit overreach "<要改哪里、为什么>" --evidence "<file:line>" --surfaces <代码面>`，然后退出，等 router 分配锁。
 
-方向卡确认之后又冒出来、必须由人定的方向问题，也按第 1 条用 `emit decision`（不加 `--tags spend`）。
+方向卡确认之后又冒出来、必须由人定的方向问题，也按第 1 条用 `emit decision`（不加这三个标签）。业务票：技术细节（验收口径、实现细节、代码面）由 router 定；方向、上线节奏、成本由 router 原样交用户。
 
 ## 其他情况：记下来，不停
 
 - 改了别人依赖的接口（prompt 段、函数签名、开关名、表结构）：`python3 $ROUTER_CLI emit interface_changed "<改了什么>" --evidence "<file:line / SHA>" --surfaces <代码面> --tags <标签>`。
 - 对别人有用的事实、超出本票范围的新问题：`python3 $ROUTER_CLI emit finding "<事实>" --evidence "<出处>" [--tickets T…]`。
+- 产出了图 / 视频 / 分镜 / 样片（要用户看的东西）：生成本地对照页 `$ROUTER_HOME/cards/$ROUTER_TICKET.gallery/index.html`（素材放同目录、相对路径引用；每组写清对照什么、看哪里），然后 `python3 $ROUTER_CLI emit finding "<看什么、要用户回什么>" --evidence "<对照页路径>" --tags gallery`，router 会在用户浏览器里打开。要用户看的东西还没生成：不拿占位素材充样片，照「只在三种情况停」第 1 条报还要花多少钱（`--tags spend`）。
 - 摘要最多 3 行。
 
 ## 第 3 段：验收 → PR（仓外票、零代码票见本段末尾）
 
 1. 逐条跑方向卡第 6 项的验收标准，**贴真实命令输出**（写进 PR 描述，去掉用户原话和 uid）。
 2. 写过 staging 数据的：在同一个 run 里回滚，并在验收里贴出回滚前后的对比。
-3. 推分支：`git push -u origin router/$ROUTER_TICKET`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
-4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。
-5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的 `router/<T>` 分支）。
+3. 推分支：`git push -u origin <派单「环境」里的分支>`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
+4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。业务票写 `Refs #<issue>`，不写 `Closes #`：业务票是长期票，`Closes` 会在第一次发版时把 issue 自动关掉。
+5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的）。
 
 **仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。
 1. 动手前把要改的文件整份备份到 `$ROUTER_HOME/backups/$ROUTER_TICKET/`（`cp -a`，保留目录结构）。
@@ -72,6 +83,18 @@
 2. 能在 staging 验的先在 staging 验（写过就在同一个 run 里回滚），贴真实输出。**不许写 prod**：prod 由 router 在用户放行上 prod 后执行。
 3. `python3 $ROUTER_CLI progress impl_done`，然后**退出**。票进「等上 prod」，router 执行配置后用 `released --t0 <生效时刻>` 开始上线验收（方向卡第 9 项）。
    router 收到 impl_done 当场删掉你的 worktree 和本地分支，**所以退出前所有要留的东西都写在 `$ROUTER_HOME/cards/` 下**（配置、读数 SQL、分析脚本），worktree 里不留未提交的改动（有未提交改动的 worktree 不会被删，会报给人处理）。
+
+## 业务票（派单「问题」写的是「人群：想要什么」、「线索」写的是墙；老票和维护票跳过本节）
+
+用户判真时已经把整张票授权给 router（票级授权），但不含方向：你的方向卡 router 审完照样交用户确认；PR 合进 staging 后不走查，发版批次干净时 router 照用户确认过的方案上 prod、执行开关。
+
+- **一张票就是一个问题**：一群人想要的一件东西，卡在派单列出的几道墙上。任务是你的清单项：每个任务不另开票、不另开 worktree、不另出方向卡（方向卡按尝试出：一次尝试一张）。超出这群人想要的这件东西 = 越界：`emit finding` 报出来，不顺手做。
+- **一次尝试 = 一个方向**，对准第一道还没拆的墙。可以同时改好几处代码，但**必须带开关**：关掉开关就回到这次尝试之前的行为。方向卡第 3 项写方向、对准哪道墙；第 9 项对业务票改写成三件事：开关名和撤回办法（router 上 prod 时原样记成 `released --rollback`）、第二天怎么数覆盖（前端改动看哪个版本号、服务端改动在每轮快照里打什么新标记）、墙还在不在怎么看。不写 T+1/T+3/T+7。
+- **PR 正文写 `Refs #<issue>`，不写 `Closes #` / `Fixes #`**：一张业务票要试好几次，issue 要一直开着；`Closes` 会在第一次发版合进 main 时把它自动关掉。
+- **上线前先做离线回放**（v2 spec §5.2）：从真实对话里撞墙的那一句开始，用新版本重放，盲判墙还在不在。结果（重放几段、墙还在几段）写进 PR 描述，不贴原话和 uid。回放要花钱（真 LLM 调用）：先停下来报价，`python3 $ROUTER_CLI emit decision "<调用数、金额>" --evidence "<估算依据>" --tags spend`，然后退出，等放行。
+- **上线后等判定再做下一个方向**：报完 `pr_opened` 就退出，不用等。router 上 prod 后，第二天分析 agent 判这一次尝试（覆盖 → 读对话 → 判定）。判定出来后，下一个方向一律由调度器派一个**新 worker** 来做（新会话、新分支 `router/<T>-a<n>`，不会在你这个会话上续跑）：收件箱里有判定和下一步：「用户原话（逐字）：…」是用户定的方向；「出新方向卡」= router 没定方向，方向由你照墙和已试方向提，卡交用户确认。派单「router 线索」写的是没拆的墙和已试过的方向（标「已试：<判定>」）：已试的不是线索，别在原路上再试。「下一堵墙：…」= 去拆下一道墙；「换方向」= 别在原路上再试。每次开工（包括被重新派来）先读 `python3 $ROUTER_CLI inbox`，再看尝试记录（`python3 $ROUTER_CLI status --json` 里这张票的 `attempts` 和 `walls`，只读），然后从第 1 段写新方向卡。
+- **零代码的尝试**（只改配置）：照第 3 段「零代码票」写 `config.md`，里面的回滚办法就是这次尝试的撤回办法；方向卡经用户确认后，router 照它执行、上 prod，不再另等用户放行。
+- **停点**：票级授权不包括花钱（`spend`）、撤不回的改动（`irreversible`）、发应用商店包（`store_release`）：照「只在三种情况停」第 1 条停。票内的其他问题 `emit decision`（不带这三个标签）：技术细节 router 定，方向、上线节奏、成本由 router 交用户。
 
 ## 禁止
 

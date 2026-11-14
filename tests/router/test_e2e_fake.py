@@ -19,9 +19,11 @@ HOOK = r'''
 import os, subprocess, sys
 argv = sys.argv[1:]
 prompt = argv[argv.index("-p") + 1]
-t, home, cli = os.environ["ROUTER_TICKET"], os.environ["ROUTER_HOME"], os.environ["ROUTER_CLI"]
+t, home, cli = os.environ["ROUTER_TICKET"], os.environ["ROUTER_HOME"], os.environ.get("ROUTER_CLI")
 call = lambda *a: subprocess.run([sys.executable, cli, *a], check=True, capture_output=True)
-if "--session-id" in argv:                                   # 第 1 段：写方向卡
+if t == "analyst":                                           # 分析 agent 不是 worker：hook 只演 worker
+    pass
+elif "--session-id" in argv:                                 # 第 1 段：写方向卡
     os.makedirs(f"{home}/cards", exist_ok=True)
     open(f"{home}/cards/{t}.md", "w").write(
         "## 方向卡\n**1. 问题**\nx\n**3. 方案方向**\n- 假方向：拆 tells\n**4. 为什么不选另一种做法**\ny\n")
@@ -72,10 +74,11 @@ def e2e(tmp_path, monkeypatch):
     (runs / "2026-10-26" / "sent").write_text("")
     bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "gh").write_text(GH); (bin_ / "gh").chmod(0o755)
     (tmp_path / "hook.py").write_text(HOOK)
+    (tmp_path / "brief.md").write_text("合成 brief\n")
     cfg = {"repo": "o/r", "base_branch": "staging", "worktree_dir": ".claude/worktrees", "map_title": "m",
            "weekly_runs_dir": str(runs), "lark_config": str(tmp_path / "none.json"), "leak_guard_globs": [],
            "slots": {"heavy": 3, "light": 2}, "kickoff_budget_min": 30, "stale_min": 45, "disk_limit_gb": 150,
-           "claude_projects_dir": str(tmp_path / "projects"),
+           "claude_projects_dir": str(tmp_path / "projects"), "analyst": {"brief": str(tmp_path / "brief.md")},
            "worker": {"model": "m", "permission_mode": "bypassPermissions", "allowed_tools": [], "disallowed_tools": [],
                       "claude_bin": [sys.executable, str(FAKE)]}}
     (home / "config.json").write_text(json.dumps(cfg))
@@ -107,9 +110,12 @@ def test_full_cycle_with_fake_claude(e2e):
          "tags": [], "depends_on": ["周报口径"], "covered_by": "", "decision": "dispatch", "reason": "r"}]}
     (e2e.tmp / "tri.json").write_text(json.dumps(tri, ensure_ascii=False))
 
-    assert e2e.out("tick")["triage_needed"] == "2026-10-26"
+    weekly = lambda: [r for r in e2e.state()["analyst"]["runs"].values() if r["mode"] == "weekly"]
+    assert "triage_needed" not in e2e.out("tick")                            # v2：新周报起分析 agent，不出分诊
+    assert [r["week"] for r in weekly()] == ["2026-10-26"]
     assert e2e.out("draft", "--from", str(e2e.tmp / "tri.json"))["ok"]
-    assert e2e.out("tick")["triage_needed"] is None and e2e.state()["tickets"]["T1"]["status"] == "draft"
+    assert "triage_needed" not in e2e.out("tick") and e2e.state()["tickets"]["T1"]["status"] == "draft"
+    assert len(weekly()) == 1                                                 # 同一期只起一次
 
     start = e2e.out("start", "--all")
     assert start["ok"] and start["dispatched"] == ["T1"]                      # T2 依赖 T1 + 同代码面 → 排队

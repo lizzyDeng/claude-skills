@@ -58,3 +58,24 @@ def test_numeric_id_order_not_lexical(state_with):
 def test_heavy_blocked_by_disk_skips_heavy_only(state_with):
     st = state_with(T1=q(["a"], "heavy"), T2=q(["b"], "light"))
     assert pick_dispatch(st, SLOTS, heavy_blocked=True) == ["T2"]
+
+
+def test_business_dispatched_before_legacy_by_impact(state_with):
+    big = {"size": 0.4, "gap": 1.0, "confidence": "high"}
+    small = {"size": 0.1, "gap": 1.0, "confidence": "high"}
+    st = state_with(T1=q(["a"], priority=1), T2=q(["b"], kind="business", impact=small),
+                    T3=q(["c"], kind="business", impact=big))
+    assert pick_dispatch(st, {"heavy": 3, "light": 3}) == ["T3", "T2", "T1"]
+
+
+def test_maint_cap(state_with):
+    st = state_with(T1=q(["a"], kind="maint"), T2=q(["b"], kind="maint"), T3=q(["c"], kind="maint"))
+    assert pick_dispatch(st, {"heavy": 3, "light": 3}, maint_slots=1) == ["T1"]
+    st = state_with(T1=q(["a"], kind="maint"), T2=q(["b"], kind="maint"), T3=q(["c"], kind="maint"),
+                    T4=q(["d"], kind="maint", unblocks=["T9"]))
+    assert pick_dispatch(st, {"heavy": 3, "light": 3}, maint_slots=1) == ["T1", "T4"]
+
+
+def test_running_maint_counts_against_cap(state_with):
+    st = state_with(T1=("executing", ["x"], {"weight": "light", "kind": "maint"}), T2=q(["b"], kind="maint"))
+    assert pick_dispatch(st, SLOTS, maint_slots=1) == []

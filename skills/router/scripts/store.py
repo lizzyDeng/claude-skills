@@ -38,9 +38,11 @@ RUNNING = {KICKOFF, EXECUTING, VERIFYING}                                  # 占
 LOCKING = RUNNING | {AWAIT_CARD, PAUSED, TAKEOVER, STUCK, AWAIT_CHECK}      # 持锁
 SETTLED = {MERGED, AWAIT_PROD, POSTLAUNCH, DONE}                            # 对下游算已解锁
 
-QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch"}
+QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict", "direction", "postlaunch",
+               "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo"}
+# assumption：核心假设被推翻的方向项（v2.1：方向归用户，router 不能 --as-router 代答）
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -178,6 +180,192 @@ def new_ticket(state: dict, **fields) -> str:
     return tid
 
 
+# ---- 业务票（v2）：一张票 = 一个用户行为问题；墙 / 尝试 / 判定 / 影响分 ----
+KINDS = ("legacy", "business", "maint")
+BIZ_VERDICTS = ("no_entry", "pending_sample", "useful", "wall_broken_not_retained", "useless", "harmful")
+_CONFIDENCE = {"low": 0.5, "mid": 0.75, "high": 1.0}
+PENDING_CAP_DAYS = 7
+USELESS_RETURN_AT = 3
+
+
+def ticket_kind(t: dict) -> str:
+    """缺字段 ⇒ legacy（老 state 不迁移）。"""
+    return t.get("kind") or "legacy"
+
+
+def _iso(s) -> datetime:
+    d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def new_business_ticket(state: dict, *, title, segment, want, walls, metric, evidence, impact,
+                        origin, absorbs=(), surfaces=(), weight=None) -> str:
+    """surfaces 空 ⇒ 按重票（weight=heavy）：没声明代码面就不知道会不会编译 Rust，先占重名额、过磁盘闸；
+    方向卡给出代码面后 router 用 surfaces --set 改成实际的。"""
+    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    surfaces = list(surfaces)
+    tid = new_ticket(state, title=title, origin=origin, kind="business", authorized=True,
+                     surfaces=surfaces, weight=weight or ("heavy" if not surfaces else "light"),
+                     segment=segment, want=want, metric=metric, evidence=list(evidence),
+                     impact=impact, absorbs=list(absorbs), parent=None, tasks=[], attempts=[],
+                     no_use_streak=0,
+                     walls=[{"id": f"W{i}", "text": w, "status": "open", "source": origin, "at": at}
+                            for i, w in enumerate(walls, 1)])
+    return tid
+
+
+def attempt_inflight(t: dict) -> bool:
+    """业务票有尝试已上线、还没判完（判定为空或待样本）：一次只验一个尝试（spec §4.4a）。历史尝试不算。"""
+    return any(a.get("verdict") in (None, "pending_sample") for a in t.get("attempts") or [] if not a.get("historical"))
+
+
+def record_shipped(state: dict, tid: str, at: str, t0: str) -> None:
+    """改动随这次发版上了 prod，但票不进上线验收（停 / 接管 / 关前已撤回）：history 记一条 shipped_at，不改状态。
+    这一条不带 status（不是状态变化，按状态读 history 的地方照旧）；staging_pending / offrepo_pending 看到它就算这次改动已出 staging。"""
+    state["tickets"][tid]["history"].append({"at": at, "shipped_at": t0, "note": "随发版上 prod（状态不变、不进上线验收）"})
+
+
+def staging_pending(t: dict) -> bool:
+    """这张票的改动合进了 staging、之后还没 released（合 main 发版会把它一起带上去）。不看票现在的状态：
+    stop / takeover / close 都不会让它离开发版批次（终审残留 #2a）。
+    依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch，
+    也没有 shipped_at（停 / 接管 / 关前已撤回的票随别的票发版上去时，released 只记这一条，残留 2 #3）。
+    老票、维护票之后直接是 done 的也算 released（老版 released 直接记 done）；业务票之后是 done = 关了票，代码还在 staging。
+    没有 history（手写的 state）就按状态算。"""
+    if not t.get("merge_sha"):
+        return False
+    return _pending_since(t, (MERGED, AWAIT_PROD), done_releases=ticket_kind(t) != "business")
+
+
+def offrepo_pending(t: dict) -> bool:
+    """仓外改动还在真身上、这次还没上线判定：最后一次进 await_check 之后没有 postlaunch（业务票核对过 = 记成尝试进
+    postlaunch）/ shipped_at。和 staging_pending 一样不看现在的状态：stop / takeover 都不会让改动消失（残留 2 #1）。"""
+    return _pending_since(t, (AWAIT_CHECK,), done_releases=ticket_kind(t) != "business")
+
+
+def _pending_since(t: dict, marks_of: tuple, done_releases: bool) -> bool:
+    hist = t.get("history") or []
+    marks = [i for i, x in enumerate(hist) if x.get("status") in marks_of]
+    if not marks:
+        return t.get("status") in marks_of
+    after = hist[marks[-1] + 1:]
+    if any(x.get("status") == POSTLAUNCH or x.get("shipped_at") for x in after):
+        return False
+    return not (done_releases and any(x.get("status") == DONE for x in after))
+
+
+def current_attempt(t: dict):
+    """业务票的「当前尝试」= 最后一条非历史的尝试（历史尝试是并进来的老票，不参与判定）；没有 → None。
+    daily 的票况、verdict、released 的在途检查、看板 / status 的最近判定都按它。"""
+    return next((a for a in reversed(t.get("attempts") or []) if not a.get("historical")), None)
+
+
+def shown_attempt(t: dict):
+    """给人看的「最近一次」：有当前尝试就是它；只有历史尝试时取最后一条历史的；都没有 → None。"""
+    atts = t.get("attempts") or []
+    return current_attempt(t) or (atts[-1] if atts else None)
+
+
+def impact_score(t: dict) -> float:
+    if ticket_kind(t) != "business":
+        return 0.0
+    return impact_of_dict(t.get("impact"))
+
+
+def impact_of_dict(imp) -> float:
+    """影响分公式只此一处：size × gap × 置信权重；缺字段 ⇒ 0。"""
+    imp = imp or {}
+    if not imp.get("size") or not imp.get("gap"):
+        return 0.0
+    return float(imp["size"]) * float(imp["gap"]) * _CONFIDENCE.get(imp.get("confidence"), 0.5)
+
+
+def queue_impact(state: dict, q: dict) -> float:
+    """决定单项的业务影响：verify_problem 取提议里的 impact；带票号的取该票的 impact_score；其余 0。"""
+    if q.get("kind") == "verify_problem":
+        return impact_of_dict((state.get("proposals", {}).get(q.get("proposal") or "") or {}).get("impact"))
+    t = state["tickets"].get(q.get("ticket") or "")
+    return impact_score(t) if t else 0.0
+
+
+def attach_wall(state: dict, tid: str, text: str, source: str, at: str) -> str:
+    walls = state["tickets"][tid]["walls"]
+    nums = [int(w["id"][1:]) for w in walls if str(w.get("id", "")).startswith("W") and w["id"][1:].isdigit()]
+    wid = f"W{max(nums, default=0) + 1}"
+    walls.append({"id": wid, "text": text, "status": "open", "source": source, "at": at})
+    return wid
+
+
+def first_open_wall(t: dict):
+    """第一道没拆的墙的编号；没有 → None。"""
+    return next((w.get("id") for w in t.get("walls") or [] if w.get("status") == "open"), None)
+
+
+def add_attempt(state: dict, tid: str, direction: str, at: str, rollback: str) -> int:
+    """记一次尝试；wall = 这次尝试对准的墙（上线那一刻第一道没拆的墙），判定拆的就是它（v2.1：并票后墙的顺序会变）。"""
+    t = state["tickets"][tid]
+    attempts = t["attempts"]
+    n = max((a.get("n", 0) for a in attempts), default=0) + 1
+    attempts.append({"n": n, "direction": direction, "at": at, "rollback": rollback, "verdict": None,
+                     "wall": first_open_wall(t)})
+    return n
+
+
+def _break_wall(t: dict, wid=None) -> None:
+    """拆这次尝试对准的那道墙（wid，还没拆的话）；没记 wid（v2.1 之前的尝试）或它已经拆了 ⇒ 拆第一道没拆的墙。"""
+    for w in t["walls"]:
+        if wid and w.get("id") == wid and w["status"] == "open":
+            w["status"] = "broken"
+            return
+    for w in t["walls"]:
+        if w["status"] == "open":
+            w["status"] = "broken"
+            return
+
+
+def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touched: int,
+                   hit_wall: int, continued: int, note: str, new_wall: str = None) -> dict:
+    if verdict not in BIZ_VERDICTS:
+        raise ValueError(f"未知判定 {verdict}")
+    t = state["tickets"][tid]
+    a = next((x for x in t["attempts"] if x.get("n") == n), None)
+    if a is None:
+        raise ValueError(f"{tid} 没有尝试 {n}")
+    if a.get("historical"):
+        raise ValueError(f"尝试 {n} 是历史记录，不能记判定")
+    if verdict == "wall_broken_not_retained" and not new_wall:
+        raise ValueError("wall_broken_not_retained 必须给 new_wall")
+    if verdict == "pending_sample":
+        since = a.get("pending_since")
+        if since and _iso(at) - _iso(since) >= timedelta(days=PENDING_CAP_DAYS):
+            if hit_wall:                          # 有人走到墙：有几个按几个判，不许再待样本
+                raise ValueError(f"待样本已满 {PENDING_CAP_DAYS} 天：走到墙的有几个按几个判")
+            # 满 7 天、碰到改动的人里没人走到墙（含碰到 0 人）：按没入口判，走 no_entry（终审裁决 #13）
+            verdict = "no_entry"
+            note = f"{note}（待样本满 {PENDING_CAP_DAYS} 天，碰到 {touched} 人、没人走到墙：按没入口判）"
+    a.update(verdict=verdict, verdict_at=at, touched=touched, hit_wall=hit_wall, continued=continued, note=note)
+    if verdict == "pending_sample":
+        a.setdefault("pending_since", at)
+    else:
+        a.pop("pending_since", None)
+    actions = []
+    if verdict == "no_entry":
+        actions = ["check_entry"]
+    elif verdict == "pending_sample":
+        actions = ["wait"]
+    elif verdict == "useful":
+        _break_wall(t, a.get("wall")); t["no_use_streak"] = 0; actions = ["next_wall"]
+    elif verdict == "wall_broken_not_retained":
+        _break_wall(t, a.get("wall")); t["no_use_streak"] = 0
+        attach_wall(state, tid, new_wall, "verdict", at); actions = ["next_wall"]
+    elif verdict == "useless":
+        t["no_use_streak"] += 1
+        actions = ["change_direction"] + (["return_to_user"] if t["no_use_streak"] >= USELESS_RETURN_AT else [])
+    elif verdict == "harmful":
+        actions = ["rollback"]
+    return {"actions": actions, "verdict": verdict}
+
+
 def set_status(state: dict, tid: str, status: str, at: str, waiting_for: str = None) -> None:
     """waiting_for 不传（None）⇒ 按状态取 DEFAULT_WAIT；显式传 "" 仍可清空。"""
     if status not in STATUSES:
@@ -209,16 +397,18 @@ CLOSEOUT_COLS = ("issue", "worktree", "branch")
 
 
 def closeout_open(co) -> dict:
-    """还没做完的栏 → {"downstream": [票号…], "cols": [栏名…]}；kept 不算没做完（要人处理，不再重试）。"""
+    """还没做完的栏 → {"downstream": [票号…], "cols": [栏名…], "old_branches": [分支…]}；kept 不算没做完
+    （要人处理，不再重试）。old_branches = 业务票旧尝试已合并的本地分支（关业务票时列出，老票没有这一栏）。"""
     if not isinstance(co, dict):
-        return {"downstream": [], "cols": []}
+        return {"downstream": [], "cols": [], "old_branches": []}
     down = [oid for oid, d in (co.get("downstream") or {}).items() if isinstance(d, dict) and d.get("state") == "pending"]
-    return {"downstream": down, "cols": [c for c in CLOSEOUT_COLS if co.get(c) == "pending"]}
+    old = [b for b, v in (co.get("old_branches") or {}).items() if v == "pending"]
+    return {"downstream": down, "cols": [c for c in CLOSEOUT_COLS if co.get(c) == "pending"], "old_branches": old}
 
 
 def closeout_pending(co) -> bool:
     o = closeout_open(co)
-    return bool(o["downstream"] or o["cols"])
+    return bool(o["downstream"] or o["cols"] or o["old_branches"])
 
 
 # ---- 上线验收（postlaunch）：released 之后 t0 + 1 / 3 / 7 天各查一次；票的终点是上线验收，不是 released ----
@@ -309,6 +499,12 @@ def _draft_count(state) -> int:
                if t.get("batch") == batch and t.get("origin", "weekly") == "weekly" and t["status"] == DRAFT)
 
 
+def router_owned(t: dict) -> bool:
+    """业务票且已授权：走查 / 上 prod 由 router 推进（spec §5.5）。其余（含 legacy）一律照旧交用户。
+    v2.1：方向卡不在内——业务票的方向卡也交用户确认；router 只上用户确认过的方案（card_confirmed_by=user）。"""
+    return ticket_kind(t) == "business" and bool(t.get("authorized"))
+
+
 def queue_blocks(state, q) -> int:
     """这一项挡住了几张票（读时现算，不存）。被挡的票按票号集合去重：同一张票可能既依赖本票、又共享代码面。
     - start：本批 weekly 草稿张数；prod：等上 prod 的张数；topic=base：还没走完的票数
@@ -318,7 +514,7 @@ def queue_blocks(state, q) -> int:
     if q.get("kind") == "start":
         return _draft_count(state)
     if q.get("kind") == "prod":
-        return sum(1 for t in tickets.values() if t["status"] == AWAIT_PROD)
+        return sum(1 for t in tickets.values() if t["status"] == AWAIT_PROD and not router_owned(t))
     if q.get("topic") == "base":
         return sum(1 for t in tickets.values() if t["status"] not in _BASE_FREE)
     t = tickets.get(q.get("ticket") or "")
@@ -333,7 +529,7 @@ def queue_blocks(state, q) -> int:
 
 
 def queue_view(state) -> list:
-    """决定单的读视图：每项浅拷贝 + 现算 blocks；start 项的「几张」按当前草稿重写；按 (-blocks, 序号) 排。
+    """决定单的读视图：每项浅拷贝 + 现算 blocks；start 项的「几张」按当前草稿重写；按 (-impact, -blocks, 序号) 排。
     只读：不改 state 本身（status 这类只读命令不存盘）。"""
     out = []
     for q in state["queue"]:
@@ -341,8 +537,9 @@ def queue_view(state) -> list:
         v["blocks"] = queue_blocks(state, q)
         if q.get("kind") == "start":
             v["summary"] = f"派发单已备好（{v['blocks']} 张）"
+        v["impact"] = queue_impact(state, q)
         out.append(v)
-    return sorted(out, key=lambda v: (-v["blocks"], int(v["id"][1:])))
+    return sorted(out, key=lambda v: (-v["impact"], -v["blocks"], int(v["id"][1:])))
 
 
 def pop_queue(state, qid) -> dict:

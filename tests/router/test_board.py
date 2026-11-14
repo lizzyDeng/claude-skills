@@ -134,3 +134,88 @@ def test_board_shows_postlaunch_next_check_last_result_and_item():
     _, card2 = _card_of(html, "T2")
     assert "生效" in card2 and "转化 2.0% → 2.6%" in card2
     assert "上线验收" in html and "Q1 知道了" in html                      # 决定单：类型名 + 你回什么
+
+
+# ---- Task 8：业务票 / 维护票 / 决定单影响分 ----
+from pathlib import Path  # noqa: E402
+
+import store  # noqa: E402
+
+
+def _biz(st, tid="T7", **extra):
+    t = store._ticket_defaults()
+    t.update(id=tid, title="示例业务票", status="executing", kind="business", segment="示例人群", want="示例诉求",
+             metric={"name": "示例指标", "now": "0.1", "direction": "up"},
+             impact={"size": 0.7, "gap": 0.5, "confidence": "low"}, no_use_streak=0,
+             walls=[{"id": "W1", "text": "墙甲<b>", "status": "open"}, {"id": "W2", "text": "墙乙", "status": "broken"}],
+             attempts=[{"n": 1, "direction": "方向一", "at": "2026-11-01T00:00:00Z", "verdict": "useful"},
+                       {"n": 2, "direction": "方向二", "at": "2026-11-02T00:00:00Z", "verdict": None}])
+    t.update(extra)
+    st["tickets"][tid] = t
+    st["seq"]["ticket"] = max(st["seq"]["ticket"], int(tid[1:]))
+    return t
+
+
+def test_business_card_shows_walls_and_attempts():
+    st = make_state()
+    _biz(st)
+    html = render(st, [], {}, NOW)
+    assert "示例人群" in html and "示例诉求" in html and "示例指标" in html
+    assert "墙甲&lt;b&gt;" in html and "墙甲<b>" not in html
+    assert "<s>墙乙</s>" in html and "<s>墙甲" not in html
+    assert "方向一" in html and "2026-11-01" in html and "useful" in html
+    assert "影响 0.17" in html
+
+
+def test_business_card_shows_historical_attempt_with_legacy_verdict():
+    st = make_state()
+    _biz(st, attempts=[{"n": 1, "direction": "旧票方向", "shipped_at": "2026-10-20T00:00:00Z",
+                        "verdict": "legacy", "legacy_verdict": "flat", "historical": True}])
+    html = render(st, [], {}, NOW)
+    assert "旧票方向" in html and "2026-10-20" in html and "判定 flat" in html and "判定 legacy" not in html
+
+
+def test_queue_row_shows_impact_for_business():
+    st = make_state()
+    _biz(st, impact={"size": 0.7, "gap": 0.6, "confidence": "high"})
+    st["queue"] = [{"id": "Q1", "ticket": "T7", "kind": "close", "summary": "x", "blocks": 1, "created_at": "t"},
+                   {"id": "Q2", "ticket": None, "kind": "verify_problem", "summary": "y", "blocks": 0,
+                    "created_at": "t", "proposal": "P1"}]
+    st["proposals"] = {"P1": {"id": "P1", "title": "提议<题>", "segment": "提议人群",
+                              "impact": {"size": 0.7, "gap": 0.6, "confidence": "high"}}}
+    html = render(st, [], {}, NOW)
+    assert html.count(" · 影响 0.42 · ") == 2
+    assert "提议结束：示例业务票" in html
+    assert "提议&lt;题&gt;" in html and "提议人群" in html
+
+
+def test_queue_row_legacy_keeps_blocks():
+    st = make_state(T1=("executing", ["a"]))
+    st["queue"] = [{"id": "Q1", "ticket": "T1", "kind": "card", "summary": "s", "blocks": 1, "created_at": "t"}]
+    html = render(st, [], {}, NOW)
+    assert "挡 1 张" in html and "影响" not in html
+
+
+def test_maint_card_shows_tasks_and_unblocks():
+    st = make_state()
+    t = store._ticket_defaults()
+    t.update(id="T9", title="维护票", status="executing", kind="maint", unblocks="T7",
+             tasks=[{"text": "任务甲", "done": True}, {"text": "任务乙", "done": False}])
+    st["tickets"]["T9"] = t
+    html = render(st, [], {}, NOW)
+    assert "<s>任务甲</s>" in html and "任务乙" in html and "<s>任务乙" not in html
+    assert "解锁 T7" in html
+
+
+def _legacy_state():
+    st = make_state(T1=("executing", ["a"], {"title": "示例甲", "problem": "示例问题", "waiting_for": "执行中"}),
+                    T2=("queued", ["b"], {"title": "示例乙", "blocked_by": ["T1"]}),
+                    T3=("done", [], {"title": "示例丙"}))
+    st["queue"] = [{"id": "Q1", "ticket": "T1", "kind": "card", "summary": "示例摘要", "blocks": 2,
+                    "created_at": "2026-11-02T09:00:00Z"}]
+    return st
+
+
+def test_legacy_card_unchanged():
+    expected = (Path(__file__).parent / "fixtures" / "board_legacy_expected.html").read_text()
+    assert render(_legacy_state(), [], {}, NOW) == expected

@@ -25,21 +25,30 @@ def _dispatchable(t) -> bool:
     return not (t.get("dispatch_fail") or {}).get("qid") and (t.get("dispatch") or {}).get("phase") != "spawning"
 
 
-def pick_dispatch(state: dict, slots: dict, heavy_blocked: bool = False) -> list:
+def pick_dispatch(state: dict, slots: dict, heavy_blocked: bool = False, maint_slots: int = 1) -> list:
     tickets = state["tickets"]
     free = free_slots(state, slots)
     occupied = set(surfaces.held_locks(state))
     candidates = [t for t in tickets.values()
                   if t["status"] == store.QUEUED and t["start_ok"] and _dispatchable(t)
                   and all(tickets.get(b, {}).get("status") in store.SETTLED for b in t["blocked_by"])]
-    candidates.sort(key=lambda t: (t["priority"], _num(t["id"])))
+    rank = {"business": 0, "legacy": 1, "maint": 2}
+    candidates.sort(key=lambda t: (rank.get(store.ticket_kind(t), 1), -store.impact_score(t),
+                                   t["priority"], _num(t["id"])))
+    maint_free = maint_slots - sum(1 for t in tickets.values() if store.ticket_kind(t) == "maint"
+                                   and t["status"] in store.RUNNING and not t.get("unblocks"))
 
     picked = []
     for t in candidates:
+        capped = store.ticket_kind(t) == "maint" and not t.get("unblocks")
+        if capped and maint_free <= 0:
+            continue
         w = t["weight"]
         if (w == "heavy" and heavy_blocked) or free.get(w, 0) <= 0 or occupied & set(t["surfaces"]):
             continue
         picked.append(t["id"])
+        if capped:
+            maint_free -= 1
         free[w] -= 1
         occupied |= set(t["surfaces"])
     return picked

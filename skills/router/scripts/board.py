@@ -25,7 +25,8 @@ PILL = {store.DRAFT: "待 start", store.QUEUED: "排队", store.KICKOFF: "出方
         store.DONE: "完成", store.PAUSED: "暂停", store.TAKEOVER: "你接管", store.STUCK: "卡住",
         store.HOLD: "暂缓", store.SKIP: "不派"}
 KIND = {"start": "派发单", "card": "方向卡", "spend": "花钱放行", "prod": "上 prod", "handson": "待你动手",
-        "stuck": "卡住", "conflict": "代码面冲突", "direction": "方向问题", "postlaunch": "上线验收"}
+        "stuck": "卡住", "conflict": "代码面冲突", "direction": "方向问题", "postlaunch": "上线验收",
+        "verify_problem": "提议待判真", "close": "提议结束", "harm": "有害待撤回", "return": "退回给你"}
 
 
 def _e(x) -> str:
@@ -33,14 +34,18 @@ def _e(x) -> str:
 
 
 # 带 topic 的项：用户回的话按 topic 定（router.cmd_answer 按 topic 分派）
+# requeue / next：回「Tn 换成：…」= redirect（业务票没有在途尝试就收，不看上一次判了什么）
 SAY_TOPIC = {"base": "{qid} 好了", "retarget": "{qid} 改好了", "dispatch": "{qid} 重派",
-             "offrepo": "{t} 核对过了 / {t} 不满意：…"}
+             "offrepo": "{t} 核对过了 / {t} 不满意：…", "requeue": "{qid} 重排 / {t} 换成：…",
+             "next": "{qid}：<下一个方向> / {t} 换成：…"}
 
 
 def _say(q) -> str:
     t, qid = q.get("ticket") or "", q["id"]
     if q.get("topic") in SAY_TOPIC:
         return SAY_TOPIC[q["topic"]].format(t=t, qid=qid)
+    if q["kind"] == "prod" and q.get("batch"):                 # 整批项（有业务票等上 prod）
+        return f"{qid} 放行 / {qid}：…"
     return {"start": "start / start T1 T3",
             "card": f"{t} 同意 / {t} 改：… / {t} 驳回：…",
             "spend": f"放行 {qid} / 不放行 {qid}",
@@ -49,7 +54,11 @@ def _say(q) -> str:
             "stuck": f"{t} 续跑 / 我接管 {t}",
             "conflict": f"{qid}：按谁来",
             "direction": f"{qid}：…",
-            "postlaunch": f"{qid} 知道了 / {qid}：…"}.get(q["kind"], qid)
+            "postlaunch": f"{qid} 知道了 / {qid}：…",
+            "verify_problem": f"{qid} 真 / {qid} 真，先放着 / {qid} 不是：理由",
+            "close": f"{qid} 关 / {qid} 不关",
+            "harm": f"{qid} 知道了 / {qid}：…",
+            "return": f"{t} 换成：… / 关 {t} / {qid}：…"}.get(q["kind"], qid)
 
 
 def _hhmm(ts: str) -> str:
@@ -82,6 +91,10 @@ def _ticket_card(t, evs, now=None) -> str:
         tags.append('<span class="pill p-review">需复核</span>')
     no = f"#{t['issue']}" if t.get("issue") else t["id"]
     wait = t.get("waiting_for") or ""
+    if t.get("merged_into"):                                    # v2.1：并进了另一张业务票
+        g = "off"
+        tags.append(f'<span class="pill p-off">已并入 {_e(t["merged_into"])}</span>')
+        wait = wait or f"已并入 {t['merged_into']}"
     if sol.get("kind") == "card":
         sol_cell = (f'<div class="cell sol"><h4>解法 · {_e(sol.get("source"))}</h4><p>{_e(sol.get("text"))}</p>'
                     f'<span class="src">{_e(t.get("card", {}).get("path", ""))}</span></div>')
@@ -102,22 +115,55 @@ def _ticket_card(t, evs, now=None) -> str:
     if df:
         foot.append(f'<span>派发失败 {_e(df.get("count", 1))} 次（阶段 {_e(df.get("phase"))}）：{_e(str(df.get("error", ""))[:120])}</span>')
     foot += _closeout_spans(t.get("closeout"))
+    sc = t.get("stale_checkouts") or []
+    if sc:                                                      # 业务票重新排队时留下的旧 checkout：要人处理
+        foot.append(f'<span>旧 checkout {len(sc)} 条待你处理：{_e("、".join(str(x.get("worktree")) for x in sc))}</span>')
     if now is not None:
         foot += _postlaunch_spans(t, now)
     tl = "".join(f'<li><span class="ts">{_e(_hhmm(e.get("ts", "")))}</span>[{_e(e.get("phase") or e.get("type"))}] '
                  f'{_e(e.get("summary", ""))}</li>' for e in evs[-5:])
+    kind = store.ticket_kind(t)
+    if kind == "business":
+        body = _biz_cells(t)
+    elif kind == "maint":
+        body = _maint_cells(t)
+    else:
+        body = f"""<div class="three">
+    <div class="cell"><h4>为什么派</h4><p>{_e(why.get("metric"))} · {_e(why.get("users"))}</p><span class="src">{_e(why.get("evidence"))}</span></div>
+    <div class="cell"><h4>解决什么问题</h4><p>{_e(t.get("problem"))}</p><span class="src"><code>{_e(t.get("problem_anchor"))}</code></span></div>
+    {sol_cell}
+  </div>"""
     return f"""<div class="issue" data-g="{g}">
   <div class="ih"><span class="no">{_e(no)} · {_e(t["id"])}</span><span class="t">{_e(t["title"])}</span>
     <span class="pill p-{g}">{_e(PILL.get(t["status"], t["status"]))}</span>{"".join(tags)}</div>
   <div class="wait">{"在等：<b>" + _e(wait) + "</b>" if wait else "&nbsp;"}</div>
-  <div class="three">
-    <div class="cell"><h4>为什么派</h4><p>{_e(why.get("metric"))} · {_e(why.get("users"))}</p><span class="src">{_e(why.get("evidence"))}</span></div>
-    <div class="cell"><h4>解决什么问题</h4><p>{_e(t.get("problem"))}</p><span class="src"><code>{_e(t.get("problem_anchor"))}</code></span></div>
-    {sol_cell}
-  </div>
+  {body}
   <div class="foot">{"".join(foot)}</div>
   {"<ul class='tl'>" + tl + "</ul>" if tl else ""}
 </div>"""
+
+
+def _biz_cells(t) -> str:
+    """业务票的卡片主体：人群 / 想要什么 / 墙 / 指标 / 最近 3 次尝试 / 影响分。全部转义。"""
+    m = t.get("metric") or {}
+    m = m if isinstance(m, dict) else {"name": m}
+    mtxt = " · ".join(str(m[k]) for k in ("name", "now", "direction") if m.get(k) not in (None, ""))
+    walls = "".join(f'<li>{"<s>" + _e(w.get("text")) + "</s>" if w.get("status") == "broken" else "<b>" + _e(w.get("text")) + "</b>"}'
+                    f'</li>' for w in t.get("walls", [])) or "<li>（无）</li>"
+    att = "".join(f'<li>#{_e(a.get("n"))} {_e(a.get("direction"))} · 上线 {_e(str(a.get("at") or a.get("shipped_at") or "")[:10])}'
+                  f' · 判定 {_e((a.get("legacy_verdict") if a.get("verdict") == "legacy" else a.get("verdict")) or "待判")}</li>' for a in t.get("attempts", [])[-3:]) or "<li>（还没有尝试）</li>"
+    return f"""<div class="three">
+    <div class="cell"><h4>人群 · 想要什么</h4><p>{_e(t.get("segment"))} · {_e(t.get("want"))}</p><span class="src">指标：{_e(mtxt)}</span></div>
+    <div class="cell"><h4>墙</h4><ul>{walls}</ul></div>
+    <div class="cell"><h4>最近尝试</h4><ul>{att}</ul><span class="src">影响 {store.impact_score(t):.2f}</span></div>
+  </div>"""
+
+
+def _maint_cells(t) -> str:
+    tasks = "".join(f'<li>{"<s>" + _e(x.get("text")) + "</s>" if x.get("done") else _e(x.get("text"))}</li>'
+                    for x in t.get("tasks", [])) or "<li>（无）</li>"
+    unb = f'<span class="src">解锁 {_e(t["unblocks"])}</span>' if t.get("unblocks") else ""
+    return f'<div class="three"><div class="cell"><h4>维护任务</h4><ul>{tasks}</ul>{unb}</div></div>'
 
 
 def _closeout_spans(co) -> list:
@@ -126,11 +172,14 @@ def _closeout_spans(co) -> list:
         return []
     o, out = store.closeout_open(co), []
     names = {"issue": "关 issue", "worktree": "清 worktree", "branch": "删分支"}
-    todo = [f"下游 {oid}" for oid in o["downstream"]] + [names[c] for c in o["cols"]]
+    todo = [f"下游 {oid}" for oid in o["downstream"]] + [names[c] for c in o["cols"]] + \
+        [f"旧分支 {b}" for b in o["old_branches"]]
     if todo:
         out.append(f'<span>收尾未完成：{_e("、".join(todo))}</span>')
     kept = [f"{ {'worktree': 'worktree', 'branch': '分支'}[c]}（{co[c][len('kept: '):]}）" for c in ("worktree", "branch")
             if str(co.get(c, "")).startswith("kept")]
+    kept += [f"旧分支 {b}（{str(v)[len('kept: '):]}）" for b, v in (co.get("old_branches") or {}).items()
+             if str(v).startswith("kept")]
     if kept:
         out.append(f'<span>保留：{_e("、".join(kept))}</span>')
     err = co.get("error") or {}
@@ -165,6 +214,23 @@ def _external_card(path, e) -> str:
 </div>"""
 
 
+def _queue_row(state, q) -> str:
+    """决定单一行：业务票 / verify_problem 显示「影响 x.xx」，legacy 照旧「挡 N 张」。"""
+    summary, extra = q["summary"], ""
+    t = state["tickets"].get(q.get("ticket") or "")
+    prop = state.get("proposals", {}).get(q.get("proposal") or "") if q["kind"] == "verify_problem" else None
+    if prop is not None:
+        extra = f' · {_e(prop.get("segment"))}'
+        summary = prop.get("title") or summary
+    biz = prop is not None or q["kind"] == "verify_problem" or (t is not None and store.ticket_kind(t) == "business")
+    if q["kind"] == "close" and t is not None:
+        summary = f'提议结束：{t["title"]}'
+    cost = f'影响 {q.get("impact", 0.0):.2f}' if biz else f'挡 {_e(q["blocks"])} 张'
+    return (f'<div class="row"><div class="what"><b>{_e(summary)}</b>'
+            f'<small>{_e(q["id"])} · {_e(KIND.get(q["kind"], q["kind"]))}{extra} · {cost} · {_e(_hhmm(q["created_at"]))}</small></div>'
+            f'<span class="say">{_e(_say(q))}</span></div>')
+
+
 def render(state, decisions, events, now, slots=None) -> str:
     slots = slots or {"heavy": 3, "light": 2}
     tickets = state["tickets"]
@@ -177,9 +243,7 @@ def render(state, decisions, events, now, slots=None) -> str:
     used["heavy"] += sum(1 for e in active_ext if e.get("weight") == "heavy")
     bar = lambda n, cap: "".join('<i class="on"></i>' if i < n else "<i></i>" for i in range(max(cap, n)))
     queue = store.queue_view(state)          # 「挡几张」读时现算（R3）
-    rows = "".join(f'<div class="row"><div class="what"><b>{_e(q["summary"])}</b>'
-                   f'<small>{_e(q["id"])} · {_e(KIND.get(q["kind"], q["kind"]))} · 挡 {_e(q["blocks"])} 张 · {_e(_hhmm(q["created_at"]))}</small></div>'
-                   f'<span class="say">{_e(_say(q))}</span></div>' for q in queue) or \
+    rows = "".join(_queue_row(state, q) for q in queue) or \
         '<div class="row"><div class="what"><small>没有要你做的事。</small></div></div>'
     order = sorted(tickets.values(), key=lambda t: (GROUP_ORDER[GROUP.get(t["status"], "off")], t["priority"], int(t["id"][1:])))
     cards = "".join(_ticket_card(t, events.get(t["id"], []), now) for t in order)

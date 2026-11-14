@@ -51,3 +51,11 @@ def conflicts(state, tid, surfaces) -> dict:
 
 def weight_for(surfaces, table) -> str:
     return "heavy" if any(table.get(s, {}).get("weight") == "heavy" for s in surfaces) else "light"
+
+
+def ticket_weight(kind, surfaces, table) -> str:
+    """票的轻重：业务票、维护票没声明代码面 ⇒ 按重票（占重名额、过磁盘闸；不知道会不会编译 Rust）；
+    其余照代码面算。老票不变（没代码面 = 轻）。"""
+    if kind in ("business", "maint") and not surfaces:
+        return "heavy"
+    return weight_for(surfaces, table)

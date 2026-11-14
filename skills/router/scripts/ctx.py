@@ -52,9 +52,14 @@ class Ctx:
 
         经 exec_receipt.py 起：它在 exec 真正的命令之前，按需（env 里有 ROUTER_RECEIPT）原子写启动回执，
         再通过一条 close-on-exec 管道告诉这里 exec 成没成。语义与 Popen 一致：
-        抛异常 ⇔ 子进程没起（找不到可执行文件、回执写不进去……）；返回 pid ⇔ 已经 exec。"""
+        抛异常 ⇔ 子进程没起（找不到可执行文件、回执写不进去……）；返回 pid ⇔ 已经 exec。
+        env 里值为 None 的键 = 从继承的环境里去掉（分析 agent 的 calibrate 不许知道 ROUTER_HOME）。"""
         full_env = {k: v for k, v in os.environ.items() if k not in SESSION_ENV}
-        full_env.update(env or {})
+        for k, v in (env or {}).items():
+            if v is None:
+                full_env.pop(k, None)
+            else:
+                full_env[k] = v
         Path(log).parent.mkdir(parents=True, exist_ok=True)
         r, w = os.pipe()
         try:

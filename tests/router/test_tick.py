@@ -229,6 +229,19 @@ def test_dispatch_creates_worktree_and_brief(proj):
         assert part in brief
 
 
+def test_brief_business_section_only_for_business(proj):
+    """9b（concern 5）：派单带票类型；「业务票」一节只在 kind=business 时出现。"""
+    proj.put(T1=("queued", ["weekly-report"], {"start_ok": True, "issue": 7, "title": "老票"}),
+             T2=("queued", ["her-reply-prompt"], {"start_ok": True, "issue": 8, "title": "业务票", "kind": "business",
+                                                  "authorized": True, "attempts": [], "walls": []}))
+    proj.run()
+    briefs = {sp["env"]["ROUTER_TICKET"]: sp["cmd"][sp["cmd"].index("-p") + 1] for sp in proj.ctx.spawned}
+    assert set(briefs) == {"T1", "T2"}
+    assert "票类型：legacy" in briefs["T1"] and "## 业务票" not in briefs["T1"]
+    assert "票类型：business" in briefs["T2"] and "## 业务票" in briefs["T2"]
+    assert "$" not in briefs["T2"].replace("$ROUTER", "")                      # 没有漏代入的变量
+
+
 def test_waiting_for_explains_queue_reason(proj):
     proj.put(T1=("executing", ["her-reply-prompt"], {"weight": "heavy", "worker": {"pid": 123, "log": None}}),
              T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "start_ok": True}),
@@ -249,15 +262,40 @@ def test_heavy_blocked_when_cargo_dir_too_big(proj):
     assert "CARGO_TARGET_DIR" in proj.state()["tickets"]["T1"]["waiting_for"]
 
 
-def test_new_weekly_run_sets_triage_needed_once(proj):
+def test_new_weekly_run_starts_weekly_analyst_once(proj):
+    """v2：新周报不再出 triage_needed，改为起分析 agent 的 weekly 跑（每期一次）。"""
+    (proj.tmp / "brief.md").write_text("合成 brief\n")
+    proj.cfg["analyst"] = {"brief": str(proj.tmp / "brief.md"), "daily_at_utc": "23:00"}   # 时钟 10:00Z：不触发 daily
+    weekly = lambda: [r for r in (proj.state().get("analyst") or {}).get("runs", {}).values() if r["mode"] == "weekly"]
     proj.put()
     (proj.runs / "2026-10-19").mkdir(); (proj.runs / "2026-10-19" / "sent").write_text("")
     (proj.runs / "2026-10-26").mkdir()                                     # 还没发出去
-    assert proj.run()["triage_needed"] == "2026-10-19"
+    res = proj.run()
+    assert "triage_needed" not in res and [r["week"] for r in weekly()] == ["2026-10-19"]
+    assert proj.run() and len(weekly()) == 1 and len(proj.ctx.spawned) == 1            # 同一期不再起
+    proj.ctx.alive.clear()
     (proj.runs / "2026-10-26" / "sent").write_text("")
-    assert proj.run()["triage_needed"] == "2026-10-26"
-    s = proj.state(); s["batch"]["id"] = "2026-10-26"; store.save_state(proj.home / "state.json", s)
-    assert proj.run()["triage_needed"] is None
+    proj.run()
+    assert [r["week"] for r in weekly()] == ["2026-10-19", "2026-10-26"]
+    assert proj.state()["analyst"]["last_weekly"] == "2026-10-26"
+    proj.run()
+    assert len(weekly()) == 2 and len(proj.ctx.spawned) == 2
+
+
+@pytest.mark.parametrize("how", ["batch_id", "drafted"])
+def test_weekly_already_triaged_by_v1_not_rerun(proj, how):
+    """v1 已经分诊过的那一期（batch.id 就是它，或已有票的 batch 是它）：不再起 weekly。"""
+    (proj.tmp / "brief.md").write_text("合成 brief\n")
+    proj.cfg["analyst"] = {"brief": str(proj.tmp / "brief.md"), "daily_at_utc": "23:00"}
+    s = proj.put(T1=("draft", [], {"batch": "2026-10-26" if how == "drafted" else None}))
+    if how == "batch_id":
+        s["batch"]["id"] = "2026-10-26"
+        store.save_state(proj.home / "state.json", s)
+    (proj.runs / "2026-10-26").mkdir(); (proj.runs / "2026-10-26" / "sent").write_text("")
+    res = proj.run()
+    assert proj.ctx.spawned == [] and "analyst_done" not in res and res["errors"] == []
+    assert not (proj.state().get("analyst") or {}).get("runs")
+    assert "last_weekly" not in (proj.state().get("analyst") or {})
 
 
 def test_notify_only_counts_and_ids(proj):
@@ -1464,6 +1502,18 @@ def test_watch_hands_postlaunch_due_every_round_until_recorded(proj, monkeypatch
     assert out["woke"] == ["max_minutes"] and out["postlaunch_due"] == []
 
 
+def test_watch_exits_on_pending_wake_keys(proj, monkeypatch):
+    proj.put(T1=_postlaunch())
+    st = proj.state()
+    st["wake"] = {"rollback_needed": [{"ticket": "T1", "rollback": "关开关"}]}
+    (proj.home / "state.json").write_text(json.dumps(st))
+    monkeypatch.setattr(tick.time, "sleep", lambda s: None)
+    env = SimpleNamespace(ctx=proj.ctx, root=proj.root, cfg=proj.cfg)
+    out = tick.cmd_watch(SimpleNamespace(interval=0, max_minutes=10), env)
+    assert out["woke"] == ["rollback_needed"] and out["rollback_needed"][0]["ticket"] == "T1"
+    assert "wake" not in proj.state()
+
+
 def test_zero_code_inrepo_impl_done_awaits_prod_not_stuck(proj):
     proj.put(T1=running("executing", ["her-reply-prompt"], log=log_with(proj, "T1", "{}"), card_confirmed=True, issue=31),
              T2=("queued", ["her-reply-prompt"], {"start_ok": True, "blocked_by": ["T1"], "issue": 32}))
@@ -1541,3 +1591,51 @@ def test_zero_code_git_failure_retries_next_round(proj, tmp_path):
     proj.ctx.script(["git", "-C", str(proj.root), "worktree", "remove"], "", returncode=0)   # 锁没了
     proj.run()                                                                     # 下一轮重试成功
     assert proj.state()["tickets"]["T1"]["worker"]["worktree"] is None
+
+
+def test_business_no_handson_after_merge(proj):
+    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41, "card_confirmed": True,
+                                                     "kind": "business", "authorized": True,
+                                                     "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}))
+    _pr_fake(proj)
+    proj.run()
+    s = proj.state()
+    assert s["tickets"]["T1"]["status"] == "await_prod" and s["tickets"]["T1"]["merge_sha"] == "deadbeef"
+    assert not [q for q in s["queue"] if q["kind"] == "handson"]
+
+
+def test_irreversible_tag_goes_to_user(proj):
+    proj.put(T1=running("executing", ["weekly-report"], log=log_with(proj, "T1", '{"type":"result","is_error":false}')))
+    events.emit(proj.home, "T1", "decision", "要删一张表", "x", tags=["irreversible"], at="2026-11-02T10:01:00Z")
+    proj.run()
+    q = proj.state()["queue"][0]
+    assert (q["kind"], q["ticket"]) == ("spend", "T1")
+    assert proj.state()["tickets"]["T1"]["status"] == "paused"
+
+
+def test_store_release_tag_goes_to_user(proj):
+    proj.put(T1=running("executing", ["weekly-report"], log=log_with(proj, "T1", '{"type":"result","is_error":false}')))
+    events.emit(proj.home, "T1", "decision", "要发商店包", "x", tags=["store_release"], at="2026-11-02T10:01:00Z")
+    proj.run()
+    s = proj.state()
+    assert (s["queue"][0]["kind"], s["tickets"]["T1"]["status"]) == ("spend", "paused")
+
+
+def test_unauthorized_business_ticket_keeps_handson_after_merge(proj):
+    proj.put(T1=("verifying", ["her-reply-prompt"], {"weight": "heavy", "issue": 11, "pr": 41, "card_confirmed": True,
+                                                     "kind": "business", "authorized": False,
+                                                     "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}))
+    _pr_fake(proj)
+    proj.run()
+    s = proj.state()
+    assert s["tickets"]["T1"]["status"] == "merged_staging" and [q["kind"] for q in s["queue"]] == ["handson"]
+
+
+def test_requeued_attempt_can_overtime_again(proj):
+    # 重派后 card_ready_at 已清：新一轮 kickoff 超时检查能再触发
+    proj.put(T1=running("kickoff", ["a"], kickoff_at="2026-11-02T09:29:00Z"))
+    proj.ctx.alive.add(123)
+    assert proj.run()["cards_for_review"] == ["T1"]
+    s = proj.state(); s["tickets"]["T1"].pop("card_ready_at", None); s["tickets"]["T1"]["kickoff_at"] = "2026-11-02T09:28:00Z"   # 重派 = 新 kickoff_at
+    store.save_state(proj.home / "state.json", s)
+    assert proj.run()["cards_for_review"] == ["T1"]

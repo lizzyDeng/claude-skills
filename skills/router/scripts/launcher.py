@@ -87,10 +87,11 @@ def is_ancestor(ctx, repo, base, a, b):
     return {0: True, 1: False}.get(r.returncode)
 
 
-def create_worktree(ctx, repo: Path, base_branch: str, wt_dir: str, tid: str):
-    """幂等：上次派到一半崩了（worktree 或分支已在），这次接着用，不报错。"""
-    branch = f"router/{tid}"
-    wt = Path(repo) / wt_dir / f"router-{tid}"
+def create_worktree(ctx, repo: Path, base_branch: str, wt_dir: str, tid: str, branch: str = None):
+    """幂等：上次派到一半崩了（worktree 或分支已在），这次接着用，不报错。
+    branch 缺省 router/<T>；业务票重新排队的尝试给 router/<T>-a<n>（新分支从 origin/<base> 切，worktree 目录跟着分支名）。"""
+    branch = branch or f"router/{tid}"
+    wt = Path(repo) / wt_dir / branch.replace("/", "-", 1)
     if wt.is_dir():
         return wt, branch
     _git(ctx, repo, "fetch", "origin", base_branch, timeout=FETCH_S)

@@ -77,6 +77,13 @@ def test_create_and_remove_worktree_commands(fake, tmp_path):
     assert fake.last_call() == ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt)]
 
 
+def test_create_worktree_named_branch_per_attempt(fake, tmp_path):
+    """9b round 2（controller 裁决）：业务票每次重新排队的尝试用新分支 router/<T>-a<n>，从 base 切，不用合过的旧分支。"""
+    wt, branch = create_worktree(fake, tmp_path, "staging", ".claude/worktrees", "T3", branch="router/T3-a2")
+    assert branch == "router/T3-a2" and wt == tmp_path / ".claude/worktrees" / "router-T3-a2"
+    assert ["git", "-C", str(tmp_path), "worktree", "add", "-b", "router/T3-a2", str(wt), "origin/staging"] in fake.calls
+
+
 def test_create_worktree_failure_raises(fake, tmp_path):
     import pytest
     fake.script(["git", "-C", str(tmp_path), "worktree", "add"], "", returncode=128, stderr="already exists")

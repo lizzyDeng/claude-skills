@@ -1,19 +1,23 @@
 """一轮巡检。顺序写死（计划 Task 9），实现者不要改顺序：
 
-0 新周报 → triage_needed      1 扫外部 session，查抢锁      2 处理退出的 worker
+0 新周报 → 分析 agent weekly 跑（+ 转 release_sync.unlabeled）   0b 分析 agent：收尾退出的 run、每日起 daily
+1 扫外部 session，查抢锁      2 处理退出的 worker
 3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时；4b 上线验收到期
 5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       6 派发      7 看板 + Lark
 
 整轮持 <home>/.lock。每一步单独 try：一步出错不拖垮后面几步，错误进返回值。
 """
+import copy
+import json
 import os
 import shutil
 import string
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import analyst
 import board
 import discover
 import events
@@ -25,10 +29,12 @@ import store
 import surfaces
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-WAKE_KEYS = ("triage_needed", "new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
-             "postlaunch_due")
+WAKE_KEYS = ("new_queue", "slow_path_events", "external_deliveries", "cards_for_review",
+             "postlaunch_due", "rollback_needed", "no_entry", "return_to_user", "analyst_done", "releases_unlabeled",
+             "prod_ready")
 # 零代码仓内票（只改配置，没有 PR）报 impl_done 后的「在等什么」：router 在用户放行上 prod 后执行配置，再 released --t0
 ZERO_CODE_WAIT = "零代码：router 执行配置后 released --t0"
+STOP_TAGS = {"spend", "irreversible", "store_release"}    # 仍要用户批的三类（花钱 / 撤不回 / 发商店包）
 STOP_KIND = {"decision": "direction", "assumption_broken": "direction", "overreach": "conflict"}
 # 意图在、启动回执不在：这么久之内按「可能还在起」保留意图（wrapper 写回执在 exec 之前，正常 <1 秒、
 # 最坏约 ps 超时 10 秒 + 解释器启动）；超过就是从没起过，清掉重派。起点 = 意图自己的 at（落盘那一刻）。
@@ -61,7 +67,7 @@ def _ts(s):
 
 
 def _empty_res() -> dict:
-    return {"triage_needed": None, "dispatched": [], "dispatch_failed": [], "new_queue": [],
+    return {"dispatched": [], "dispatch_failed": [], "new_queue": [],
             "slow_path_events": [], "external_deliveries": [], "cards_for_review": [], "postlaunch_due": [],
             "notified": False, "errors": []}
 
@@ -239,24 +245,184 @@ class Run:
         store.append_decision(self.home / "decisions.md", self.state, "-", what, AUTO_FIX_WHY, basis, self.now,
                               key=inc["key"])
 
-    # ---- 0 ----
+    # ---- 0：新周报 → 分析 agent weekly（替代 v1 分诊）----
     def step0_weekly(self):
-        runs = Path(os.path.expanduser(self.cfg.get("weekly_runs_dir", "")))
-        if not runs.is_dir():
+        latest = self._new_weekly()
+        if not latest:
             return
+        an = self.state.setdefault("analyst", {})
+        an["last_weekly"] = latest              # 先记：起不来也不每分钟重试（router 可手动 analyst run --mode weekly）
+        unlabeled = self._unlabeled(latest)
+        if unlabeled:                           # 原来由分诊转：现在巡检直接交给 router，由它转给用户
+            self.state.setdefault("wake", {})["releases_unlabeled"] = unlabeled
+        if not analyst.enabled(self.cfg):
+            self._analyst_failed(None, "weekly", f"新周报 {latest}：config 没配 analyst.brief，分析 agent 没跑 weekly")
+            return
+        try:
+            rid = analyst.start(self._env(), self.state, "weekly", week=latest)
+        except Exception as e:  # noqa: BLE001
+            self._analyst_failed(None, "weekly", f"新周报 {latest}：分析 agent weekly 没起来（{str(e)[:160]}）；"
+                                                 "修好后跑 router.py analyst run --mode weekly")
+            return
+        self.state["analyst"]["runs"][rid].setdefault("week", latest)
+
+    def _weekly_runs_dir(self) -> Path:
+        return Path(os.path.expanduser(self.cfg.get("weekly_runs_dir", "")))
+
+    def _new_weekly(self):
+        """最新一期已发出（有 sent）的周报，且 v1 没分诊过、分析 agent 也没跑过 → 期号；否则 None。"""
+        runs = self._weekly_runs_dir()
+        if not runs.is_dir():
+            return None
         weeks = sorted(d.name for d in runs.iterdir() if (d / "sent").exists())
         if not weeks:
-            return
+            return None
         latest = weeks[-1]
-        drafted = any(t["batch"] == latest for t in self.state["tickets"].values())
-        if latest != self.state["batch"]["id"] and not drafted:
-            self.res["triage_needed"] = latest
+        drafted = any(t.get("batch") == latest for t in self.state["tickets"].values())
+        seen = latest in (self.state["batch"]["id"], (self.state.get("analyst") or {}).get("last_weekly"))
+        return None if drafted or seen else latest
+
+    def _unlabeled(self, week) -> list:
+        p = self._weekly_runs_dir() / week / "summary.json"
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.res["errors"].append(f"新周报 {week}：summary.json 读不了（{str(e)[:120]}），release_sync.unlabeled 没转")
+            return []
+        rs = data.get("release_sync") if isinstance(data, dict) else None
+        u = rs.get("unlabeled") if isinstance(rs, dict) else None
+        return list(u) if isinstance(u, list) else []
+
+    def _env(self):
+        """propose_from / apply_daily / analyst.start 要的 router.Env，用这一轮的 cfg 和 home（cfg 不一定落了盘）。"""
+        import router
+        env = router.Env(self.root, self.ctx)
+        env.cfg, env.home, env.table = self.cfg, self.home, self.table
+        env.state_path, env.decisions = self.home / "state.json", self.home / "decisions.md"
+        return env
+
+    # ---- 0b：分析 agent ----
+    def step_analyst(self):
+        """先收尾退出的 run（每个只收一次），再看要不要起今天的 daily。"""
+        for rid, run in list(((self.state.get("analyst") or {}).get("runs") or {}).items()):
+            if analyst.finished(run):
+                continue
+            try:
+                self._analyst_collect(rid, run)
+            except Exception as e:  # noqa: BLE001 — 一个 run 出错不挡其它 run
+                self.res["errors"].append(f"分析 agent {rid}：收尾出错 {e!r}")
+        if analyst.enabled(self.cfg):
+            self._analyst_daily()
+
+    def _analyst_daily(self):
+        """UTC 过了 analyst.daily_at_utc、今天还没起过 ⇒ 起 daily。起不来也记 last_daily：当天不再试，次日才重跑。"""
+        now = self.ctx.now()
+        an = self.state.setdefault("analyst", {})
+        today = now.strftime("%Y-%m-%d")
+        if an.get("last_daily") == today or (now.hour, now.minute) < analyst.daily_at(self.cfg):
+            return
+        an["last_daily"] = today
+        try:
+            analyst.start(self._env(), self.state, "daily", (now - timedelta(days=1)).strftime("%Y-%m-%d"), today)
+        except Exception as e:  # noqa: BLE001
+            self._analyst_failed(None, "daily", f"分析 agent daily 没起来（{str(e)[:160]}）：今天不再试")
+
+    def _analyst_collect(self, rid, run):
+        live = launcher.worker_liveness(self.ctx, run)
+        if live != "dead":                      # 还在跑（或认不出）：不动；跑太久才判失败
+            if _ts(self.now) - _ts(run.get("started_at")) >= analyst.STALE_S:
+                launcher.stop_worker(self.ctx, run)          # 身份对得上才停
+                how = "认不出进程，没停" if live == "unknown" else "已停掉"
+                self._analyst_fail(rid, f"跑了 {analyst.STALE_S // 3600} 小时还没退出（{how}）")
+            return
+        data, err = analyst.read_out(run["out"])
+        if err:
+            self._analyst_fail(rid, err)
+            return
+        self._analyst_ingest(rid, data)
+
+    def _analyst_fail(self, rid, why):
+        """标 failed、报一次错并叫醒 router：不改别的状态，不自动重跑。"""
+        run = self.state["analyst"]["runs"][rid]
+        run.update(failed=True, error=why[:300], failed_at=self.now)
+        self._analyst_failed(rid, run["mode"], f"分析 agent {rid}（{run['mode']}）失败：{why}；不自动重跑"
+                                               f"（要重跑：router.py analyst run --mode {run['mode']}）")
+
+    def _analyst_failed(self, rid, mode, text):
+        """分析 agent 没跑成：errors 一条 + 唤醒键 analyst_done（failed）。只进 errors 的话 watch 要连错 3 轮才醒。"""
+        self.res["errors"].append(text)
+        self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+            {"run": rid, "mode": mode, "failed": True, "error": text})
+
+    def _analyst_ingest(self, rid, data):
+        """daily → apply_daily；weekly / migrate → propose_from（模式以 run 记录为准，产出自称什么不算）；
+        calibrate → 只叫醒 router（analyst_done），由它判过没过。期间直接推进决定单的项也进 new_queue。"""
+        import router
+        snap = copy.deepcopy(self.state)
+        before = {q["id"] for q in self.state["queue"]}
+        mode = self.state["analyst"]["runs"][rid]["mode"]
+        # 先标「收过」：收的过程中续跑 worker 会中途存盘，盘上必须已经是收过，崩了重启也不会再收一次
+        self.state["analyst"]["runs"][rid]["ingested"] = self.now
+        try:
+            if mode == "daily":
+                out = router.apply_daily(self._env(), self.state, data)
+                result = {"applied": len(out["applied"]), "errors": out["errors"], "notes": out.get("notes", "")}
+                for e in out["errors"]:
+                    self.res["errors"].append(f"分析 agent {rid}：第 {e['index'] + 1} 条 {e['kind']}"
+                                              f"（{e.get('ticket') or '-'}）没落：{str(e['error'])[:160]}")
+            elif mode == "weekly":
+                out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
+                result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
+                          "maint": out["maint"]}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
+            elif mode == "migrate":                # 不自动落：整份清单交用户确认，router 再 migrate-apply（controller 裁决）
+                router.migrate_check(self._env(), copy.deepcopy(self.state), data)       # 先验一遍：坏清单不交给用户
+                result = {"awaiting_confirm": True}
+                run = self.state["analyst"]["runs"][rid]
+                self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+                    {"run": rid, "mode": mode, "out": run["out"]})
+            else:
+                result = {}
+                run = self.state["analyst"]["runs"][rid]
+                self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+                    {"run": rid, "mode": mode, "out": run["out"]})
+        except Exception as e:  # noqa: BLE001 — 整份拒收（校准门 / 泄漏 / 格式）：状态复原，按失败报一次
+            self.state.clear()
+            self.state.update(snap)
+            self._analyst_fail(rid, f"产出没收进来：{str(e)[:200]}（产出在 {snap['analyst']['runs'][rid]['out']}）")
+            return
+        self.state["analyst"]["runs"][rid]["result"] = result
+        self.res["new_queue"] += [q["id"] for q in self.state["queue"] if q["id"] not in before]
+
+    def step_maint_start(self):
+        """DRAFT 的维护票（收产出 / maint add 留下的）：start。失败只记一条错、票留 DRAFT，下一轮重试；不回滚任何东西。"""
+        import router
+        ids = [tid for tid, t in self.state["tickets"].items()
+               if store.ticket_kind(t) == "maint" and t["status"] == store.DRAFT]
+        if not ids:
+            return
+        try:
+            router._start_locked(self._env(), self.state, ids)
+        except Exception as e:  # noqa: BLE001
+            self.res["errors"].append(f"维护票 {' '.join(ids)} start 没成（留在 DRAFT，下一轮重试）：{str(e)[:200]}")
 
     # ---- 1 ----
+    def _router_checkouts(self):
+        """router 自己的分支和 worktree 路径（当前 worker、旧尝试、留着待人处理的旧 checkout）：discover 不当外部 session。"""
+        branches, paths = set(), set()
+        for t in self.state["tickets"].values():
+            w = t.get("worker") or {}
+            branches.add(w.get("branch")); paths.add(w.get("worktree"))
+            for x in (t.get("attempts") or []) + (t.get("stale_checkouts") or []):
+                branches.add(x.get("branch")); paths.add(x.get("worktree"))
+        return {b for b in branches if b}, {p for p in paths if p}
+
     def step1_external(self):
+        branches, paths = self._router_checkouts()
         ext = discover.scan(self.ctx, self.root, f"origin/{self.cfg.get('base_branch', 'staging')}", self.table,
-                            set(), self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24),
-                            self.cfg.get("repo"))
+                            branches, self.cfg.get("stale_min", 45), self.cfg.get("external_lock_hours", 24),
+                            self.cfg.get("repo"), router_paths=paths)
         self.state["external"] = ext
         # 同一个冲突只报一次：答完之后外部 session 仍持有那块代码，也不再每分钟叫用户（反目标 5）
         current = {f"{wt}|{surf}|{tid}": (wt, surf, tid) for wt, surf, tid in discover.conflicts_with_router(self.state, ext)}
@@ -308,16 +474,18 @@ class Run:
         phase = last.get("phase") if last else None
         if last and last.get("stop"):
             t["stops"] += 1
-            kind = "spend" if "spend" in last.get("affects", {}).get("tags", []) else STOP_KIND[last["type"]]
+            kind = "spend" if STOP_TAGS & set(last.get("affects", {}).get("tags", [])) else STOP_KIND[last["type"]]
             prefix = {"assumption_broken": "核心假设被推翻：", "overreach": "要越界："}.get(last["type"], "")
-            qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}")
+            # 核心假设被推翻 = 用户确认过的方向不成立了：方向归用户，router 不能代答（v2.1 第 1 条）
+            topic = "assumption" if kind == "direction" and last["type"] == "assumption_broken" else None
+            qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}", topic=topic)
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
         elif phase == "card_ready" and t["status"] == store.KICKOFF:
             t["card_ready_at"] = self.now
             t["waiting_for"] = "router 方向审中"
             self.res["cards_for_review"].append(tid)
         elif phase == "pr_opened" and not t.get("card_confirmed"):
-            # 🔴 方向卡没经用户确认就开了 PR：不进验收，更不会被合（方案确认归用户）
+            # 🔴 方向卡没经用户确认就开了 PR：不进验收，更不会被合（方案确认归用户，业务票也一样）
             qid = self.queue(tid, "direction", f"{tid}：方向卡还没确认就开了 PR，不会合；先确认或驳回方向卡")
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
         elif phase == "pr_opened":
@@ -330,6 +498,7 @@ class Run:
             t["fail_streak"] = {"step": "", "count": 0}
             store.set_status(self.state, tid, store.AWAIT_PROD, self.now, ZERO_CODE_WAIT)
             self._drop_zero_code_checkout(tid, t)
+            self._prod_ready(tid, t)
         elif pause:
             store.set_status(self.state, tid, store.PAUSED, self.now, "你让它先停，已停在检查点")
         elif result and result.get("is_error"):
@@ -362,6 +531,8 @@ class Run:
                 if ev.get("type") not in events.TYPES or ev["type"] in ("decision", "overreach"):
                     continue                          # progress / 坏行不路由；decision / overreach 走第 2 步的决定单
                 hits, exts, fast = events.route(self.state, ev)
+                if ev["type"] == "finding" and "gallery" in (ev.get("affects") or {}).get("tags", []):
+                    fast = False                      # 对照页（v2.1 第 7 条）：有订阅方也交 router，由它 open 给用户看
                 for h in hits:
                     events.deliver(self.home, h, ev)
                 for x in exts:
@@ -591,7 +762,13 @@ class Run:
                                        f"备份 {self.home}/backups/{tid}/（满意说「{tid} 核对过了」；"
                                        f"不满意说「{tid} 不满意：…」）", topic="offrepo")
             return
-        store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
+        owned = store.router_owned(t)
+        if owned:
+            store.set_status(self.state, tid, store.AWAIT_PROD, self.now,
+                             "已合 staging（票级授权，免走查）：等 router 按发版批次上 prod")
+            self._prod_ready(tid, t)
+        else:
+            store.set_status(self.state, tid, store.MERGED, self.now, f"等你 {base} 走查")
         try:
             guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
         except github.GuardEmpty as e:
@@ -607,7 +784,14 @@ class Run:
                 self.res["errors"].append(f"删 worktree {tid}：{e}")      # 删失败：保留指针，接管命令仍可用
             else:
                 w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
-        self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+        if not owned:
+            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+
+    def _prod_ready(self, tid, t):
+        """票级授权的业务票进了 await_prod（合 staging / 零代码做完）：唤醒 router 跑 prod-batch（终审 #1）——
+        整批都可上 ⇒ router 自己上；还有待走查 / 待放行的票 ⇒ prod 项交用户。老票照 v1，不叫醒。"""
+        if store.router_owned(t):
+            self.state.setdefault("wake", {}).setdefault("prod_ready", []).append({"ticket": tid})
 
     # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
     def step5a_closeout(self):
@@ -653,12 +837,33 @@ class Run:
                 progressed = True
                 if v == "done":
                     w[col] = None             # 清了才清指针：看板不再给失效的接管命令
+        progressed |= self._closeout_old_branches(t, co, errs)
         if self._gh_open(co):
             if guard is None:
                 errs.append(guard_err or "收尾暂停：防泄漏闸失效")
             else:
                 progressed |= self._closeout_github(tid, t, co, guard, errs)
         self._closeout_note(tid, t, errs, progressed)
+
+    def _closeout_old_branches(self, t, co, errs) -> bool:
+        """业务票旧尝试的本地分支（关票时只列已合并的）：没有未推送提交才删；那次尝试的旧 checkout 还在
+        （stale_checkouts，交人处理）⇒ 不碰，记 kept。done / kept 不再重试，error 下一轮重试。"""
+        olds, progressed = co.get("old_branches") or {}, False
+        stale = {x.get("branch"): x.get("worktree") for x in t.get("stale_checkouts") or []}
+        for b, v in olds.items():
+            if v != "pending":
+                continue
+            if stale.get(b) and Path(stale[b]).exists():
+                olds[b] = "kept: 旧 checkout 还在（stale_checkouts，交人处理）"
+                progressed = True
+                continue
+            r = launcher.cleanup_ticket_checkout(self.ctx, self.root, None, b).get("branch") or "error: 没有结果"
+            if r.startswith("error"):
+                errs.append(f"旧分支 {b}：{r[len('error: '):]}")
+                continue
+            olds[b] = r
+            progressed = True
+        return progressed
 
     def _closeout_github(self, tid, t, co, guard, errs) -> bool:
         repo, progressed = self.cfg["repo"], False
@@ -706,6 +911,11 @@ class Run:
         return str(at)[:10]
 
     def _closeout_body(self, tid, t) -> str:
+        if t.get("merged_into"):                       # v2.1：并进另一张业务票（同一业务目标）
+            into = self.state["tickets"].get(t["merged_into"]) or {}
+            ref = f" #{into['issue']}" if into.get("issue") else ""
+            return (f"本票已并入 {t['merged_into']}{ref}（同一业务目标、同一指标）：墙、证据、尝试都挪过去了，"
+                    "之后在那张票上推进。由 /router 关闭。")
         surf = "、".join(t.get("surfaces", [])) or "未声明"
         return (f"仓外改动已由用户核对（{self._done_date(t)}），本票完成。改动在本机（代码面：{surf}），"
                 f"不经 PR / staging。由 /router 关闭。")
@@ -773,7 +983,8 @@ class Run:
         w = t["worker"]
         try:
             wt, branch = launcher.create_worktree(self.ctx, self.root, self.cfg.get("base_branch", "staging"),
-                                                  self.cfg.get("worktree_dir", ".claude/worktrees"), tid)
+                                                  self.cfg.get("worktree_dir", ".claude/worktrees"), tid,
+                                                  branch=w.get("branch"))
         except Exception as e:  # noqa: BLE001
             self._fail(tid, "worktree", e)
             return "failed"
@@ -918,11 +1129,20 @@ class Run:
 
 
 def _brief(run, tid):
+    """派单 = templates/brief.md；业务票（kind=business）再代入 templates/brief_business.md 那一节（9b，concern 5）。"""
     t = run.state["tickets"][tid]
     why = t.get("why", {})
+    kind = store.ticket_kind(t)
     tpl = string.Template((SKILL_DIR / "templates" / "brief.md").read_text(encoding="utf-8"))
+    biz = ""
+    if kind == "business":
+        import router
+        prod = router._product_line(t.get("product")) or "（分析 agent 没写：方向卡上自己先写产品诊断五问）"
+        biz = string.Template((SKILL_DIR / "templates" / "brief_business.md").read_text(encoding="utf-8")) \
+            .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"), product=prod)
     return tpl.safe_substitute(
-        ticket=tid, title=t["title"],
+        ticket=tid, title=t["title"], kind=kind, business_section=biz,
+        branch=t["worker"].get("branch") or f"router/{tid}",
         issue_line=f"GitHub：{run.cfg['repo']}#{t['issue']}" if t.get("issue") else "（没有 issue）",
         worker_md=str(SKILL_DIR / "worker.md"),
         why_metric=why.get("metric", ""), why_users=why.get("users", ""), why_evidence=why.get("evidence", ""),
@@ -937,7 +1157,7 @@ def _brief(run, tid):
                 f"{run.home}/backups/{tid}/（cp -a，保留目录结构）；改完把 `diff -ru <备份> <现状>` 写到 "
                 f"{run.home}/cards/{tid}.diff，跑验收，然后 progress impl_done 退出。")
         if run._offrepo(t) else
-        (f"改完照 worker.md 第 3 段：推 router/{tid}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
+        (f"改完照 worker.md 第 3 段：推 {t['worker'].get('branch') or f'router/{tid}'}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
          "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"
          "方向卡确认的方案只改配置、不改仓库代码（零代码票）：不开 PR，照 worker.md 第 3 段「零代码票」做，"
          "然后 progress impl_done 退出。"))
@@ -994,7 +1214,8 @@ def dispatch(ctx, root, cfg, state, run=None) -> list:
     heavy_cand = any(t["status"] == store.QUEUED and t["start_ok"] and t["weight"] == "heavy"
                      for t in state["tickets"].values())
     disk = run.disk_block() if heavy_cand else ""
-    picked = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), bool(disk))
+    picked = scheduler.pick_dispatch(state, cfg.get("slots", {"heavy": 3, "light": 2}), bool(disk),
+                                     cfg.get("analyst", {}).get("maint_slots", 1))
     done = []
     if picked and run.ensure_base()["ok"]:
         for tid in picked:
@@ -1025,14 +1246,17 @@ def run(ctx, root, cfg, resurface=False) -> dict:
     with store.locked(home):
         state = store.load_state(home / "state.json")
         r = Run(ctx, root, cfg, state)
-        for step in (r.step0_weekly, r.step1_external, r.step2_exits, r.step3_events, r.step4_patrol,
-                     r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
+        for step in (r.step0_weekly, r.step_analyst, r.step_maint_start, r.step1_external, r.step2_exits, r.step3_events,
+                     r.step4_patrol, r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
             try:
                 step()
             except Exception as e:  # 一步出错不拖垮整轮；错误交给 router
                 r.res["errors"].append(f"{step.__name__}：{e!r}\n{traceback.format_exc(limit=3)}")
         if resurface:
             _resurface(r)
+        # 唤醒键（verdict 的 rollback_needed / no_entry / return_to_user，分析 agent 的 analyst_done / releases_unlabeled）：
+        # 弹出交给 router
+        r.res.update(state.pop("wake", None) or {})
         store.save_state(home / "state.json", state)
     return r.res
 
