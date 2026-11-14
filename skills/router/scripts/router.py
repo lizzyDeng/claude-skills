@@ -33,7 +33,7 @@ RESUME_KINDS = {"card", "spend", "direction", "stuck", "conflict"}
 ROUTER_ONLY = {"draft", "add", "start", "answer", "submit-card", "decide", "revoke", "tell", "stop", "takeover",
                "handback", "prioritize", "walkthrough-done", "prod-batch", "released", "postlaunch-result", "surfaces",
                "ack-slow", "review-pack", "review-canary", "propose", "verdict", "apply-daily", "analyst", "maint", "impact",
-               "redirect", "close", "absorb", "migrate-apply", "merge"}
+               "redirect", "close", "absorb", "migrate-apply", "merge", "walls", "daemon", "feed", "ack"}
 # answer --as-router 只收这几类、且只收票级授权的业务票：方向卡（card）、花钱 / 撤不回 / 发商店包（spend）、判真、关票、
 # 有害 / 退回（harm、return）都归用户；方向项里问「要下一个方向吗」（next）和「核心假设被推翻」（assumption）也归用户（v2.1 第 1 条）
 AS_ROUTER_KINDS = {"direction", "stuck", "conflict"}
@@ -388,6 +388,9 @@ def _start_locked(env, st, sel):
             except github.GhError as e:
                 errors.append({"ticket": tid, "error": str(e)})
                 continue
+            if store.ticket_kind(t) == "business":       # 建票时写的正文就是同步的起点：巡检不再立刻重发一遍
+                t["issue_sync"] = {"hash": github.body_hash(t["title"], github.issue_body(st["map"], t)),
+                                   "title": t["title"], "at": env.now()}
             store.save_state(env.state_path, st)          # 建一张存一次：中途崩了重跑不会重复建票
         t["start_ok"] = True
         store.set_status(st, tid, store.QUEUED, env.now())
@@ -479,6 +482,10 @@ def cmd_answer(a, env):
             if t:
                 t.pop("dispatch_fail", None)
             hint = "下一轮重派"
+        elif topic == "issue_sync":                      # 正文过不了防泄漏闸：只记回答，下一轮按当前文本重试
+            if t:
+                (t.get("issue_sync") or {}).pop("blocked", None)
+            hint = "下一轮巡检按票上当前的文本重试同步（还过不了闸会再进决定单）；改墙用 router.py walls"
         elif topic == "requeue":                         # 判定后没排上队：再排一次（不在旧 worker 上续跑）
             if not t:
                 raise Fail(f"{q['id']} 指向的票不在了")
@@ -1355,6 +1362,204 @@ def cmd_merge(a, env):
         return merge_business(env, st, a.target, a.source, said, walls_first=a.walls_first)
 
 
+# ---- 改墙（用户定）：一次换掉整张业务票的墙 ---------------------------------------------------------
+# 墙 = 根因 + 占流失比例 + 挂在下面的症状（v2.1 补充 A：不到 10% 的不成墙，写进 notes）。
+# router 自己不改墙（v2.1：router 不定方向）：必须带用户原话 --said；分析 agent 的新墙照旧走 propose / apply-daily。
+
+WALLS_HINT = ('walls.json：{"walls": [{"root_cause": "根因", "share": 0.35, "symptoms": ["症状", …], '
+              '"was": ["旧墙号"，可选：这道墙接着旧的哪道], "status": "open|broken"（可选）}, …], '
+              '"notes": ["不到 10% 的，可选"], "title": "新标题，可选"}')
+
+
+def _nonempty(x) -> bool:
+    return isinstance(x, str) and bool(x.strip())
+
+
+def _read_walls_file(path) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Fail(f"读不了 {path}：{e}")
+    if isinstance(data, list):
+        data = {"walls": data}
+    if not isinstance(data, dict):
+        raise Fail(f"walls.json 顶层要是对象或墙的列表。{WALLS_HINT}")
+    return data
+
+
+def _check_new_walls(t, data) -> list:
+    """逐道校验，整份通过才落。→ 规整过的新墙 [{root_cause, share, symptoms, was, status}]。"""
+    walls = data.get("walls")
+    if not isinstance(walls, list) or not walls:
+        raise Fail(f"walls 至少一道（一张业务票总得卡在某处；全拆完了等分析 agent 提议结束）。{WALLS_HINT}")
+    old_ids = {w.get("id") for w in t.get("walls") or []}
+    bad, small, out, claimed = [], [], [], {}
+    for i, w in enumerate(walls, 1):
+        wid = f"W{i}"
+        if not isinstance(w, dict):
+            bad.append(f"{wid} 不是对象")
+            continue
+        if not _nonempty(w.get("root_cause")):
+            bad.append(f"{wid} 没写根因（root_cause）")
+        s = w.get("share")
+        if not isinstance(s, (int, float)) or isinstance(s, bool) or not 0 < s <= 1:
+            bad.append(f"{wid} 占流失比例（share）要是 0~1 的数（0.35 = 35%）：{s!r}")
+        elif s < SMALL_SHARE:
+            small.append(f"{wid}「{str(w.get('root_cause', ''))[:30]}」占流失 {s * 100:.0f}%")
+        syms = w.get("symptoms")
+        if not isinstance(syms, list) or not syms or not all(
+                _nonempty(x) or (isinstance(x, dict) and _nonempty(x.get("text"))) for x in syms):
+            bad.append(f"{wid} 没写挂在它下面的症状（symptoms：非空列表，每条是文字或 {{text, from}}）")
+            syms = []
+        syms = [{"text": x.strip()} if isinstance(x, str) else
+                {"text": x["text"].strip(), **({"from": x["from"]} if x.get("from") else {})} for x in syms]
+        was = w.get("was", [])
+        was = [was] if isinstance(was, str) else was
+        if not isinstance(was, list) or not all(isinstance(x, str) and x in old_ids for x in was):
+            bad.append(f"{wid} 的 was 要是这张票现有的墙号（现有：{'、'.join(sorted(i for i in old_ids if i))}）：{w.get('was')!r}")
+            was = []
+        for x in was:
+            if x in claimed:
+                bad.append(f"旧墙 {x} 被 {claimed[x]} 和 {wid} 两道新墙认领：只能接给一道")
+            claimed[x] = wid
+        if w.get("status") not in (None, "open", "broken"):
+            bad.append(f"{wid} 的 status 只能是 open / broken")
+        out.append({"root_cause": str(w.get("root_cause", "")).strip(), "share": s, "symptoms": syms,
+                    "was": list(was), "status": w.get("status")})
+    notes = data.get("notes", [])
+    if not isinstance(notes, list) or not all(_nonempty(x) for x in notes):
+        bad.append("notes 要是文字的列表")
+    if "title" in data and not _nonempty(data.get("title")):
+        bad.append("title 给了就不能是空的")
+    if bad:
+        raise Fail("walls.json 不合格：" + "；".join(bad) + f"。{WALLS_HINT}")
+    if small:
+        raise Fail("这几道占流失不到 10%，不成墙（v2.1 补充 A）：" + "；".join(small)
+                   + "。改写进 walls.json 的 notes（备注会同步进 issue 正文），再跑一次")
+    return out
+
+
+def _parse_remap(items, old_ids, n_new) -> dict:
+    out = {}
+    for item in items or []:
+        for pair in _csv(item):
+            old, sep, new = pair.partition("=")
+            old, new = old.strip(), new.strip()
+            if not sep or old not in old_ids:
+                raise Fail(f"--remap {pair!r}：左边要是这张票现有的墙号（现有：{'、'.join(sorted(old_ids))}）")
+            if not re.fullmatch(r"W\d+", new) or not 1 <= int(new[1:]) <= n_new:
+                raise Fail(f"--remap {pair!r}：右边要是新墙的编号 W1~W{n_new}（按 walls.json 里的顺序）")
+            if old in out and out[old] != new:
+                raise Fail(f"--remap 把 {old} 指向了两道新墙：{out[old]}、{new}")
+            out[old] = new
+    return out
+
+
+def _migrate_walls_v1(t) -> None:
+    """11-14 手工改墙留下的 walls_v1（及 title_v1 / metric_v1）挪成 walls_history 的第一条：数据不丢、只留一套历史。"""
+    if "walls_v1" not in t:
+        return
+    entry = {"source": "walls_v1", "at": None, "decision": None, "walls": t.pop("walls_v1")}
+    for k in ("title_v1", "metric_v1"):
+        if k in t:
+            entry[k[:-3]] = t.pop(k)
+    t.setdefault("walls_history", []).insert(0, entry)
+
+
+def walls_replace(env, st, tid, data, said, remap_args=(), source="") -> dict:
+    """用户定的新墙整张换上（调用方持锁、负责存盘）。旧墙进 walls_history（带时间、决定号），记一条 decide、
+    给 worker 收件箱发一条「墙改了」。在途尝试（已上线、还没判完）对准的墙被删了 ⇒ 拒，除非 --remap / was 写清改对准哪道。"""
+    t = env.ticket(st, tid)
+    if store.ticket_kind(t) != "business":
+        raise Fail(f"{tid} 不是业务票：只有业务票有墙")
+    if t["status"] in (store.DONE, store.SKIP):
+        raise Fail(f"{tid} 已关（{t['status']}）：关掉的票不改墙")
+    new = _check_new_walls(t, data)
+    old_walls = copy.deepcopy(t.get("walls") or [])
+    old_ids = {w.get("id") for w in old_walls if w.get("id")}
+    remap = _parse_remap(remap_args, old_ids, len(new))
+    wmap = {x: f"W{i}" for i, w in enumerate(new, 1) for x in w["was"]}
+    clash = [f"{o}（was 接给 {wmap[o]}，--remap 又指 {n}）" for o, n in remap.items() if o in wmap and wmap[o] != n]
+    if clash:
+        raise Fail("旧墙的去向写了两遍、对不上：" + "；".join(clash))
+    wmap.update(remap)
+    first_old = store.first_open_wall(t)
+    lost = []
+    for a in t.get("attempts") or []:
+        if a.get("historical") or a.get("verdict") not in (None, "pending_sample"):
+            continue
+        x = a["wall"] if "wall" in a else first_old       # v2.1 之前的在途尝试没记对准哪道：按第一道没拆的算（同 merge）
+        if x and x not in wmap:
+            text = next((w.get("text", "") for w in old_walls if w.get("id") == x), "")
+            lost.append(f"尝试 {a.get('n')} 对准的墙 {x}「{' '.join(str(text).split())[:30]}」")
+    if lost:
+        raise Fail("在途尝试（已上线、还在等 daily 判定）对准的墙在新墙里没有了：" + "；".join(lost)
+                   + "。写清改对准哪道：--remap <旧墙号>=W<k>（W<k> 是新墙按 walls.json 顺序的编号），"
+                     "或在那道新墙的 was 里写上旧墙号")
+    notes = list(data.get("notes") or [])
+    title = data.get("title", "").strip() if _nonempty(data.get("title")) else None
+    guard = _guard(env)
+    hits = _leaks(guard, title, *(w["root_cause"] for w in new), *(s["text"] for w in new for s in w["symptoms"]), *notes)
+    if hits:
+        raise Fail("墙 / 症状 / 备注 / 标题里有用户 uid 或原话（会同步进 GitHub），拒收", hits=hits)
+    at = env.now()
+    _migrate_walls_v1(t)
+    olds = {w.get("id"): w for w in old_walls}
+    walls = []
+    for i, w in enumerate(new, 1):
+        status = w["status"] or ("broken" if w["was"] and all(olds[x].get("status") == "broken" for x in w["was"])
+                                 else "open")
+        walls.append({"id": f"W{i}", "text": w["root_cause"], "root_cause": w["root_cause"], "share": w["share"],
+                      "symptoms": w["symptoms"], "status": status, "source": "user", "at": at,
+                      **({"was": w["was"]} if w["was"] else {})})
+    old_title = t["title"]
+    summary = "；".join(f"{w['id']} {w['text'][:24]} {store.wall_share(w)}" for w in walls)
+    did = store.append_decision(
+        env.decisions, st, tid,
+        f"换墙：{len(old_walls)} 道 → {len(walls)} 道（{summary}）"
+        + (f"；在途尝试改对准 {'、'.join(f'{o}→{n}' for o, n in remap.items())}" if remap else "")
+        + (f"；标题改为「{title}」" if title and title != old_title else ""),
+        "用户定的墙（原话见 answers.md）；router 不自己改墙（v2.1：router 不定方向）",
+        f"walls.json：{source or '-'}；旧墙存 walls_history", at)
+    t.setdefault("walls_history", []).append({"at": at, "decision": did, "walls": old_walls, "title": old_title,
+                                              **({"remap": remap} if remap else {})})
+    t["walls"] = walls
+    for a in t.get("attempts") or []:                 # 尝试上记的墙号换成新编号；对不上的（判完的）记下原来的
+        if a.get("historical"):
+            continue
+        if "wall" not in a and a.get("verdict") in (None, "pending_sample"):
+            a["wall"] = first_old
+        if not a.get("wall"):
+            continue
+        old = a["wall"]
+        a["wall"] = wmap.get(old)
+        a.setdefault("wall_history", []).append({"wall": old, "decision": did})
+    if title:
+        t["title"] = title
+    cur = t.get("notes") or []
+    cur = [cur] if isinstance(cur, str) else list(cur)
+    t["notes"] = cur + [x.strip() for x in notes if x.strip() not in cur]
+    if t["status"] in (store.DRAFT, store.HOLD, store.QUEUED) and (t.get("solution") or {}).get("kind") == "clue":
+        t["solution"]["text"] = _requeue_clue(t)          # 还没派出去：下一个 worker 的线索换成新墙
+    events.deliver(env.home, tid, {"ts": at, "ticket": "router", "type": "tell",
+                                   "summary": f"墙改了（{did}，用户定）：现在的墙 {summary}。"
+                                              "旧墙存在 walls_history；照新墙继续（对准第一道没拆的墙）。"})
+    _append_local(env.home / "answers.md", f"- {at} | - | walls | {tid} | {' '.join(said.splitlines())}")
+    offered = _offer_next(env, st, tid, "墙改了") if any(w["status"] == "open" for w in walls) else None
+    return {"ok": True, "ticket": tid, "walls": [w["id"] for w in walls], "decision": did, "remap": remap,
+            **({"next_item": offered} if offered else {})}
+
+
+def cmd_walls(a, env):
+    """用户说「T3 的墙改成：…」：router 把他的话写成 walls.json，walls <T> --from <walls.json> --said "<原话>"。"""
+    said = (a.said or "").strip()
+    if not said:
+        raise Fail("--said 要写用户定这些墙时的原话（router 不自己改墙）")
+    data = _read_walls_file(a.source)
+    with env.state() as st:
+        return walls_replace(env, st, a.ticket, data, said, a.remap, str(a.source))
+
+
 def cmd_submit_card(a, env):
     card = Path(a.card)
     if not card.exists():
@@ -1499,10 +1704,64 @@ def cmd_surfaces(a, env):
 
 
 def cmd_ack_slow(a, env):
+    """兼容：清掉存着的慢路径事件，feed 上没 ack 的慢路径事件一并 ack。"""
+    import feed
     with env.state() as st:
         n = len(st.get("slow_path", []))
         st["slow_path"] = []
-    return {"ok": True, "cleared": n}
+    acked = feed.ack_where(env.home, lambda e: e.get("kind") == feed.SLOW, env.now())
+    return {"ok": True, "cleared": n, "acked": acked}
+
+
+# ---- 巡检常驻 + 事件流（daemon / feed / ack）------------------------------------------------------
+
+def cmd_daemon(a, env):
+    """daemon start|stop|status|run：巡检常驻（脱离 router session），见 daemon.py。"""
+    import daemon
+    if a.daemon_cmd == "status":
+        return {"ok": True, **daemon.status(env.home, env.ctx.now())}
+    if a.daemon_cmd == "start":
+        out = daemon.start(env, a.interval, a.max_hours, a.wait)
+    elif a.daemon_cmd == "stop":
+        out = daemon.stop(env.home, env.ctx, a.wait, a.force)
+    else:                                             # run：daemon start 起的前台循环
+        out = daemon.serve(env, a.interval, a.max_hours)
+    if not out.get("ok"):
+        raise Fail(out.pop("error", "daemon 命令没成"), **{k: v for k, v in out.items() if k != "ok"})
+    return out
+
+
+def cmd_feed(a, env):
+    """一行一个 JSON：没 ack 的事件（先补发全部，--follow 之后有新的就发、30 分钟没 ack 再提醒一次）。逐行 flush。"""
+    import daemon
+    import feed
+    import time
+
+    def write(s):
+        sys.stdout.write(s + "\n")
+        sys.stdout.flush()
+    if not a.follow:
+        evs = feed.unacked(env.home)
+        for ev in evs:
+            write(feed.line(ev))
+        return {"ok": True, "unacked": len(evs)}
+    reason = feed.follow(env.home, write, clock=time.time, sleep=time.sleep, interval=a.interval,
+                         max_s=a.max_minutes * 60, daemon_check=lambda: daemon.down(env.home, env.ctx.now()))
+    return {"ok": True, "ended": reason}
+
+
+def cmd_ack(a, env):
+    """处理完的事件 ack 掉（幂等）：feed 不再发它。--all：全部没 ack 的（切换协议时清旧积压）。"""
+    import feed
+    if a.all:
+        acked = feed.ack_where(env.home, lambda e: True, env.now())
+        return {"ok": True, "acked": acked, "already": [], "unknown": []}
+    if not a.ids:
+        raise Fail("要写事件编号（E<n>，feed 每行的 id），或 --all")
+    out = feed.ack(env.home, a.ids, env.now())
+    if out["unknown"]:
+        raise Fail(f"feed 里没有这些事件：{'、'.join(out['unknown'])}（编号见 feed 每行的 id）", **out)
+    return {"ok": True, **out}
 
 
 def cmd_prioritize(a, env):
@@ -2017,7 +2276,7 @@ def _requeue_business(env, st, tid, text, wait) -> None:
 
 def _requeue_clue(t) -> str:
     """重新排队后派单的「router 线索」：没拆的墙（下一次对准第一道）+ 已试过的方向（标判定，不是线索）。"""
-    opens = [f"{w.get('id')} {w.get('text', '')}" for w in t.get("walls", []) if w.get("status") == "open"]
+    opens = [f"{w.get('id')} {store.wall_line(w)}" for w in t.get("walls", []) if w.get("status") == "open"]
     lines = ["没拆的墙（下一次尝试对准第一道）：" + ("；".join(opens) if opens else "无（下一个方向见收件箱）")]
     prev, cur = t.get("solution") or {}, store.current_attempt(t) or {}
     if prev.get("kind") == "card" and prev.get("text"):
@@ -2314,13 +2573,21 @@ def _status_tickets(st) -> dict:
 def cmd_status(a, env):
     with env.locked():
         st = store.load_state(env.state_path)
+    import daemon
+    import feed
     counts, used, queue = _summary(st)
     slots = env.cfg.get("slots", {"heavy": 3, "light": 2})
+    dmn = daemon.status(env.home, env.ctx.now())
+    unacked = len(feed.unacked(env.home))
     if a.json:
         return {"ok": True, "counts": counts, "slots": slots, "used": used, "queue": queue,
-                "tickets": _status_tickets(st), "external": st["external"], "batch": st["batch"]}
+                "tickets": _status_tickets(st), "external": st["external"], "batch": st["batch"],
+                "daemon": dmn, "feed_unacked": unacked}
     lines = [f"批次 {st['batch']['id']}（{'已 start' if st['batch']['started'] else '未 start'}）"
              f" · 重票 {used['heavy']}/{slots.get('heavy')} · 轻票 {used['light']}/{slots.get('light')}",
+             f"巡检：{'daemon 在跑（pid ' + str(dmn['pid']) + '）' if dmn['running'] else 'daemon 没在跑'}"
+             f" · 最后一次巡检 {dmn['last_patrol_at'] or '—'}{'（超过 3 分钟）' if dmn['stale'] else ''}"
+             f" · 没 ack 的事件 {unacked} 条",
              "决定单：" + ("" if queue else "（空）")]
     lines += [f"  {q['id']} [{q['kind']}] {q['summary']}（挡 {q['blocks']} 张）" for q in queue]
     lines.append("票：")
@@ -2442,7 +2709,29 @@ def build_parser():
     s = sub.add_parser("surfaces", help="更新票的代码面 / 越界时分配锁（记一条决定）")
     s.add_argument("ticket"); s.add_argument("--set", required=True); s.add_argument("--why", required=True)
     s.add_argument("--force", action="store_true")
-    sub.add_parser("ack-slow", help="慢路径事件处理完了：清掉存档")
+    sub.add_parser("ack-slow", help="慢路径事件处理完了：清掉存档（兼容；新协议用 ack <事件编号>）")
+    s = sub.add_parser("walls", help="用户定的新墙：一次换掉整张业务票的墙（旧墙进 walls_history，记一条决定）")
+    s.add_argument("ticket"); s.add_argument("--from", dest="source", required=True, help="walls.json")
+    s.add_argument("--said", required=True, help="用户定这些墙时的原话（进 answers.md；router 不自己改墙）")
+    s.add_argument("--remap", action="append", default=[],
+                   help="在途尝试对准的旧墙被删时，改对准哪道新墙：W1=W2（可多次，或逗号分隔）")
+    s = sub.add_parser("daemon", help="巡检常驻：start / stop / status（脱离 router session，默认 24 小时自停）")
+    dsub = s.add_subparsers(dest="daemon_cmd", required=True)
+    for name, h in (("start", "起一份（已在跑就不起第二份）"), ("run", "前台跑循环（daemon start 内部用）")):
+        d = dsub.add_parser(name, help=h)
+        d.add_argument("--interval", type=float, default=60, help="每轮间隔秒数")
+        d.add_argument("--max-hours", type=float, default=24, help="跑满这么久自停")
+        d.add_argument("--wait", type=float, default=5, help="start：最多等几秒确认它起来了")
+    d = dsub.add_parser("stop", help="SIGTERM，跑完当前一轮再停")
+    d.add_argument("--wait", type=float, default=120); d.add_argument("--force", action="store_true")
+    dsub.add_parser("status", help="pid、最后一轮时间、是否超过 3 分钟没巡检")
+    s = sub.add_parser("feed", help="事件流：一行一个 JSON，只发没 ack 的（router 用 Monitor 挂 --follow）")
+    s.add_argument("--follow", action="store_true", help="持续输出：先补发全部没 ack 的，之后有新的就发")
+    s.add_argument("--interval", type=float, default=2, help="--follow 轮询间隔秒数")
+    s.add_argument("--max-minutes", type=float, default=30, help="--follow 跑满这么久退出（Monitor 到期就重挂）")
+    s = sub.add_parser("ack", help="事件处理完了：ack 掉（幂等），feed 不再发它")
+    s.add_argument("ids", nargs="*", help="事件编号 E<n>（可多个）")
+    s.add_argument("--all", action="store_true", help="全部没 ack 的（切换协议时清旧积压）")
     s = sub.add_parser("prioritize", help="调整优先级（越小越先）")
     s.add_argument("ticket"); s.add_argument("n", type=int)
     s = sub.add_parser("emit", help="worker 往上抛事件")

@@ -80,7 +80,7 @@ def state_summary(st, mode) -> str:
     biz = [(tid, t) for tid, t in st["tickets"].items()
            if store.ticket_kind(t) == "business" and t.get("status") not in (store.DONE, store.SKIP)]
     for tid, t in biz:
-        walls = "；".join(f"{w.get('id')} {w.get('text', '')}" for w in t.get("walls", [])
+        walls = "；".join(f"{w.get('id')} {store.wall_line(w)}" for w in t.get("walls", [])
                          if w.get("status") == "open") or "无"
         cur = store.current_attempt(t)                # 当前尝试 = 最后一条非历史的（历史尝试排在哪都不能盖住它）
         hist = sum(1 for a in t.get("attempts") or [] if a.get("historical"))

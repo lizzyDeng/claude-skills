@@ -94,6 +94,8 @@ h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-sp
 .tl .ts{font-family:var(--mono);color:var(--faint);margin-right:6px}
 .p-review{background:var(--q-bg);color:var(--accent)}
 .revoked{text-decoration:line-through;color:var(--faint)}
+.patrol{font-size:13px;color:var(--soft);margin:2px 0 0}
+.patrol-stale{color:#e5534b;font-weight:700}
 </style>
 </head>
 <body>
@@ -102,6 +104,7 @@ h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-sp
   <h1>Router 看板</h1>
   <span class="meta">批次：—（未 start）· 更新于 11-02 10:00 UTC · 只读，30 秒自动刷新</span>
 </header>
+<div class="patrol patrol-stale" data-patrol-at="">最后一次巡检：还没有<span class="age"> · 还没巡检过</span></div>
 <div class="stats">
   <div class="stat you"><b>1</b><span>等你</span></div>
   <div class="stat run"><b>1</b><span>在跑</span></div>
@@ -159,6 +162,11 @@ h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-sp
 </main>
 <script>
 (function(){
+  var hb=document.querySelector('.patrol');
+  if(hb){var at=Date.parse(hb.getAttribute('data-patrol-at')||'');
+    if(!(at>0)||Date.now()-at>180000){hb.classList.add('patrol-stale');
+      var m=at>0?Math.round((Date.now()-at)/60000):null;
+      hb.querySelector('.age').textContent=m===null?' · 还没巡检过':' · 已 '+m+' 分钟没巡检：router.py daemon status';}}
   var btns=document.querySelectorAll('.tabs button');
   var items=document.querySelectorAll('#list .issue');
   btns.forEach(function(b){

@@ -42,7 +42,8 @@ QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict",
                "verify_problem", "close", "harm", "return"}
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
 # assumption：核心假设被推翻的方向项（v2.1：方向归用户，router 不能 --as-router 代答）
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption"}
+# issue_sync：业务票 issue 正文要同步，但文本过不了防泄漏闸（没发到 GitHub，交用户看）
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption", "issue_sync"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -299,6 +300,35 @@ def attach_wall(state: dict, tid: str, text: str, source: str, at: str) -> str:
 def first_open_wall(t: dict):
     """第一道没拆的墙的编号；没有 → None。"""
     return next((w.get("id") for w in t.get("walls") or [] if w.get("status") == "open"), None)
+
+
+def wall_share(w) -> str:
+    """墙占流失的比例 → 「35%」；没写（老墙）→ 空串。"""
+    s = w.get("share") if isinstance(w, dict) else None
+    if isinstance(s, (int, float)) and not isinstance(s, bool):
+        return f"{s * 100:.0f}%"
+    return ""
+
+
+def wall_symptoms(w) -> list:
+    """挂在墙下面的症状文本（字符串或 {text, from}）。"""
+    out = []
+    for s in (w.get("symptoms") or []) if isinstance(w, dict) else []:
+        text = s.get("text") if isinstance(s, dict) else s
+        if isinstance(text, str) and text.strip():
+            out.append(text.strip())
+    return out
+
+
+def wall_line(w, symptoms=True) -> str:
+    """一道墙的一行：根因（占流失 P%；症状：a / b）。老墙（只有 text）原样返回 text。
+    派单线索、分析 agent 的票况、issue 正文、看板共用这一处。"""
+    text = str(w.get("text", "") if isinstance(w, dict) else w)
+    parts = [f"占流失 {wall_share(w)}"] if wall_share(w) else []
+    syms = wall_symptoms(w) if symptoms else []
+    if syms:
+        parts.append("症状：" + " / ".join(syms))
+    return text + (f"（{'；'.join(parts)}）" if parts else "")
 
 
 def add_attempt(state: dict, tid: str, direction: str, at: str, rollback: str) -> int:
