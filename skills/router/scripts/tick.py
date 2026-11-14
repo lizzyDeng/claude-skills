@@ -3,9 +3,12 @@
 0 新周报 → 分析 agent weekly 跑（+ 转 release_sync.unlabeled）   0b 分析 agent：收尾退出的 run、每日起 daily
 1 扫外部 session，查抢锁      2 处理退出的 worker
 3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时；4b 上线验收到期
-5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       6 派发      7 看板 + Lark
+5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       5b 业务票 issue 正文同步
+6 派发      7 看板 + Lark
+最后：唤醒项逐条写进事件流 feed.jsonl（feed.py；router 挂 feed --follow 收）。
 
 整轮持 <home>/.lock。每一步单独 try：一步出错不拖垮后面几步，错误进返回值。
+谁跑这一轮都一样：daemon（常驻，daemon.py）、tick 子命令、兼容的 watch。
 """
 import copy
 import json
@@ -21,6 +24,7 @@ import analyst
 import board
 import discover
 import events
+import feed
 import github
 import launcher
 import notify
@@ -793,6 +797,60 @@ class Run:
         if store.router_owned(t):
             self.state.setdefault("wake", {}).setdefault("prod_ready", []).append({"ticket": tid})
 
+    # ---- 5b：业务票 issue 正文同步 -------------------------------------------------------------------
+    def step5b_issue_sync(self):
+        """业务票的 issue 正文（含「当前的墙和备注」）按票上现在的字段重算，哈希和上次发出去的不一样就 gh issue edit
+        （改墙、merge、absorb、改标题……不管哪条路径改的都算）。标题变了一起改。
+        先过防泄漏闸：命中不发，进决定单（topic=issue_sync，同一份文本只报一次）；gh 失败进 errors（同一份文本只报
+        第一次），下一轮重试。闸失效 ⇒ 这一轮一张都不发（fail-closed）。已关的票不同步（收尾会关 issue）。"""
+        todo = []
+        for tid, t in self.state["tickets"].items():
+            if store.ticket_kind(t) != "business" or not t.get("issue") or t["status"] in (store.DONE, store.SKIP):
+                continue
+            body = github.issue_body(self.state.get("map") or 0, t)
+            h = github.body_hash(t["title"], body)
+            sync = t.get("issue_sync") or {}
+            if sync.get("hash") == h:
+                self._withdraw_sync_item(t)
+                continue
+            if (sync.get("blocked") or {}).get("hash") == h:
+                continue                                      # 这份文本已经报过泄漏：等文本变了再试
+            todo.append((tid, t, body, h))
+        if not todo:
+            return
+        try:
+            guard = github.load_guard(self.cfg.get("leak_guard_globs", []))
+        except github.GuardEmpty as e:
+            self.res["errors"].append(f"issue 正文同步暂停：防泄漏闸失效（{e}）")
+            return
+        for tid, t, body, h in todo:
+            sync = t.setdefault("issue_sync", {})
+            title = t["title"] if sync.get("title") != t["title"] else None
+            try:
+                github.edit_issue(self.ctx, self.cfg["repo"], t["issue"], body, guard, title=title)
+            except github.LeakBlocked as e:
+                self._withdraw_sync_item(t)
+                qid = self.queue(tid, "stuck", f"{tid} #{t['issue']} 的 issue 正文 / 标题含用户 uid 或原话"
+                                               f"（{len(e.hits)} 处），没同步到 GitHub：先改掉票上的墙 / 备注 / 标题"
+                                               f"（router.py walls），下一轮自动重试", topic="issue_sync")
+                sync["blocked"] = {"hash": h, "qid": qid, "n": len(e.hits), "at": self.now}
+                continue
+            except github.GhError as e:
+                p = sync.get("pending") or {}
+                n = p.get("n", 0) + 1 if p.get("hash") == h else 1
+                sync["pending"] = {"hash": h, "n": n, "error": str(e)[:200], "at": self.now}
+                if n == 1:
+                    self.res["errors"].append(f"{tid} #{t['issue']} issue 正文同步失败（下一轮重试）：{str(e)[:200]}")
+                continue
+            sync.update(hash=h, title=t["title"], at=self.now)
+            sync.pop("pending", None)
+            self._withdraw_sync_item(t)
+
+    def _withdraw_sync_item(self, t):
+        b = (t.get("issue_sync") or {}).pop("blocked", None)
+        if b and store.in_queue(self.state, b.get("qid")):
+            store.pop_queue(self.state, b["qid"])
+
     # ---- 5a：仓外票核对完之后的收尾（R6 ⑫）--------------------------------------
     def step5a_closeout(self):
         """DONE 且 closeout 还有 pending 的票，逐栏、逐目标先查后做（投递「至少一次」，靠 marker 去重成「恰好一次」）：
@@ -1238,7 +1296,8 @@ def _resurface(r):
     r.res["slow_path_events"] = pending + r.res["slow_path_events"]
 
 
-def run(ctx, root, cfg, resurface=False) -> dict:
+def run(ctx, root, cfg, resurface=False, by="tick") -> dict:
+    """by：谁跑的这一轮（daemon / watch / tick），记进 state["patrol"]（看板的巡检心跳）。"""
     bad = store.base_branch_problem(cfg)
     if bad:                                      # 配置把 base 写成 main：一步都不走（不派、不合、不重建），只报错
         return {**_empty_res(), "errors": [bad]}
@@ -1246,8 +1305,14 @@ def run(ctx, root, cfg, resurface=False) -> dict:
     with store.locked(home):
         state = store.load_state(home / "state.json")
         r = Run(ctx, root, cfg, state)
+        state["patrol"] = {"at": r.now, "by": by}   # 心跳：看板显示最后一次巡检，超过 3 分钟标红
+        try:
+            feed.prune_slow_path(home, state)    # 已在 feed 上 ack 的慢路径事件：不再存、不再重投
+        except Exception as e:  # noqa: BLE001
+            r.res["errors"].append(f"feed 清理：{e!r}")
         for step in (r.step0_weekly, r.step_analyst, r.step_maint_start, r.step1_external, r.step2_exits, r.step3_events,
-                     r.step4_patrol, r.step4b_postlaunch, r.step5_merge, r.step6_dispatch, r.step7_board_and_notify):
+                     r.step4_patrol, r.step4b_postlaunch, r.step5_merge, r.step5b_issue_sync, r.step6_dispatch,
+                     r.step7_board_and_notify):
             try:
                 step()
             except Exception as e:  # 一步出错不拖垮整轮；错误交给 router
@@ -1256,7 +1321,16 @@ def run(ctx, root, cfg, resurface=False) -> dict:
             _resurface(r)
         # 唤醒键（verdict 的 rollback_needed / no_entry / return_to_user，分析 agent 的 analyst_done / releases_unlabeled）：
         # 弹出交给 router
-        r.res.update(state.pop("wake", None) or {})
+        wake = state.pop("wake", None) or {}
+        r.res.update(wake)
+        # 唤醒项逐条进事件流（router 用 Monitor 挂 feed --follow）：谁跑的这一轮都写，同一件事只写一次。
+        # 先写事件、后存 state：存盘前崩了，下一轮按自然 id 去重，不会丢也不会重复。
+        try:
+            r.res["feed"] = feed.record_tick(home, state, r.res, WAKE_KEYS, r.now)
+        except Exception as e:  # noqa: BLE001 — 写不了事件：只交一次的唤醒项留在 state 里，下一轮再写
+            r.res["errors"].append(f"写事件流（feed.jsonl）失败：{e!r}")
+            if wake:
+                state["wake"] = wake
         store.save_state(home / "state.json", state)
     return r.res
 
@@ -1274,10 +1348,22 @@ def cmd_tick(a, env):
     return {"ok": True, **run(env.ctx, env.root, env.cfg, resurface=True)}
 
 
+DAEMON_ON = ("巡检 daemon 在跑（router.py daemon status）：watch 不再并行巡检，避免两个引擎。"
+             "改用 Monitor 挂 router.py feed --follow 收事件")
+
+
 def cmd_watch(a, env):
+    """兼容旧协议：循环巡检、有事才退出。daemon 在跑时拒绝（不并行 tick）；跑着跑着 daemon 起来了就退出。"""
+    import daemon
+    home = home_for(env.root)
+    if daemon.running(home):
+        import router
+        raise router.Fail(DAEMON_ON)
     started, err_streak, first = time.time(), 0, True
     while True:
-        res = run(env.ctx, env.root, env.cfg, resurface=first)
+        if daemon.running(home):
+            return {"ok": True, "woke": ["daemon"], "note": DAEMON_ON}
+        res = run(env.ctx, env.root, env.cfg, resurface=first, by="watch")
         first = False
         err_streak = err_streak + 1 if res["errors"] else 0
         if any(res.get(k) for k in WAKE_KEYS) or err_streak >= 3:

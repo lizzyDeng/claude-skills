@@ -159,6 +159,9 @@ def ensure_map(ctx, repo, title) -> int:
 
 
 def issue_body(map_no: int, t: dict) -> str:
+    """业务票：business_issue_body（含「当前的墙和备注」，之后由巡检同步）；其余票：建票时写一次的三段正文。"""
+    if t.get("kind") == "business":
+        return business_issue_body(map_no, t)
     why, sol = t.get("why", {}), t.get("solution", {})
     return "\n".join([
         f"Part of #{map_no}", "",
@@ -172,6 +175,54 @@ def issue_body(map_no: int, t: dict) -> str:
         "## router 线索（非方案）",
         sol.get("text", "") or "（无）",
         "", "解法由 worker 的方向卡提出、用户确认后才定。由 /router 派发。"])
+
+
+WALL_STATUS = {"open": "没拆", "broken": "已拆"}
+
+
+def business_issue_body(map_no: int, t: dict) -> str:
+    """业务票的 issue 正文：只由票上相对稳定的业务字段算出来（不含时间戳、不含方向卡），
+    墙 / 备注 / 标题 / 并进来的老票一变，哈希就变，巡检据此 gh issue edit（tick.Run.step5b_issue_sync）。"""
+    import store
+    m = t.get("metric") or {}
+    m = m if isinstance(m, dict) else {"name": str(m)}
+    mtxt = m.get("name", "") + "".join(f"（{k}：{m[k]}）" for k in ("now", "direction") if m.get(k) not in (None, ""))
+    walls = []
+    for w in t.get("walls") or []:
+        tail = f" · 占流失 {store.wall_share(w)}" if store.wall_share(w) else ""
+        walls.append(f"- {w.get('id', '')}（{WALL_STATUS.get(w.get('status'), w.get('status') or '')}）"
+                     f"{w.get('text', '')}{tail}")
+        walls += [f"  - 症状：{s}" for s in store.wall_symptoms(w)]
+    notes = t.get("notes") or []
+    notes = [notes] if isinstance(notes, str) else [str(x) for x in notes if str(x).strip()]
+    lines = [f"Part of #{map_no}", "",
+             "## 为什么派",
+             f"- 指标：{mtxt}",
+             f"- 人群：{t.get('segment', '')}",
+             f"- 证据（本地路径）：{'；'.join(t.get('evidence') or [])}", "",
+             "## 解决什么问题",
+             f"{t.get('segment', '')}：{t.get('want', '')}", "",
+             "## 当前的墙和备注",
+             "墙是根因，不是方案；按用户路径先后排，一次尝试对准第一道没拆的墙。",
+             *(walls or ["- （无）"])]
+    if notes:
+        lines += ["", "备注（影响面不到 10%、不成墙，或还说不清根因）：", *[f"- {x}" for x in notes]]
+    if t.get("absorbs"):
+        lines += ["", f"并进来的老票：{'、'.join(t['absorbs'])}"]
+    lines += ["", "解法由 worker 的方向卡提出、用户确认后才定。由 /router 派发；墙和备注由 /router 自动同步。"]
+    return "\n".join(lines)
+
+
+def body_hash(title: str, body: str) -> str:
+    """issue 标题 + 正文的哈希：票上存一份，巡检比对，变了才 gh issue edit。"""
+    import hashlib
+    return hashlib.sha256(f"{title}\0{body}".encode("utf-8")).hexdigest()[:16]
+
+
+def edit_issue(ctx, repo, n, body, guard, title=None) -> None:
+    """改 issue 正文（title 给了就连标题一起改）。先过防泄漏闸：命中抛 LeakBlocked，一个字都不发。"""
+    _guard(((title or "") + "\n" + body), guard)
+    _gh(ctx, ["issue", "edit", str(n), "-R", repo, *(["--title", title] if title is not None else []), "--body", body])
 
 
 def create_ticket_issue(ctx, repo, map_no: int, ticket: dict, uids) -> int:
