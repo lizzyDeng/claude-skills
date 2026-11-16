@@ -233,7 +233,10 @@ def staging_pending(t: dict) -> bool:
     依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch，
     也没有 shipped_at（停 / 接管 / 关前已撤回的票随别的票发版上去时，released 只记这一条，残留 2 #3）。
     老票、维护票之后直接是 done 的也算 released（老版 released 直接记 done）；业务票之后是 done = 关了票，代码还在 staging。
-    没有 history（手写的 state）就按状态算。"""
+    没有 history（手写的 state）就按状态算。
+    多轮票（老票 / 维护票）：还有已合进 staging、没记 shipped_at 的轮次（rounds_unshipped）就算待发。"""
+    if rounds_unshipped(t):
+        return True
     if not t.get("merge_sha"):
         return False
     return _pending_since(t, (MERGED, AWAIT_PROD), done_releases=ticket_kind(t) != "business")
@@ -280,6 +283,19 @@ def open_next_round(t: dict, rp: dict, branch: str) -> dict:
     t["fail_streak"] = {"step": "", "count": 0}
     t["worker"]["branch"] = branch
     return rnd
+
+
+def rounds_unshipped(t: dict) -> list:
+    """多轮票已合进 staging、还没随发版上 prod 的轮次（原对象，released 直接往上记 shipped_at）：已归档的 rounds，
+    加上还没归档的 round_pending（切下一轮分支没成）；有 merge_sha、没有 shipped_at 的才算。"""
+    rs = list(t.get("rounds") or []) + ([t["round_pending"]] if t.get("round_pending") else [])
+    return [r for r in rs if r.get("merge_sha") and not r.get("shipped_at")]
+
+
+def round_running(t: dict) -> bool:
+    """多轮票还在做：有已合没发的轮次，票还没收（状态不在 SETTLED，stuck / paused 也算）。发版会把已合的轮次一起带上去，
+    但票不是这次上线的票：prod-batch 要用户放行（round / round_ok），released 只记 shipped_at、状态不变。"""
+    return bool(rounds_unshipped(t)) and t.get("status") not in SETTLED
 
 
 def round_note(rnd: dict, branch: str, base: str) -> str:

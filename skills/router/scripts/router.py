@@ -279,10 +279,13 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None,
     note = ""
     if t["status"] in store.SETTLED:
         _refuse_settled_resume(t, tid)
-        note = _reopen_settled(env, st, tid)
+        note = _reopen_settled(env, st, tid)          # 先过锁检查
         status = store.EXECUTING
-    elif t.get("round_pending"):
-        note = _finish_round(env, st, tid)
+    else:
+        if not store.holds_lock(t):                   # 当前不持锁（hold 之类）：锁可能已被别的票拿走
+            _check_lock(st, tid)
+        if t.get("round_pending"):
+            note = _finish_round(env, st, tid)
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
@@ -1716,15 +1719,17 @@ def cmd_tell(a, env):
         if a.resume:
             _refuse_pending(t, a.ticket, env.ctx)     # 先拒再投递：不然重试会投两份
             _refuse_settled_resume(t, a.ticket)
-            if t["status"] in store.SETTLED:
+            if not store.holds_lock(t):
                 _check_lock(st, a.ticket)
         alive = launcher.worker_alive(env.ctx, t["worker"])
         if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
             said = f"{ROUTER_RELAY}（不是用户原话）：{a.text}" if relay else a.text
             events.deliver(env.home, a.ticket, {"ts": env.now(), "ticket": "router", "type": "tell", "summary": said})
         resumed = None
-        if a.resume and _resume(env, st, a.ticket, "direction", a.text,
-                                t["status"] if t["status"] in store.RUNNING else store.KICKOFF, relay=relay) == "resumed":
+        # 不在跑的票：方向卡确认过 ⇒ 回执行（不是回 kickoff：waiting_for 会变成「改方向卡」、kickoff 超时按旧时间算）
+        status = (t["status"] if t["status"] in store.RUNNING
+                  else store.EXECUTING if t.get("card_confirmed") else store.KICKOFF)
+        if a.resume and _resume(env, st, a.ticket, "direction", a.text, status, relay=relay) == "resumed":
             resumed = a.ticket
         elif not a.resume:
             pass
@@ -1973,7 +1978,7 @@ def cmd_walkthrough_done(a, env):
 # 发版批次（终审 #6 + 残留 #2/#3 + 残留 2）：上 prod = 合 main 发版，staging 上领先 main 的东西会一起上去
 PROD_STATE = {"ready": "可上", "approved": "已放行", "walkthrough": "待走查", "release": "待放行",
               "unjudged": "上次尝试还没判", "unconfirmed": "方向卡没经你确认"}
-_PROD_OK = ("ready", "approved", "ride_ok")          # 不挡 router 自己上
+_PROD_OK = ("ready", "approved", "ride_ok", "round_ok")   # 不挡 router 自己上（round_ok = 用户放行过的多轮在做的票）
 _PROD_SHIPS = ("ready", "approved")                   # 发完照常 released（进 router_ships）
 # 「放行」读法（v2.1 第 8 条）：可带前缀「Q<数字>」、空格、全角标点和尾随说明（「Q332 放行。生图放行，用grok」= 整批放行）；
 # 关键词后面只能是结尾 / 空白 / 标点（可带「了 / 吧」；「放行吗」「放行不了」不算）；整句里有否定（「先不放行」「不放行」「先别」）一律不算
@@ -2005,7 +2010,12 @@ def _ride_along(t):
 def _prod_state(t):
     """批次里一张票能不能由 router 带上 prod → (状态码, 给人看的说明)。状态码在 _PROD_OK 里 = 不挡；在 _PROD_SHIPS 里 = 进
     router_ships。已停 / 接管 / 已关的票只有用户放行过才不挡（ride_ok），也永远不进 router_ships：它们不是这次上线的票，
-    released 对它们只记 shipped_at（已停 / 接管）或跳过（关前已撤回），不进上线验收。"""
+    released 对它们只记 shipped_at（已停 / 接管）或跳过（关前已撤回），不进上线验收。
+    多轮在做的票（老票 / 维护票还没收、已合的轮次没发）：round / round_ok，放不放行由用户定，也永远不进 router_ships。"""
+    if store.round_running(t):
+        ok = bool(t.get("prod_ok"))
+        return ("round_ok" if ok else "round"), \
+            f"多轮在做：已合 {len(store.rounds_unshipped(t))} 轮还没发·{'已放行' if ok else '要放行'}"
     ride = _ride_along(t)
     if ride:
         ok = bool(t.get("prod_ok"))
@@ -2028,8 +2038,10 @@ def _prod_state(t):
 
 
 def _needs_batch(st) -> bool:
-    """有票级授权的业务票等上 prod ⇒ 走整批规则；没有就照 v1（老票、维护票攒成一条交用户）。"""
-    return any(t["status"] == store.AWAIT_PROD and store.router_owned(t) for t in st["tickets"].values())
+    """有票级授权的业务票等上 prod，或有多轮在做的票（已合的轮次会随发版上去）⇒ 走整批规则、对账；
+    都没有就照 v1（老票、维护票攒成一条交用户）。"""
+    return any((t["status"] == store.AWAIT_PROD and store.router_owned(t)) or store.round_running(t)
+               for t in st["tickets"].values())
 
 
 def _staging_commits(env) -> dict:
@@ -2074,9 +2086,14 @@ def _attribute(st, members, commits) -> list:
     """对不上批次里任何一张票的提交。对上的规则：提交 sha = 这张票记的合并 sha（merge_sha，gh 给的合并 commit）；
     或者它是普通提交（单个父提交）、标题以「(#<这张票的 PR 号>)」结尾。merge 提交（多个父提交）只认 sha。
     main 回合 base 的 merge 提交（sync）不在这里算：调用方单列成 sync_merges。"""
-    shas = {str(st["tickets"][tid].get("merge_sha")): tid for tid in members
-            if st["tickets"][tid].get("merge_sha") not in (None, "", "?")}
-    prs = {str(st["tickets"][tid].get("pr")): tid for tid in members if st["tickets"][tid].get("pr")}
+    shas, prs = {}, {}
+    for tid in members:                               # 多轮票：每一轮（rounds + 还没归档的 round_pending）都算
+        t = st["tickets"][tid]
+        for x in [t, *(t.get("rounds") or []), *([t["round_pending"]] if t.get("round_pending") else [])]:
+            if x.get("merge_sha") not in (None, "", "?"):
+                shas[str(x["merge_sha"])] = tid
+            if x.get("pr"):
+                prs[str(x["pr"])] = tid
     out = []
     for c in commits:
         if c.get("sync") or c["sha"] in shas:
@@ -2192,8 +2209,9 @@ def _release_mode(t) -> str:
     ride = 已停 / 接管：改动随这次发版上去了，但票不归 router 推进 ⇒ 只在 history 记 shipped_at，不改状态、不进上线验收；
     skip = 带 --rolled-back 关掉的业务票：关前已撤回，不是这次上线的票 ⇒ 跳过（不记尝试、不报错），history 记 shipped_at
            让它出发版批次；
-    release = 照常（业务票记尝试进 postlaunch，其余进 T+1/T+3/T+7 上线验收）。"""
-    if t["status"] in (store.PAUSED, store.TAKEOVER):
+    release = 照常（业务票记尝试进 postlaunch，其余进 T+1/T+3/T+7 上线验收）。
+    多轮在做的票（store.round_running，含 stuck）也是 ride：已合的轮次随这次发版上去了，票还在做。"""
+    if t["status"] in (store.PAUSED, store.TAKEOVER) or store.round_running(t):
         return "ride"
     if store.ticket_kind(t) == "business" and t["status"] == store.DONE and t.get("rolled_back_at"):
         return "skip"
@@ -2240,12 +2258,20 @@ def cmd_released(a, env):
         for tid in a.tickets:
             t = st["tickets"][tid]
             t.pop("prod_ok", None)                                       # 放行只管这一次发版
+            running = store.round_running(t)
+            for r in store.rounds_unshipped(t):                          # 多轮票：已合的轮次都随这次发版上去了
+                r["shipped_at"] = t0
             if mode[tid] == "skip":
                 store.record_shipped(st, tid, env.now(), t0)
                 skipped.append({"ticket": tid, "why": "已关（关前已撤回）：不是这次上线的票，跳过；只记 shipped_at，出发版批次"})
                 continue
             if mode[tid] == "ride":
                 store.record_shipped(st, tid, env.now(), t0)
+                if running:
+                    parked.append({"ticket": tid, "status": t["status"],
+                                   "hint": f"{tid} 多轮在做：已合的轮次随这次发版上去了，记 shipped_at、状态不变、"
+                                           "不进上线验收；最后一轮收票后再 released"})
+                    continue
                 who = "已停" if t["status"] == store.PAUSED else "在你接管中"
                 parked.append({"ticket": tid, "status": t["status"],
                                "hint": f"{tid} {who}：改动随这次发版上去了，只记 shipped_at、状态不变、不进上线验收；"

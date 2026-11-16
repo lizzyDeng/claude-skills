@@ -588,3 +588,187 @@ def test_round_fetch_failure_retries_then_stuck(mp):                            
     assert t2["status"] == "stuck" and t2["round_pending"]["pr"] == 42 and head(wt2) == "router/T2"
     (q,) = [q for q in mp.state()["queue"] if q["kind"] == "stuck" and q["ticket"] == "T2"]
     assert "连续 2 次" in q["summary"]
+
+
+# =====================================================================================================
+# D. 续跑和发版只认「一个 PR」
+# =====================================================================================================
+
+def test_tell_resume_confirmed_card_goes_executing_not_kickoff(mp):                       # D1a
+    wt = mp.worktree("T1")
+    mp.put(T1=("paused", ["llm-config"], {"title": "合成老票", "card_confirmed": True, "kickoff_at": OLD,
+                                          "worker": worker("sid-1", wt)}))
+    mp.register("sid-1", wt)
+    out = mp.out("tell", "T1", "合成：接着做", "--resume")
+    t = mp.state()["tickets"]["T1"]
+    assert out["resumed"] == "T1" and t["status"] == "executing"                    # 不是 kickoff
+    assert t["waiting_for"] != "按 router 转来的意见改方向卡"
+    assert not mp.result("T1", 2)["is_error"]
+
+
+def test_resume_refuses_when_surface_held_by_other(mp):                                   # D1b
+    wt = mp.worktree("T1")
+    mp.put(T1=("hold", ["llm-config"], {"title": "合成老票", "card_confirmed": True, "worker": worker("sid-1", wt)}),
+           T2=("executing", ["llm-config"], {"title": "合成另一张"}))
+    mp.register("sid-1", wt)
+    r = mp.run("tell", "T1", "合成：接着做", "--resume", check=False)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and "T2" in out["error"] and out["held"] == {"llm-config": "T2"}
+    assert mp.state()["tickets"]["T1"]["status"] == "hold" and mp.claude() == []
+    assert events.read_all(mp.home, "T1") == [] and not (mp.home / "inbox" / "T1.jsonl").exists()   # 先拒再投递
+
+
+def _round_maint(status, **kw):
+    return (status, ["llm-config"], _maint(worker=worker("sid-9", None, "router/T2-r2"), **kw))
+
+
+def test_prod_batch_running_round_ticket_needs_user(mp):                                  # D2a
+    push_main(mp.root)
+    s41 = staging_commit(mp.root, "合成 PR (#41)")
+    mp.put(T1=("await_prod", ["her-reply-prompt"], {"title": "合成老票"}),
+           T2=_round_maint("executing", rounds=[{"pr": 41, "merge_sha": s41, "branch": "router/T2", "at": OLD}]))
+    out = mp.out("prod-batch")
+    assert "batch" in out and out["router_ships"] == [] and out["verified"] and out["commits"] == []   # 轮次的提交对得上
+    row = {r["ticket"]: r for r in out["batch"]}
+    assert "多轮在做" in row["T2"]["state"] and "要放行" in row["T2"]["state"]
+    q = out["queue"]
+    assert mp.out("answer", q, "放行")["approved"] == ["T1", "T2"]
+    out = mp.out("prod-batch")
+    assert out["router_ships"] == ["T1"] and out["queue"] is None                     # 放行后不挡，也不进 router_ships
+    assert "已放行" in {r["ticket"]: r for r in out["batch"]}["T2"]["state"]
+
+
+def test_released_rides_running_and_stuck_round_tickets(mp):                              # D2b
+    mp.put(T1=("executing", ["llm-config"], _maint(rounds=[{"pr": 41, "merge_sha": "a" * 40, "branch": "router/T1",
+                                                            "at": OLD}])),
+           T2=("stuck", ["her-reply-prompt"], _maint(pr=42, round_pending={"pr": 42, "merge_sha": "b" * 40,
+                                                                            "branch": "router/T2", "at": OLD})))
+    out = mp.out("released", "--tickets", "T1", "T2", "--what", "合成发版", "--metrics", "m",
+                 "--t0", "2026-11-16T03:00:00Z")
+    s = mp.state()
+    assert sorted(x["ticket"] for x in out.get("parked", [])) == ["T1", "T2"] and out["postlaunch"] == {}
+    assert (s["tickets"]["T1"]["status"], s["tickets"]["T2"]["status"]) == ("executing", "stuck")
+    assert not s["tickets"]["T1"].get("postlaunch") and not s["tickets"]["T2"].get("postlaunch")
+    assert s["tickets"]["T1"]["rounds"][0]["shipped_at"] == "2026-11-16T03:00:00Z"
+    assert s["tickets"]["T2"]["round_pending"]["shipped_at"] == "2026-11-16T03:00:00Z"
+    assert not store.rounds_unshipped(s["tickets"]["T1"]) and not store.rounds_unshipped(s["tickets"]["T2"])
+
+
+def test_round_ticket_not_pending_after_release(mp):                                      # D2c（反例）
+    push_main(mp.root)
+    s41, s42 = staging_commit(mp.root, "合成 PR (#41)"), staging_commit(mp.root, "合成 PR (#42)")
+    mp.put(T1=("merged_staging", ["llm-config"], _maint(
+               pr=42, merge_sha=s42, history=[{"at": OLD, "status": "merged_staging"}],
+               rounds=[{"pr": 41, "merge_sha": s41, "branch": "router/T1", "at": OLD}])),
+           T2=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "card_confirmed": True,
+                                                    "card_confirmed_by": "user", "attempts": [], "title": "合成业务票"}))
+    out = mp.out("prod-batch")
+    assert [r["ticket"] for r in out["batch"]] == ["T1", "T2"]
+    mp.out("walkthrough-done", "T1")
+    mp.out("released", "--tickets", "T1", "--what", "合成发版", "--metrics", "m")
+    t1 = mp.state()["tickets"]["T1"]
+    assert t1["status"] == "postlaunch" and not store.staging_pending(t1)
+    assert [r["ticket"] for r in mp.out("prod-batch")["batch"]] == ["T2"]           # 发版后不再待发
+
+
+def test_attribute_counts_all_round_commits():                                            # D3
+    import router
+    st = make_state(T1=("executing", ["llm-config"], {"kind": "maint", "pr": 43, "merge_sha": "c3",
+                                                      "rounds": [{"pr": 41, "merge_sha": "c1"}, {"pr": 42}],
+                                                      "round_pending": {"pr": 44, "merge_sha": "c4"}}))
+    commits = [{"sha": "c1", "parents": ["p", "q"], "subject": "Merge 合成"},          # merge 提交只认 sha
+               {"sha": "x2", "parents": ["p"], "subject": "合成 (#42)"},                # squash：标题带轮次 PR 号
+               {"sha": "c3", "parents": ["p"], "subject": "合成"},
+               {"sha": "c4", "parents": ["p"], "subject": "合成"},                       # 还没归档的那一轮
+               {"sha": "zz", "parents": ["p"], "subject": "别的 (#99)"}]
+    assert [c["sha"] for c in router._attribute(st, ["T1"], commits)] == ["zz"]
+    t = st["tickets"]["T1"]
+    t["merge_sha"] = None                                                            # 还没收票：只有轮次合过
+    assert store.staging_pending(t)
+
+
+# =====================================================================================================
+# 端到端：一张维护票两轮 PR（第 1 个带 --more、第 2 个不带），真 git、真子进程、严格假 claude、假 gh
+# =====================================================================================================
+
+HOOK = r'''
+import json, os, subprocess, sys
+argv = sys.argv[1:]
+prompt = argv[argv.index("-p") + 1]
+t, home, cli = os.environ["ROUTER_TICKET"], os.environ["ROUTER_HOME"], os.environ["ROUTER_CLI"]
+call = lambda *a: subprocess.run([sys.executable, cli, *a], check=True, capture_output=True)
+git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True, text=True).stdout.strip()
+branch = git("rev-parse", "--abbrev-ref", "HEAD")
+with open(os.environ["HOOK_LOG"], "a") as f:
+    f.write(json.dumps({"cwd": os.path.realpath(os.getcwd()), "branch": branch}) + "\n")
+
+def open_pr(more=None):
+    with open(branch.replace("/", "-") + ".txt", "w") as fh:
+        fh.write("合成改动\n")
+    git("add", "."); git("commit", "-qm", "合成：" + branch); git("push", "-q", "-u", "origin", branch)
+    p = os.environ["GH_PRS"]
+    prs = json.loads(open(p).read()) if os.path.exists(p) else {}
+    prs.setdefault("open", {})[branch] = 41 + len(prs.get("open", {}))
+    open(p, "w").write(json.dumps(prs))
+    call("progress", "pr_opened", *(["--more", more] if more else []))
+
+if "--session-id" in argv:                                   # 第 1 段：写方向卡
+    os.makedirs(home + "/cards", exist_ok=True)
+    open(home + "/cards/" + t + ".md", "w").write(
+        "## 方向卡\n**3. 方案方向**\n- 合成：两个条目，一条一个 PR\n**4. 为什么不选另一种做法**\n合成\n")
+    call("progress", "card_ready")
+elif "方向卡已确认" in prompt:                                 # 第 1 条：开 PR，后面还有
+    open_pr(more="第 2 条：合成条目")
+elif "已合进" in prompt:                                       # 下一轮（router 切好分支叫醒）：最后一条，不带 --more
+    open_pr()
+'''
+
+
+def test_e2e_maint_two_rounds_then_settle(mp, monkeypatch):
+    import router
+    from ctx import Ctx
+    monkeypatch.setenv("FAKE_CLAUDE_HOOK", str(mp.tmp / "hook.py"))
+    monkeypatch.setenv("HOOK_LOG", str(mp.tmp / "hook.log"))
+    (mp.tmp / "hook.py").write_text(HOOK)
+    push_main(mp.root)
+    mp.put(T1=("draft", ["llm-config"], {"kind": "maint", "title": "维护 合成周",
+                                          "problem": "合成：两个条目"}))
+    ticks = []
+
+    def tick_until(cond, timeout=30):
+        def once():
+            ticks.append(mp.out("tick"))
+            return cond(mp.state()["tickets"]["T1"], ticks[-1])
+        wait_until(once, timeout)
+
+    assert mp.out("start", "T1")["dispatched"] == ["T1"]
+    tick_until(lambda t, out: "T1" in out["cards_for_review"])
+    q = mp.out("submit-card", "T1", "--card", str(mp.home / "cards" / "T1.md"))["queue"]
+    assert mp.out("answer", q, "合成：同意")["resumed"] == "T1"
+    tick_until(lambda t, out: t["status"] == "merged_staging")
+    t = mp.state()["tickets"]["T1"]
+    prs = json.loads((mp.tmp / "prs.json").read_text())
+    hook = [json.loads(l) for l in (mp.tmp / "hook.log").read_text().splitlines()]
+    # 中途没有「没有可续跑」，也没有 already in use / No conversation found
+    errs = " ".join(e for out in ticks for e in out["errors"])
+    assert "没有可续跑" not in errs and "already in use" not in errs and "No conversation found" not in errs
+    results = [launcher.read_result(f) for f in sorted((mp.home / "logs").glob("T1-*.log"))]
+    assert len(results) == 3 and not any(r["is_error"] for r in results), results
+    # 第 2 轮分支 router/T1-r2，worktree 路径不变
+    assert [h["branch"] for h in hook] == ["router/T1", "router/T1", "router/T1-r2"]
+    assert len({h["cwd"] for h in hook}) == 1
+    # 只出 1 个走查项；rounds 1 条（第 2 轮是收票那一轮，记在 t.pr / t.merge_sha）
+    hs = [q for q in mp.state()["queue"] if q["kind"] == "handson"]
+    assert len(hs) == 1 and "#41" in hs[0]["summary"] and "#42" in hs[0]["summary"]
+    assert [r["pr"] for r in t["rounds"]] == [41] and t["rounds"][0]["merge_sha"] == prs["merged"]["41"]
+    assert (t["pr"], t["merge_sha"]) == (42, prs["merged"]["42"])
+    assert t["worker"]["worktree"] is None and not Path(hook[0]["cwd"]).exists()     # 收票：干净才删
+    # 两个合并提交在对账里都对得上
+    env = router.Env(mp.root, Ctx())
+    check = router._staging_commits(env)
+    assert check["ok"] and {c["sha"] for c in check["commits"]} >= {prs["merged"]["41"], prs["merged"]["42"]}
+    assert router._attribute(mp.state(), ["T1"], check["commits"]) == []
+    # released 之后不再待发
+    mp.out("walkthrough-done", "T1")
+    mp.out("released", "--tickets", "T1", "--what", "合成两条", "--metrics", "m")
+    assert not store.staging_pending(mp.state()["tickets"]["T1"])

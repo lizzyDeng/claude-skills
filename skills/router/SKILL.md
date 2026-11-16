@@ -164,7 +164,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「先停 A」 | `router.py pause <T>`（做完当前这一步停） |
 | 「立刻停 A」 | `router.py stop <T>`（直接停进程，worktree 和进度保留） |
 | 「B 插队」/「C 往后放」 | `router.py prioritize <T> <n>`（越小越先），记一条 decide |
-| 「告诉 A：…」 | `router.py tell <T> "<原话>"`（用户原话，不加 `--as-router`）；A 已停下就加 `--resume`。你自己要转告 worker 的话（方向审挑战、转述）才加 `--as-router` |
+| 「告诉 A：…」 | `router.py tell <T> "<原话>"`（用户原话，不加 `--as-router`）；A 已停下就加 `--resume`（方向卡确认过的票回执行、没确认的回方向卡；票当前不持锁、代码面已被别的票拿走 ⇒ 拒，先拒再投递）。你自己要转告 worker 的话（方向审挑战、转述）才加 `--as-router` |
 | 「推翻 Dn」 | `router.py revoke <Dn> --reason "<原话>"` |
 | 「我接管 A」 | `router.py takeover <T>`，把它打印的命令给用户；之后不再调度 A |
 | 「还给 router」 | `router.py handback <T>` |
@@ -211,6 +211,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
   - **提交对账**：先 `git fetch` origin 的 main 和 base，再列 `origin/<main_branch>..origin/<base_branch>` 的每个提交，逐个对到批次里的票。对得上 = 提交 sha 就是这张票记的合并 sha（`merge_sha`）；或者它是普通提交（单个父提交）、标题以「(#<PR 号>)」结尾（squash 合并的默认标题），PR 号是批次里某张票的 PR。merge 提交（多个父提交）只认 sha；main 回合 staging 的 merge 提交（任一非首父提交是 `origin/<main_branch>` 的祖先，每次发版后都会有）不算对不上，单列在输出的 `sync_merges`。对不上的提交（用户自己 session 推的、同事的 PR……）一律算没放行，列进整批项；git 核对不了（fetch / rev-parse / log 失败）也一样，router 不自己上（fail-closed）。
   - **钉住核对过的 staging**：prod-batch 输出 `staging_sha` = 这次对账用的 `origin/<base_branch>` 提交。合 main 时钉在这个 sha 上，不在它之后另取 staging 最新——之后才落到 staging 的提交没核对过。
   - **已停 / 接管 / 关前已撤回的票**（stop、takeover、`close --rolled-back` 之后代码还在 staging 上）：留在 `batch` 里、标出状态，用户放行之前挡着 router 自己上；放行之后跟着整批上去，但永远不进 `router_ships`——它们不是这次上线的票。发完对它们也跑一次 `router.py released --tickets <T> …`：已停 / 接管的只在状态历史记 shipped_at、不改状态、不进上线验收（输出 `parked`）；关前已撤回的跳过、不报错（输出 `skipped`，也记 shipped_at），它们这才出批次。
+  - **多轮在做的票**（老票 / 维护票报过 `--more`、已合了几轮、票还没收：executing / verifying / stuck…）：合 main 会把已合的轮次一起带上去。只要有这样的票，prod-batch 就走整批规则（只有老票时也对账，轮次的合并 sha / PR 号都算对得上）；它在 `batch` 里标「多轮在做：已合 k 轮还没发·要放行」，放不放行由用户定（放行后不挡，但永远不进 `router_ships`）。发完对它也跑一次 `router.py released --tickets <T> …`：只给已合的轮次记 shipped_at、状态不变、不进上线验收（输出 `parked`）；最后一轮收票后照常 released。
   - 整批都满足 ⇒ `router_ships` = 整批里发完要照常验收的票，**你自己**照项目发版流程上 prod（合 main 钉在 `staging_sha`），每次都带开关，发完逐张 `router.py released --tickets <T> --what "<这次尝试的方向>" --metrics … --rollback "<撤回办法：关哪个开关 / 回哪个配置>" [--t0 <生效时刻>] [--config-keys …]`（业务票的撤回办法照方向卡上写的；用户放行过的老票照 v1 不带 `--rollback`；各记一条 decide）。
   - 还有待走查、待放行（或上一次尝试还没判、代码还在 staging 上的已停 / 接管 / 已关的票）、对不上的提交，或核对不了 ⇒ `router_ships` 为空，决定单上一条整批 prod 项，列出整批每张票的状态（输出的 `batch`）、对不上的提交（`commits`）和核对成没成（`verified`）。告诉用户，等他走查完、或回「Qn 放行」（整批每张票、每个列出的提交记已放行，你再整批上）。批次不变（同一组票、同一组对不上的提交）时这一项原地更新、保留 Q 号，用户照看到的号回就行；批次变了才换一条新的（要重新放行）。
   - 没有业务票等上 prod 时照 v1：`tickets`（老票、维护票）攒成一条「上 prod：…」等用户。
