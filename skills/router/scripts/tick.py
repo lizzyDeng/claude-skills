@@ -466,10 +466,22 @@ class Run:
     def _offrepo(self, t) -> bool:
         return is_offrepo(t, self.table, self.root)
 
+    def _this_run_events(self, tid, t) -> list:
+        """这次运行报的进度 / 停止事件：started_at 之后、而且在上一次退出处理读到的位置之后（events_handled，字节偏移）。
+        时间戳只到秒：上一次运行的 progress 和这次续跑的 started_at 落在同一秒时，只看时间会把旧事件也算进来
+        （旧的 card_ready 被当成新卡、上一轮的 pr_opened --more 被再读一次）。文件比记的偏移短（被清过）⇒ 从头读。"""
+        w = t["worker"]
+        path = self.home / "events" / f"{tid}.jsonl"
+        off = t.get("events_handled") or 0
+        if not path.exists() or path.stat().st_size < off:
+            off = 0
+        items, t["events_handled"] = events._read_from(path, off)
+        return [e for e in items
+                if e.get("ts", "") >= (w.get("started_at") or "") and (e.get("type") == "progress" or e.get("stop"))]
+
     def _handle_exit(self, tid, t):
         w = t["worker"]
-        mine = [e for e in events.read_all(self.home, tid)
-                if e.get("ts", "") >= (w.get("started_at") or "") and (e.get("type") == "progress" or e.get("stop"))]
+        mine = self._this_run_events(tid, t)
         result = launcher.read_result(w["log"]) if w.get("log") else None
         w["exit"] = {"at": self.now, "result": result is not None, "is_error": bool(result and result.get("is_error"))}
         w["pid"] = None
@@ -481,6 +493,14 @@ class Run:
             # 后面还有 PR（多轮）：带值才写。CI 红 / 冲突被叫醒修完再报 pr_opened 不带 --more，不动它；
             # 只在开下一轮成功时清（store.open_next_round）
             t["more"] = mores[-1]
+        # 这次运行出过方向卡（不只看最后一条：先 card_ready 再 pr_opened 也算，D237 同类）。不在 kickoff 出的 =
+        # 新一版方向卡（诊断卡确认后出下一道墙的卡、分期票下一期，D571）：撤掉旧卡的确认，回方向审；
+        # 不撤的话旧卡的 card_confirmed 会让新卡还没确认的 PR 被合。stop 事件仍然优先。
+        new_card = any(e.get("phase") == "card_ready" for e in mine) and not (last and last.get("stop"))
+        if new_card and t["status"] != store.KICKOFF:
+            t["card_confirmed"] = False
+            t.pop("card_confirmed_by", None)
+            t.setdefault("solution", {})["source"] = "新方向卡待审（执行中出的新一版）"
         if last and last.get("stop"):
             t["stops"] += 1
             kind = "spend" if STOP_TAGS & set(last.get("affects", {}).get("tags", [])) else STOP_KIND[last["type"]]
@@ -489,7 +509,11 @@ class Run:
             topic = "assumption" if kind == "direction" and last["type"] == "assumption_broken" else None
             qid = self.queue(tid, kind, f"{tid}：{prefix}{last['summary']}", topic=topic)
             store.set_status(self.state, tid, store.PAUSED, self.now, f"等你回答 {qid}")
-        elif phase == "card_ready" and t["status"] == store.KICKOFF:
+        elif new_card:
+            # 交卡走现成路径：回 KICKOFF → router 方向审 → submit-card → 用户确认 → --resume 同一 session 接着做。
+            # 同一次运行里卡后面又开了 PR：PR 留着，确认前 _verify 的未确认闸挡着不合
+            if t["status"] != store.KICKOFF:
+                store.set_status(self.state, tid, store.KICKOFF, self.now, "router 方向审中")
             t["card_ready_at"] = self.now
             t["waiting_for"] = "router 方向审中"
             self.res["cards_for_review"].append(tid)

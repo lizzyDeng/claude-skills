@@ -49,6 +49,7 @@
   - `interface_changed` / `assumption_broken`（来自别的票）：对照你的方向卡核心假设；没受影响就继续；你的核心假设也被推翻了，照下一节第 2 条停。
   - `tell`：router 转来的话，照办。
 - 细节设计边做边定，不再出 plan v2、v3。conductor 的好规矩照做：锚定 SHA、非 happy path 必测、验收贴真实输出。
+- 执行中要出新方向卡时（用户回答要你出卡、诊断卡确认后出下一道墙的卡、分期票的下一期）：写完卡（同一路径 `$ROUTER_HOME/cards/$ROUTER_TICKET.md`）就 `python3 $ROUTER_CLI progress card_ready` 退出，**不要接着开工**。之前那张卡的确认随之作废，router 走方向审后交用户确认；确认后会用 `--resume` 叫醒你（同一会话、同一分支），从新卡接着做。
 
 ## 只在三种情况停
 

@@ -772,3 +772,84 @@ def test_e2e_maint_two_rounds_then_settle(mp, monkeypatch):
     mp.out("walkthrough-done", "T1")
     mp.out("released", "--tickets", "T1", "--what", "合成两条", "--metrics", "m")
     assert not store.staging_pending(mp.state()["tickets"]["T1"])
+
+
+# =====================================================================================================
+# F. 执行中出的新方向卡被当成卡住（D571）
+# =====================================================================================================
+
+def test_card_ready_while_executing_goes_to_review(mp):                                   # F1
+    wt = mp.worktree("T1")
+    log = mp.home / "logs" / "T1-1.log"; log.parent.mkdir(parents=True)
+    log.write_text('{"type": "result", "is_error": false, "result": "ok"}')
+    mp.put(T1=("executing", ["llm-config"], {
+        "title": "合成老票", "card_confirmed": True, "card_confirmed_by": "user",
+        "solution": {"kind": "card", "text": "合成：先诊断", "source": "方向卡 v1（已确认）"},
+        "worker": worker("sid-1", wt, pid=DEAD_PID, log=str(log))}))
+    mp.register("sid-1", wt)
+    card = mp.home / "cards" / "T1.md"; card.parent.mkdir(parents=True, exist_ok=True)
+    card.write_text("## 方向卡\n**3. 方案方向**\n- 合成：拆下一道墙\n**4. 为什么不选另一种做法**\n合成\n")
+    mp.out("progress", "card_ready", "--ticket", "T1")                            # 照用户回答写好了新方向卡
+    out = mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert out["cards_for_review"] == ["T1"] and t["status"] == "kickoff"
+    assert t["card_confirmed"] is False and "card_confirmed_by" not in t and "新方向卡待审" in t["solution"]["source"]
+    assert not [q for q in mp.state()["queue"] if q["kind"] == "stuck"] and mp.claude() == []   # 不是卡住、没起进程
+    assert mp.out("tick")["cards_for_review"] == ["T1"]                           # 重启后 _resurface 能再交一次
+    q = mp.out("submit-card", "T1", "--card", str(card))["queue"]
+    assert mp.state()["tickets"]["T1"]["status"] == "await_card"
+    out = mp.out("answer", q, "合成：同意")
+    t = mp.state()["tickets"]["T1"]
+    assert out["resumed"] == "T1" and t["status"] == "executing" and t["card_confirmed"] is True
+    assert not mp.result("T1", 2)["is_error"]                                     # 同一 session、同一 cwd
+    argv = mp.claude()[-1]
+    assert argv[argv.index("--resume") + 1] == "sid-1"
+
+
+def test_new_card_then_pr_same_run_not_merged(fk):                                        # F2
+    fk.put(T1=("executing", ["llm-config"], {"card_confirmed": True, "card_confirmed_by": "user", "issue": 11,
+                                             "worker": {"session_id": "sid", "worktree": "/wt/x", "pid": 123,
+                                                        "branch": "router/T1", "runs": 1, "started_at": T0,
+                                                        "log": fk_log(fk, "T1")}}))
+    progress(fk.home, "T1", "card_ready", "2026-11-02T10:01:00Z")
+    progress(fk.home, "T1", "pr_opened", "2026-11-02T10:02:00Z")                 # 同一次运行：新卡之后又开了 PR
+    fk.ctx.script(["gh", "pr", "list"], json.dumps([{"number": 41}]))
+    fk.ctx.script(["gh", "pr", "view"], (FIX / "gh_pr_green.json").read_text())
+    res = fk.run()
+    t = fk.state()["tickets"]["T1"]
+    assert (t["status"], t["card_confirmed"]) == ("kickoff", False) and res["cards_for_review"] == ["T1"]
+    assert not fk.ctx.calls_with("pr", "merge")                                   # 新卡没确认：PR 不合
+
+
+def test_previous_run_events_in_same_second_not_reread(fk):                               # F3（事件边界）
+    # 时间戳只到秒：上一次运行的 progress 和这次续跑的 started_at 落在同一秒时，「started_at 之后」会把旧事件也算进来：
+    # 旧的 card_ready 被当成执行中出的新卡；第 1 轮的 pr_opened --more 被第 2 轮再读一次 ⇒ 最后一个 PR 被当成「后面还有」
+    wt = _clean_wt(fk)
+    card = fk.home / "cards" / "T1.md"; card.parent.mkdir(parents=True, exist_ok=True)
+    card.write_text("## 方向卡\n**3. 方案方向**\n- 合成：两个条目\n**4. 为什么不选另一种做法**\n合成\n")
+    fk.put(T1=("kickoff", ["llm-config"], _maint(card_confirmed=False, worker={
+        "session_id": "sid", "worktree": str(wt), "pid": 123, "branch": "router/T1", "runs": 1, "started_at": T0,
+        "log": fk_log(fk, "T1")})))
+    fk.ctx.script(["gh", "pr", "list"], lambda cmd: json.dumps([{"number": 42 if "router/T1-r2" in cmd else 41}]))
+    merged = lambda pr: fk.ctx.calls_with("pr", "merge", pr)
+    fk.ctx.script(["gh", "pr", "view", "41"], lambda cmd: _pr_json("MERGED", "a41") if merged("41") else _pr_json("OPEN"))
+    fk.ctx.script(["gh", "pr", "view", "42"], lambda cmd: _pr_json("MERGED", "b42") if merged("42") else _pr_json("OPEN"))
+
+    def worker_exits(*evs):                                                          # 这次运行报的进度（都在同一秒 T0）
+        t = fk.state()["tickets"]["T1"]
+        fk.ctx.alive.clear()
+        Path(t["worker"]["log"]).parent.mkdir(exist_ok=True)
+        Path(t["worker"]["log"]).write_text('{"type":"result","is_error":false}')
+        for phase, extra in evs:
+            progress(fk.home, "T1", phase, T0, **extra)
+        return fk.run()
+    assert worker_exits(("card_ready", {}))["cards_for_review"] == ["T1"]
+    q = _cli(fk, "submit-card", "T1", "--card", str(card))["queue"]
+    assert _cli(fk, "answer", q, "合成：同意")["resumed"] == "T1"                     # 续跑：started_at 还是 T0
+    worker_exits(("pr_opened", {"more": "第 2 条：合成条目"}))                          # 第 1 轮：合 #41 → 开第 2 轮
+    t = fk.state()["tickets"]["T1"]
+    assert (t["status"], t["worker"]["branch"], t["card_confirmed"]) == ("executing", "router/T1-r2", True)
+    worker_exits(("pr_opened", {}))                                                  # 第 2 轮：最后一个 PR
+    t = fk.state()["tickets"]["T1"]
+    assert (t["status"], t["merge_sha"], t.get("more")) == ("merged_staging", "b42", None)   # 收票，不是第 3 轮
+    assert [r["pr"] for r in t["rounds"]] == [41]

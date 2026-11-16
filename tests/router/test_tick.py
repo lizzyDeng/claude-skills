@@ -337,9 +337,10 @@ def test_pr_opened_before_card_confirmed_is_not_merged(proj):        # C2
     proj.put(T1=running("kickoff", ["a"], log=log_with(proj, "T1", "{}")))
     events.emit_progress(proj.home, "T1", "card_ready", "2026-11-02T10:01:00Z")
     events.emit_progress(proj.home, "T1", "pr_opened", "2026-11-02T10:02:00Z")
-    proj.run()
+    res = proj.run()
     t = proj.state()["tickets"]["T1"]
-    assert t["status"] == "paused" and [q["kind"] for q in proj.state()["queue"]] == ["direction"]
+    # 缺陷 F（D571）之后：这次运行出过方向卡 ⇒ 回方向审（卡交用户确认），PR 留着；确认前未确认闸挡着不合
+    assert t["status"] == "kickoff" and res["cards_for_review"] == ["T1"] and not t.get("card_confirmed")
     s = proj.state(); store.set_status(s, "T1", store.VERIFYING, T0); s["tickets"]["T1"]["pr"] = 41
     store.save_state(proj.home / "state.json", s)
     _pr_fake(proj)
