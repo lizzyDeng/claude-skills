@@ -1315,10 +1315,46 @@ def _add_wall(env, st, tid, text, source):
     return wid, _offer_next(env, st, tid, f"新墙 {wid}「{' '.join(str(text).split())[:40]}」待拆")
 
 
+def _close_other(env, st, tid, why) -> None:
+    """老票 / 维护票收票（附录 G：零代码票按决定收票后状态仍停在 await_prod，被拉进下一个发版批次）：
+    决定不做 / 前提失效、没有要上 prod 的改动 ⇒ 票进 done，走 v1 收尾（下一轮巡检留言说明后关 issue、清 worktree /
+    分支），清掉它在决定单上的项，记一条 decide。只记 decide 不改状态 = 票留在 await_prod，每次发版都被拉进批次。
+    拒：已上线（终点是上线验收）；没写理由；改动还在 staging 上 / 仓外改了还没核对（照常发版、走上线验收）；
+    worker 还在跑 / 认不出。"""
+    t = env.ticket(st, tid)
+    if t["status"] == store.DONE:
+        raise Fail(f"{tid} 已经关了")
+    if t["status"] == store.POSTLAUNCH:
+        raise Fail(f"{tid} 是{_KIND_ZH.get(store.ticket_kind(t), '老票')}、已上线：终点是上线验收（postlaunch-result 判完即 done），"
+                   "不能 close；close 只收业务票，和没有要上 prod 改动的老票 / 维护票")
+    if not why:
+        raise Fail(f"{tid} 是{_KIND_ZH.get(store.ticket_kind(t), '老票')}：收票要写 --reason（为什么不做 / 前提怎么失效的）")
+    if store.staging_pending(t) or store.offrepo_pending(t):
+        raise Fail(f"{tid} 还有在途的改动（合进了 staging 还没上 prod，或仓外改了还没核对）：不能直接收票；"
+                   "照常发版、走上线验收（postlaunch-result 判完即 done）")
+    _refuse_pending(t, tid, env.ctx)
+    pid = t["worker"].get("pid")
+    if pid and env.ctx.pid_alive(pid):
+        raise Fail(f"{tid} 的 worker 还在跑（pid {pid}）：先 stop {tid}，再收票")
+    t["closeout"] = {"downstream": _closeout_targets(st, tid), "issue": "pending" if t.get("issue") else "n/a",
+                     "worktree": "pending", "branch": "pending"}
+    t["closed"] = {"why": why, "at": env.now()}
+    st["queue"] = [q for q in st["queue"] if q.get("ticket") != tid]
+    store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
+    store.append_decision(env.decisions, st, tid, "收票（不做 / 前提失效，没有要上 prod 的改动）", why,
+                          f"router.py close {tid}", env.now())
+
+
 def cmd_close(a, env):
-    """用户说「关 Tn」：关业务票（同「Qn 关」的收尾）。worker 还活着 ⇒ 拒，先 stop。"""
+    """「关 Tn」：业务票照 _close_business（同「Qn 关」的收尾）；老票 / 维护票照 _close_other（收票，要 --reason）。
+    worker 还活着 ⇒ 拒，先 stop。"""
     reason = (a.reason or "").strip()
     with env.state() as st:
+        if store.ticket_kind(env.ticket(st, a.ticket)) != "business":
+            if a.rolled_back:
+                raise Fail("--rolled-back 只给业务票：老票 / 维护票的改动还在 staging 上就照常发版、走上线验收")
+            _close_other(env, st, a.ticket, reason)
+            return {"ok": True, "ticket": a.ticket, "status": store.DONE}
         _close_business(env, st, a.ticket, reason or "用户要关",
                         f"用户：关 {a.ticket}" + (f"（{reason}）" if reason else ""), rolled_back=a.rolled_back)
         _append_local(env.home / "answers.md",
@@ -2807,8 +2843,9 @@ def build_parser():
     g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，必填；进 answers.md）")
     g.add_argument("--new-card", action="store_true", help="router 只要一张新方向卡（不带方向）：新 worker 提方向，卡交用户确认")
     g.add_argument("--as-router", action="store_true", help="v2.1 起一律拒：router 不定方向（用 --new-card）")
-    s = sub.add_parser("close", help="用户说「关 Tn」：关业务票（收尾：关 issue、清 worktree）")
-    s.add_argument("ticket"); s.add_argument("--reason")
+    s = sub.add_parser("close", help="关票（收尾：关 issue、清 worktree）：业务票（用户说「关 Tn」）；老票 / 维护票收票"
+                                     "（不做 / 前提失效、没有要上 prod 的改动，要 --reason）")
+    s.add_argument("ticket"); s.add_argument("--reason", help="老票 / 维护票必填：为什么不做 / 前提怎么失效的")
     s.add_argument("--rolled-back", action="store_true",
                    help="还有在途尝试 / 改动时：router 已照撤回办法撤回，确认要关（记一条 decide）")
     s = sub.add_parser("absorb", help="把老票并进已有的业务票（设 parent；验收过的记一次历史尝试）")

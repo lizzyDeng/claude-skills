@@ -853,3 +853,34 @@ def test_previous_run_events_in_same_second_not_reread(fk):                     
     t = fk.state()["tickets"]["T1"]
     assert (t["status"], t["merge_sha"], t.get("more")) == ("merged_staging", "b42", None)   # 收票，不是第 3 轮
     assert [r["pr"] for r in t["rounds"]] == [41]
+
+
+# =====================================================================================================
+# G. 零代码票按决定收票后，状态仍停在 await_prod，被拉进下一个发版批次（D538 / D541 / D543 → Q445）
+# =====================================================================================================
+
+def test_close_zero_code_legacy_leaves_release_batch(mp):                                 # G
+    mp.put(T1=("await_prod", ["llm-config"], {"title": "合成零代码票", "issue": 11, "card_confirmed": True,
+                                              "waiting_for": tick.ZERO_CODE_WAIT}),
+           T2=("await_prod", ["her-reply-prompt"], {"title": "合成老票", "issue": 12}),
+           T3=("merged_staging", ["her-reply-prompt"], {"title": "合成在途", "issue": 13, "pr": 43,
+                                                        "merge_sha": "c" * 40,
+                                                        "history": [{"at": OLD, "status": "merged_staging"}]}))
+    assert mp.out("prod-batch")["tickets"] == ["T1", "T2"]
+    out = mp.out("close", "T1", "--reason", "合成：前提已失效")
+    t = mp.state()["tickets"]["T1"]
+    assert out["ok"] and t["status"] == "done" and t["closeout"]["issue"] == "pending"
+    assert mp.out("prod-batch")["tickets"] == ["T2"]                                 # 不再被拉进发版批次
+    dec = (mp.home / "decisions.md").read_text()
+    assert "| T1 | 收票" in dec and "合成：前提已失效" in dec
+    r = mp.run("close", "T3", "--reason", "合成", check=False)                       # 改动还在 staging 上：不能直接收
+    assert r.returncode == 1 and "staging" in json.loads(r.stdout)["error"]
+    r = mp.run("close", "T2", check=False)                                           # 老票收票要写理由
+    assert r.returncode == 1 and "--reason" in json.loads(r.stdout)["error"]
+    s = mp.state()
+    assert (s["tickets"]["T2"]["status"], s["tickets"]["T3"]["status"]) == ("await_prod", "merged_staging")
+    mp.out("tick")                                                                   # 收尾：留言说明后关 issue
+    assert mp.state()["tickets"]["T1"]["closeout"]["issue"] == "done"
+    body = next(c for c in mp.gh() if c[:3] == ["issue", "comment", "11"])[-1]
+    assert "收票" in body and "合成：前提已失效" in body and "仓外改动" not in body
+    assert ["issue", "close", "11", "-R", "o/r", "--reason", "completed"] in mp.gh()

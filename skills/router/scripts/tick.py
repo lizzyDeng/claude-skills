@@ -1101,6 +1101,9 @@ class Run:
         return str(at)[:10]
 
     def _closeout_body(self, tid, t) -> str:
+        if t.get("closed"):                            # 老票 / 维护票收票（router.py close）：没有要上 prod 的改动
+            return (f"本票收票（{self._done_date(t)}）：{t['closed'].get('why', '')}。没有要上 prod 的改动。"
+                    "由 /router 关闭。")
         if t.get("merged_into"):                       # v2.1：并进另一张业务票（同一业务目标）
             into = self.state["tickets"].get(t["merged_into"]) or {}
             ref = f" #{into['issue']}" if into.get("issue") else ""
@@ -1116,6 +1119,9 @@ class Run:
         why = ("依赖已解锁" if tid in o.get("blocked_by", []) else
                f"共享代码面 {'、'.join(sorted(shared))} 已释放" if shared else "上游已完成")
         issue = f" #{t['issue']}" if t.get("issue") else ""
+        if t.get("closed"):
+            return (f"上游 {tid}{issue}「{t['title']}」已收票（{str(t['closed'].get('why', ''))[:300]}），"
+                    f"没有要上 prod 的改动。\n- 对本票的影响：{why}。\n\n由 /router 自动留言。")
         return (f"上游 {tid}{issue}「{t['title']}」已完成（仓外改动，不经 PR；用户已核对）。\n"
                 f"- 改了什么：{(t.get('solution') or {}).get('text', '')[:300]}\n"
                 f"- 对本票的影响：{why}；开工 / 继续前先看本机最新的仓外文件。\n\n由 /router 自动留言。")
