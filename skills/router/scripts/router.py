@@ -558,6 +558,8 @@ def _conflict_resumable(t) -> bool:
 def cmd_answer(a, env):
     as_router = bool(getattr(a, "as_router", False))
     go = bool(getattr(a, "go", False))
+    if go and a.reject:                               # 放行和驳回矛盾：一律拒，队列不动（审查修复轮 3）
+        raise Fail("--go 和 --reject 不能一起用：放行整批就只加 --go，驳回方向卡就只加 --reject")
     with env.state() as st:
         pos = next((i for i, x in enumerate(st["queue"]) if x["id"] == a.qid), None)
         try:

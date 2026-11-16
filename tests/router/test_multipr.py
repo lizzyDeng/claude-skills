@@ -1161,3 +1161,17 @@ def test_e2e_stale_merged_pr_pointer_then_new_pr(mp, monkeypatch):              
     assert wt.is_dir() and t["worker"]["worktree"] == str(wt)                        # worktree 不删
     assert not [q for q in mp.state()["queue"] if q["kind"] in ("handson", "prod")] and not res.get("prod_ready")
     assert not [c for c in mp.gh() if c[:3] == ["pr", "merge", "41"]]
+
+
+def test_go_and_reject_together_refused(mp):                                              # 审查修复轮 3
+    push_main(mp.root)
+    mp.put(T1=("await_prod", ["llm-config"], {"title": "合成老票"}),
+           T2=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "attempts": [],
+                                                    "title": "合成业务票"}))
+    q = mp.out("prod-batch")["queue"]
+    before = mp.state()["queue"]
+    r = mp.run("answer", q, "不放行", "--go", "--reject", check=False)
+    assert r.returncode == 1 and "--reject" in json.loads(r.stdout)["error"]
+    s = mp.state()
+    assert s["queue"] == before and not any(t.get("prod_ok") for t in s["tickets"].values())
+    assert not (mp.home / "answers.md").exists()
