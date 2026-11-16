@@ -256,6 +256,42 @@ def _pending_since(t: dict, marks_of: tuple, done_releases: bool) -> bool:
     return not (done_releases and any(x.get("status") == DONE for x in after))
 
 
+# ---- 多轮（老票、维护票）：一张票多个 PR。worker 报 pr_opened --more ⇒ 合并后不收票，同一路径切 router/<T>-r<k> 续跑 ----
+# 按 PR 记的一次性标记：开下一轮时清（同 router._requeue_business 那份，但不清 merge_sha）
+ROUND_FLAGS = ("verifying_at", "unconfirmed_reported", "no_pr_reported", "no_ci_reported", "leak_reported",
+               "wrong_base_reported", "retarget_fail")
+
+
+def round_branch(tid: str, t: dict) -> str:
+    """下一轮的分支：第 1 轮是派单时的 router/<T>，第 k 轮 router/<T>-r<k>（k = 已归档轮数 + 2）。"""
+    return f"router/{tid}-r{len(t.get('rounds') or []) + 2}"
+
+
+def open_next_round(t: dict, rp: dict, branch: str) -> dict:
+    """开下一轮（切分支成功之后才调）：rp 归档进 rounds，PR 指针、more、按 PR 记的一次性标记清掉，worker.branch 换成
+    新分支。不清 merge_sha（发版对账 / 待发判断要认它）。→ 归档的那一轮。"""
+    rnd = dict(rp)
+    t.setdefault("rounds", []).append(rnd)
+    t.pop("round_pending", None)
+    t["pr"] = None
+    t.pop("more", None)
+    for k in ROUND_FLAGS:
+        t.pop(k, None)
+    t["fail_streak"] = {"step": "", "count": 0}
+    t["worker"]["branch"] = branch
+    return rnd
+
+
+def round_note(rnd: dict, branch: str, base: str) -> str:
+    """开下一轮时给 worker 的说明（续跑提示的开头）。"""
+    sha = str(rnd.get("merge_sha") or "?")[:12]
+    nxt = f"再做下一项：{rnd['more']}" if rnd.get("more") else "再接着做这张票剩下的（上一轮没报 --more：先读 inbox）"
+    return (f"【router】PR #{rnd.get('pr') or '?'} 已合进 {base}（合并 sha {sha}）。你现在在新分支 {branch}，"
+            f"从 origin/{base} 切的，还是同一个目录。先读 inbox（python3 $ROUTER_CLI inbox），{nxt}。"
+            "后面还有 PR 就照旧 progress pr_opened --more \"<还剩什么>\"；这是最后一个就不带 --more"
+            "（PR 正文写 Closes）；报过 --more 后发现没有下一项：progress impl_done 退出。")
+
+
 def current_attempt(t: dict):
     """业务票的「当前尝试」= 最后一条非历史的尝试（历史尝试是并进来的老票，不参与判定）；没有 → None。
     daily 的票况、verdict、released 的在途检查、看板 / status 的最近判定都按它。"""

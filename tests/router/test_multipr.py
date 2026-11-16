@@ -370,3 +370,221 @@ def test_verify_skips_already_settled_merge(fk):                                
     assert fk.ctx.calls_with("pr", "merge", "42")                                    # 验的是 #42
     assert (t["pr"], t["merge_sha"]) == (42, "b42")
     assert not fk.ctx.calls_with("pr", "merge", "41")
+
+
+# =====================================================================================================
+# B. 合一个 PR 就收票 / C. 下一轮复用 squash 合并过的旧分支（多轮只给老票、维护票）
+# =====================================================================================================
+
+def _maint(**kw):
+    return {"kind": "maint", "title": "维护 合成周", "issue": 11, "card_confirmed": True, **kw}
+
+
+def _ls_remote(p):
+    return _git("ls-remote", "origin", cwd=p.root)
+
+
+def _prompt(argv):
+    return argv[argv.index("-p") + 1]
+
+
+def test_progress_more_recorded_business_rejected(mp):                                    # B1
+    mp.put(T1=("executing", ["llm-config"], _maint()),
+           T2=("executing", ["her-reply-prompt"], {"kind": "business", "authorized": True}))
+    out = mp.out("progress", "pr_opened", "--more", "第 2 条：合成条目", "--ticket", "T1")
+    assert out["ok"] and out["event"]["more"] == "第 2 条：合成条目"
+    assert events.read_all(mp.home, "T1")[-1]["more"] == "第 2 条：合成条目"
+    r = mp.run("progress", "pr_opened", "--more", "合成", "--ticket", "T2", check=False)
+    assert r.returncode == 2 and "业务票" in json.loads(r.stdout)["error"]
+    assert events.read_all(mp.home, "T2") == []
+    r = mp.run("progress", "card_ready", "--more", "合成", "--ticket", "T1", check=False)
+    assert r.returncode == 2
+
+
+def test_tick_settle_with_more_switches_and_resumes(mp):                                  # B2
+    wt = mp.worktree("T1")
+    mp.put(T1=("verifying", ["llm-config"], _maint(pr=41, more="第 2 条：合成条目", worker=worker("sid-1", wt))),
+           T2=("queued", ["llm-config"], {"issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
+    mp.register("sid-1", wt)
+    mp.prs(merged={"41": staging_commit(mp.root, "合成 PR (#41)")})
+    mp.out("tick")
+    s = mp.state(); t = s["tickets"]["T1"]
+    assert t["status"] == "executing" and t["worker"]["worktree"] == str(wt) and wt.is_dir()     # 同一路径
+    assert head(wt) == "router/T1-r2" and t["worker"]["branch"] == "router/T1-r2"
+    assert _git("rev-parse", "HEAD", cwd=wt) == _git("rev-parse", "origin/staging", cwd=wt)   # 从 origin/staging 切
+    assert store.holds_lock(t) and s["tickets"]["T2"]["status"] == "queued"                   # 持锁，下游不派
+    assert [q for q in s["queue"] if q["kind"] in ("handson", "prod")] == []
+    assert not [c for c in mp.gh() if c[:2] == ["issue", "comment"]]                          # 下游不留言
+    assert [r["pr"] for r in t["rounds"]] == [41] and t["pr"] is None and not t.get("more")
+    assert not t.get("round_pending")
+    assert subprocess.run(["git", "-C", str(mp.root), "rev-parse", "--verify", "--quiet", "refs/heads/router/T1"],
+                          capture_output=True).returncode != 0                                # 旧轮本地分支已删
+    assert t["rounds"][0]["branch_cleanup"] == "done"
+    res = mp.result("T1", 2)
+    assert not res["is_error"], res["result"]                                                 # 严格假 claude：同 cwd 续跑
+    p = _prompt(mp.claude()[-1])
+    assert "--resume" in mp.claude()[-1] and "PR #41" in p and "router/T1-r2" in p and "第 2 条：合成条目" in p
+
+
+def test_ci_red_repr_without_more_keeps_round(fk):                                        # B3
+    wt = _clean_wt(fk)
+    fk.put(T1=("executing", ["llm-config"], _maint(worker={"session_id": "sid", "worktree": str(wt), "pid": 123,
+                                                              "branch": "router/T1", "runs": 1, "started_at": T0,
+                                                              "log": fk_log(fk, "T1")})))
+    progress(fk.home, "T1", "pr_opened", "2026-11-02T10:01:00Z", more="第 2 条：合成条目")
+    fk.ctx.script(["gh", "pr", "list"], json.dumps([{"number": 41}]))
+    fk.ctx.script(["gh", "pr", "view"], (FIX / "gh_pr_failed.json").read_text())
+    fk.run()                                                                         # CI 红 ⇒ 叫醒修
+    t = fk.state()["tickets"]["T1"]
+    assert t["status"] == "executing" and t["more"] == "第 2 条：合成条目" and len(fk.ctx.spawned) == 1
+    fk.ctx.alive.clear()
+    Path(t["worker"]["log"]).parent.mkdir(exist_ok=True)
+    Path(t["worker"]["log"]).write_text('{"type":"result","is_error":false}')
+    fk.ctx.advance(5)
+    progress(fk.home, "T1", "pr_opened", "2026-11-02T10:06:00Z")                       # 修好再报：不带 --more
+    fk.ctx.script(["gh", "pr", "view"], lambda cmd: (FIX / ("gh_pr_merged.json" if fk.ctx.calls_with("pr", "merge")
+                                                            else "gh_pr_green.json")).read_text())
+    fk.run()
+    t = fk.state()["tickets"]["T1"]
+    assert fk.ctx.calls_with("pr", "merge", "41")
+    assert t["status"] == "executing" and t["worker"]["branch"] == "router/T1-r2"   # 仍走开下一轮
+    assert [r["pr"] for r in t["rounds"]] == [41] and [r["more"] for r in t["rounds"]] == ["第 2 条：合成条目"]
+    assert [q for q in fk.state()["queue"] if q["kind"] == "handson"] == []
+    assert len(fk.ctx.spawned) == 2 and "--resume" in fk.ctx.spawned[-1]["cmd"]
+
+
+def test_settle_without_more_unchanged(fk):                                               # B4（回归）
+    wt = _clean_wt(fk)
+    fk.put(T1=("verifying", ["llm-config"], {"issue": 11, "pr": 41, "card_confirmed": True,
+                                                "worker": {"worktree": str(wt), "branch": "router/T1"}}),
+           T2=("queued", ["llm-config"], {"issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
+    fk.ctx.script(["gh", "pr", "view"], lambda cmd: (FIX / ("gh_pr_merged.json" if fk.ctx.calls_with("pr", "merge")
+                                                            else "gh_pr_green.json")).read_text())
+    res = fk.run()
+    s = fk.state(); t = s["tickets"]["T1"]
+    assert (t["status"], t["merge_sha"], t["pr"]) == ("merged_staging", "deadbeef", 41)
+    assert t["worker"]["worktree"] is None and t["worker"]["branch"] == "router/T1"
+    assert [q["kind"] for q in s["queue"]] == ["handson"] and not t.get("rounds")
+    assert fk.ctx.calls_with("issue", "comment") and res["dispatched"] == ["T2"]
+    assert fk.ctx.spawned[0]["env"]["ROUTER_TICKET"] == "T2"                              # 只派了下游，没续跑 T1
+
+
+def test_round_impl_done_without_pr_closes_ticket(fk):                                    # B5
+    wt = _clean_wt(fk)
+    fk.put(T1=("executing", ["llm-config"], _maint(
+        rounds=[{"pr": 41, "merge_sha": "a41", "branch": "router/T1", "at": T0, "more": "第 2 条：合成条目"}],
+        worker={"session_id": "sid", "worktree": str(wt), "pid": 123, "branch": "router/T1-r2", "runs": 2,
+                "started_at": T0, "log": fk_log(fk, "T1")})),
+           T2=("queued", ["llm-config"], {"issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
+    progress(fk.home, "T1", "impl_done", "2026-11-02T10:01:00Z")                     # 报过 --more，最后发现没有下一项
+    fk.run()
+    s = fk.state(); t = s["tickets"]["T1"]
+    assert (t["status"], t.get("merge_sha")) == ("merged_staging", "a41")             # 今天：当成零代码票进 await_prod
+    assert t["worker"]["worktree"] is None
+    (q,) = [q for q in s["queue"] if q["kind"] == "handson"]
+    assert "#41" in q["summary"] and "Closes" in q["summary"] and "手关" in q["summary"]
+    assert fk.ctx.calls_with("issue", "comment")                                     # 下游照常通知
+
+
+def test_resume_settled_legacy_opens_round_at_same_path(mp):                              # B6
+    wt = mp.worktree("T1")
+    _git("worktree", "remove", str(wt), cwd=mp.root)                                 # 收票时删掉的
+    s = mp.put(T1=("merged_staging", ["llm-config"], {
+        "title": "合成老票", "issue": 11, "pr": 41, "merge_sha": "4" * 40, "card_confirmed": True,
+        "worker": worker("sid-1", None, last_worktree=str(wt))}))
+    s["seq"]["queue"] = 1
+    s["queue"].append({"id": "Q1", "ticket": "T1", "kind": "handson", "summary": "staging 走查 T1：合成老票",
+                       "created_at": OLD, "notified_at": OLD})
+    mp.save(s)
+    mp.register("sid-1", wt)
+    out = mp.out("tell", "T1", "合成：接着做第 2 条", "--resume")
+    t = mp.state()["tickets"]["T1"]
+    assert out["resumed"] == "T1" and t["status"] == "executing"
+    assert wt.is_dir() and head(wt) == "router/T1-r2" and t["worker"]["worktree"] == str(wt)
+    assert _git("rev-parse", "HEAD", cwd=wt) == _git("rev-parse", "origin/staging", cwd=wt)
+    assert [(r["pr"], r["merge_sha"]) for r in t["rounds"]] == [(41, "4" * 40)] and t["pr"] is None
+    assert [q for q in mp.state()["queue"] if q["kind"] == "handson"] == []          # 走查项撤掉（收票时出汇总）
+    res = mp.result("T1", 2)
+    assert not res["is_error"], res["result"]
+    assert "router/T1-r2" in _prompt(mp.claude()[-1])
+
+
+def test_resume_refuses_settled_business_and_released_legacy(mp):                         # B7
+    wt1, wt2 = mp.worktree("T1"), mp.worktree("T2")
+    mp.put(T1=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "card_confirmed": True,
+                                                    "card_confirmed_by": "user", "pr": 41, "merge_sha": "4" * 40,
+                                                    "attempts": [], "worker": worker("sid-1", wt1)}),
+           T2=("postlaunch", ["llm-config"], {"title": "合成老票", "pr": 42, "merge_sha": "5" * 40,
+                                                  "card_confirmed": True, "worker": worker("sid-2", wt2, "router/T2")}))
+    mp.register("sid-1", wt1); mp.register("sid-2", wt2)
+    for tid, word in (("T1", "业务票"), ("T2", "已上线")):
+        r = mp.run("tell", tid, "合成：再改一点", "--resume", check=False)
+        assert r.returncode == 1 and word in json.loads(r.stdout)["error"], r.stdout
+    s = mp.state()
+    assert (s["tickets"]["T1"]["status"], s["tickets"]["T2"]["status"]) == ("await_prod", "postlaunch")
+    assert mp.claude() == []
+
+
+def test_round_dirty_worktree_stuck_then_answer_switches_first(mp):                       # C1
+    wt = mp.worktree("T1")
+    (wt / "T1.txt").write_text("改了没提交\n"); (wt / "wip.txt").write_text("合成草稿\n")
+    mp.put(T1=("verifying", ["llm-config"], _maint(pr=41, more="第 2 条：合成条目", worker=worker("sid-1", wt))))
+    mp.register("sid-1", wt)
+    mp.prs(merged={"41": "4" * 40})
+    remote = _ls_remote(mp)
+    mp.out("tick")
+    s = mp.state(); t = s["tickets"]["T1"]
+    (q,) = [q for q in s["queue"] if q["kind"] == "stuck"]
+    assert t["status"] == "stuck" and str(wt) in q["summary"] and "wip.txt" in q["summary"]
+    assert head(wt) == "router/T1" and (wt / "wip.txt").exists() and (wt / "T1.txt").read_text() == "改了没提交\n"
+    assert _ls_remote(mp) == remote                                                  # 没推
+    assert not t.get("rounds") and t["round_pending"]["pr"] == 41 and t["pr"] == 41
+    r = mp.run("answer", q["id"], "合成：好了", check=False)                          # 没清改动就回答：补切还是失败
+    assert r.returncode == 1 and "未提交" in json.loads(r.stdout)["error"]
+    assert q["id"] in [x["id"] for x in mp.state()["queue"]] and mp.claude() == []
+    _git("checkout", "--", ".", cwd=wt); (wt / "wip.txt").unlink()
+    out = mp.out("answer", q["id"], "合成：好了")
+    t = mp.state()["tickets"]["T1"]
+    assert out["resumed"] == "T1" and t["status"] == "executing" and head(wt) == "router/T1-r2"
+    assert [r["pr"] for r in t["rounds"]] == [41] and not t.get("round_pending") and t["pr"] is None
+    res = mp.result("T1", 2)
+    assert not res["is_error"], res["result"]                                        # 同一路径续跑
+    assert "router/T1-r2" in _prompt(mp.claude()[-1])
+
+
+def test_round_fetch_failure_retries_then_stuck(mp):                                      # C2
+    origin, off = mp.tmp / "origin.git", mp.tmp / "origin.off"
+    wt = mp.worktree("T1")
+    mp.put(T1=("verifying", ["llm-config"], _maint(pr=41, more="第 2 条：合成条目", worker=worker("sid-1", wt))))
+    mp.register("sid-1", wt)
+    mp.prs(merged={"41": "4" * 40})
+    origin.rename(off)                                                               # 网断了：fetch 失败
+    res = mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert any("T1" in e and "切" in e for e in res["errors"])
+    assert (t["status"], t["pr"]) == ("verifying", 41) and not t.get("rounds") and t["round_pending"]["pr"] == 41
+    assert head(wt) == "router/T1" and not [q for q in mp.state()["queue"] if q["kind"] == "stuck"]
+    off.rename(origin)                                                               # 网好了：下一轮重试切成
+    mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert t["status"] == "executing" and head(wt) == "router/T1-r2" and [r["pr"] for r in t["rounds"]] == [41]
+    assert not mp.result("T1", 2)["is_error"]
+    # 另一路：连续两次失败 ⇒ stuck
+    wt2 = mp.worktree("T2")
+    s = mp.state()
+    s["tickets"]["T1"]["status"] = "paused"
+    s["tickets"]["T2"] = make_state(T2=("verifying", ["her-reply-prompt"], _maint(
+        pr=42, more="第 3 条：合成条目", worker=worker("sid-2", wt2, "router/T2"))))["tickets"]["T2"]
+    mp.save(s)
+    mp.prs(merged={"42": "5" * 40})
+    origin.rename(off)
+    try:
+        mp.out("tick")
+        assert mp.state()["tickets"]["T2"]["status"] == "verifying"
+        mp.out("tick")
+    finally:
+        off.rename(origin)
+    t2 = mp.state()["tickets"]["T2"]
+    assert t2["status"] == "stuck" and t2["round_pending"]["pr"] == 42 and head(wt2) == "router/T2"
+    (q,) = [q for q in mp.state()["queue"] if q["kind"] == "stuck" and q["ticket"] == "T2"]
+    assert "连续 2 次" in q["summary"]

@@ -476,6 +476,11 @@ class Run:
         pause = t.pop("pause_requested", False)
         last = mine[-1] if mine else None
         phase = last.get("phase") if last else None
+        mores = [e["more"] for e in mine if e.get("phase") == "pr_opened" and e.get("more")]
+        if mores and store.ticket_kind(t) != "business":
+            # 后面还有 PR（多轮）：带值才写。CI 红 / 冲突被叫醒修完再报 pr_opened 不带 --more，不动它；
+            # 只在开下一轮成功时清（store.open_next_round）
+            t["more"] = mores[-1]
         if last and last.get("stop"):
             t["stops"] += 1
             kind = "spend" if STOP_TAGS & set(last.get("affects", {}).get("tags", [])) else STOP_KIND[last["type"]]
@@ -497,6 +502,13 @@ class Run:
             t["verifying_at"] = self.now
         elif phase == "impl_done" and t.get("card_confirmed") and self._offrepo(t):
             self._settle(tid, t, sha=None)
+        elif phase == "impl_done" and t.get("card_confirmed") and t.get("rounds") and not t.get("pr"):
+            # 多轮票报过 --more、最后一轮发现没有下一项（没开 PR）：按收票处理，不是零代码票
+            last_round = t["rounds"][-1]
+            t.pop("more", None)
+            issue = f"issue #{t['issue']}" if t.get("issue") else "issue"
+            self._settle(tid, t, last_round.get("merge_sha") or "?",
+                         note=f"最后一轮没开 PR，{issue} 没有 Closes，走查通过时 router 手关")
         elif phase == "impl_done" and t.get("card_confirmed") and not t.get("pr"):
             # 零代码仓内票（方向卡确认的方案只改配置）：没有 PR 可合，等用户放行上 prod，router 执行配置后 released --t0
             t["fail_streak"] = {"step": "", "count": 0}
@@ -676,6 +688,8 @@ class Run:
             self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
                        f"{tid}：方向卡没经你确认，PR 不合")
             return
+        if t.get("round_pending"):
+            return self._next_round(tid, t)       # 上一轮已合、切下一轮分支没成：直接重试切，不再查 PR
         branch = t["worker"].get("branch") or f"router/{tid}"
         pr = t.get("pr") or github.pr_for_branch(self.ctx, repo, branch)
         st = github.pr_status(self.ctx, repo, pr) if pr else None
@@ -767,11 +781,15 @@ class Run:
         self._once(t, "wrong_base_reported", pr, tid, "stuck",
                    f"{tid} PR #{pr} 的 base 是 {st['base']}，不是 {base}：不合（gh pr edit {pr} --base {base}）")
 
-    def _settle(self, tid, t, sha):
+    def _settle(self, tid, t, sha, note=""):
         """一张票改完。
         仓内（sha = 合并 commit）：合进 base ⇒ 放锁、通知下游、删 worktree（成功才清指针）、进「待你动手」走查。
         仓外（sha=None）：仓外没有 staging 隔离层，改完就是真身 ⇒ 待你核对（AWAIT_CHECK）：继续持锁、不解依赖、
-        不通知下游、不删 worktree（不满意时续跑要用它当 cwd）。核对后的收尾在 step5a_closeout。"""
+        不通知下游、不删 worktree（不满意时续跑要用它当 cwd）。核对后的收尾在 step5a_closeout。
+        多轮票（老票 / 维护票，worker 报过 pr_opened --more）合了一轮 ⇒ 不收票，分流到 _settle_round。
+        note：附在走查项后面的说明（最后一轮没开 PR 时写明 issue 要手关）。"""
+        if sha is not None and t.get("more") and store.ticket_kind(t) != "business":
+            return self._settle_round(tid, t, sha)
         base = self.cfg.get("base_branch", "staging")
         t["merge_sha"] = sha
         t["fail_streak"] = {"step": "", "count": 0}
@@ -798,7 +816,55 @@ class Run:
         if t["worker"].get("worktree"):
             self._drop_settled_worktree(tid, t)
         if not owned:
-            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+            prs = [r.get("pr") for r in t.get("rounds") or []] + ([t["pr"]] if t.get("pr") else [])
+            multi = f"（共 {len(prs)} 个 PR：{'、'.join(f'#{n}' for n in prs if n)}）" if t.get("rounds") else ""
+            self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}{multi}" + (f"；{note}" if note else ""))
+
+    # ---- 多轮（老票 / 维护票）：合一轮、后面还有 ⇒ 同一路径切新分支，持锁续跑原 session -----------------------
+    def _settle_round(self, tid, t, sha):
+        """多轮票合了一轮、后面还有（t.more）：不收票——不放锁、不删 worktree、不出走查项和 prod 项、不通知下游
+        （下游留言写的是「已解锁」，这时还持着锁）。先记 round_pending（已经有了就沿用：重试时不重记），再切分支。"""
+        if not t.get("round_pending"):
+            t["round_pending"] = {"pr": t.get("pr"), "merge_sha": sha, "branch": t["worker"].get("branch"),
+                                  "at": self.now, "more": t.get("more")}
+        self._next_round(tid, t)
+
+    def _next_round(self, tid, t):
+        """先切分支、后归档（v2：反过来的话切失败就接不回来）。切成 ⇒ 归档这一轮（清 PR 指针）、清旧轮本地分支、续跑；
+        fetch / switch 失败 ⇒ 状态不前进（round_pending 留着、t.pr 仍指着刚合的 PR），第 1 次进 errors、连续第 2 次进
+        stuck；有未提交改动 / worktree 不在 ⇒ 直接 stuck（不切、不丢、不推），回答时 router._resume 先补切再续跑。
+        切分支和存盘不是一个事务：git 切了、state 没落盘 ⇒ 下一轮还会见到 round_pending，switch 幂等收回来。"""
+        w, rp, base = t["worker"], t["round_pending"], self.cfg.get("base_branch", "staging")
+        branch = store.round_branch(tid, t)
+        k = len(t.get("rounds") or []) + 2
+        r = launcher.switch_round_branch(self.ctx, w.get("worktree"), base, branch)
+        if r["ok"]:
+            old = rp.get("branch")
+            rnd = store.open_next_round(t, rp, branch)
+            rnd["branch_cleanup"] = self._drop_round_branch(old)
+            return self.resume(tid, store.round_note(rnd, branch, base), store.EXECUTING)
+        merged = f"第 {k - 1} 轮（PR #{rp.get('pr')}）已合进 {base}"
+        if r["reason"] in ("fetch", "switch"):
+            fs = t["fail_streak"]
+            if fs.get("step") == "round" and fs.get("count", 0) >= 1:
+                fs["count"] += 1
+                return self._stuck(tid, f"{tid} {merged}，切第 {k} 轮分支 {branch} 连续 {fs['count']} 次失败："
+                                        f"{r['error'][:160]}；回答后 router 先补切再续跑")
+            t["fail_streak"] = {"step": "round", "count": 1}
+            t["waiting_for"] = f"{merged}，切下一轮分支失败，下一轮重试"
+            self.res["errors"].append(f"{tid} {merged}，切第 {k} 轮分支 {branch} 失败（第 1 次，下一轮重试）："
+                                      f"{r['error'][:200]}")
+            return
+        why = "不在了" if r["reason"] == "missing" else r["error"]
+        self._stuck(tid, f"{tid} {merged}，但 worktree {w.get('worktree')} {why}：没切分支、没删东西、没推。"
+                         f"处理好后回答，router 先切到 {branch} 再续跑")
+
+    def _drop_round_branch(self, branch) -> str:
+        """切到新一轮之后当场清旧轮本地分支：没有未推送提交才删（cleanup_ticket_checkout）。
+        结果记在那一轮的 branch_cleanup；kept / error 不重试，也不挡续跑。"""
+        if not branch:
+            return "done"
+        return launcher.cleanup_ticket_checkout(self.ctx, self.root, None, branch).get("branch") or "error: 没有结果"
 
     def _drop_settled_worktree(self, tid, t):
         """收票（合进 staging）后删 worktree：干净才删，不 --force（launcher.cleanup_ticket_checkout）。分支保留：
@@ -1265,7 +1331,10 @@ def _brief(run, tid):
         if run._offrepo(t) else
         (f"改完照 worker.md 第 3 段：推 {t['worker'].get('branch') or f'router/{tid}'}，`gh pr create --base {run.cfg.get('base_branch', 'staging')}`"
          "（🔴 必须写 --base，默认 base 是 main），然后 progress pr_opened 退出。"
-         "方向卡确认的方案只改配置、不改仓库代码（零代码票）：不开 PR，照 worker.md 第 3 段「零代码票」做，"
+         + ("" if kind == "business" else
+            "维护票多条目、分期票按一条一个 PR 做：后面还有 PR 就 `progress pr_opened --more \"<还剩什么，一句话>\"`"
+            "（这个 PR 正文写 Refs #<issue>，最后一个照旧写 Closes），合并后 router 在同一个目录切新分支叫醒你做下一项。")
+         + "方向卡确认的方案只改配置、不改仓库代码（零代码票）：不开 PR，照 worker.md 第 3 段「零代码票」做，"
          "然后 progress impl_done 退出。"))
 
 

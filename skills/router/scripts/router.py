@@ -184,15 +184,105 @@ def _refuse_pending(t, tid, ctx=None) -> None:
                    "认不出是不是它：稍后再试")
 
 
+def _check_lock(st, tid) -> None:
+    """续跑一张当前不持锁的票之前：它的代码面被别的票 / 外部 session 拿走了 ⇒ 拒（不然两张票同时改一个面）。"""
+    held = surfaces.conflicts(st, tid, st["tickets"][tid].get("surfaces", []))
+    if held:
+        raise Fail(f"{tid} 的代码面被别人锁着（{'；'.join(f'{s}：{h}' for s, h in sorted(held.items()))}）："
+                   "等它们放锁再续跑", held=held)
+
+
+def _refuse_settled_resume(t, tid) -> None:
+    """已收的票（SETTLED）能不能续跑。业务票一律不行：下一次尝试一律派新 worker（_requeue_business）；今天靠的是
+    「worktree 被删了」这个副作用，删失败时能续跑上去，所以显式拒。老票 / 维护票只有已合未发（merged_staging /
+    await_prod）的能续跑 = 原路径开下一轮（_reopen_settled）；已上线的拒。"""
+    if t["status"] not in store.SETTLED:
+        return
+    if store.ticket_kind(t) == "business":
+        raise Fail(f"{tid} 是业务票、状态 {t['status']}：已收的业务票不续跑旧 worker，"
+                   "下一次尝试由判定后重排 / redirect 派新 worker")
+    if t["status"] not in (store.MERGED, store.AWAIT_PROD):
+        raise Fail(f"{tid} 已上线（{t['status']}）：不续跑；要接着改，add 一张跟进票")
+    if not t["worker"].get("session_id"):
+        raise Fail(f"{tid} 没有可续跑的 worker session")
+
+
+def _drop_branch(env, branch) -> str:
+    """开下一轮后当场清旧轮本地分支：没有未推送提交才删。结果记在那一轮的 branch_cleanup，kept / error 不挡续跑。"""
+    if not branch:
+        return "done"
+    return launcher.cleanup_ticket_checkout(env.ctx, env.root, None, branch).get("branch") or "error: 没有结果"
+
+
+def _round_checkout(env, t, branch):
+    """多轮票开下一轮的 git 一步 → (结果, 路径)。路径必须是原来那个（claude --resume 按 cwd 找会话）：
+    worktree 还在 ⇒ 原地切分支（launcher.switch_round_branch）；不在 ⇒ 在原路径重建（launcher.reopen_round）。"""
+    w, base = t["worker"], env.cfg.get("base_branch", "staging")
+    wt = w.get("worktree") or w.get("last_worktree")
+    if not wt:
+        return {"ok": False, "reason": "missing", "error": "没有记 worktree 路径"}, None
+    if Path(wt).is_dir():
+        return launcher.switch_round_branch(env.ctx, wt, base, branch), wt
+    return launcher.reopen_round(env.ctx, env.root, wt, base, branch), wt
+
+
+def _open_round(env, st, tid, rp, wt, branch) -> str:
+    """切分支成功之后：rp 归档成一轮、清 PR 指针（store.open_next_round）、记 worktree、清旧轮本地分支 → 给 worker 的轮次说明。"""
+    t = st["tickets"][tid]
+    rnd = store.open_next_round(t, rp, branch)
+    t["worker"]["worktree"] = str(wt)
+    rnd["branch_cleanup"] = _drop_branch(env, rp.get("branch"))
+    return store.round_note(rnd, branch, env.cfg.get("base_branch", "staging"))
+
+
+def _finish_round(env, st, tid) -> str:
+    """上一轮已合、切下一轮分支没成（round_pending 还在，C.4）：续跑 / 回答 stuck 前先补切。
+    还失败 ⇒ Fail（state 不存，项留在决定单上，不续跑）；成功才归档、续跑，续跑提示里带上轮次说明。"""
+    t = st["tickets"][tid]
+    branch = store.round_branch(tid, t)
+    r, wt = _round_checkout(env, t, branch)
+    if not r["ok"]:
+        raise Fail(f"{tid} 上一轮已合，切下一轮分支 {branch} 还是不行（{r['reason']}：{r['error'][:200]}）："
+                   "没续跑，项留在决定单上；处理好后再回答")
+    return _open_round(env, st, tid, t["round_pending"], wt, branch)
+
+
+def _reopen_settled(env, st, tid) -> str:
+    """兜底（B.5）：worker 忘了报 --more、票已经收了（老票 / 维护票，已合未发）。续跑 = 在原路径开下一轮：
+    锁检查 → 切分支 / 原路径重建 → 当前 pr / merge_sha 归档成一轮 → 撤掉这张票待走查的项（收票时出汇总）。
+    任一步失败 ⇒ Fail，state 不存（env.state 出异常不落盘）。"""
+    t = st["tickets"][tid]
+    _check_lock(st, tid)
+    branch = store.round_branch(tid, t)
+    r, wt = _round_checkout(env, t, branch)
+    if not r["ok"]:
+        raise Fail(f"{tid} 开下一轮没成（{r['reason']}：{r['error'][:200]}）：没续跑")
+    rp = {"pr": t.get("pr"), "merge_sha": t.get("merge_sha"), "branch": t["worker"].get("branch"), "at": env.now(),
+          "more": None, "reopened": True}
+    note = _open_round(env, st, tid, rp, wt, branch)
+    st["queue"] = [q for q in st["queue"]
+                   if not (q.get("ticket") == tid and (q["kind"] == "handson" or q.get("topic") == "checkout"))]
+    t.pop("settle_checkout", None)
+    return note
+
+
 def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False, relay=False):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
     force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
     waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
-    续跑走与派单相同的事务：意图落盘 → 起进程（带启动回执）→ 命令结束时存盘；那次存盘失败，下一轮按回执认领。"""
+    续跑走与派单相同的事务：意图落盘 → 起进程（带启动回执）→ 命令结束时存盘；那次存盘失败，下一轮按回执认领。
+    多轮票：已收的老票 / 维护票（已合未发）续跑 = 原路径开下一轮；上一轮切分支没成（round_pending）先补切。"""
     t = st["tickets"][tid]
     if t["status"] == store.TAKEOVER:
         raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
     _refuse_pending(t, tid, env.ctx)
+    note = ""
+    if t["status"] in store.SETTLED:
+        _refuse_settled_resume(t, tid)
+        note = _reopen_settled(env, st, tid)
+        status = store.EXECUTING
+    elif t.get("round_pending"):
+        note = _finish_round(env, st, tid)
     if not (t["worker"].get("session_id") and t["worker"].get("worktree")):
         raise Fail(f"{tid} 没有可续跑的 worker session")
     if launcher.worker_alive(env.ctx, t["worker"]):
@@ -204,8 +294,9 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None,
         launcher.stop_worker(env.ctx, t["worker"])
     inbox = events.read_inbox(env.home, st, tid)
     wait = waiting if waiting is not None else _resume_wait(kind, status)
+    prompt = _resume_prompt(kind, text, inbox, as_router, relay)
     try:
-        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, _resume_prompt(kind, text, inbox, as_router, relay),
+        launcher.resume_with_intent(env.ctx, env.home, env.cfg, st, tid, f"{note}\n\n{prompt}" if note else prompt,
                                     status,
                                     wait, env.now(), lambda: store.save_state(env.state_path, st))
     except launcher.IntentNotSaved as e:
@@ -1624,6 +1715,9 @@ def cmd_tell(a, env):
             raise Fail(f"{a.ticket} 在你接管中：先「还给 router」（handback）再续跑")
         if a.resume:
             _refuse_pending(t, a.ticket, env.ctx)     # 先拒再投递：不然重试会投两份
+            _refuse_settled_resume(t, a.ticket)
+            if t["status"] in store.SETTLED:
+                _check_lock(st, a.ticket)
         alive = launcher.worker_alive(env.ctx, t["worker"])
         if not (a.resume and alive):                  # 活着时由 _resume 投递，别投两份
             said = f"{ROUTER_RELAY}（不是用户原话）：{a.text}" if relay else a.text
@@ -1789,8 +1883,20 @@ def cmd_emit(a, env):
 
 
 def cmd_progress(a, env):
+    """--more：后面还有 PR（老票 / 维护票的多轮）。只跟 pr_opened；业务票一次尝试一个 PR，带 --more ⇒ 退出码 2。
+    不带 --more 时不读 state（照旧）；带了只读一次 state（不持锁：state.json 是原子替换写的）。"""
+    tid = _worker_ticket(a)
+    more = getattr(a, "more", None)
+    if more is not None:
+        if a.phase != "pr_opened":
+            raise Fail("--more 只跟 pr_opened（这个 PR 之后还有 PR）", code=2)
+        if not more.strip():
+            raise Fail("--more 要写还剩什么（一句话）", code=2)
+        t = store.load_state(env.state_path)["tickets"].get(tid)
+        if t is not None and store.ticket_kind(t) == "business":
+            raise Fail(f"{tid} 是业务票：一次尝试一个 PR，不带 --more（下一个方向等判定后由新 worker 做）", code=2)
     try:
-        ev = events.emit_progress(env.home, _worker_ticket(a), a.phase, env.now())
+        ev = events.emit_progress(env.home, tid, a.phase, env.now(), more=more)
     except ValueError as e:
         raise Fail(str(e), code=2)
     return {"ok": True, "event": ev}
@@ -2742,6 +2848,7 @@ def build_parser():
         s.add_argument(f"--{k}")
     s = sub.add_parser("progress", help="worker 报进度（只更新 UI）")
     s.add_argument("phase"); s.add_argument("--ticket")
+    s.add_argument("--more", help="老票 / 维护票：这个 PR 之后还有 PR，还剩什么（一句话）；合并后 router 在同一个目录切新分支叫醒你")
     s = sub.add_parser("inbox", help="worker 读收件箱")
     s.add_argument("--ticket")
     sub.add_parser("prod-batch", help="把等上 prod 的票攒成一条决定")
