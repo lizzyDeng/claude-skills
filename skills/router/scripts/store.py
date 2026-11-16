@@ -303,7 +303,9 @@ def round_note(rnd: dict, branch: str, base: str) -> str:
     sha = str(rnd.get("merge_sha") or "?")[:12]
     nxt = f"再做下一项：{rnd['more']}" if rnd.get("more") else "再接着做这张票剩下的（上一轮没报 --more：先读 inbox）"
     return (f"【router】PR #{rnd.get('pr') or '?'} 已合进 {base}（合并 sha {sha}）。你现在在新分支 {branch}，"
-            f"从 origin/{base} 切的，还是同一个目录。先读 inbox（python3 $ROUTER_CLI inbox），{nxt}。"
+            f"从 origin/{base} 切的，还是同一个目录。这一轮推这条：`git push -u origin {branch}`，PR 也从它开"
+            f"（`gh pr create --base {base}`）；不要再推派单「环境」里那条（已合并），修 CI / rebase 后"
+            f"`--force-with-lease` 也只推 {branch}。先读 inbox（python3 $ROUTER_CLI inbox），{nxt}。"
             "后面还有 PR 就照旧 progress pr_opened --more \"<还剩什么>\"；这是最后一个就不带 --more"
             "（PR 正文写 Closes）；报过 --more 后发现没有下一项：progress impl_done 退出。")
 

@@ -70,9 +70,9 @@
 
 1. 逐条跑方向卡第 6 项的验收标准，**贴真实命令输出**（写进 PR 描述，去掉用户原话和 uid）。
 2. 写过 staging 数据的：在同一个 run 里回滚，并在验收里贴出回滚前后的对比。
-3. 推分支：`git push -u origin <派单「环境」里的分支>`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
+3. 推分支：`git push -u origin <派单「环境」里的分支>`；多轮票第 2 轮起推 router 叫醒你时说的新分支 `git push -u origin router/<T>-r<k>`（派单里那条已经合并了，别再推它）。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
 4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。业务票写 `Refs #<issue>`，不写 `Closes #`：业务票是长期票，`Closes` 会在第一次发版时把 issue 自动关掉。老票 / 维护票后面还有 PR 的（见 5）也写 `Refs #<issue>`，最后一个 PR 照旧写 `Closes #<issue>`。
-5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的）。修好再报 `pr_opened` 时不用再带 `--more`（router 记着）。
+5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的；多轮票第 2 轮起是当前这一轮的 `router/<T>-r<k>`）。修好再报 `pr_opened` 时不用再带 `--more`（router 记着）。
    - **一张票分几个 PR**（只限老票、维护票：维护票多条目、分期票按一条一个 PR 做）：这个 PR 之后还有 ⇒ `python3 $ROUTER_CLI progress pr_opened --more "<还剩什么，一句话>"` 后退出。router 合并后不收票：在**同一个目录**切新分支 `router/<T>-r<k>`（从 `origin/<base>` 切，不带上一轮的提交），用 `--resume` 叫醒你做下一项；worktree 里留着未提交的改动会切不了分支，router 会停下来问人。最后一个 PR 不带 `--more`。报过 `--more` 后发现没有下一项：不开 PR，`progress impl_done` 退出（router 照收票处理，issue 由 router 手关）。业务票一次尝试一个 PR，带 `--more` 会被拒。
 
 **仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。

@@ -424,6 +424,7 @@ def test_tick_settle_with_more_switches_and_resumes(mp):                        
     assert not res["is_error"], res["result"]                                                 # 严格假 claude：同 cwd 续跑
     p = _prompt(mp.claude()[-1])
     assert "--resume" in mp.claude()[-1] and "PR #41" in p and "router/T1-r2" in p and "第 2 条：合成条目" in p
+    assert "git push -u origin router/T1-r2" in p                                    # 审查修复轮 #3：写明推哪条
 
 
 def test_ci_red_repr_without_more_keeps_round(fk):                                        # B3
@@ -960,3 +961,14 @@ def test_settle_clears_stale_pr_items(fk, more):                                
     left = [q["id"] for q in fk.state()["queue"] if q["id"] in ("Q1", "Q2", "Q3", "Q4", "Q5")]
     assert left == ["Q4", "Q5"]                                                       # 别的票、冲突项不动
     assert fk.state()["tickets"]["T1"]["status"] == ("merged_staging" if more is None else "executing")
+
+
+def test_round_prompt_and_worker_doc_name_push_branch():                                  # R3：第 2 轮起推哪条分支
+    note = store.round_note({"pr": 41, "merge_sha": "a" * 40, "more": "第 2 条：合成条目"}, "router/T1-r2", "staging")
+    assert "git push -u origin router/T1-r2" in note and "不要再推" in note
+    worker_md = (SCRIPTS.parent / "worker.md").read_text(encoding="utf-8")
+    sec3 = worker_md[worker_md.index("## 第 3 段"):worker_md.index("**仓外票**")]
+    push = next(line for line in sec3.splitlines() if "git push -u origin" in line)
+    assert "router/<T>-r<k>" in push                                                 # 推分支那一步写明多轮推哪条
+    fix = next(line for line in sec3.splitlines() if "--force-with-lease" in line)
+    assert "router/<T>-r<k>" in fix                                                  # 修 CI / rebase 时推哪条
