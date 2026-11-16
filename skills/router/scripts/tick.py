@@ -1052,6 +1052,12 @@ class Run:
         except Exception as e:  # noqa: BLE001
             self._fail(tid, "brief", e)
             return "failed"
+        # 新派单 = 新 session（D214）：用过的 id（跑过一次，started_at 有值）再 --session-id 会被 claude 拒
+        # （already in use）。手工置 hold 的票 start 走到这里。要接着原会话做用 tell --resume，不走派单。
+        # 派单意图从没起过（_recover_one 清掉的）那个 id 没用过：started_at 没记，照旧复用。
+        if w.get("session_id") and w.get("started_at"):
+            w.setdefault("prev_sessions", []).append(w["session_id"])
+            w["session_id"] = None
         before = {k: w.get(k) for k in ("session_id", "runs")}
         log = launcher.prepare_run(w, self.home, tid)
         receipt = launcher.receipt_path(log)

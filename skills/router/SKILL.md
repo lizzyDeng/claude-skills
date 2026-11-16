@@ -158,7 +158,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「这个问题要重新定义：…」 | 他说的新问题等于判过真：`router.py add --business …` 再 `router.py start <T>`；原票 `router.py close <T>` |
 | 「加个问题：…」（某群人要的某件东西没拿到） | `router.py add --business --title … --segment … --want … --wall … [--wall …] --metric … [--evidence …] [--surfaces a,b]`（用户直接提 = 判过真；不知道代码面就不写，按重票算，方向卡出来再 `surfaces --set`），再 `router.py start <T>`（他说先放着就不 start）；影响分缺省 0，用 `router.py impact` 补 |
 | 「加个需求：…」（纯 bug / 合规 / 基建 / 工具） | `router.py maint add --title … --problem … --surfaces a,b [--unblocks <T>]`：并进本周维护票（挡住业务票验证或覆盖的加 `--unblocks`，单独一张） |
-| 「start T1 T3」/「start 周报 角色」 | 把名字对到票号，`router.py start T1 T3`。「start」/「start 全部」= `router.py start --all`（只含 v1 留下的本批周报草稿；v2 不再出周报草稿） |
+| 「start T1 T3」/「start 周报 角色」 | 把名字对到票号，`router.py start T1 T3`。「start」/「start 全部」= `router.py start --all`（只含 v1 留下的本批周报草稿；v2 不再出周报草稿）。`start` = 新派单 = 新会话（跑过的旧 session id 记进 `prev_sessions`，换新 id），从方向卡重来；手工置 hold 的票要接着原会话、原上下文做，用 `router.py tell <T> "<话>" --resume`，不用 start |
 | 「A 同意」/「C 改：…」/「放行 Q4」 | `router.py answer <Qn> "<原话>"`。花钱项的原话原样转给 worker；输出的 `go` 是 router 的读法（`go` 放行 / `no` 不放行 / `null` 看不出来），和你的理解对不上就问用户 |
 | 「A 驳回：…」 | `router.py answer <Qn> "<原话>" --reject` |
 | 「先停 A」 | `router.py pause <T>`（做完当前这一步停） |
