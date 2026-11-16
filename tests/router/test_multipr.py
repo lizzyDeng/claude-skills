@@ -911,3 +911,52 @@ def test_prod_go_reader_accepts_keyi_shang(mp):                                 
     out = mp.out("answer", q, "#1可以上")
     assert out["approved"] == ["T1", "T2"]
     assert mp.out("prod-batch")["router_ships"] == ["T1", "T2"]
+
+
+# =====================================================================================================
+# 审查修复轮
+# =====================================================================================================
+
+def _q(qid, tid, kind, summary, **kw):
+    return {"id": qid, "ticket": tid, "kind": kind, "summary": summary, "created_at": OLD, "notified_at": OLD, **kw}
+
+
+def test_answer_old_item_does_not_reopen_settled_ticket(mp):                              # R2：回答旧项不开新一轮
+    wt = mp.worktree("T1")
+    s = mp.put(T1=("merged_staging", ["llm-config"], {"title": "合成老票", "issue": 11, "pr": 41, "merge_sha": "4" * 40,
+                                                      "card_confirmed": True, "worker": worker("sid-1", wt)}))
+    s["queue"] = [_q("Q1", "T1", "handson", "staging 走查 T1：合成老票"),
+                  _q("Q2", "T1", "stuck", "T1 PR #41 30 分钟了还没有任何 CI 检查"),
+                  _q("Q3", "T1", "direction", "T1：方向卡没经你确认，PR 不合")]
+    s["seq"]["queue"] = 3
+    mp.save(s)
+    mp.register("sid-1", wt)
+    for qid in ("Q2", "Q3"):
+        out = mp.out("answer", qid, "合成：知道了")
+        assert out["resumed"] is None and out["delivered"] is None and "tell" in out["hint"]
+    t = mp.state()["tickets"]["T1"]
+    assert t["status"] == "merged_staging" and head(wt) == "router/T1" and not t.get("rounds") and t["pr"] == 41
+    assert [q["id"] for q in mp.state()["queue"]] == ["Q1"] and mp.claude() == []       # 走查项还在、没起 worker
+    out = mp.out("tell", "T1", "合成：接着做第 2 条", "--resume")                       # 只有 tell --resume 开新一轮
+    assert out["resumed"] == "T1" and head(wt) == "router/T1-r2"
+
+
+@pytest.mark.parametrize("more", [None, "第 2 条：合成条目"], ids=["last", "round"])
+def test_settle_clears_stale_pr_items(fk, more):                                          # R2：收票 / 开下一轮清掉旧 PR 项
+    wt = _clean_wt(fk)
+    s = fk.put(T1=("verifying", ["llm-config"], _maint(pr=41, more=more, worker={
+        "session_id": "sid", "worktree": str(wt), "branch": "router/T1", "runs": 1, "started_at": T0})),
+               T2=("verifying", ["her-reply-prompt"], {"pr": 42, "card_confirmed": True}))
+    s["queue"] = [_q("Q1", "T1", "stuck", "T1 PR #41 30 分钟了还没有任何 CI 检查"),
+                  _q("Q2", "T1", "direction", "T1：方向卡没经你确认，PR 不合"),
+                  _q("Q3", "T1", "stuck", "T1 PR #41 改回 staging 失败 2 次", topic="retarget"),
+                  _q("Q4", "T1", "conflict", "外部 session 合成 改了 T1 锁着的代码面 llm-config"),
+                  _q("Q5", "T2", "stuck", "T2 PR #42 30 分钟了还没有任何 CI 检查")]
+    s["seq"]["queue"] = 5
+    store.save_state(fk.home / "state.json", s)
+    fk.ctx.script(["gh", "pr", "view", "41"], _pr_json("MERGED", "a41"))
+    fk.ctx.script(["gh", "pr", "view", "42"], (FIX / "gh_pr_pending.json").read_text())   # T2 还在等 CI
+    fk.run()
+    left = [q["id"] for q in fk.state()["queue"] if q["id"] in ("Q1", "Q2", "Q3", "Q4", "Q5")]
+    assert left == ["Q4", "Q5"]                                                       # 别的票、冲突项不动
+    assert fk.state()["tickets"]["T1"]["status"] == ("merged_staging" if more is None else "executing")

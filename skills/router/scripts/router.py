@@ -266,12 +266,14 @@ def _reopen_settled(env, st, tid) -> str:
     return note
 
 
-def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False, relay=False):
+def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None, as_router=False, relay=False,
+            reopen=False):
     """续跑 worker → "resumed"；worker 还活着 → 只投递收件箱、不起第二个进程 → "delivered"。
     force_restart：用户回答的是「卡住」，旧进程可能挂死，先停再续。接管中的票一律不碰。
     waiting：续跑后的 waiting_for；不传就按 kind 给（RESUME_WAIT），不会被清空。
     续跑走与派单相同的事务：意图落盘 → 起进程（带启动回执）→ 命令结束时存盘；那次存盘失败，下一轮按回执认领。
-    多轮票：已收的老票 / 维护票（已合未发）续跑 = 原路径开下一轮；上一轮切分支没成（round_pending）先补切。"""
+    多轮票：已收的老票 / 维护票（已合未发）续跑 = 原路径开下一轮——只有 reopen=True（tell --resume：router 确认这张票
+    还有下一项）才开；回答收票前留下的旧项不会把已合的票拉回去重做。上一轮切分支没成（round_pending）先补切。"""
     t = st["tickets"][tid]
     if t["status"] == store.TAKEOVER:
         raise Fail(f"{tid} 在你接管中：先「还给 router」（handback）再续跑")
@@ -279,6 +281,8 @@ def _resume(env, st, tid, kind, text, status, force_restart=False, waiting=None,
     note = ""
     if t["status"] in store.SETTLED:
         _refuse_settled_resume(t, tid)
+        if not reopen:
+            raise Fail(f"{tid} 已收票（{t['status']}）：续跑 = 开新一轮，只有 router.py tell {tid} \"<话>\" --resume 能开")
         note = _reopen_settled(env, st, tid)          # 先过锁检查
         status = store.EXECUTING
     else:
@@ -601,6 +605,10 @@ def cmd_answer(a, env):
         elif t and q["kind"] == "conflict" and not _conflict_resumable(t):
             # 冲突项落下时持锁的 worker 已经不在 / 票已不持锁（例如合 staging 后 worktree 删了）：只记回答，不续跑
             hint = f"{t['id']} 已没有在跑的 worker（或不再持锁）：冲突项只记回答，不续跑"
+        elif t and q["kind"] in RESUME_KINDS and t["status"] in store.SETTLED:
+            # 收票前留下的项（卡住 / 方向 / 冲突……）：票已合进 staging，回答只记原话，不续跑、不开新一轮
+            hint = (f"{t['id']} 已收票（{t['status']}）：这一项是收票前留下的，只记回答，不续跑；"
+                    f"要接着做下一项用 router.py tell {t['id']} \"<话>\" --resume")
         elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
             kind = q["kind"]
             if kind == "card" and a.reject:
@@ -1765,7 +1773,7 @@ def cmd_tell(a, env):
         # 不在跑的票：方向卡确认过 ⇒ 回执行（不是回 kickoff：waiting_for 会变成「改方向卡」、kickoff 超时按旧时间算）
         status = (t["status"] if t["status"] in store.RUNNING
                   else store.EXECUTING if t.get("card_confirmed") else store.KICKOFF)
-        if a.resume and _resume(env, st, a.ticket, "direction", a.text, status, relay=relay) == "resumed":
+        if a.resume and _resume(env, st, a.ticket, "direction", a.text, status, relay=relay, reopen=True) == "resumed":
             resumed = a.ticket
         elif not a.resume:
             pass

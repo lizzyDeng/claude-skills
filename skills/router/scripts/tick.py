@@ -812,6 +812,8 @@ class Run:
         不通知下游、不删 worktree（不满意时续跑要用它当 cwd）。核对后的收尾在 step5a_closeout。
         多轮票（老票 / 维护票，worker 报过 pr_opened --more）合了一轮 ⇒ 不收票，分流到 _settle_round。
         note：附在走查项后面的说明（最后一轮没开 PR 时写明 issue 要手关）。"""
+        if sha is not None:
+            self._drop_pr_items(tid)
         if sha is not None and t.get("more") and store.ticket_kind(t) != "business":
             return self._settle_round(tid, t, sha)
         base = self.cfg.get("base_branch", "staging")
@@ -843,6 +845,14 @@ class Run:
             prs = [r.get("pr") for r in t.get("rounds") or []] + ([t["pr"]] if t.get("pr") else [])
             multi = f"（共 {len(prs)} 个 PR：{'、'.join(f'#{n}' for n in prs if n)}）" if t.get("rounds") else ""
             self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}{multi}" + (f"；{note}" if note else ""))
+
+    def _drop_pr_items(self, tid):
+        """PR 合了：验收这一个 PR 时出的项（找不到 PR、没有 CI、CI 连红、合并失败、泄漏、base 不对 / 改回失败、
+        方向卡没确认……kind 是 stuck / direction、topic 为空或 retarget）都作废，撤掉。留着的话回答其中一条会把
+        已合的票拉回去重做。冲突项、别的 topic 的项不动。"""
+        self.state["queue"] = [q for q in self.state["queue"]
+                               if not (q.get("ticket") == tid and q["kind"] in ("stuck", "direction")
+                                       and q.get("topic") in (None, "retarget"))]
 
     # ---- 多轮（老票 / 维护票）：合一轮、后面还有 ⇒ 同一路径切新分支，持锁续跑原 session -----------------------
     def _settle_round(self, tid, t, sha):
