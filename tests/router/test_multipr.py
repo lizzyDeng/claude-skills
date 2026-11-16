@@ -1001,3 +1001,20 @@ def test_close_refuses_ticket_with_open_pr(mp):                                 
         assert r.returncode == 1 and word in json.loads(r.stdout)["error"], (tid, r.stdout)
     s = mp.state()
     assert [s["tickets"][t]["status"] for t in ("T1", "T2", "T3")] == ["verifying", "verifying", "paused"]
+
+
+def test_new_round_branch_has_no_upstream(mp):                                            # R6：--no-track 有判别力
+    # 新一轮分支从 origin/<base> 切：带 upstream 的话上游就是 origin/staging，push.default=upstream 时一推就推到 staging
+    from ctx import Ctx
+
+    def upstream(wt, branch):
+        r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"],
+                           capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+    wt = mp.worktree("T1")                                                            # 原地切（switch_round_branch）
+    assert launcher.switch_round_branch(Ctx(), wt, "staging", "router/T1-r2") == {"ok": True}
+    assert head(wt) == "router/T1-r2" and upstream(wt, "router/T1-r2") is None
+    wt2 = mp.worktree("T2")                                                           # 原路径重建（reopen_round）
+    _git("worktree", "remove", str(wt2), cwd=mp.root)
+    assert launcher.reopen_round(Ctx(), mp.root, wt2, "staging", "router/T2-r2") == {"ok": True}
+    assert head(wt2) == "router/T2-r2" and upstream(wt2, "router/T2-r2") is None
