@@ -447,3 +447,23 @@ def test_skill_residual2_close_gate_sync_merges_staging_sha():
     assert "release 回合的 merge 提交" not in s7                                    # 回合并提交不再算对不上
     pr = next(l for l in _section(text, "2.").splitlines() if l.startswith("| `prod_ready`"))
     assert "staging_sha" in pr
+
+
+# 11-16 用户「改」：墙在用户看得见的那一屏时先看实物、做外部对照；相对检验没差别不等于整体够好
+def test_direction_review_challenges_directions_that_skip_the_visible_screen():
+    text = (SKILL / "templates" / "direction_review.md").read_text(encoding="utf-8")
+    items = re.findall(r"^(\d+)\.\s\*\*(.*?)\*\*", text, re.M)
+    assert [int(n) for n, _ in items] == list(range(1, len(items) + 1))           # 编号连续
+    q = text[text.index("8. "):]
+    assert "第一句话之前" in q and "那一屏" in q and "截图" in q
+    assert "外部" in q and "对照" in q                                            # 和外部头部产品同一屏比
+    assert "比不出差别" in q                                                      # 相对检验不能证「不是 X 的问题」
+    assert "最多 3 条" in text                                                     # 上限不变
+
+
+def test_analyst_weekly_looks_at_the_screen_before_first_message_and_needs_absolute_check():
+    text = (SKILL / "templates" / "analyst_weekly.md").read_text(encoding="utf-8")
+    sec = text[text.index("## 先自下而上归因"):text.index("## problems 每条怎么写")]
+    assert "第一句话之前" in sec and "看不到" in sec                              # 没开口就走的人读对话看不到
+    assert "实物" in sec and "截图" in sec and "外部" in sec and "对照" in sec
+    assert "比不出差别" in sec and "整体水平未判" in sec                            # 只比了相对差别要写明
