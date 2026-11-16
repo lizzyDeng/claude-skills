@@ -990,3 +990,14 @@ def test_round_switch_refuses_dir_that_is_not_its_own_worktree(mp):             
     assert t["status"] == "stuck" and str(half) in q["summary"] and t["round_pending"]["pr"] == 41
     r = mp.run("answer", q["id"], "合成：好了", check=False)                           # 回答补切也一样拒
     assert r.returncode == 1 and head(mp.root) == main_branch and mp.claude() == []
+
+
+def test_close_refuses_ticket_with_open_pr(mp):                                           # R5：PR 还开着不能收票
+    mp.put(T1=("verifying", ["llm-config"], {"title": "合成老票", "issue": 11, "pr": 41, "card_confirmed": True}),
+           T2=("verifying", ["her-reply-prompt"], {"title": "合成老票二", "issue": 12, "card_confirmed": True}),
+           T3=("paused", ["her-reply-prompt"], {"title": "合成老票三", "issue": 13, "pr": 43}))
+    for tid, word in (("T1", "PR #41"), ("T2", "verifying"), ("T3", "PR #43")):
+        r = mp.run("close", tid, "--reason", "合成：不做了", check=False)
+        assert r.returncode == 1 and word in json.loads(r.stdout)["error"], (tid, r.stdout)
+    s = mp.state()
+    assert [s["tickets"][t]["status"] for t in ("T1", "T2", "T3")] == ["verifying", "verifying", "paused"]

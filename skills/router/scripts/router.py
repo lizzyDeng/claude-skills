@@ -1328,7 +1328,7 @@ def _close_other(env, st, tid, why) -> None:
     决定不做 / 前提失效、没有要上 prod 的改动 ⇒ 票进 done，走 v1 收尾（下一轮巡检留言说明后关 issue、清 worktree /
     分支），清掉它在决定单上的项，记一条 decide。只记 decide 不改状态 = 票留在 await_prod，每次发版都被拉进批次。
     拒：已上线（终点是上线验收）；没写理由；改动还在 staging 上 / 仓外改了还没核对（照常发版、走上线验收）；
-    worker 还在跑 / 认不出。"""
+    PR 还开着没合 / 在验收 PR（verifying）；worker 还在跑 / 认不出。"""
     t = env.ticket(st, tid)
     if t["status"] == store.DONE:
         raise Fail(f"{tid} 已经关了")
@@ -1340,6 +1340,10 @@ def _close_other(env, st, tid, why) -> None:
     if store.staging_pending(t) or store.offrepo_pending(t):
         raise Fail(f"{tid} 还有在途的改动（合进了 staging 还没上 prod，或仓外改了还没核对）：不能直接收票；"
                    "照常发版、走上线验收（postlaunch-result 判完即 done）")
+    if t.get("pr") and not t.get("merge_sha"):       # 同 _merge_checks：PR 还开着没合（审查修复轮 #5）
+        raise Fail(f"{tid} 的 PR #{t['pr']} 还开着没合：先关掉 PR，或等它合进 staging、走完上线验收；不能直接收票")
+    if t["status"] == store.VERIFYING:                # 报了 pr_opened、PR 在验收（指针可能还没找到 / 是下一轮的）
+        raise Fail(f"{tid} 在验收 PR（verifying）：先关掉 PR 或等它合进 staging，不能直接收票")
     _refuse_pending(t, tid, env.ctx)
     pid = t["worker"].get("pid")
     if pid and env.ctx.pid_alive(pid):
