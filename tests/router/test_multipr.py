@@ -884,3 +884,28 @@ def test_close_zero_code_legacy_leaves_release_batch(mp):                       
     body = next(c for c in mp.gh() if c[:3] == ["issue", "comment", "11"])[-1]
     assert "收票" in body and "合成：前提已失效" in body and "仓外改动" not in body
     assert ["issue", "close", "11", "-R", "o/r", "--reason", "completed"] in mp.gh()
+
+
+# =====================================================================================================
+# H. 整批 prod 项只认「放行」/「上 prod」：「#1可以上」没被认成放行（Q387）
+# =====================================================================================================
+
+GO_H = ("#1可以上", "#1 可以上", "Q387 可以上", "可以上", "可以上 prod", "可以上。整批一起", "#2 放行", "#1可以上了")
+NOT_GO_H = ("可以上吗", "#1可以上吗？", "不可以上", "可以上，T3 先不", "#1 先别上", "可以", "#1 可以上不了")
+
+
+def test_prod_go_reader_accepts_keyi_shang(mp):                                           # H
+    import router
+    for text in GO_H:
+        assert router._said_go(text) == "go", text
+    for text in NOT_GO_H:
+        assert router._said_go(text) != "go", text
+    assert router._said_go("不可以上") == "no"
+    push_main(mp.root)
+    mp.put(T1=("await_prod", ["llm-config"], {"title": "合成老票"}),
+           T2=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "attempts": [],
+                                                    "title": "合成业务票"}))           # 没经用户确认的卡：要放行
+    q = mp.out("prod-batch")["queue"]
+    out = mp.out("answer", q, "#1可以上")
+    assert out["approved"] == ["T1", "T2"]
+    assert mp.out("prod-batch")["router_ships"] == ["T1", "T2"]

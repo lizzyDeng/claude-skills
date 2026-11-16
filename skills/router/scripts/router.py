@@ -2018,8 +2018,11 @@ _PROD_OK = ("ready", "approved", "ride_ok", "round_ok")   # 不挡 router 自己
 _PROD_SHIPS = ("ready", "approved")                   # 发完照常 released（进 router_ships）
 # 「放行」读法（v2.1 第 8 条）：可带前缀「Q<数字>」、空格、全角标点和尾随说明（「Q332 放行。生图放行，用grok」= 整批放行）；
 # 关键词后面只能是结尾 / 空白 / 标点（可带「了 / 吧」；「放行吗」「放行不了」不算）；整句里有否定（「先不放行」「不放行」「先别」）一律不算
-_PROD_GO = re.compile(r"^(?:Q\d+[\s，,：:。.、]*)?(?:放行|上\s*prod)[了吧啦]?(?:$|[\s，,。.！!；;、：:])", re.I)
-_PROD_NO = re.compile(r"不放行|先别|别上|先不|暂缓|不要上|不能上|不上\s*prod", re.I)
+# 附录 H（Q387）：「可以上」「可以上 prod」也是放行；前缀也可以是 router 回复里的序号「#<数字>」（「#1可以上」）。
+# 「可以上吗」「可以上不了」照样不算，「不可以上」算明确不放行
+_PROD_GO = re.compile(r"^(?:[Q#]\d+[\s，,：:。.、]*)?(?:放行|上\s*prod|可以上(?:\s*prod)?)[了吧啦]?(?:$|[\s，,。.！!；;、：:])",
+                      re.I)
+_PROD_NO = re.compile(r"不放行|先别|别上|先不|暂缓|不要上|不能上|不可以|不上\s*prod", re.I)
 
 
 def _said_go(text):
