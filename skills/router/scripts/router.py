@@ -207,6 +207,17 @@ def _refuse_settled_resume(t, tid) -> None:
         raise Fail(f"{tid} 没有可续跑的 worker session")
 
 
+def _settled_next(t) -> str:
+    """已收的票接下来怎么办（给人看的提示）：只指向真的能走的路——_refuse_settled_resume 会拒的不提 tell --resume。"""
+    tid = t["id"]
+    if store.ticket_kind(t) == "business":
+        return ("业务票不重开旧 worker：下一次尝试等 daily 判定后重排，或 router.py redirect；"
+                "要另做一件事就 add 一张票")
+    if t["status"] in (store.MERGED, store.AWAIT_PROD) and t["worker"].get("session_id"):
+        return f"还有下一项要做：router.py tell {tid} \"<话>\" --resume（在原路径开下一轮）"
+    return f"{tid} 已上线 / 已完成，不能重开：要接着改，add 一张跟进票"
+
+
 def _drop_branch(env, branch) -> str:
     """开下一轮后当场清旧轮本地分支：没有未推送提交才删。结果记在那一轮的 branch_cleanup，kept / error 不挡续跑。"""
     if not branch:
@@ -612,8 +623,7 @@ def cmd_answer(a, env):
             hint = f"{t['id']} 已没有在跑的 worker（或不再持锁）：冲突项只记回答，不续跑"
         elif t and q["kind"] in RESUME_KINDS and t["status"] in store.SETTLED:
             # 收票前留下的项（卡住 / 方向 / 冲突……）：票已合进 staging，回答只记原话，不续跑、不开新一轮
-            hint = (f"{t['id']} 已收票（{t['status']}）：这一项是收票前留下的，只记回答，不续跑；"
-                    f"要接着做下一项用 router.py tell {t['id']} \"<话>\" --resume")
+            hint = f"{t['id']} 已收票（{t['status']}）：这一项是收票前留下的，只记回答，不续跑；" + _settled_next(t)
         elif t and q["kind"] in RESUME_KINDS and t["worker"].get("session_id"):
             kind = q["kind"]
             if kind == "card" and a.reject:
@@ -1167,6 +1177,8 @@ def _close_business(env, st, tid, why, basis, rolled_back=False) -> None:
     pid = ct["worker"].get("pid")
     if pid and env.ctx.pid_alive(pid):
         raise Fail(f"{tid} 的 worker 还在跑（pid {pid}）：先 stop {tid}，再关")
+    if ct.get("pr") in _check_prs_closed(env, ct):   # 开着的 PR 拒、gh 查不了拒（审查修复轮 2 #5 B3）
+        ct["pr"] = None
     ct["closeout"] = {"downstream": _closeout_targets(st, tid),
                       "issue": "pending" if ct.get("issue") else "n/a",
                       "worktree": "pending", "branch": "pending"}
@@ -1333,12 +1345,44 @@ def _add_wall(env, st, tid, text, source):
     return wid, _offer_next(env, st, tid, f"新墙 {wid}「{' '.join(str(text).split())[:40]}」待拆")
 
 
+def _check_prs_closed(env, t) -> list:
+    """收票 / 关票前查 GitHub（审查修复轮 2 #5）：这张票记过的每个 PR（当前 t.pr、每一轮 rounds、还没归档的
+    round_pending）和当前分支上开着的 PR。OPEN ⇒ 拒；CLOSED 没合 ⇒ 放行（返回它，调用方清指针）；MERGED ⇒ 放行
+    （合进 staging 还没发的另有在途闸）。gh 查不了 ⇒ 拒（fail-closed）。merge_sha / shipped_at 是上一轮的也不放过
+    这一轮开着的 PR。→ 关了没合的 PR 号。"""
+    tid, repo = t["id"], env.cfg.get("repo")
+    nums = []
+    for x in [t, *(t.get("rounds") or []), *([t["round_pending"]] if t.get("round_pending") else [])]:
+        if x.get("pr") and x["pr"] not in nums:
+            nums.append(x["pr"])
+    closed = []
+    for n in nums:
+        try:
+            ps = github.pr_status(env.ctx, repo, n)
+        except Exception as e:  # noqa: BLE001 — gh 报错 / 超时 / 输出看不懂：确认不了没开着，就不收
+            raise Fail(f"{tid} 查不了 PR #{n} 的状态（{str(e)[:160]}）：确认不了它没开着，不收票；gh 好了再试")
+        if ps["state"] == "OPEN":
+            raise Fail(f"{tid} 的 PR #{n} 还开着：先关掉 PR，或等它合进 staging、走完上线验收；不能直接收票")
+        if not ps["merged"]:
+            closed.append(n)
+    branch = t["worker"].get("branch")
+    if branch:
+        try:
+            open_pr = github.pr_for_branch(env.ctx, repo, branch)
+        except Exception as e:  # noqa: BLE001
+            raise Fail(f"{tid} 查不了分支 {branch} 上有没有开着的 PR（{str(e)[:160]}）：不收票；gh 好了再试")
+        if open_pr:
+            raise Fail(f"{tid} 的分支 {branch} 上有开着的 PR #{open_pr}（票上还没记）：先关掉 PR 或等它合进 staging；"
+                       "不能直接收票")
+    return closed
+
+
 def _close_other(env, st, tid, why) -> None:
     """老票 / 维护票收票（附录 G：零代码票按决定收票后状态仍停在 await_prod，被拉进下一个发版批次）：
     决定不做 / 前提失效、没有要上 prod 的改动 ⇒ 票进 done，走 v1 收尾（下一轮巡检留言说明后关 issue、清 worktree /
     分支），清掉它在决定单上的项，记一条 decide。只记 decide 不改状态 = 票留在 await_prod，每次发版都被拉进批次。
     拒：已上线（终点是上线验收）；没写理由；改动还在 staging 上 / 仓外改了还没核对（照常发版、走上线验收）；
-    PR 还开着没合 / 在验收 PR（verifying）；worker 还在跑 / 认不出。"""
+    worker 还在跑 / 认不出；GitHub 上还有开着的 PR / gh 查不了（_check_prs_closed）。"""
     t = env.ticket(st, tid)
     if t["status"] == store.DONE:
         raise Fail(f"{tid} 已经关了")
@@ -1350,21 +1394,21 @@ def _close_other(env, st, tid, why) -> None:
     if store.staging_pending(t) or store.offrepo_pending(t):
         raise Fail(f"{tid} 还有在途的改动（合进了 staging 还没上 prod，或仓外改了还没核对）：不能直接收票；"
                    "照常发版、走上线验收（postlaunch-result 判完即 done）")
-    if t.get("pr") and not t.get("merge_sha"):       # 同 _merge_checks：PR 还开着没合（审查修复轮 #5）
-        raise Fail(f"{tid} 的 PR #{t['pr']} 还开着没合：先关掉 PR，或等它合进 staging、走完上线验收；不能直接收票")
-    if t["status"] == store.VERIFYING:                # 报了 pr_opened、PR 在验收（指针可能还没找到 / 是下一轮的）
-        raise Fail(f"{tid} 在验收 PR（verifying）：先关掉 PR 或等它合进 staging，不能直接收票")
     _refuse_pending(t, tid, env.ctx)
     pid = t["worker"].get("pid")
     if pid and env.ctx.pid_alive(pid):
         raise Fail(f"{tid} 的 worker 还在跑（pid {pid}）：先 stop {tid}，再收票")
+    closed = _check_prs_closed(env, t)                # 最后查 GitHub：开着的 PR 拒，gh 查不了拒
+    if t.get("pr") in closed:
+        t["pr"] = None                                # 已在 GitHub 关掉、没合：指针清掉
     t["closeout"] = {"downstream": _closeout_targets(st, tid), "issue": "pending" if t.get("issue") else "n/a",
                      "worktree": "pending", "branch": "pending"}
     t["closed"] = {"why": why, "at": env.now()}
     st["queue"] = [q for q in st["queue"] if q.get("ticket") != tid]
     store.set_status(st, tid, store.DONE, env.now(), "收尾中（下一轮巡检：关 issue、清 worktree）")
-    store.append_decision(env.decisions, st, tid, "收票（不做 / 前提失效，没有要上 prod 的改动）", why,
-                          f"router.py close {tid}", env.now())
+    gone = f"；PR {'、'.join(f'#{n}' for n in closed)} 已在 GitHub 关掉、没合" if closed else ""
+    store.append_decision(env.decisions, st, tid, f"收票（不做 / 前提失效，没有要上 prod 的改动{gone}）", why,
+                          f"router.py close {tid}；gh pr view 查过记录的 PR", env.now())
 
 
 def cmd_close(a, env):

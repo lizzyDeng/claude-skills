@@ -189,6 +189,15 @@ def _git(proj, *a):
     return subprocess.run(["git", *a], cwd=proj.root, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _gh_merged(proj, *prs):
+    """收票前 router 用 gh 查 PR 的真实状态（审查修复轮 2）：给假 gh 一份应答，这几个 PR 在 GitHub 上已合 → GH_CANNED 路径。"""
+    f = proj.tmp / "gh_merged.json"
+    f.write_text(json.dumps({f"pr view {n}": json.dumps({"state": "MERGED", "mergeCommit": {"oid": f"m{n}"},
+                                                         "baseRefName": "staging", "statusCheckRollup": []})
+                             for n in prs}))
+    return {"GH_CANNED": str(f)}
+
+
 def test_close_gate_not_bypassed_by_stop(proj):
     """① 改动在 staging 上（await_prod）的业务票：stop 之后 close / 「Qn 关」照样拒；③ --rolled-back 才收。"""
     _biz(proj, status="await_prod", attempts=_JUDGED, merge_sha="bbb0001", pr=42, history=list(H_AP))
@@ -200,7 +209,7 @@ def test_close_gate_not_bypassed_by_stop(proj):
     cq = _push_q(proj, "T1", "close")
     r = proj.run("answer", cq, "关", check=False)
     assert r.returncode == 1 and "--rolled-back" in _err(r)
-    assert proj.out("close", "T1", "--rolled-back")["ok"]
+    assert proj.out("close", "T1", "--rolled-back", env=_gh_merged(proj, 42))["ok"]
     assert proj.state()["tickets"]["T1"]["status"] == "done"
 
 
@@ -228,7 +237,7 @@ def test_rolled_back_decide_names_this_inflight_change(proj):
     _biz(proj, status="await_prod", attempts=_JUDGED, merge_sha="bbb0001", pr=42, history=list(H_AP))
     r = proj.run("close", "T1", check=False)
     assert "#42" in _err(r) and "bbb0001" in _err(r)
-    proj.out("close", "T1", "--rolled-back")
+    proj.out("close", "T1", "--rolled-back", env=_gh_merged(proj, 42))
     dec = (proj.home / "decisions.md").read_text()
     block = dec[dec.index("关票前已撤回"):]
     assert "#42" in block and "bbb0001" in block and "合成：第一次的撤回办法" not in dec
@@ -284,7 +293,7 @@ def _parked_batch(proj):
          T2=_biz_ready())
     proj.out("stop", "T1")
     proj.out("takeover", "T4")
-    proj.out("close", "T3", "--rolled-back")
+    proj.out("close", "T3", "--rolled-back", env=_gh_merged(proj, 43))
 
 
 def test_parked_members_listed_but_not_router_ships(proj):

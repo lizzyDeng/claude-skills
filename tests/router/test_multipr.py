@@ -27,13 +27,17 @@ OLD = "2026-01-01T00:00:00Z"          # 种子里「上一次运行」的起点�
 DEAD_PID = 999999                     # 不存在的 pid：worker 已退出
 
 GH = r'''#!/usr/bin/env python3
-# 假 gh。PR 状态在 $GH_PRS：open = {分支: PR 号}，merged = {PR 号: 合并 sha}，checks = {PR 号: success | failure}
+# 假 gh。PR 状态在 $GH_PRS：open = {分支: PR 号}，merged = {PR 号: 合并 sha}，closed = {PR 号: true}（关了没合），
+# checks = {PR 号: success | pending | failure}，fail = {PR 号 / 分支: true}（gh 查它就报错）
 import json, os, subprocess, sys, pathlib
 log = pathlib.Path(os.environ["GH_LOG"]); args = sys.argv[1:]
 with log.open("a") as f: f.write(json.dumps(args, ensure_ascii=False) + "\n")
 prs_p = pathlib.Path(os.environ["GH_PRS"])
 prs = json.loads(prs_p.read_text()) if prs_p.exists() else {}
-for k in ("open", "merged", "checks"): prs.setdefault(k, {})
+for k in ("open", "merged", "checks", "closed", "fail"): prs.setdefault(k, {})
+if (args[:2] in (["pr", "view"], ["pr", "merge"]) and args[2] in prs["fail"]) or (
+        args[:2] == ["pr", "list"] and args[args.index("--head") + 1] in prs["fail"]):
+    print("HTTP 502: 合成故障", file=sys.stderr); sys.exit(1)
 calls = [json.loads(l) for l in log.read_text().splitlines()]
 creates = sum(1 for c in calls if c[:2] == ["issue", "create"])
 if args[:2] == ["issue", "list"]: print("[]")
@@ -43,15 +47,17 @@ elif args[:2] == ["pr", "list"]:
     head = args[args.index("--head") + 1]
     state = args[args.index("--state") + 1] if "--state" in args else "open"
     n = prs["open"].get(head)
-    ok = n is not None and state == "open" and str(n) not in prs["merged"]
+    ok = n is not None and state == "open" and str(n) not in prs["merged"] and str(n) not in prs["closed"]
     print(json.dumps([{"number": n}] if ok else []))
 elif args[:2] == ["pr", "view"] and "title,body" in args:
     print(json.dumps({"title": "合成标题", "body": "合成验收输出"}))
 elif args[:2] == ["pr", "view"]:
     pr = args[2]; merged = prs["merged"].get(pr)
-    ok = prs["checks"].get(pr, "success") == "success"
-    run = {"__typename": "CheckRun", "name": "e2e", "status": "COMPLETED", "conclusion": "SUCCESS" if ok else "FAILURE"}
-    print(json.dumps({"state": "MERGED" if merged else "OPEN", "mergedAt": None,
+    chk = prs["checks"].get(pr, "success")
+    run = {"__typename": "CheckRun", "name": "e2e", "status": "IN_PROGRESS" if chk == "pending" else "COMPLETED",
+           "conclusion": {"success": "SUCCESS", "pending": None}.get(chk, "FAILURE")}
+    state = "MERGED" if merged else ("CLOSED" if pr in prs["closed"] else "OPEN")
+    print(json.dumps({"state": state, "mergedAt": None,
                       "mergeCommit": {"oid": merged} if merged else None, "headRefOid": "head" + pr,
                       "baseRefName": "staging", "mergeable": "MERGEABLE", "statusCheckRollup": [run]}))
 elif args[:2] == ["pr", "merge"]:
@@ -995,9 +1001,11 @@ def test_round_switch_refuses_dir_that_is_not_its_own_worktree(mp):             
 
 def test_close_refuses_ticket_with_open_pr(mp):                                           # R5：PR 还开着不能收票
     mp.put(T1=("verifying", ["llm-config"], {"title": "合成老票", "issue": 11, "pr": 41, "card_confirmed": True}),
-           T2=("verifying", ["her-reply-prompt"], {"title": "合成老票二", "issue": 12, "card_confirmed": True}),
+           T2=("verifying", ["her-reply-prompt"], {"title": "合成老票二", "issue": 12, "card_confirmed": True,
+                                                    "worker": worker("sid-2", None, "router/T2")}),
            T3=("paused", ["her-reply-prompt"], {"title": "合成老票三", "issue": 13, "pr": 43}))
-    for tid, word in (("T1", "PR #41"), ("T2", "verifying"), ("T3", "PR #43")):
+    mp.prs(open={"router/T2": 48})                                                   # T2：报了 pr_opened，指针还没找到
+    for tid, word in (("T1", "PR #41"), ("T2", "PR #48"), ("T3", "PR #43")):
         r = mp.run("close", tid, "--reason", "合成：不做了", check=False)
         assert r.returncode == 1 and word in json.loads(r.stdout)["error"], (tid, r.stdout)
     s = mp.state()
@@ -1061,3 +1069,52 @@ def test_go_flag_rejected_on_non_batch_items(mp):                               
         assert r.returncode == 1 and "--go" in json.loads(r.stdout)["error"], qid
         assert qid in [x["id"] for x in mp.state()["queue"]]
     assert mp.claude() == [] and not (mp.home / "answers.md").exists()
+
+
+def test_close_checks_real_pr_state_on_github(mp):                                        # R2-5：close 前查 GitHub
+    push_main(mp.root)
+    mp.put(T1=("stuck", ["llm-config"], {"title": "合成一", "pr": 41}),
+           T2=("stuck", ["her-reply-prompt"], {"title": "合成二", "pr": 42}),
+           T3=("stuck", ["llm-config"], _maint(pr=44, merge_sha="3" * 40, rounds=[
+               {"pr": 43, "merge_sha": "3" * 40, "shipped_at": OLD, "reopened": True}],
+               history=[{"at": OLD, "status": "merged_staging"}, {"at": OLD, "shipped_at": OLD},
+                        {"at": OLD, "status": "executing"}, {"at": OLD, "status": "stuck"}])),
+           T4=("paused", ["her-reply-prompt"], {"kind": "business", "authorized": True, "attempts": [], "pr": 45,
+                                                "title": "合成业务票"}),
+           T5=("stuck", ["her-reply-prompt"], {"title": "合成五", "pr": 46}),
+           T6=("verifying", ["her-reply-prompt"], {"title": "合成六", "worker": worker("sid-6", None, "router/T6")}),
+           T7=("await_prod", ["her-reply-prompt"], {"title": "合成零代码", "waiting_for": tick.ZERO_CODE_WAIT}))
+    mp.prs(merged={"43": "3" * 40}, closed={"42": True}, fail={"46": True}, open={"router/T6": 47})
+
+    def close(tid):
+        r = mp.run("close", tid, "--reason", "合成：不做了", check=False)
+        return r.returncode, json.loads(r.stdout).get("error", "")
+    for tid, word in (("T1", "PR #41 还开着"), ("T3", "PR #44 还开着"),               # B2：上一轮发过了，这一轮的还开着
+                      ("T4", "PR #45 还开着"), ("T5", "查不了 PR #46"), ("T6", "PR #47")):   # B3 业务票；gh 报错 fail-closed
+        rc, err = close(tid)
+        assert rc == 1 and word in err, (tid, err)
+        assert mp.state()["tickets"][tid]["status"] != "done"
+    assert close("T2") == (0, "") and close("T7") == (0, "")                          # 关了没合 / 没有 PR：放行
+    t2 = mp.state()["tickets"]["T2"]
+    assert t2["status"] == "done" and t2["pr"] is None                                # 清掉关掉的 PR 指针
+    assert "PR #42" in (mp.home / "decisions.md").read_text(encoding="utf-8")
+
+
+def test_answer_stale_item_hint_matches_what_can_reopen(mp):                              # R2-C：提示别指向会被拒的命令
+    s = mp.put(T1=("postlaunch", ["llm-config"], {"title": "合成老票", "pr": 41, "merge_sha": "4" * 40,
+                                                  "worker": worker("sid-1", None)}),
+               T2=("await_prod", ["her-reply-prompt"], {"title": "合成业务票", "kind": "business", "authorized": True,
+                                                        "worker": worker("sid-2", None)}),
+               T3=("merged_staging", ["llm-config"], {"title": "合成老票三", "pr": 43, "merge_sha": "5" * 40,
+                                                      "worker": worker("sid-3", None)}))
+    s["queue"] = [_q("Q1", "T1", "stuck", "合成旧项"), _q("Q2", "T2", "direction", "合成旧项"),
+                  _q("Q3", "T3", "stuck", "合成旧项")]
+    s["seq"]["queue"] = 3
+    mp.save(s)
+    for qid in ("Q1", "Q2"):                                                          # 已上线 / 业务票：tell --resume 会被拒
+        out = mp.out("answer", qid, "合成：知道了")
+        assert out["resumed"] is None and "tell" not in out["hint"] and "add" in out["hint"], out["hint"]
+    out = mp.out("answer", "Q3", "合成：知道了")                                      # 已合未发的老票：tell --resume 能开下一轮
+    assert "tell" in out["hint"]
+    for tid in ("T1", "T2"):
+        assert mp.run("tell", tid, "合成", "--resume", check=False).returncode == 1
