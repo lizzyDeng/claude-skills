@@ -43,7 +43,8 @@ QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict",
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
 # assumption：核心假设被推翻的方向项（v2.1：方向归用户，router 不能 --as-router 代答）
 # issue_sync：业务票 issue 正文要同步，但文本过不了防泄漏闸（没发到 GitHub，交用户看）
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption", "issue_sync"}
+# checkout：收票时 worktree 有未提交改动、没删（回答后下一轮巡检重试，不续跑 worker）
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption", "issue_sync", "checkout"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",

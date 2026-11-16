@@ -160,6 +160,8 @@ def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
                                                      "solution": {"kind": "card", "text": "底座改为承认是 AI", "source": "v1"},
                                                      "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}),
              T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
+    (proj.root / "wt1").mkdir()
+    proj.ctx.script(["git", "-C", str(proj.root / "wt1"), "status", "--porcelain"], "")      # 干净
     _pr_fake(proj)
     res = proj.run()
     s = proj.state()
@@ -167,7 +169,8 @@ def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
     assert ["gh", "pr", "merge", "41", "--squash", "--match-head-commit", "abc123", "-R", "o/r"] in proj.ctx.calls
     c = proj.ctx.calls_with("issue", "comment")
     assert c and c[0][3] == "12" and "deadbeef" in c[0][c[0].index("--body") + 1]
-    assert ["git", "-C", str(proj.root), "worktree", "remove", "--force", str(proj.root / "wt1")] in proj.ctx.calls
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(proj.root / "wt1")] in proj.ctx.calls   # 干净才删
+    assert not proj.ctx.calls_with("worktree", "remove", "--force")                     # 不再 --force
     assert s["tickets"]["T1"]["worker"]["worktree"] is None          # R6：remove 成功就清指针（看板不再给失效的接管命令）
     assert res["dispatched"] == ["T2"] and s["tickets"]["T2"]["status"] == "kickoff"
     assert [q["kind"] for q in s["queue"]] == ["handson"]

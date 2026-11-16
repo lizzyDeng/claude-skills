@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 from ctx import Ctx
-from launcher import claude_cmd, create_worktree, read_result, remove_worktree, spawn, stop_now
+from launcher import claude_cmd, create_worktree, read_result, spawn, stop_now
 
 FAKE = str(Path(__file__).resolve().parent / "fake_claude.py")
 CFG = {"model": "claude-opus-5-5", "permission_mode": "bypassPermissions", "allowed_tools": [],
@@ -67,14 +67,13 @@ def test_read_result_takes_last_result_object(tmp_path):
     assert read_result(tmp_path / "w.log")["result"] == "two"
 
 
-def test_create_and_remove_worktree_commands(fake, tmp_path):
+def test_create_worktree_commands(fake, tmp_path):
     wt, branch = create_worktree(fake, tmp_path, "staging", ".claude/worktrees", "T3")
     assert branch == "router/T3" and wt == tmp_path / ".claude/worktrees" / "router-T3"
     assert fake.calls == [["git", "-C", str(tmp_path), "fetch", "origin", "staging"],
                           ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/router/T3"],
                           ["git", "-C", str(tmp_path), "worktree", "add", "-b", "router/T3", str(wt), "origin/staging"]]
-    remove_worktree(fake, tmp_path, wt)
-    assert fake.last_call() == ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt)]
+    # 删 worktree 不再有 --force 的入口（remove_worktree 已删）：收票走 cleanup_ticket_checkout，干净才删
 
 
 def test_create_worktree_named_branch_per_attempt(fake, tmp_path):

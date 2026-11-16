@@ -612,6 +612,7 @@ class Run:
     def step4b_postlaunch(self):
         """上线验收：到期（now ≥ at）、还没记结果的检查点每一轮都交（postlaunch_due），直到 postlaunch-result 记上；
         压缩 / 重启后 watch 首轮照样交，不会丢。顺手把 postlaunch 票的「在等什么」刷成下一次检查的时间。"""
+        self._retry_settled_checkouts()                            # 收票时没删成的 worktree：回答过 / git 失败的重试
         for tid in sorted(self.state["tickets"], key=lambda x: int(x[1:])):
             t = self.state["tickets"][tid]
             if t["status"] == store.AWAIT_PROD and t.get("waiting_for") == ZERO_CODE_WAIT:
@@ -780,16 +781,43 @@ class Run:
             self.res["errors"].append(f"下游留言跳过（防泄漏闸失效）：{e}")
         if guard is not None:
             self._notify_downstream(tid, t, sha, base, guard)
-        w = t["worker"]
-        if w.get("worktree"):
-            try:
-                launcher.remove_worktree(self.ctx, self.root, w["worktree"])
-            except RuntimeError as e:
-                self.res["errors"].append(f"删 worktree {tid}：{e}")      # 删失败：保留指针，接管命令仍可用
-            else:
-                w["worktree"] = None          # 分支保留：squash 合并后分支上有远端 base 没有的提交
+        if t["worker"].get("worktree"):
+            self._drop_settled_worktree(tid, t)
         if not owned:
             self.queue(tid, "handson", f"{base} 走查 {tid}：{t['title']}")
+
+    def _drop_settled_worktree(self, tid, t):
+        """收票（合进 staging）后删 worktree：干净才删，不 --force（launcher.cleanup_ticket_checkout）。分支保留：
+        squash 合并后分支上有远端 base 没有的提交。
+        done ⇒ 清指针，路径记进 worker.last_worktree（老票 / 维护票在原路径开下一轮要用，B.5）；
+        有未提交改动 ⇒ 不删、保留指针，进决定单（topic=checkout，写明路径和 git status 前几行）；回答后下一轮重试；
+        git 失败 ⇒ 保留指针，第 1 次进 errors，下一轮重试。"""
+        w, base = t["worker"], self.cfg.get("base_branch", "staging")
+        wt = w["worktree"]
+        sc = t.get("settle_checkout") or {}
+        r = launcher.cleanup_ticket_checkout(self.ctx, self.root, wt, None)["worktree"]
+        if r == "done":
+            w["last_worktree"], w["worktree"] = wt, None
+            if store.in_queue(self.state, sc.get("qid")):
+                store.pop_queue(self.state, sc["qid"])
+            t.pop("settle_checkout", None)
+        elif r.startswith("kept"):
+            qid = self.queue(tid, "stuck", f"{tid} 已合进 {base}，但 worktree {wt} 有未提交改动，没删（不 --force）："
+                                           f"{launcher.status_lines(self.ctx, wt)}。要的提交推走、不要的清掉后回"
+                                           f"「{{qid}} 好了」，下一轮巡检重试（干净才删）", topic="checkout")
+            t["settle_checkout"] = {"qid": qid, "at": self.now}
+        else:
+            if not sc.get("error"):
+                self.res["errors"].append(f"删 worktree {tid}：{r}（保留指针，下一轮重试）")
+            t["settle_checkout"] = {"error": r[:200], "at": self.now}
+
+    def _retry_settled_checkouts(self):
+        """收票时没删成的 worktree（有改动且你已回答 / git 失败）：下一轮重试；决定单项还在 ⇒ 等你回答，不重试。"""
+        for tid, t in self.state["tickets"].items():
+            sc = t.get("settle_checkout")
+            if (sc and t["status"] in store.SETTLED and t["worker"].get("worktree")
+                    and not store.in_queue(self.state, sc.get("qid"))):
+                self._drop_settled_worktree(tid, t)
 
     def _prod_ready(self, tid, t):
         """票级授权的业务票进了 await_prod（合 staging / 零代码做完）：唤醒 router 跑 prod-batch（终审 #1）——

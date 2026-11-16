@@ -171,7 +171,7 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 | 「看板」/「现在什么情况」 | `router.py status`，只说要点 + 看板路径 |
 | 「T2 走查过了」/「T1 核对过了」 | `router.py walkthrough-done <T>`，或回答那条「待你动手」：`router.py answer <Qn> "<原话>"`。仓内票 → 等上 prod，攒够一批 `router.py prod-batch`；仓外票 → 完成，下一轮巡检逐目标收尾（下游留言、关 issue、清 worktree 和分支）；仓外的**业务票**不关票：核对过 = 这次尝试上线，记一次尝试（撤回办法 = 从 `backups/<T>/` 恢复），进 postlaunch 等 daily 判定 |
 | 「T1 不满意：…」 | `router.py answer <Qn> "<原话>" --reject`：仓外待核对的票续跑 worker 按原话改（可从 backups 恢复）。仓内已合 staging 的没有驳回通道：`router.py add` 一张跟进票 |
-| 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
+| 「Qn 好了」/「Qn 改好了」/「Qn 重派」 | `router.py answer <Qn> "<原话>"`：远端 base / 改回 PR / 派发失败 / 收票时 worktree 有未提交改动没删（topic=checkout：合进 staging 后删 worktree 只删干净的，不 --force；项里有路径和 `git status` 前几行）这几类项不唤醒 worker，下一轮巡检重查（仍不对会重新进决定单） |
 | 「Qn 放行」/「Qn 上 prod」（整批 prod 项，列了每张票的状态） | `router.py answer <Qn> "<原话>"`：整批每张票记「已放行」；再跑一次 `router.py prod-batch`，`router_ships` 非空就照项目发版流程整批上 prod（合 main 钉在它输出的 `staging_sha`），发完逐张 `released`（业务票带 `--rollback`；已停 / 接管 / 关前已撤回的票也 `released` 一次，见第 7 节）；又推了新的整批项（staging 上多了东西）就再交用户。原话可带「Qn」前缀、全角标点和尾随说明（「Q332 放行。生图放行，用grok」= 整批放行）；整句带否定（「先不放行」「不放行」「先别」）或看不出放行（「放行吗」）的只记原话、不放行 |
 | 「上 prod」 | 按项目现有发版流程上 prod（不在本 skill 内），发完 `router.py released --tickets … --what "…" --metrics m1,m2 [--t0 <ISO>] [--config-keys k1,k2]`（写进周报 releases.json，带 `at` = 生效时刻；票进上线验收 postlaunch，不是完成）。零代码票先执行配置，`--t0` 写配置生效的时刻（带时区）；改了配置键就写 `--config-keys`（周报按它认登记，缺了同窗判定会被封顶）。已停 / 接管的票 `released` 只在状态历史记 shipped_at、不改状态、不进上线验收（输出 `parked`）；带 `--rolled-back` 关掉的业务票跳过、不报错（输出 `skipped`）。业务票不等这句话，见第 7 节 |
 | 「Qn 知道了」/「Qn：…」（上线验收项） | `router.py answer <Qn> "<原话>"`：只记原话，不唤醒 worker；照原话调整。检查点都走完了 ⇒ 票完成 |

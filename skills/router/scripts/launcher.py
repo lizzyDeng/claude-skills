@@ -177,8 +177,13 @@ def stop_now(pid: int) -> None:
         pass
 
 
-def remove_worktree(ctx, repo, wt) -> None:
-    _git(ctx, repo, "worktree", "remove", "--force", str(wt))
+def status_lines(ctx, wt, n=5) -> str:
+    """worktree 里 git status --porcelain 的前 n 行（决定单项里给人看：哪些文件没提交）。"""
+    r = ctx.run(["git", "-C", str(wt), "status", "--porcelain"])
+    lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if r.returncode != 0:
+        return f"git status 失败：{_err(r)[:120]}"
+    return "；".join(lines[:n]) + (f" 等 {len(lines)} 项" if len(lines) > n else "") if lines else "（git status 为空）"
 
 
 def _registered_worktrees(ctx, repo) -> set:

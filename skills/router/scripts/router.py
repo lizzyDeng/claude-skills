@@ -482,6 +482,8 @@ def cmd_answer(a, env):
             if t:
                 t.pop("dispatch_fail", None)
             hint = "下一轮重派"
+        elif topic == "checkout":                        # 收票时 worktree 有未提交改动没删：不续跑 worker，下一轮重试
+            hint = "下一轮巡检重试删 worktree（干净才删；还有未提交改动会再进决定单）"
         elif topic == "issue_sync":                      # 正文过不了防泄漏闸：只记回答，下一轮按当前文本重试
             if t:
                 (t.get("issue_sync") or {}).pop("blocked", None)

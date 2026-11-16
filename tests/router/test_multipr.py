@@ -242,7 +242,7 @@ def test_fake_claude_strict_sessions(tmp_path):                                 
 
 def test_dispatch_rotates_used_session_id(mp):                                            # E2
     # 手改形态的 HOLD 票（D196 / D253 这类：router 把跑过的票手工置 hold）：有用过的 session、没有 worktree
-    mp.put(T1=("hold", ["weekly-report"], {"title": "合成老票", "issue": 11,
+    mp.put(T1=("hold", ["llm-config"], {"title": "合成老票", "issue": 11,
                                            "worker": worker("sid-old", None, None, runs=2)}))
     mp.register("sid-old", mp.tmp / "somewhere-else")
     out = mp.out("start", "T1")
@@ -258,7 +258,7 @@ def test_dispatch_rotates_used_session_id(mp):                                  
 
 def test_recover_intent_keeps_receipt_session(fk):                                        # E3（回归）
     L = fk.home / "logs" / "T1-1.log"; R = fk.home / "logs" / "T1-1.receipt.json"
-    s = fk.put(T1=("queued", ["weekly-report"], {"start_ok": True, "worker": {
+    s = fk.put(T1=("queued", ["llm-config"], {"start_ok": True, "worker": {
         "session_id": "sid-r", "worktree": str(fk.root / ".claude/worktrees/router-T1"), "branch": "router/T1",
         "runs": 1, "started_at": OLD}}))
     s["tickets"]["T1"]["dispatch"] = {"phase": "spawning", "kind": "dispatch", "session_id": "sid-r", "log": str(L),
@@ -271,3 +271,39 @@ def test_recover_intent_keeps_receipt_session(fk):                              
     w = fk.state()["tickets"]["T1"]["worker"]
     assert fk.ctx.spawn_attempts == [] and w["session_id"] == "sid-r" and not w.get("prev_sessions")
     assert fk.state()["tickets"]["T1"]["status"] == "kickoff"
+
+
+# =====================================================================================================
+# 顺带：收票删 worktree 用 --force（有未提交改动也删）⇒ 干净才删，有改动进决定单
+# =====================================================================================================
+
+def _checkout_items(p, tid="T1"):
+    return [q for q in p.state()["queue"] if q.get("ticket") == tid and q.get("topic") == "checkout"]
+
+
+def test_settle_dirty_worktree_not_force_removed(mp):                                     # S1
+    wt = mp.worktree("T1")
+    (wt / "notes.txt").write_text("没提交的合成笔记\n")
+    mp.put(T1=("verifying", ["llm-config"], {"title": "合成老票", "issue": 11, "pr": 41, "card_confirmed": True,
+                                                "worker": worker("sid-1", wt)}))
+    mp.prs(merged={"41": "4" * 40})
+    mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert t["status"] == "merged_staging"
+    assert (wt / "notes.txt").exists() and t["worker"]["worktree"] == str(wt)        # 不 --force：改动原样在
+    (q,) = _checkout_items(mp)
+    assert q["kind"] == "stuck" and str(wt) in q["summary"] and "notes.txt" in q["summary"]
+    assert [x["kind"] for x in mp.state()["queue"] if not x.get("topic")] == ["handson"]
+    out = mp.out("answer", q["id"], "合成：看过了")                                    # 回答不续跑 worker
+    assert out["resumed"] is None and mp.claude() == []
+    mp.out("tick")                                                                   # 还没清 ⇒ 再问一次（新项）
+    (q2,) = _checkout_items(mp)
+    assert q2["id"] != q["id"] and (wt / "notes.txt").exists()
+    mp.out("tick")
+    assert [x["id"] for x in _checkout_items(mp)] == [q2["id"]]                      # 没回答之前不重复问
+    (wt / "notes.txt").unlink()
+    mp.out("answer", q2["id"], "好了")
+    mp.out("tick")
+    w = mp.state()["tickets"]["T1"]["worker"]
+    assert not wt.exists() and w["worktree"] is None and w["last_worktree"] == str(wt)
+    assert _checkout_items(mp) == [] and mp.claude() == []
