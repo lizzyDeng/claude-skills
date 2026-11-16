@@ -546,11 +546,16 @@ def _conflict_resumable(t) -> bool:
 
 def cmd_answer(a, env):
     as_router = bool(getattr(a, "as_router", False))
+    go = bool(getattr(a, "go", False))
     with env.state() as st:
+        pos = next((i for i, x in enumerate(st["queue"]) if x["id"] == a.qid), None)
         try:
             q = store.pop_queue(st, a.qid)
         except KeyError:
             raise Fail(f"决定单里没有 {a.qid}")
+        batch_prod = q["kind"] == "prod" and bool(q.get("batch"))
+        if go and not batch_prod:                     # Fail 不存盘：项留在决定单里
+            raise Fail(f"--go 只用于整批 prod 项（放行整批上 prod）；{q['id']} 是 {q['kind']} 项：去掉 --go，照原话回答")
         if as_router:
             _check_as_router(st, q, a.reject)
         if q["kind"] in ("verify_problem", "close"):      # 格式不对 ⇒ Fail，不存盘：项留在决定单里
@@ -641,8 +646,13 @@ def cmd_answer(a, env):
                 hint = extra.pop("hint", "")
         elif q["kind"] == "start":
             hint = "派发单要用 start 子命令"
-        elif q["kind"] == "prod" and q.get("batch"):   # 整批项（有业务票等上 prod）：放行 = 整批一起上
+        elif batch_prod and go:                         # 整批项：router 读懂用户原话是放行才加 --go ⇒ 整批一起上
             hint, extra = _prod_answered(env, st, q, a.text)
+        elif batch_prod:                                # 不带 --go 一律不放行：原话已存档，项留在决定单上保持待答
+            st["queue"].insert(pos if pos is not None else len(st["queue"]), q)
+            hint = (f"没放行：整批 prod 项只认 --go。原话已逐字存档，{q['id']} 留在决定单上；用户的意思是放行整批 ⇒ "
+                    f"router.py answer {q['id']} \"<原话>\" --go；看不出来就问用户")
+            extra = {"approved": [], "pending": q["id"]}
         elif q["kind"] == "prod":
             hint = "按 aifriends 发版流程上 prod，发完用 released"
     return {"ok": True, "queue": q["id"], "kind": q["kind"], "resumed": resumed, "delivered": delivered, "hint": hint,
@@ -2041,7 +2051,8 @@ _PROD_NO = re.compile(r"不放行|先别|别上|先不|暂缓|不要上|不能�
 
 
 def _said_go(text):
-    """放行类回答（整批 prod 项、花钱项）→ "go"（放行）/ "no"（明确不放行）/ None（看不出来）。只有 go 才算放行。"""
+    """花钱项回答的读法提示 → "go"（像放行）/ "no"（明确不放行）/ None（看不出来）。只给 router 核对用（answer 输出的
+    go 字段），不决定任何事：花钱项的原话原样转给 worker；整批 prod 项放不放行只认 answer --go（审查修复轮 2 #1）。"""
     t = (text or "").strip()
     if _PROD_NO.search(t):
         return "no"
@@ -2218,10 +2229,8 @@ def _prod_item(env, st, check=None):
 
 
 def _prod_answered(env, st, q, text):
-    """用户回整批 prod 项：「放行」/「上 prod」⇒ 整批每张票、每个列出的提交都记已放行，router 照项目发版流程整批上；
-    别的话只记原话（answers.md 已写），不放行。"""
-    if _said_go(text) != "go":
-        return "原话已记，没放行：整批照旧等你（再跑 prod-batch 会重推这一项）", {"approved": []}
+    """整批 prod 项带 --go（router 读懂用户原话是放行整批）：整批每张票、每个列出的提交都记已放行，router 照项目发版
+    流程整批上。放不放行只看 --go，不再从原话里猜（审查修复轮 2 #1）；原话照旧逐字存档（answers.md）。"""
     approved = []
     for tid in q.get("batch") or []:
         t = st["tickets"].get(tid)
@@ -2857,6 +2866,8 @@ def build_parser():
     s.add_argument("--as-router", action="store_true",
                    help="router 按票级授权代答（只收业务票的技术细节类方向项 / 卡住 / 冲突项；方向卡、下一个方向、"
                         "核心假设被推翻归用户）：标为 router 决定，不冒充用户原话")
+    s.add_argument("--go", action="store_true",
+                   help="整批 prod 项：router 读懂用户原话是放行整批才加；不带一律不放行（只记原话、项留着）。别的项带它报错")
     s = sub.add_parser("redirect", help="业务票换方向：用户定的方向（--as-user）或出新方向卡交用户（--new-card）；重新排队派新 worker")
     s.add_argument("ticket"); s.add_argument("text", nargs="?", default="")
     g = s.add_mutually_exclusive_group(required=True)

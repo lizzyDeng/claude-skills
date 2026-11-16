@@ -115,7 +115,7 @@ def test_v21_1_prod_batch_router_confirmed_card_needs_release(proj):
     out = proj.out("prod-batch")
     assert out["router_ships"] == [] and out["queue"]
     assert {b["ticket"]: b["state"] for b in out["batch"]} == {"T2": "方向卡没经你确认"}
-    proj.out("answer", out["queue"], "放行")
+    proj.out("answer", out["queue"], "放行", "--go")
     assert proj.out("prod-batch")["router_ships"] == ["T2"]
     seed(proj, T2=_ready_biz(card_confirmed_by="user"))                           # 用户确认过的方案：router 照常上
     out = proj.out("prod-batch")
@@ -561,7 +561,9 @@ def test_v21_8_prod_item_accepts_qn_prefix_and_trailing_notes(proj):
     out = proj.out("answer", q, "先不放行")
     assert out["approved"] == [] and proj.out("prod-batch")["router_ships"] == []
     q = proj.out("prod-batch")["queue"]
-    out = proj.out("answer", q, f"{q} 放行。生图放行，用grok")
+    out = proj.out("answer", q, f"{q} 放行。生图放行，用grok")                    # 审查修复轮 2：不带 --go 一律不放行
+    assert out["approved"] == [] and q in [x["id"] for x in proj.state()["queue"]]
+    out = proj.out("answer", q, f"{q} 放行。生图放行，用grok", "--go")            # router 读懂是放行才加 --go
     assert out["approved"] == ["T1", "T2"] and proj.out("prod-batch")["router_ships"] == ["T1", "T2"]
 
 
@@ -581,7 +583,7 @@ def test_v21_8_skill_documents_go_reading():
     from test_docs import SKILL, _section
     s6 = _section((SKILL / "SKILL.md").read_text(encoding="utf-8"), "6.")
     row = next(l for l in s6.splitlines() if l.startswith("| 「Qn 放行」"))
-    assert "Q332 放行。生图放行，用grok" in row and "先不放行" in row and "不放行" in row
+    assert "--go" in row and "不带 `--go` 一律不放行" in row and "逐字存档" in row      # 审查修复轮 2：放行只认 --go
     spend = next(l for l in s6.splitlines() if "「放行 Q4」" in l)
     assert "`go`" in spend and "原样转给 worker" in spend
 

@@ -634,7 +634,7 @@ def test_prod_batch_running_round_ticket_needs_user(mp):                        
     row = {r["ticket"]: r for r in out["batch"]}
     assert "多轮在做" in row["T2"]["state"] and "要放行" in row["T2"]["state"]
     q = out["queue"]
-    assert mp.out("answer", q, "放行")["approved"] == ["T1", "T2"]
+    assert mp.out("answer", q, "放行", "--go")["approved"] == ["T1", "T2"]            # 放行只认 --go（审查修复轮 2）
     out = mp.out("prod-batch")
     assert out["router_ships"] == ["T1"] and out["queue"] is None                     # 放行后不挡，也不进 router_ships
     assert "已放行" in {r["ticket"]: r for r in out["batch"]}["T2"]["state"]
@@ -910,7 +910,8 @@ def test_prod_go_reader_accepts_keyi_shang(mp):                                 
            T2=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "attempts": [],
                                                     "title": "合成业务票"}))           # 没经用户确认的卡：要放行
     q = mp.out("prod-batch")["queue"]
-    out = mp.out("answer", q, "#1可以上")
+    assert mp.out("answer", q, "#1可以上")["approved"] == []                         # 审查修复轮 2：读法只是提示，
+    out = mp.out("answer", q, "#1可以上", "--go")                                     # 放行只认 router 加的 --go
     assert out["approved"] == ["T1", "T2"]
     assert mp.out("prod-batch")["router_ships"] == ["T1", "T2"]
 
@@ -1018,3 +1019,45 @@ def test_new_round_branch_has_no_upstream(mp):                                  
     _git("worktree", "remove", str(wt2), cwd=mp.root)
     assert launcher.reopen_round(Ctx(), mp.root, wt2, "staging", "router/T2-r2") == {"ok": True}
     assert head(wt2) == "router/T2-r2" and upstream(wt2, "router/T2-r2") is None
+
+
+# =====================================================================================================
+# 审查修复轮 2
+# =====================================================================================================
+
+QUESTIONS_2 = ("可以上 prod嘛", "可以上 prod呢", "可以上 prod没", "可以上 prod 对不对", "可以上 prod吗", "可以上 prod?",
+               "上 prod 没", "放行 呢")
+NOTES_2 = ("放行 不过T3配置晚点再说", "放行，没什么", "放行。T3什么时候上？", "可以上 不用等T3了", "放行 不用等 CI 了")
+
+
+def test_prod_batch_approval_only_with_go_flag(mp):                                       # R2-1：放行只认 --go
+    push_main(mp.root)
+    mp.put(T1=("await_prod", ["llm-config"], {"title": "合成老票"}),
+           T2=("await_prod", ["her-reply-prompt"], {"kind": "business", "authorized": True, "attempts": [],
+                                                    "title": "合成业务票"}))
+    q = mp.out("prod-batch")["queue"]
+    for text in QUESTIONS_2 + NOTES_2 + ("放行", "#1可以上"):                          # 不带 --go：一律不放行
+        out = mp.out("answer", q, text)
+        s = mp.state()
+        assert out["approved"] == [] and "--go" in out["hint"], text
+        assert q in [x["id"] for x in s["queue"]], text                                  # 项留着，保持待答
+        assert not any(t.get("prod_ok") for t in s["tickets"].values()), text
+    answers = (mp.home / "answers.md").read_text(encoding="utf-8")
+    assert all(f"| {q} | prod | - | {text}" in answers for text in QUESTIONS_2 + NOTES_2)   # 原话逐字存档
+    out = mp.out("answer", q, "放行 不过T3配置晚点再说", "--go")                        # router 读懂是放行才加 --go
+    assert out["approved"] == ["T1", "T2"] and q not in [x["id"] for x in mp.state()["queue"]]
+    assert mp.out("prod-batch")["router_ships"] == ["T1", "T2"]
+
+
+def test_go_flag_rejected_on_non_batch_items(mp):                                         # R2-1：--go 只给整批 prod 项
+    s = mp.put(T1=("paused", ["llm-config"], {"title": "合成老票", "worker": worker("sid-1", None)}),
+               T2=("await_prod", ["her-reply-prompt"], {"title": "合成老票二"}))
+    s["queue"] = [_q("Q1", "T1", "spend", "T1：要花钱（合成）")]
+    s["seq"]["queue"] = 1
+    mp.save(s)
+    v1 = mp.out("prod-batch")["queue"]                                                   # 只有老票：v1 的 prod 项（不是整批）
+    for qid in ("Q1", v1):
+        r = mp.run("answer", qid, "放行", "--go", check=False)
+        assert r.returncode == 1 and "--go" in json.loads(r.stdout)["error"], qid
+        assert qid in [x["id"] for x in mp.state()["queue"]]
+    assert mp.claude() == [] and not (mp.home / "answers.md").exists()

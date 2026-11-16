@@ -105,7 +105,7 @@ def test_unattributed_staging_commit_blocks_router_ship(proj):
     assert [(c["sha"], c["subject"]) for c in out["commits"]] == [(other, "合成：同事的改动")]
     (q,) = [q for q in proj.state()["queue"] if q["kind"] == "prod"]
     assert other[:12] in q["summary"] and "对不上" in q["summary"]
-    proj.out("answer", out["queue"], "放行")                                   # 用户放行整批（连这条提交）⇒ 能上
+    proj.out("answer", out["queue"], "放行", "--go")                           # 用户放行整批（连这条提交）⇒ 能上
     out = proj.out("prod-batch")
     assert out["router_ships"] == ["T2"] and out["queue"] is None
 
@@ -158,7 +158,7 @@ def test_batch_prod_item_keeps_id_while_batch_unchanged(proj):
     assert out["queue"] == q1 == q["id"] and "T1 老票·待放行" in q["summary"]
     proj.out("released", "--tickets", "T5", "--what", "合成重上", "--metrics", "m1")   # 批次外的票 released：不动这一项
     assert [q["id"] for q in proj.state()["queue"] if q["kind"] == "prod"] == [q1]
-    proj.out("answer", q1, "放行")                                              # 按看到的号回「放行」照样生效
+    proj.out("answer", q1, "放行", "--go")                                      # 按看到的号回「放行」照样生效
     assert proj.out("prod-batch")["router_ships"] == ["T1", "T2"]
 
 
@@ -297,7 +297,7 @@ def test_parked_members_listed_but_not_router_ships(proj):
     assert st["T3"][0] == "done" and "关前已撤回" in st["T3"][1]
     (q,) = [q for q in proj.state()["queue"] if q["kind"] == "prod"]
     assert "已停" in q["summary"] and "接管" in q["summary"] and "关前已撤回" in q["summary"]
-    proj.out("answer", out["queue"], "放行")                                   # 用户放行整批：它们跟着上，但不进 router_ships
+    proj.out("answer", out["queue"], "放行", "--go")                           # 用户放行整批：它们跟着上，但不进 router_ships
     out = proj.out("prod-batch")
     assert out["router_ships"] == ["T2"] and out["queue"] is None
     assert {b["ticket"] for b in out["batch"]} == {"T1", "T2", "T3", "T4"}
@@ -305,7 +305,7 @@ def test_parked_members_listed_but_not_router_ships(proj):
 
 def test_released_parks_paused_takeover_and_skips_rolled_back(proj):
     _parked_batch(proj)
-    proj.out("answer", proj.out("prod-batch")["queue"], "放行")
+    proj.out("answer", proj.out("prod-batch")["queue"], "放行", "--go")
     before = proj.state()["tickets"]
     out = proj.out("released", "--tickets", "T3", "--what", "合成：随批次上线", "--metrics", "m1")
     assert out["ok"] and [x["ticket"] for x in out["skipped"]] == ["T3"]
