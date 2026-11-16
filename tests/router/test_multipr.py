@@ -1118,3 +1118,46 @@ def test_answer_stale_item_hint_matches_what_can_reopen(mp):                    
     assert "tell" in out["hint"]
     for tid in ("T1", "T2"):
         assert mp.run("tell", tid, "合成", "--resume", check=False).returncode == 1
+
+
+HOOK_A = r'''
+import json, os, subprocess, sys
+argv = sys.argv[1:]
+cli = os.environ["ROUTER_CLI"]
+git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True, text=True).stdout.strip()
+branch = git("rev-parse", "--abbrev-ref", "HEAD")
+if "--resume" in argv:                                       # 带回改动：在当前分支开新 PR，CI 还在跑
+    open("合成带回.txt", "w").write("合成\n")
+    git("add", "."); git("commit", "-qm", "合成：带回"); git("push", "-q", "-u", "origin", branch)
+    p = os.environ["GH_PRS"]
+    prs = json.loads(open(p).read()) if os.path.exists(p) else {}
+    prs.setdefault("open", {})[branch] = 42
+    prs.setdefault("checks", {})["42"] = "pending"
+    open(p, "w").write(json.dumps(prs))
+    subprocess.run([sys.executable, cli, "progress", "pr_opened"], check=True, capture_output=True)
+'''
+
+
+def test_e2e_stale_merged_pr_pointer_then_new_pr(mp, monkeypatch):                        # 缺陷 A 的真实顺序（T108 / D580）
+    # 业务票：PR #41 已合进 staging（merge_sha 记着），router 把票换到新分支、续跑；worker 开了新 PR #42、报 pr_opened。
+    # 旧代码：tick 先取 t.pr = #41（已合）⇒ 当场判「已合 staging」进 await_prod，还把 worktree 清了
+    monkeypatch.setenv("FAKE_CLAUDE_HOOK", str(mp.tmp / "hook_a.py"))
+    (mp.tmp / "hook_a.py").write_text(HOOK_A)
+    push_main(mp.root)
+    s41 = staging_commit(mp.root, "合成 PR (#41)")
+    mp.prs(merged={"41": s41})
+    wt = mp.worktree("T1", branch="router/T1-v2")
+    mp.put(T1=("paused", ["llm-config"], {
+        "kind": "business", "authorized": True, "title": "合成业务票", "issue": 11, "card_confirmed": True,
+        "card_confirmed_by": "user", "pr": 41, "merge_sha": s41, "attempts": [],
+        "worker": worker("sid-1", wt, "router/T1-v2"),
+        "history": [{"at": OLD, "status": "await_prod"}, {"at": OLD, "status": "paused"}]}))
+    mp.register("sid-1", wt)
+    assert mp.out("tell", "T1", "合成：带回改动、开新 PR", "--resume")["resumed"] == "T1"
+    assert not mp.result("T1", 2)["is_error"]
+    res = mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert t["status"] == "verifying" and t["pr"] == 42                              # 不收票，指针换成新 PR
+    assert wt.is_dir() and t["worker"]["worktree"] == str(wt)                        # worktree 不删
+    assert not [q for q in mp.state()["queue"] if q["kind"] in ("handson", "prod")] and not res.get("prod_ready")
+    assert not [c for c in mp.gh() if c[:3] == ["pr", "merge", "41"]]
