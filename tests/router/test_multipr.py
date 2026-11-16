@@ -323,6 +323,7 @@ def _pr_json(state, sha=None, head="abc123"):
 def _clean_wt(p, name="wt1"):
     wt = p.root / name; wt.mkdir(parents=True, exist_ok=True)
     p.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    p.ctx.script(["git", "-C", str(wt), "rev-parse", "--show-toplevel"], f"{wt}\n")   # 它自己就是 git 顶层
     return wt
 
 
@@ -972,3 +973,20 @@ def test_round_prompt_and_worker_doc_name_push_branch():                        
     assert "router/<T>-r<k>" in push                                                 # 推分支那一步写明多轮推哪条
     fix = next(line for line in sec3.splitlines() if "--force-with-lease" in line)
     assert "router/<T>-r<k>" in fix                                                  # 修 CI / rebase 时推哪条
+
+
+def test_round_switch_refuses_dir_that_is_not_its_own_worktree(mp):                       # R4：不切到主 checkout 上
+    # worktree 删到一半（.git 没了、目录还在）：git -C <目录> 会落到外层的主 checkout 上，一切就切了主 checkout 的分支
+    half = mp.root / ".claude" / "worktrees" / "router-T1"
+    half.mkdir(parents=True)
+    (half / "残留.txt").write_text("合成\n")
+    main_branch = head(mp.root)
+    mp.put(T1=("verifying", ["llm-config"], _maint(pr=41, more="第 2 条：合成条目", worker=worker("sid-1", half))))
+    mp.prs(merged={"41": "4" * 40})
+    mp.out("tick")
+    t = mp.state()["tickets"]["T1"]
+    assert head(mp.root) == main_branch                                              # 主 checkout 的分支没动
+    (q,) = [q for q in mp.state()["queue"] if q["kind"] == "stuck"]
+    assert t["status"] == "stuck" and str(half) in q["summary"] and t["round_pending"]["pr"] == 41
+    r = mp.run("answer", q["id"], "合成：好了", check=False)                           # 回答补切也一样拒
+    assert r.returncode == 1 and head(mp.root) == main_branch and mp.claude() == []

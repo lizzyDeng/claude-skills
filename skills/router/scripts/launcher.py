@@ -107,10 +107,18 @@ def switch_round_branch(ctx, wt, base, branch) -> dict:
     """多轮票开下一轮：在同一个 worktree 路径上切到 branch（claude --resume 按 cwd 找会话，路径不能变）。
     幂等：已在目标分支 ⇒ ok；目标分支已在（上次切到一半）⇒ 直接 switch 过去；否则从 origin/<base> 新切（--no-track）。
     不强推、不碰远端、不丢东西：有未提交改动 ⇒ dirty，一步都不做。
-    → {"ok": True} | {"ok": False, "reason": "missing" | "dirty" | "fetch" | "switch", "error"}"""
+    目录在、但它自己不是 git 顶层（worktree 删到一半、.git 没了）⇒ foreign，一步都不做：git -C 会落到外层的主
+    checkout 上，切的就是主 checkout 的分支。
+    → {"ok": True} | {"ok": False, "reason": "missing" | "foreign" | "dirty" | "fetch" | "switch", "error"}"""
     p = Path(wt) if wt else None
     if not p or not p.is_dir():
         return {"ok": False, "reason": "missing", "error": f"worktree 不在：{wt}"}
+    top = ctx.run(["git", "-C", str(p), "rev-parse", "--show-toplevel"])
+    top_dir = (top.stdout or "").strip()
+    if top.returncode != 0 or not top_dir or os.path.realpath(top_dir) != os.path.realpath(str(p)):
+        return {"ok": False, "reason": "foreign",
+                "error": f"不是独立的 worktree（git 顶层是 {top_dir or '?'}：{_err(top) if top.returncode else '对不上'}），"
+                         "没切分支：先确认这个目录是怎么回事"}
     st = ctx.run(["git", "-C", str(p), "status", "--porcelain"])
     if st.returncode != 0:
         return {"ok": False, "reason": "switch", "error": f"git status 失败：{_err(st)}"}
