@@ -2020,8 +2020,11 @@ _PROD_SHIPS = ("ready", "approved")                   # 发完照常 released（
 # 关键词后面只能是结尾 / 空白 / 标点（可带「了 / 吧」；「放行吗」「放行不了」不算）；整句里有否定（「先不放行」「不放行」「先别」）一律不算
 # 附录 H（Q387）：「可以上」「可以上 prod」也是放行；前缀也可以是 router 回复里的序号「#<数字>」（「#1可以上」）。
 # 「可以上吗」「可以上不了」照样不算，「不可以上」算明确不放行
-_PROD_GO = re.compile(r"^(?:[Q#]\d+[\s，,：:。.、]*)?(?:放行|上\s*prod|可以上(?:\s*prod)?)[了吧啦]?(?:$|[\s，,。.！!；;、：:])",
-                      re.I)
+# 审查修复轮 #1：关键词后面（隔着空格 / prod）跟问句（吗 / 么 / ? / ？ / 不）不算放行：「可以上 prod吗」「可以上 prod?」
+# 原来会回溯成「可以上」+ 空格 ⇒ 误判放行；整句以问句收尾（「可以上，对吗」）也不算
+_PROD_GO = re.compile(r"^(?:[Q#]\d+[\s，,：:。.、]*)?(?:放行|上\s*prod|可以上(?:\s*prod)?)(?!\s*(?:prod\s*)?[吗么?？不])"
+                      r"[了吧啦]?(?:$|[\s，,。.！!；;、：:])", re.I)
+_PROD_ASK = re.compile(r"[吗么?？]\s*$")
 _PROD_NO = re.compile(r"不放行|先别|别上|先不|暂缓|不要上|不能上|不可以|不上\s*prod", re.I)
 
 
@@ -2030,6 +2033,8 @@ def _said_go(text):
     t = (text or "").strip()
     if _PROD_NO.search(t):
         return "no"
+    if _PROD_ASK.search(t):                        # 问句收尾：是在问，不是放行
+        return None
     return "go" if _PROD_GO.match(t) else None
 _KIND_ZH = {"business": "业务票", "maint": "维护票", "legacy": "老票"}
 _PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")             # squash 合并的默认标题：「<PR 标题> (#<PR 号>)」
