@@ -103,6 +103,64 @@ def create_worktree(ctx, repo: Path, base_branch: str, wt_dir: str, tid: str, br
     return wt, branch
 
 
+def switch_round_branch(ctx, wt, base, branch) -> dict:
+    """多轮票开下一轮：在同一个 worktree 路径上切到 branch（claude --resume 按 cwd 找会话，路径不能变）。
+    幂等：已在目标分支 ⇒ ok；目标分支已在（上次切到一半）⇒ 直接 switch 过去；否则从 origin/<base> 新切（--no-track）。
+    不强推、不碰远端、不丢东西：有未提交改动 ⇒ dirty，一步都不做。
+    目录在、但它自己不是 git 顶层（worktree 删到一半、.git 没了）⇒ foreign，一步都不做：git -C 会落到外层的主
+    checkout 上，切的就是主 checkout 的分支。
+    → {"ok": True} | {"ok": False, "reason": "missing" | "foreign" | "dirty" | "fetch" | "switch", "error"}"""
+    p = Path(wt) if wt else None
+    if not p or not p.is_dir():
+        return {"ok": False, "reason": "missing", "error": f"worktree 不在：{wt}"}
+    top = ctx.run(["git", "-C", str(p), "rev-parse", "--show-toplevel"])
+    top_dir = (top.stdout or "").strip()
+    if top.returncode != 0 or not top_dir or os.path.realpath(top_dir) != os.path.realpath(str(p)):
+        return {"ok": False, "reason": "foreign",
+                "error": f"不是独立的 worktree（git 顶层是 {top_dir or '?'}：{_err(top) if top.returncode else '对不上'}），"
+                         "没切分支：先确认这个目录是怎么回事"}
+    st = ctx.run(["git", "-C", str(p), "status", "--porcelain"])
+    if st.returncode != 0:
+        return {"ok": False, "reason": "switch", "error": f"git status 失败：{_err(st)}"}
+    lines = [x.strip() for x in (st.stdout or "").splitlines() if x.strip()]
+    if lines:
+        return {"ok": False, "reason": "dirty",
+                "error": "有未提交改动：" + "；".join(lines[:5]) + (f" 等 {len(lines)} 项" if len(lines) > 5 else "")}
+    cur = ctx.run(["git", "-C", str(p), "rev-parse", "--abbrev-ref", "HEAD"])
+    if cur.returncode == 0 and (cur.stdout or "").strip() == branch:
+        return {"ok": True}
+    f = ctx.run(["git", "-C", str(p), "fetch", "origin", base], timeout=FETCH_S)
+    if f.returncode != 0:
+        return {"ok": False, "reason": "fetch", "error": f"git fetch origin {base} 失败：{_err(f)}"}
+    exists = ctx.run(["git", "-C", str(p), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
+    cmd = (["switch", branch] if exists.returncode == 0 and (exists.stdout or "").strip()
+           else ["switch", "--no-track", "-c", branch, f"origin/{base}"])
+    r = ctx.run(["git", "-C", str(p), *cmd])
+    if r.returncode != 0:
+        return {"ok": False, "reason": "switch", "error": f"git {' '.join(cmd)} 失败：{_err(r)}"}
+    return {"ok": True}
+
+
+def reopen_round(ctx, repo, path, base, branch) -> dict:
+    """收票时 worktree 已删：在原路径重建、检出 branch（已在就直接检出，否则从 origin/<base> 新切）。路径必须是原来那个：
+    claude --resume 按 cwd 找会话。→ {"ok": True} | {"ok": False, "reason": "exists" | "fetch" | "add", "error"}"""
+    p = Path(path)
+    if p.exists():
+        return {"ok": False, "reason": "exists", "error": f"路径已存在（不是这张票的 worktree？）：{p}"}
+    if str(p) in _registered_worktrees(ctx, repo):                    # 路径没了、git 还登记着
+        ctx.run(["git", "-C", str(repo), "worktree", "prune"])
+    f = ctx.run(["git", "-C", str(repo), "fetch", "origin", base], timeout=FETCH_S)
+    if f.returncode != 0:
+        return {"ok": False, "reason": "fetch", "error": f"git fetch origin {base} 失败：{_err(f)}"}
+    exists = ctx.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
+    cmd = (["worktree", "add", str(p), branch] if exists.returncode == 0 and (exists.stdout or "").strip()
+           else ["worktree", "add", "--no-track", "-b", branch, str(p), f"origin/{base}"])
+    r = ctx.run(["git", "-C", str(repo), *cmd])
+    if r.returncode != 0:
+        return {"ok": False, "reason": "add", "error": f"git worktree add 失败：{_err(r)}"}
+    return {"ok": True}
+
+
 def worker_liveness(ctx, w: dict) -> str:
     """→ "alive" | "dead" | "unknown"（RV M-2，鲁棒性清单②「ps 超时 ≠ 没进程」）。
     pid 不在 = dead；没记启动时间 = 只能信 pid（alive）；查到的启动时间与记录一致 = alive、不一致 = pid 被复用 = dead；
@@ -177,8 +235,13 @@ def stop_now(pid: int) -> None:
         pass
 
 
-def remove_worktree(ctx, repo, wt) -> None:
-    _git(ctx, repo, "worktree", "remove", "--force", str(wt))
+def status_lines(ctx, wt, n=5) -> str:
+    """worktree 里 git status --porcelain 的前 n 行（决定单项里给人看：哪些文件没提交）。"""
+    r = ctx.run(["git", "-C", str(wt), "status", "--porcelain"])
+    lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if r.returncode != 0:
+        return f"git status 失败：{_err(r)[:120]}"
+    return "；".join(lines[:n]) + (f" 等 {len(lines)} 项" if len(lines) > n else "") if lines else "（git status 为空）"
 
 
 def _registered_worktrees(ctx, repo) -> set:

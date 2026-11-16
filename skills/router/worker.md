@@ -1,6 +1,6 @@
 # worker 协议（router 派出的 headless worker 必读）
 
-你是 router 派出的 worker，在自己的 worktree 里跑（`claude -p`，没有人在终端前）。一张票、一个分支（派单「环境」里写的那条：老票是 `router/<T>`，业务票每次尝试一条新分支 `router/<T>-a<n>`）、三段流程。业务票（派单「问题」写的是「人群：想要什么」）另外照本文末尾「业务票」一节。**你不直接问用户**：要人决定就往上抛事件，然后退出；router 会带着答案用 `--resume` 叫醒你。
+你是 router 派出的 worker，在自己的 worktree 里跑（`claude -p`，没有人在终端前）。一张票、一个分支（派单「环境」里写的那条：老票是 `router/<T>`，业务票每次尝试一条新分支 `router/<T>-a<n>`；老票 / 维护票一张票分几个 PR 做时，每轮一条新分支 `router/<T>-r<k>`，见第 3 段）、三段流程。业务票（派单「问题」写的是「人群：想要什么」）另外照本文末尾「业务票」一节。**你不直接问用户**：要人决定就往上抛事件，然后退出；router 会带着答案用 `--resume` 叫醒你。
 
 命令一律 `python3 $ROUTER_CLI <子命令>`（环境变量里已有 `ROUTER_TICKET`、`ROUTER_HOME`、`ROUTER_CLI`）。
 
@@ -49,6 +49,7 @@
   - `interface_changed` / `assumption_broken`（来自别的票）：对照你的方向卡核心假设；没受影响就继续；你的核心假设也被推翻了，照下一节第 2 条停。
   - `tell`：router 转来的话，照办。
 - 细节设计边做边定，不再出 plan v2、v3。conductor 的好规矩照做：锚定 SHA、非 happy path 必测、验收贴真实输出。
+- 执行中要出新方向卡时（用户回答要你出卡、诊断卡确认后出下一道墙的卡、分期票的下一期）：写完卡（同一路径 `$ROUTER_HOME/cards/$ROUTER_TICKET.md`）就 `python3 $ROUTER_CLI progress card_ready` 退出，**不要接着开工**。之前那张卡的确认随之作废，router 走方向审后交用户确认；确认后会用 `--resume` 叫醒你（同一会话、同一分支），从新卡接着做。
 
 ## 只在三种情况停
 
@@ -69,9 +70,10 @@
 
 1. 逐条跑方向卡第 6 项的验收标准，**贴真实命令输出**（写进 PR 描述，去掉用户原话和 uid）。
 2. 写过 staging 数据的：在同一个 run 里回滚，并在验收里贴出回滚前后的对比。
-3. 推分支：`git push -u origin <派单「环境」里的分支>`。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
-4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。业务票写 `Refs #<issue>`，不写 `Closes #`：业务票是长期票，`Closes` 会在第一次发版时把 issue 自动关掉。
-5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的）。
+3. 推分支：`git push -u origin <派单「环境」里的分支>`；多轮票第 2 轮起推 router 叫醒你时说的新分支 `git push -u origin router/<T>-r<k>`（派单里那条已经合并了，别再推它）。aifriends 的 pre-push 钩子很重：先手动跑项目 CLAUDE.md 规定的等价校验（`cargo check` + `cargo test --lib --bins`、前端 `npx tsc -b`），过了再 `git push --no-verify`。
+4. `gh pr create --base <派单里的 base 分支> --title "<票标题>" --body "<验收输出 + Closes #<issue>>"`。🔴 必须写 `--base`：默认 base 是 main，router 发现 base 不对一律不合。业务票写 `Refs #<issue>`，不写 `Closes #`：业务票是长期票，`Closes` 会在第一次发版时把 issue 自动关掉。老票 / 维护票后面还有 PR 的（见 5）也写 `Refs #<issue>`，最后一个 PR 照旧写 `Closes #<issue>`。
+5. `python3 $ROUTER_CLI progress pr_opened`，然后**退出**。CI 和合并由 router 负责；CI 红了或和 base 冲突，你会被叫醒修（rebase 后只许 `--force-with-lease` 推你自己的那条分支，即派单「环境」里写的；多轮票第 2 轮起是当前这一轮的 `router/<T>-r<k>`）。修好再报 `pr_opened` 时不用再带 `--more`（router 记着）。
+   - **一张票分几个 PR**（只限老票、维护票：维护票多条目、分期票按一条一个 PR 做）：这个 PR 之后还有 ⇒ `python3 $ROUTER_CLI progress pr_opened --more "<还剩什么，一句话>"` 后退出。router 合并后不收票：在**同一个目录**切新分支 `router/<T>-r<k>`（从 `origin/<base>` 切，不带上一轮的提交），用 `--resume` 叫醒你做下一项；worktree 里留着未提交的改动会切不了分支，router 会停下来问人。最后一个 PR 不带 `--more`。报过 `--more` 后发现没有下一项：不开 PR，`progress impl_done` 退出（router 照收票处理，issue 由 router 手关）。业务票一次尝试一个 PR，带 `--more` 会被拒。
 
 **仓外票**（派单「收尾」一节写着「只改仓外目录」，例如 `~/.her-persona-daily/`）：没有 PR 可开。
 1. 动手前把要改的文件整份备份到 `$ROUTER_HOME/backups/$ROUTER_TICKET/`（`cp -a`，保留目录结构）。

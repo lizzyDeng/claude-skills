@@ -124,8 +124,10 @@ def test_close_business_lists_only_merged_old_branches(tmp_path, monkeypatch):
         {"n": 3, "direction": "乙", "verdict": "useless", "branch": "router/T1-a2", "merge_sha": None},
         {"n": 4, "direction": "丙", "verdict": "useful", "branch": "router/T1-a3", "merge_sha": "ccc"}],
         worker={"branch": "router/T1-a3"})))
+    import subprocess
+    gh_none = lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "[]", "")   # 关票前查 gh：没有开着的 PR
     env = router.Env(tmp_path, SimpleNamespace(now=lambda: datetime(2026, 11, 13, tzinfo=timezone.utc),
-                                               pid_alive=lambda pid: False))
+                                               pid_alive=lambda pid: False, run=gh_none))
     router._close_business(env, st, "T1", "测试", "测试")
     assert st["tickets"]["T1"]["closeout"]["old_branches"] == {"router/T1": "pending"}   # 当前分支照 v1 的 branch 栏收
 

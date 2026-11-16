@@ -105,7 +105,7 @@ def test_unattributed_staging_commit_blocks_router_ship(proj):
     assert [(c["sha"], c["subject"]) for c in out["commits"]] == [(other, "合成：同事的改动")]
     (q,) = [q for q in proj.state()["queue"] if q["kind"] == "prod"]
     assert other[:12] in q["summary"] and "对不上" in q["summary"]
-    proj.out("answer", out["queue"], "放行")                                   # 用户放行整批（连这条提交）⇒ 能上
+    proj.out("answer", out["queue"], "放行", "--go")                           # 用户放行整批（连这条提交）⇒ 能上
     out = proj.out("prod-batch")
     assert out["router_ships"] == ["T2"] and out["queue"] is None
 
@@ -158,7 +158,7 @@ def test_batch_prod_item_keeps_id_while_batch_unchanged(proj):
     assert out["queue"] == q1 == q["id"] and "T1 老票·待放行" in q["summary"]
     proj.out("released", "--tickets", "T5", "--what", "合成重上", "--metrics", "m1")   # 批次外的票 released：不动这一项
     assert [q["id"] for q in proj.state()["queue"] if q["kind"] == "prod"] == [q1]
-    proj.out("answer", q1, "放行")                                              # 按看到的号回「放行」照样生效
+    proj.out("answer", q1, "放行", "--go")                                      # 按看到的号回「放行」照样生效
     assert proj.out("prod-batch")["router_ships"] == ["T1", "T2"]
 
 
@@ -189,6 +189,15 @@ def _git(proj, *a):
     return subprocess.run(["git", *a], cwd=proj.root, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _gh_merged(proj, *prs):
+    """收票前 router 用 gh 查 PR 的真实状态（审查修复轮 2）：给假 gh 一份应答，这几个 PR 在 GitHub 上已合 → GH_CANNED 路径。"""
+    f = proj.tmp / "gh_merged.json"
+    f.write_text(json.dumps({f"pr view {n}": json.dumps({"state": "MERGED", "mergeCommit": {"oid": f"m{n}"},
+                                                         "baseRefName": "staging", "statusCheckRollup": []})
+                             for n in prs}))
+    return {"GH_CANNED": str(f)}
+
+
 def test_close_gate_not_bypassed_by_stop(proj):
     """① 改动在 staging 上（await_prod）的业务票：stop 之后 close / 「Qn 关」照样拒；③ --rolled-back 才收。"""
     _biz(proj, status="await_prod", attempts=_JUDGED, merge_sha="bbb0001", pr=42, history=list(H_AP))
@@ -200,7 +209,7 @@ def test_close_gate_not_bypassed_by_stop(proj):
     cq = _push_q(proj, "T1", "close")
     r = proj.run("answer", cq, "关", check=False)
     assert r.returncode == 1 and "--rolled-back" in _err(r)
-    assert proj.out("close", "T1", "--rolled-back")["ok"]
+    assert proj.out("close", "T1", "--rolled-back", env=_gh_merged(proj, 42))["ok"]
     assert proj.state()["tickets"]["T1"]["status"] == "done"
 
 
@@ -228,7 +237,7 @@ def test_rolled_back_decide_names_this_inflight_change(proj):
     _biz(proj, status="await_prod", attempts=_JUDGED, merge_sha="bbb0001", pr=42, history=list(H_AP))
     r = proj.run("close", "T1", check=False)
     assert "#42" in _err(r) and "bbb0001" in _err(r)
-    proj.out("close", "T1", "--rolled-back")
+    proj.out("close", "T1", "--rolled-back", env=_gh_merged(proj, 42))
     dec = (proj.home / "decisions.md").read_text()
     block = dec[dec.index("关票前已撤回"):]
     assert "#42" in block and "bbb0001" in block and "合成：第一次的撤回办法" not in dec
@@ -284,7 +293,7 @@ def _parked_batch(proj):
          T2=_biz_ready())
     proj.out("stop", "T1")
     proj.out("takeover", "T4")
-    proj.out("close", "T3", "--rolled-back")
+    proj.out("close", "T3", "--rolled-back", env=_gh_merged(proj, 43))
 
 
 def test_parked_members_listed_but_not_router_ships(proj):
@@ -297,7 +306,7 @@ def test_parked_members_listed_but_not_router_ships(proj):
     assert st["T3"][0] == "done" and "关前已撤回" in st["T3"][1]
     (q,) = [q for q in proj.state()["queue"] if q["kind"] == "prod"]
     assert "已停" in q["summary"] and "接管" in q["summary"] and "关前已撤回" in q["summary"]
-    proj.out("answer", out["queue"], "放行")                                   # 用户放行整批：它们跟着上，但不进 router_ships
+    proj.out("answer", out["queue"], "放行", "--go")                           # 用户放行整批：它们跟着上，但不进 router_ships
     out = proj.out("prod-batch")
     assert out["router_ships"] == ["T2"] and out["queue"] is None
     assert {b["ticket"] for b in out["batch"]} == {"T1", "T2", "T3", "T4"}
@@ -305,7 +314,7 @@ def test_parked_members_listed_but_not_router_ships(proj):
 
 def test_released_parks_paused_takeover_and_skips_rolled_back(proj):
     _parked_batch(proj)
-    proj.out("answer", proj.out("prod-batch")["queue"], "放行")
+    proj.out("answer", proj.out("prod-batch")["queue"], "放行", "--go")
     before = proj.state()["tickets"]
     out = proj.out("released", "--tickets", "T3", "--what", "合成：随批次上线", "--metrics", "m1")
     assert out["ok"] and [x["ticket"] for x in out["skipped"]] == ["T3"]

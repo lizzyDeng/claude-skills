@@ -43,7 +43,8 @@ QUEUE_KINDS = {"start", "card", "spend", "prod", "handson", "stuck", "conflict",
 # 决定单项的 topic（可选）：同一 kind 下按 topic 分派回答（router.cmd_answer）、看板文案
 # assumption：核心假设被推翻的方向项（v2.1：方向归用户，router 不能 --as-router 代答）
 # issue_sync：业务票 issue 正文要同步，但文本过不了防泄漏闸（没发到 GitHub，交用户看）
-QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption", "issue_sync"}
+# checkout：收票时 worktree 有未提交改动、没删（回答后下一轮巡检重试，不续跑 worker）
+QUEUE_TOPICS = {"base", "retarget", "dispatch", "offrepo", "requeue", "next", "assumption", "issue_sync", "checkout"}
 
 # set_status 不传 waiting_for 时按状态给的默认值（R5：续跑路径不再把「在等什么」清空）
 DEFAULT_WAIT = {KICKOFF: "写方向卡", EXECUTING: "执行中", VERIFYING: "等 CI", AWAIT_CARD: "等你确认方向卡",
@@ -232,7 +233,10 @@ def staging_pending(t: dict) -> bool:
     依据 = merge_sha（_settle 记的合并 commit）+ history：最后一次进 merged_staging / await_prod 之后没有 postlaunch，
     也没有 shipped_at（停 / 接管 / 关前已撤回的票随别的票发版上去时，released 只记这一条，残留 2 #3）。
     老票、维护票之后直接是 done 的也算 released（老版 released 直接记 done）；业务票之后是 done = 关了票，代码还在 staging。
-    没有 history（手写的 state）就按状态算。"""
+    没有 history（手写的 state）就按状态算。
+    多轮票（老票 / 维护票）：还有已合进 staging、没记 shipped_at 的轮次（rounds_unshipped）就算待发。"""
+    if rounds_unshipped(t):
+        return True
     if not t.get("merge_sha"):
         return False
     return _pending_since(t, (MERGED, AWAIT_PROD), done_releases=ticket_kind(t) != "business")
@@ -253,6 +257,57 @@ def _pending_since(t: dict, marks_of: tuple, done_releases: bool) -> bool:
     if any(x.get("status") == POSTLAUNCH or x.get("shipped_at") for x in after):
         return False
     return not (done_releases and any(x.get("status") == DONE for x in after))
+
+
+# ---- 多轮（老票、维护票）：一张票多个 PR。worker 报 pr_opened --more ⇒ 合并后不收票，同一路径切 router/<T>-r<k> 续跑 ----
+# 按 PR 记的一次性标记：开下一轮时清（同 router._requeue_business 那份，但不清 merge_sha）
+ROUND_FLAGS = ("verifying_at", "unconfirmed_reported", "no_pr_reported", "no_ci_reported", "leak_reported",
+               "wrong_base_reported", "retarget_fail")
+
+
+def round_branch(tid: str, t: dict) -> str:
+    """下一轮的分支：第 1 轮是派单时的 router/<T>，第 k 轮 router/<T>-r<k>（k = 已归档轮数 + 2）。"""
+    return f"router/{tid}-r{len(t.get('rounds') or []) + 2}"
+
+
+def open_next_round(t: dict, rp: dict, branch: str) -> dict:
+    """开下一轮（切分支成功之后才调）：rp 归档进 rounds，PR 指针、more、按 PR 记的一次性标记清掉，worker.branch 换成
+    新分支。不清 merge_sha（发版对账 / 待发判断要认它）。→ 归档的那一轮。"""
+    rnd = dict(rp)
+    t.setdefault("rounds", []).append(rnd)
+    t.pop("round_pending", None)
+    t["pr"] = None
+    t.pop("more", None)
+    for k in ROUND_FLAGS:
+        t.pop(k, None)
+    t["fail_streak"] = {"step": "", "count": 0}
+    t["worker"]["branch"] = branch
+    return rnd
+
+
+def rounds_unshipped(t: dict) -> list:
+    """多轮票已合进 staging、还没随发版上 prod 的轮次（原对象，released 直接往上记 shipped_at）：已归档的 rounds，
+    加上还没归档的 round_pending（切下一轮分支没成）；有 merge_sha、没有 shipped_at 的才算。"""
+    rs = list(t.get("rounds") or []) + ([t["round_pending"]] if t.get("round_pending") else [])
+    return [r for r in rs if r.get("merge_sha") and not r.get("shipped_at")]
+
+
+def round_running(t: dict) -> bool:
+    """多轮票还在做：有已合没发的轮次，票还没收（状态不在 SETTLED，stuck / paused 也算）。发版会把已合的轮次一起带上去，
+    但票不是这次上线的票：prod-batch 要用户放行（round / round_ok），released 只记 shipped_at、状态不变。"""
+    return bool(rounds_unshipped(t)) and t.get("status") not in SETTLED
+
+
+def round_note(rnd: dict, branch: str, base: str) -> str:
+    """开下一轮时给 worker 的说明（续跑提示的开头）。"""
+    sha = str(rnd.get("merge_sha") or "?")[:12]
+    nxt = f"再做下一项：{rnd['more']}" if rnd.get("more") else "再接着做这张票剩下的（上一轮没报 --more：先读 inbox）"
+    return (f"【router】PR #{rnd.get('pr') or '?'} 已合进 {base}（合并 sha {sha}）。你现在在新分支 {branch}，"
+            f"从 origin/{base} 切的，还是同一个目录。这一轮推这条：`git push -u origin {branch}`，PR 也从它开"
+            f"（`gh pr create --base {base}`）；不要再推派单「环境」里那条（已合并），修 CI / rebase 后"
+            f"`--force-with-lease` 也只推 {branch}。先读 inbox（python3 $ROUTER_CLI inbox），{nxt}。"
+            "后面还有 PR 就照旧 progress pr_opened --more \"<还剩什么>\"；这是最后一个就不带 --more"
+            "（PR 正文写 Closes）；报过 --more 后发现没有下一项：progress impl_done 退出。")
 
 
 def current_attempt(t: dict):

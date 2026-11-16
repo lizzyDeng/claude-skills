@@ -177,7 +177,7 @@ def test_prod_batch_holds_business_when_legacy_awaits_walkthrough(proj):
     proj.out("answer", out["queue"], "先别")                                    # 不是放行：只记原话
     out = proj.out("prod-batch")
     assert out["router_ships"] == []
-    proj.out("answer", out["queue"], "放行")                                    # 用户放行整批 ⇒ router 连同老票一起上
+    proj.out("answer", out["queue"], "放行", "--go")                            # 用户放行整批（router 读懂才加 --go）⇒ 连同老票一起上
     out = proj.out("prod-batch")
     assert out["router_ships"] == ["T1", "T2"] and out["queue"] is None
 

@@ -40,10 +40,13 @@ def emit(dir: Path, ticket: str, type: str, summary: str, evidence: str,
     return ev
 
 
-def emit_progress(dir: Path, ticket: str, phase: str, at: str = None) -> dict:
+def emit_progress(dir: Path, ticket: str, phase: str, at: str = None, more: str = None) -> dict:
+    """more：pr_opened 之后还有 PR（老票 / 维护票的多轮）时，还剩什么（一句话）；合并后 router 开下一轮。"""
     if phase not in PHASES:
         raise ValueError(f"未知进度 {phase}；只有 {sorted(PHASES)}")
     ev = {"ts": at or _now(), "ticket": ticket, "type": "progress", "phase": phase}
+    if more:
+        ev["more"] = more.strip()
     _append(Path(dir) / "events" / f"{ticket}.jsonl", ev)
     return ev
 

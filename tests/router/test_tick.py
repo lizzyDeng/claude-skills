@@ -160,6 +160,8 @@ def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
                                                      "solution": {"kind": "card", "text": "底座改为承认是 AI", "source": "v1"},
                                                      "worker": {"worktree": str(proj.root / "wt1"), "branch": "router/T1"}}),
              T2=("queued", ["her-reply-prompt"], {"weight": "heavy", "issue": 12, "start_ok": True, "blocked_by": ["T1"]}))
+    (proj.root / "wt1").mkdir()
+    proj.ctx.script(["git", "-C", str(proj.root / "wt1"), "status", "--porcelain"], "")      # 干净
     _pr_fake(proj)
     res = proj.run()
     s = proj.state()
@@ -167,7 +169,8 @@ def test_merge_releases_lock_comments_downstream_and_dispatches_next(proj):
     assert ["gh", "pr", "merge", "41", "--squash", "--match-head-commit", "abc123", "-R", "o/r"] in proj.ctx.calls
     c = proj.ctx.calls_with("issue", "comment")
     assert c and c[0][3] == "12" and "deadbeef" in c[0][c[0].index("--body") + 1]
-    assert ["git", "-C", str(proj.root), "worktree", "remove", "--force", str(proj.root / "wt1")] in proj.ctx.calls
+    assert ["git", "-C", str(proj.root), "worktree", "remove", str(proj.root / "wt1")] in proj.ctx.calls   # 干净才删
+    assert not proj.ctx.calls_with("worktree", "remove", "--force")                     # 不再 --force
     assert s["tickets"]["T1"]["worker"]["worktree"] is None          # R6：remove 成功就清指针（看板不再给失效的接管命令）
     assert res["dispatched"] == ["T2"] and s["tickets"]["T2"]["status"] == "kickoff"
     assert [q["kind"] for q in s["queue"]] == ["handson"]
@@ -334,9 +337,10 @@ def test_pr_opened_before_card_confirmed_is_not_merged(proj):        # C2
     proj.put(T1=running("kickoff", ["a"], log=log_with(proj, "T1", "{}")))
     events.emit_progress(proj.home, "T1", "card_ready", "2026-11-02T10:01:00Z")
     events.emit_progress(proj.home, "T1", "pr_opened", "2026-11-02T10:02:00Z")
-    proj.run()
+    res = proj.run()
     t = proj.state()["tickets"]["T1"]
-    assert t["status"] == "paused" and [q["kind"] for q in proj.state()["queue"]] == ["direction"]
+    # 缺陷 F（D571）之后：这次运行出过方向卡 ⇒ 回方向审（卡交用户确认），PR 留着；确认前未确认闸挡着不合
+    assert t["status"] == "kickoff" and res["cards_for_review"] == ["T1"] and not t.get("card_confirmed")
     s = proj.state(); store.set_status(s, "T1", store.VERIFYING, T0); s["tickets"]["T1"]["pr"] = 41
     store.save_state(proj.home / "state.json", s)
     _pr_fake(proj)

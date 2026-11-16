@@ -37,7 +37,7 @@ def _e(x) -> str:
 # requeue / next：回「Tn 换成：…」= redirect（业务票没有在途尝试就收，不看上一次判了什么）
 SAY_TOPIC = {"base": "{qid} 好了", "retarget": "{qid} 改好了", "dispatch": "{qid} 重派",
              "offrepo": "{t} 核对过了 / {t} 不满意：…", "requeue": "{qid} 重排 / {t} 换成：…",
-             "next": "{qid}：<下一个方向> / {t} 换成：…"}
+             "next": "{qid}：<下一个方向> / {t} 换成：…", "checkout": "{qid} 好了"}
 
 
 def _say(q) -> str:
