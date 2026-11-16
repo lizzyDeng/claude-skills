@@ -307,3 +307,66 @@ def test_settle_dirty_worktree_not_force_removed(mp):                           
     w = mp.state()["tickets"]["T1"]["worker"]
     assert not wt.exists() and w["worktree"] is None and w["last_worktree"] == str(wt)
     assert _checkout_items(mp) == [] and mp.claude() == []
+
+
+# =====================================================================================================
+# A. PR 指针过期：第二个 PR 不验，旧 PR 被重复收票
+# =====================================================================================================
+
+def _pr_json(state, sha=None, head="abc123"):
+    return json.dumps({"state": state, "mergedAt": None, "mergeCommit": {"oid": sha} if sha else None,
+                       "headRefOid": head, "baseRefName": "staging", "mergeable": "MERGEABLE",
+                       "statusCheckRollup": [{"__typename": "CheckRun", "name": "rust", "status": "COMPLETED",
+                                              "conclusion": "SUCCESS"}]})
+
+
+def _clean_wt(p, name="wt1"):
+    wt = p.root / name; wt.mkdir(parents=True, exist_ok=True)
+    p.ctx.script(["git", "-C", str(wt), "status", "--porcelain"], "")
+    return wt
+
+
+def _env(p):
+    import router
+    (p.home / "config.json").write_text(json.dumps(p.cfg))
+    return router.Env(p.root, p.ctx)
+
+
+def _cli(p, *argv):
+    import router
+    a = router.build_parser().parse_args(["--root", str(p.root), *argv])
+    return getattr(router, "cmd_" + a.cmd.replace("-", "_"))(a, _env(p))
+
+
+def test_single_pr_settle_keeps_pointer_for_attempt(fk):                                  # A1（回归）
+    wt1, wt2 = _clean_wt(fk, "wt1"), _clean_wt(fk, "wt2")
+    fk.put(T1=("verifying", ["her-reply-prompt"], {"kind": "business", "authorized": True, "card_confirmed": True,
+                                                   "card_confirmed_by": "user", "pr": 41, "attempts": [], "walls": [],
+                                                   "worker": {"worktree": str(wt1), "branch": "router/T1"}}),
+           T2=("verifying", ["llm-config"], {"card_confirmed": True, "pr": 42,
+                                                "worker": {"worktree": str(wt2), "branch": "router/T2"}}))
+    fk.ctx.script(["gh", "pr", "view", "41"], _pr_json("MERGED", "a41"))
+    fk.ctx.script(["gh", "pr", "view", "42"], _pr_json("MERGED", "a42"))
+    fk.run()
+    s = fk.state()
+    assert (s["tickets"]["T1"]["status"], s["tickets"]["T1"]["pr"]) == ("await_prod", 41)    # 收票不动指针
+    assert (s["tickets"]["T2"]["status"], s["tickets"]["T2"]["pr"]) == ("merged_staging", 42)
+    _cli(fk, "released", "--tickets", "T1", "--what", "合成方向", "--metrics", "m", "--rollback", "关合成开关")
+    att = fk.state()["tickets"]["T1"]["attempts"][-1]
+    assert (att["pr"], att["merge_sha"]) == (41, "a41")                              # released 照旧把它记进尝试
+
+
+def test_verify_skips_already_settled_merge(fk):                                          # A2
+    # router 手工续跑已收的票（D219 / D542）：worker 在同一分支开了 #42、报 pr_opened；指针还指着已收过的 #41
+    fk.put(T1=("verifying", ["llm-config"], {"card_confirmed": True, "pr": 41, "merge_sha": "a41", "issue": 11,
+                                                "verifying_at": T0,
+                                                "worker": {"worktree": None, "branch": "router/T1"}}))
+    fk.ctx.script(["gh", "pr", "view", "41"], _pr_json("MERGED", "a41"))
+    fk.ctx.script(["gh", "pr", "view", "42"],
+                  lambda cmd: _pr_json("MERGED", "b42") if fk.ctx.calls_with("pr", "merge", "42") else _pr_json("OPEN"))
+    fk.ctx.script(["gh", "pr", "list"], json.dumps([{"number": 42}]))
+    fk.run()
+    t = fk.state()["tickets"]["T1"]
+    assert fk.ctx.calls_with("pr", "merge", "42")                                    # 验的是 #42
+    assert (t["pr"], t["merge_sha"]) == (42, "b42")
+    assert not fk.ctx.calls_with("pr", "merge", "41")

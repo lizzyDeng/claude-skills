@@ -676,13 +676,20 @@ class Run:
             self._once(t, "unconfirmed_reported", t.get("pr") or True, tid, "direction",
                        f"{tid}：方向卡没经你确认，PR 不合")
             return
-        pr = t.get("pr") or github.pr_for_branch(self.ctx, repo, t["worker"].get("branch") or f"router/{tid}")
+        branch = t["worker"].get("branch") or f"router/{tid}"
+        pr = t.get("pr") or github.pr_for_branch(self.ctx, repo, branch)
+        st = github.pr_status(self.ctx, repo, pr) if pr else None
+        if st and st["merged"] and self._settled_merge(t, st.get("merge_sha")):
+            # 指针指着一个已经收过的合并（手工续跑已收的票、手改 state、老数据：D219 / D542）：不再 settle 一遍，
+            # 指针作废，按当前分支重找 open 的 PR
+            t["pr"] = None
+            pr = github.pr_for_branch(self.ctx, repo, branch)
+            st = github.pr_status(self.ctx, repo, pr) if pr else None
         if not pr:
             if self.ctx.now().timestamp() - _ts(t.get("verifying_at") or self.now) > 30 * 60:
                 self._once(t, "no_pr_reported", t.get("verifying_at"), tid, "stuck", f"{tid} 报了 pr_opened，但找不到它的 PR")
             return
         t["pr"] = pr
-        st = github.pr_status(self.ctx, repo, pr)
         if st["base"] != base:
             return self._wrong_base(tid, t, repo, base, pr, st)
         if st["merged"]:
@@ -719,6 +726,13 @@ class Run:
                 self._stuck(tid, f"{tid} PR #{pr} 合并失败 {t['fail_streak']['count']} 次")
             return
         self._settle(tid, t, github.pr_status(self.ctx, repo, pr)["merge_sha"] or "?")
+
+    @staticmethod
+    def _settled_merge(t, sha) -> bool:
+        """这个合并 sha 已经收过：等于票上的 merge_sha，或任一已归档轮次（rounds）的 merge_sha。"""
+        if not sha or sha == "?":
+            return False
+        return sha == t.get("merge_sha") or any(r.get("merge_sha") == sha for r in t.get("rounds") or [])
 
     def _wrong_base(self, tid, t, repo, base, pr, st):
         """🔴 合进 main = 上 prod，归用户。base 不对一律不合（合并闸 merge_if_green 再兜一道）。
