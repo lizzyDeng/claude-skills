@@ -96,7 +96,13 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
      - 仍然 `ok: false`（boundary / canary_stale / canary_failed / leak / guard …）⇒ 本轮不跑 codex，`router.py decide --ticket <T> --decision "codex 跳过：<reason>" --why "<error 原文>" --basis "review-pack 输出"`，只用 Opus 审。
      - review-canary 报 `canary_inconclusive`（模型没真执行命令、只是复述，或超时）不是定论：下一张卡的 review-pack 会再报 canary_stale、再补跑一次。
      - review-canary 报 `canary_leak`（金丝雀读出了被拒路径的假数据）⇒ 另外**告诉用户**「codex 读边界失效」：这是安全事件，人要知道；只有这种情况 review-pack 才会一直报 canary_failed、跳过 codex，直到用户查过 codex 版本和配置。
-2. 有挑战，且这张卡讨论轮数 < 2、从派发起 < 25 分钟：`router.py tell <T> "<挑战，≤3 条>" --resume --as-router`（你自己的话：worker 收到的标「router 转述 / 决定」，不冒充用户原话），worker 改卡后会再次 `progress card_ready`，回到这里。
+2. **先分挑战的类，再决定打不打回**（用户 11-20 定，目的是少跑没用的第 2 轮）：
+   - **方向问题**：根因判错或没验证、悄悄换了问题、方案可能无效或净收益为负、方向越出本票、在用代码修产品问题。
+   - **细节问题**：实现细节、验收口径、清单漏项（以前修过几次、成本测算、行为收益指标、一键开关、查询怎么写）。
+   - **小修卡**：同时满足不花钱、不改 prod 配置或数据、不发商店包、卡上工作量 ≤ 2 小时、不改产品方向（维护项、bug 修复）。小修卡**只审 1 轮**：有方向问题就打回一次，worker 改完直接交卡，不再审第 2 轮；只有细节问题就不打回，照第 3 步写进 `## router 裁决` 交卡。
+   - **其他卡**：第 1 轮有方向问题，且这张卡讨论轮数 < 2、从派发起 < 25 分钟 ⇒ 打回；只有细节问题 ⇒ 不打回，照第 3 步写进 `## router 裁决`、`submit-card --rounds 1` 交卡。
+   - 打回：`router.py tell <T> "<挑战，≤3 条>" --resume --as-router`（你自己的话：worker 收到的标「router 转述 / 决定」，不冒充用户原话），细节问题可以一起带上让它顺手改。worker 改卡后会再次 `progress card_ready`，回到这里。
+   - 卡末尾没有 worker 的「交卡前自查」一节（见 worker.md 第 1 段第 4 步）⇒ 先不派审，`tell --resume` 让它补齐再交；这一次不算一轮。
 3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime] [--unresolved]`，卡交用户确认。codex 与 Opus 有分歧：只有验收口径和实现细节由你裁决，在卡末尾追加 `## router 裁决` 一段写明——这一段只能写验收口径和实现细节，不能改方向、上线节奏（例如「上线即开」）、成本；分歧落在这三样上的，原样写进 `## 未解决的挑战` 交用户。
 4. 超时（25 分钟 / 2 轮）没谈拢 ⇒ 卡连同未解决的挑战一起交用户确认（不是 router 裁决后自动确认）：卡末尾追加 `## 未解决的挑战`（逐条：挑战、worker 的回应、卡在哪），注明哪部分没完成、为什么，`submit-card … --overtime --unresolved`（卡上有这一段而没加 `--unresolved` 也会被认出来；加了却没有这一段会被拒）。决定单的卡项会标「含未解决的挑战」，用户看完挑战再回「同意 / 改 / 驳回」。
 
