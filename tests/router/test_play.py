@@ -75,7 +75,7 @@ def learned_rows(p):
 # ---- A：play 的票况 / 上下文 / prompt -----------------------------------------------------------
 
 def test_play_context_must_review_and_streaks():
-    s = make_state(T1=biz_m([att(1, "useless", 10), att(2, "no_entry", 11), att(3, "harmful", 12)]),
+    s = make_state(T1=biz_m([att(1, "useless", 10), att(2, "wall_broken_not_retained", 11), att(3, "harmful", 12)]),
                    T2=biz_m([att(1, "useful", 9), att(2, "useless", 12, refuted={"killed": "play", "lesson": "l"})],
                             metric="合成指标乙"),
                    T3=biz_m([att(1, "pending_sample", 12), att(2, None, 13)], metric="合成指标丙"))
@@ -198,7 +198,7 @@ def test_play_output_records_review_and_learned_then_wakes_router(ap):
 
 def _case_state(case):
     if case == "streak":
-        return make_state(T1=biz_m([att(1, "useless", 9), att(2, "no_entry", 10), att(3, "harmful", 11)]))
+        return make_state(T1=biz_m([att(1, "useless", 9), att(2, "wall_broken_not_retained", 10), att(3, "harmful", 11)]))
     if case == "dead_play":
         return make_state(T1=biz_m([att(1, "useless", 9, refuted={"killed": "play", "lesson": "合成"}),
                                     att(2, "useless", 11)]))
@@ -475,3 +475,14 @@ def test_skill_play_protocol_and_product_first_reports():
     for w in ("第一段固定是产品读数", "status --json", "analyst.funnel", "最近学到的一件", "工程进度压成一行"):
         assert w in rep, w
     assert "learned.jsonl" in _section(text, "10.")
+
+
+def test_play_streak_skips_no_entry():
+    """没入口 = 没人碰到改动，对玩法没有信息：不算进连败，也不打断连败；但照样要复盘。"""
+    s = make_state(T1=biz_m([att(1, "useless", 10), att(2, "no_entry", 11), att(3, "harmful", 12)]))
+    ctx = analyst.play_context(s, "2026-11-01")
+    assert ctx["must_review"] == ["T1 a1", "T1 a2", "T1 a3"] and ctx["streaks"] == []
+    s = make_state(T1=biz_m([att(1, "useless", 10), att(2, "no_entry", 11), att(3, "harmful", 12),
+                             att(4, "useless", 13)]))
+    ctx = analyst.play_context(s, "2026-11-01")
+    assert ctx["streaks"] == [{"metric": "合成指标", "refs": ["T1 a1", "T1 a3", "T1 a4"]}]

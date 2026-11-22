@@ -32,6 +32,7 @@ ANALYST_ENV = "analyst"  # 起进程时的 ROUTER_TICKET
 
 # play（玩法复盘）
 NEGATIVE = ("useless", "no_entry", "harmful", "wall_broken_not_retained")   # 否定的判定：play 逐条复盘
+REFUTING = ("useless", "harmful", "wall_broken_not_retained")   # 算连败的判定：no_entry = 没人碰到，对玩法没有信息，连败里跳过
 KILLED = ("mechanism", "play")           # 这次否定否掉的是做法（机制）还是玩法本身
 STREAK_AT = 3                            # 同一指标最近连续几次判定都是否定 ⇒ 必须 escalate（重审前提）
 PRIOR_PLAYS = 4                          # 传给 play 的上几次 play 产出（最多几份）
@@ -208,7 +209,7 @@ def iso_week(ts) -> str:
 def play_context(st, since) -> dict:
     """play 起跑时定下的两件事（存进 run 记录，收产出时按它校验，期间新落的判定留给下一次）：
     - must_review：上次 play（跑成功的那次起跑时刻；没有就是这次的 since）以来判了否定、还没复盘过的尝试，逐条要写 refuted_review；
-    - streaks：同一指标最近连续 STREAK_AT 次判定都是否定、其中有这次要复盘的 ⇒ 这次必须填 escalate。"""
+    - streaks：同一指标最近连续 STREAK_AT 次判定都是否定（no_entry 跳过：没人碰到不算否定玩法）、其中有这次要复盘的 ⇒ 这次必须填 escalate。"""
     done = [r.get("started_at") or "" for r in ((st.get("analyst") or {}).get("runs") or {}).values()
             if r.get("mode") == "play" and r.get("ingested") and not r.get("failed")]
     cutoff = max(done) if done else (since or "")
@@ -218,13 +219,14 @@ def play_context(st, since) -> dict:
             if a.get("historical") or a.get("verdict") in (None, "pending_sample", "legacy"):
                 continue
             ref = attempt_ref(tid, a)
-            by_metric.setdefault(_metric_name(t) or tid, []).append((a.get("verdict_at") or "", ref, a["verdict"]))
+            if a["verdict"] != "no_entry":                       # 没入口不算对玩法的否定，也不打断连败
+                by_metric.setdefault(_metric_name(t) or tid, []).append((a.get("verdict_at") or "", ref, a["verdict"]))
             if a["verdict"] in NEGATIVE and not a.get("refuted") and (a.get("verdict_at") or "") >= cutoff:
                 must.append(ref)
     streaks = []
     for metric, rows in by_metric.items():
         last = sorted(rows)[-STREAK_AT:]
-        if len(last) == STREAK_AT and all(v in NEGATIVE for _, _, v in last) and any(r in must for _, r, _ in last):
+        if len(last) == STREAK_AT and all(v in REFUTING for _, _, v in last) and any(r in must for _, r, _ in last):
             streaks.append({"metric": metric, "refs": [r for _, r, _ in last]})
     return {"cutoff": cutoff, "must_review": must, "streaks": streaks}
 
