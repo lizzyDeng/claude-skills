@@ -1206,3 +1206,16 @@ def test_branch_suffix_counts_live_attempts_not_history(proj):
     _biz(proj, attempts=[hist, {**_A1[0]}])
     _verdict(proj)
     assert proj.state()["tickets"]["T1"]["worker"]["branch"] == "router/T1-a2"
+
+
+def test_redirect_overlap_user_only_keeps_pending_attempt(proj):
+    """用户原话明确要提前开下一个方向：--as-user --overlap 放行，那次尝试照常等判定；router 自己不能提前开。"""
+    _biz(proj, attempts=[{**_A1[0], "verdict": "pending_sample"}])
+    r = proj.run("redirect", "T1", "--new-card", "--overlap", check=False)
+    assert r.returncode == 1 and "--overlap" in json.loads(r.stdout)["error"]
+    r = proj.run("redirect", "T1", "x", "--as-user", check=False)
+    assert r.returncode == 1 and "--overlap" in json.loads(r.stdout)["error"]
+    out = json.loads(proj.run("redirect", "T1", "合成方向", "--as-user", "--overlap").stdout)
+    t = proj.state()["tickets"]["T1"]
+    assert out["status"] == "queued" and t["status"] == "queued"
+    assert t["attempts"][0]["verdict"] == "pending_sample"               # 那次尝试不动，照常等 daily 判定

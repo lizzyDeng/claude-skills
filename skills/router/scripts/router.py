@@ -1256,7 +1256,7 @@ NEW_CARD_REFUSE = ("换方向归用户定（v2.1）：router 不能自己定方�
                    "用户给了方向：router.py redirect {t} \"<原话>\" --as-user")
 
 
-def _redirect_core(env, st, tid, text, who, record_answer=True) -> dict:
+def _redirect_core(env, st, tid, text, who, record_answer=True, overlap=False) -> dict:
     """业务票换方向（redirect 和回答「要下一个方向吗」项共用）：话写进收件箱、票回 queued，调度器派新 worker
     （读收件箱和尝试记录，出新方向卡，卡交用户确认）。不在原 worker 上 resume。清掉这张票的 harm / return / requeue / next 项。
     只看有没有在途尝试（已派、没 released，或上线了还没判完），不看上一次判了什么（终审 #3）。
@@ -1278,16 +1278,21 @@ def _redirect_core(env, st, tid, text, who, record_answer=True) -> dict:
     verdict = (last or {}).get("verdict")
     waiting = next((a for a in t.get("attempts") or [] if not a.get("historical")
                     and a.get("verdict") in (None, "pending_sample")), None)     # 并票后可能不止一次在等判定
-    if last is None or waiting is not None:
+    if overlap and who != "user":
+        raise Fail("--overlap 只配 --as-user：提前开下一个方向只能由用户定")
+    if last is None or (waiting is not None and not overlap):
         w = waiting or last or {}
-        raise Fail(f"{tid} 有在途尝试：尝试 {w.get('n', '?')} 还在等 daily 判定（{w.get('verdict') or '待判'}），判完再换方向")
+        raise Fail(f"{tid} 有在途尝试：尝试 {w.get('n', '?')} 还在等 daily 判定（{w.get('verdict') or '待判'}），判完再换方向"
+                   "（用户原话明确要提前开下一个方向：加 --overlap，那次尝试照常等判定）")
     pending_return = [q["id"] for q in st["queue"] if q.get("ticket") == tid and q["kind"] == "return"]
     if pending_return and who != "user":
         raise Fail(f"{tid} 已退回用户（{'、'.join(pending_return)} 还没回）：下一步由用户定（换方向 / 重新定义问题 / 关），"
                    "他给了方向用 --as-user 记他的原话（router 不能出新卡绕过）")
     returned = t.get("waiting_for") == RETURN_WAIT or bool(pending_return)
+    early = (f"尝试 {waiting['n']} 还在等判定（开关照开、daily 照判），用户定提前开下一个方向；"
+             if overlap and waiting is not None else "")
     if who == "user":
-        msg = (f"换方向（尝试 {last['n']} 判定 {verdict}）。{USER_LABEL}：{text}。"
+        msg = (f"{early}换方向（尝试 {last['n']} 判定 {verdict or '待判'}）。{USER_LABEL}：{text}。"
                "先读尝试记录和没拆的墙，再从第 1 段照这个方向写新方向卡（卡交用户确认）。")
     else:
         msg = (f"出新方向卡（尝试 {last['n']} 判定 {verdict}）。router 没定方向：方向由你照没拆的墙和已试方向提，"
@@ -1304,7 +1309,8 @@ def _redirect_core(env, st, tid, text, who, record_answer=True) -> dict:
     did = store.append_decision(
         env.decisions, st, tid, f"换方向：{text}" if who == "user" else "出新方向卡交用户（router 不定方向）",
         "用户定的方向（原话见 answers.md）" if who == "user" else "v2.1：方向一律用户定，新方向卡交用户确认",
-        f"尝试 {last['n']} 判定 {verdict}" + ("；连续没用已退回用户" if returned else ""), env.now())
+        f"尝试 {last['n']} 判定 {verdict or '待判'}" + ("；连续没用已退回用户" if returned else "")
+        + (f"；{early.rstrip('；')}" if early else ""), env.now())
     return {"ok": True, "ticket": tid, "status": store.QUEUED, "cleared": cleared, "decision": did}
 
 
@@ -1318,8 +1324,10 @@ def cmd_redirect(a, env):
         raise Fail("--new-card 不带方向：方向由新 worker 提、用户在方向卡上确认（router 不定方向）")
     if a.as_user and not text:
         raise Fail("--as-user 要写用户定的方向（原话，逐字）")
+    if a.overlap and not a.as_user:
+        raise Fail("--overlap 只配 --as-user：提前开下一个方向只能由用户定")
     with env.state() as st:
-        return _redirect_core(env, st, a.ticket, text, "user" if a.as_user else "new_card")
+        return _redirect_core(env, st, a.ticket, text, "user" if a.as_user else "new_card", overlap=a.overlap)
 
 
 def _offer_next(env, st, tid, why):
@@ -3033,6 +3041,8 @@ def build_parser():
     g.add_argument("--as-user", action="store_true", help="用户定的方向（原话逐字，必填；进 answers.md）")
     g.add_argument("--new-card", action="store_true", help="router 只要一张新方向卡（不带方向）：新 worker 提方向，卡交用户确认")
     g.add_argument("--as-router", action="store_true", help="v2.1 起一律拒：router 不定方向（用 --new-card）")
+    s.add_argument("--overlap", action="store_true",
+                   help="用户原话明确要在当前尝试判完前就开下一个方向（只配 --as-user）：那次尝试开关照开、daily 照判")
     s = sub.add_parser("close", help="关票（收尾：关 issue、清 worktree）：业务票（用户说「关 Tn」）；老票 / 维护票收票"
                                      "（不做 / 前提失效、没有要上 prod 的改动，要 --reason）")
     s.add_argument("ticket"); s.add_argument("--reason", help="老票 / 维护票必填：为什么不做 / 前提怎么失效的")
