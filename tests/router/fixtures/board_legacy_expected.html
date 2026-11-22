@@ -96,6 +96,14 @@ h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-sp
 .revoked{text-decoration:line-through;color:var(--faint)}
 .patrol{font-size:13px;color:var(--soft);margin:2px 0 0}
 .patrol-stale{color:#e5534b;font-weight:700}
+.funnel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px}
+.funnel table{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}
+.funnel th,.funnel td{text-align:left;padding:4px 8px 4px 0}
+.funnel th{color:var(--faint);font-weight:600;font-size:12.5px}
+.funnel td+td,.funnel th+th{text-align:right}
+.funnel tr+tr td{border-top:1px solid var(--line)}
+.funnel .learned{margin:8px 0 0;padding-left:18px;font-size:13.5px;color:var(--soft)}
+.funnel small{color:var(--faint)}
 </style>
 </head>
 <body>
@@ -105,6 +113,8 @@ h2{font-size:15px;color:var(--soft);font-weight:600;margin:26px 0 10px;letter-sp
   <span class="meta">批次：—（未 start）· 更新于 11-02 10:00 UTC · 只读，30 秒自动刷新</span>
 </header>
 <div class="patrol patrol-stale" data-patrol-at="">最后一次巡检：还没有<span class="age"> · 还没巡检过</span></div>
+<h2>产品漏斗</h2>
+<div class="funnel"><div><small>还没有漏斗读数（daily 产出的 funnel）。</small></div><div><small>还没有学到关于用户的新事实（learned）。</small></div></div>
 <div class="stats">
   <div class="stat you"><b>1</b><span>等你</span></div>
   <div class="stat run"><b>1</b><span>在跑</span></div>

@@ -15,7 +15,7 @@ def help_commands():
     return set(re.search(r"\{([a-z,-]+)\}", out).group(1).split(","))
 
 
-ANALYST_MODES = ("daily", "weekly", "calibrate", "migrate")
+ANALYST_MODES = ("daily", "weekly", "calibrate", "migrate", "play")
 
 
 def test_docs_reference_only_existing_subcommands():
@@ -178,7 +178,8 @@ def test_skill_documents_postlaunch_protocol():
 
 GH_FIELDS = ("title", "segment", "want", "walls", "metric", "evidence")
 PROBLEM_KEYS = {"key", "title", "segment", "want", "walls", "metric", "evidence", "impact", "absorbs", "new_evidence"}
-VERDICT_KEYS = {"ticket", "attempt", "verdict", "touched", "hit_wall", "continued", "note", "new_wall"}
+VERDICT_KEYS = {"ticket", "attempt", "verdict", "touched", "hit_wall", "continued", "note", "new_wall",
+                "experience", "readable"}
 
 
 def _analyst_tpl(mode):
@@ -212,14 +213,19 @@ def test_analyst_templates_contract():
         assert all(f in red[0] for f in GH_FIELDS) and "uid" in red[0] and "原话" in red[0], (mode, red[0])
         ex = _json_example(text, mode)
         if mode == "daily":
-            assert set(ex) <= {"verdicts", "walls", "notes"} and ex["verdicts"], set(ex)
+            import router
+            assert set(ex) <= {"verdicts", "walls", "notes", "funnel"} and ex["verdicts"], set(ex)
             for v in ex["verdicts"]:
                 assert set(v) == VERDICT_KEYS, set(v) ^ VERDICT_KEYS
                 assert v["verdict"] in store.BIZ_VERDICTS
                 assert all(type(v[k]) is int for k in ("attempt", "touched", "hit_wall", "continued"))
                 if v["verdict"] == "wall_broken_not_retained":
                     assert v["new_wall"]
+                assert v["experience"] and {"enough", "min_diff_points", "basis"} <= set(v["readable"])
             assert all(set(w) == {"ticket", "text"} for w in ex["walls"])
+            router._check_funnel(ex["funnel"])                        # 和 apply-daily 的校验是同一个函数
+        elif mode == "play":
+            _check_play_example(ex)
         else:
             _check_problems(mode, ex)
     # 校准：盲跑，只给数据入口和时间范围
@@ -227,6 +233,27 @@ def test_analyst_templates_contract():
     assert "$state_summary" not in cal and "$home" not in cal
     assert "$brief" in cal and "$since" in cal and "$until" in cal
     assert all(p["absorbs"] == [] for p in _json_example(cal, "calibrate")["problems"])
+
+
+def _check_play_example(ex):
+    """play 的输出示例照抄也收得进来：用和收产出同一个校验函数，票况合成（示例引用的 T1 a2 判了没用）。"""
+    import analyst
+    import router
+    from conftest import make_state
+    assert ex.get("mode") == "play"
+    assert {"plays_observed", "hypotheses", "refuted_review", "learned", "escalate"} <= set(ex)
+    assert ex["hypotheses"] and len(ex["hypotheses"]) <= analyst.MAX_HYPOTHESES and ex["refuted_review"]
+    for h in ex["hypotheses"]:
+        assert set(analyst.HYPO_KEYS) <= set(h), set(analyst.HYPO_KEYS) - set(h)
+    for p in ex["plays_observed"]:
+        assert {"segment", "how_they_play", "hooked_at", "we_designed", "gap"} <= set(p)
+    st = make_state(T1=("postlaunch", [], {"kind": "business", "attempts": [
+        {"n": 1, "direction": "合成甲", "verdict": "useful", "verdict_at": "2026-11-10T00:00:00Z"},
+        {"n": 2, "direction": "合成乙", "verdict": "useless", "verdict_at": "2026-11-12T00:00:00Z"}]}))
+
+    class Env:
+        cfg = {"leak_guard_globs": []}
+    router._check_play(Env(), st, {"must_review": ["T1 a2"], "streaks": []}, ex)
 
 
 def test_analyst_daily_three_steps_and_verdict_words():

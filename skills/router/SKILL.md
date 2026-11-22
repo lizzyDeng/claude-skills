@@ -21,12 +21,12 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 ## 1. 启动（每次 /router，包括压缩或重启之后）
 
 1. `router.py discover`：扫外部 worktree，认出用户自己开着的 session，登记它们锁着的代码面。router 自己派的 worker worktree（分支 `router/…`、state 里任一票的分支 / worktree 路径、目录名 `router-T<n>`，含合 staging 后正在删、分支已脱离的那一刻）不算外部 session，不会对它报代码面冲突。
-2. 巡检常驻：`router.py daemon status`；`running` 是 false ⇒ `router.py daemon start`（脱离 session 常驻，每 60 秒一轮巡检，默认 24 小时自停；已在跑就不起第二份）。再 `router.py status` 读出决定单和全部票（第二行是巡检心跳和没 ack 的事件数）。状态只以 `state.json` / `decisions.md` 为准，不靠你的记忆。
+2. 巡检常驻：`router.py daemon status`；`running` 是 false ⇒ `router.py daemon start`（脱离 session 常驻，每 60 秒一轮巡检，默认 24 小时自停；已在跑就不起第二份）。再 `router.py status` 读出决定单和全部票（第一行是产品读数：漏斗和最近学到的一件事；第三行是巡检心跳和没 ack 的事件数）。状态只以 `state.json` / `decisions.md` 为准，不靠你的记忆。
    - **这个常驻进程在 session 关掉之后照跑**：派单、CI 全绿合 staging、收 worker 事件、分析 agent 的每日 / 每周照常；**上 prod、花钱不在巡检里**（照旧由你 / 用户做）。跑满 24 小时自停（feed 交一条 `daemon_stopped`），要接着巡检再 `daemon start`；要停：`router.py daemon stop`（跑完当前一轮再停）。
 3. 看分析 agent 的状态（第 3 节）：
    - config 有没有 `analyst.brief`。没有 = 分析 agent 没启用：没有每日验证、没有每周问题清单。告诉用户一次。
    - `state.json` 的 `analyst.calibrated`：不是 `true` = 校准没过，weekly 的提议一律不收。还没校准过就先走第 3 节的校准流程；没过就看 `calibrated_note`，先修方法。
-   - `analyst.runs` 里标了 `failed`、你还没处理过的（压缩或重启前的唤醒可能丢了）：照第 2 节 `analyst_done` 一行处理。daily 不用你起：tick 每天过了 `analyst.daily_at_utc` 自己起。
+   - `analyst.runs` 里标了 `failed`、你还没处理过的（压缩或重启前的唤醒可能丢了）：照第 2 节 `analyst_done` 一行处理。daily 不用你起：tick 每天过了 `analyst.daily_at_utc` 自己起；play 也不用你起：weekly 跑完 tick 自己起。
 4. 查挂着没办完的业务票动作（唤醒键只交一次，压缩或重启前交出的可能没办完）：`status` 决定单里的 `harm` 项、`return` 项、问「要下一个方向吗」的方向项（topic=next），waiting_for 是「有害：等 router 按回滚办法撤回」「没有入口：等 router 查入口」的业务票，以及停在 `await_prod` 的业务票 ⇒ 照第 2 节 `rollback_needed` / `return_to_user` / `no_entry` / `new_queue` / `prod_ready` 那几行办。撤回前先看 `decisions.md` 有没有记过这次撤回，别撤两次。
 5. 用 Claude Code 的 **Monitor** 挂 `router.py feed --follow`：每行 stdout = 一条通知，一行一个 JSON `{"id": "E12", "kind": <第 2 节的返回字段>, "item": …}`。它先**补发全部没 ack 的事件**（压缩、重启前交出、没处理完的不会丢），之后有新的就发；发出 30 分钟还没 ack 的再提醒一次（`"remind": true`）；daemon 没在跑会发一条 `daemon_down`。
 6. 每条事件按第 2 节的表处理（`kind` 就是表里的返回字段），**处理完再 `router.py ack <id>`**（可以一次写几个；幂等，重复 ack 不出错）。没处理完不 ack：没 ack 的每次重挂都会再发。
@@ -48,7 +48,7 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 | `rollback_needed` | 业务票某次尝试被 daily 判了「有害」，每项 `{ticket, rollback}`。**当天照 rollback 文本撤回**（关开关 / 回配置，照项目发版流程；这属于票级授权，不用先问）；撤回后核实生效，`router.py decide --ticket <T> --decision "撤回尝试：<rollback>" --why "daily 判有害：<note>" --basis "<home>/analyst/out/<run>.json"`，**并告诉用户**（≤ 100 字：哪张票、伤到了什么、已撤回）。rollback 文本要删数据 / 不可逆 / 发商店包：不自己做，告诉用户等他批。撤回之后不自己定方向：`router.py redirect <T> --new-card`——票回队列、调度器派新 worker 照没拆的墙和已试方向出新方向卡，卡交用户确认，这张票的 `harm` 项一并清掉（会记一条 decide）；用户先给了方向就 `redirect <T> "<原话>" --as-user`。 |
 | `no_entry` | daily 判「没入口」：碰到新代码的是 0 人，每项 `{ticket, attempt}`。当天查开关、部署和覆盖（开关开了没、发版生效没、前端版本到没到新用户）。授权内能修的（开开关、补配置、补部署）修好后 `router.py released --tickets <T> --what "<同一方向，补了入口>" --metrics … --rollback "…" [--t0 <生效时刻>]` 记一次新尝试，第二天 daily 重判；要改代码才到得了（例如前端到不了新用户的第一段聊天）⇒ `router.py maint add --title … --problem … --surfaces … --unblocks <T>`（挡验证的维护项，单独一张、不占名额）。各记一条 `decide`。 |
 | `return_to_user` | 业务票连续 3 次判「没用」，每项 `{ticket, attempt}`。worker **不续跑**，票停在 postlaunch，决定单上有一条 `return` 项。告诉用户（≤ 100 字）：这几次各试了什么方向、判定是什么（`status --json` 里这张票的 `attempts`），问题本身可能要重新定义；等他回，照第 6 节办：他给了新方向 ⇒ `router.py redirect <T> "<原话>" --as-user`（`return` 项清掉、没用的连续计数归零）。`return` 项没回之前 `redirect --new-card` 也被拒（`--as-router` 一律拒）：下一步只能由用户定，没用的连续计数也只在用户定方向时归零。他要重新定义问题 ⇒ 新问题 `router.py add --business …` 并 start，原票 `router.py close <T>`；他要关 ⇒ `router.py close <T>`。 |
-| `analyst_done` | 分析 agent 跑完要你看的，每项 `{run, mode, out}` 或 `{run, mode, failed: true, error}`。`mode=calibrate` 且没失败 ⇒ 判校准（第 3 节）。`mode=migrate` 且没失败 ⇒ 产出没落：把整份迁移清单（每个问题和它 `absorbs` 的老票、`attach`、`walls`）交给用户确认，他确认后 `router.py migrate-apply <run> --said "<原话>" [--skip …] [--hold …]`（第 3 节）。`failed` ⇒ 读 `error` 和 `<home>/analyst/logs/<run>.log`：能修就修（config、claude 登录、brief 路径），修好 `router.py analyst run --mode <mode>` 重跑（daily 当天不会自动重跑）；「校准未过」拒收 weekly 是预期，不用修；被防泄漏闸整份拒收 ⇒ 重跑，不要手改它的产出再收；修不了告诉用户。daily / weekly 跑成功不进这里：判定、墙、提议 tick 已经落好（新项进 `new_queue`，单条没落的进 `errors`）。 |
+| `analyst_done` | 分析 agent 跑完要你看的，每项 `{run, mode, out}` 或 `{run, mode, failed: true, error}`。`mode=calibrate` 且没失败 ⇒ 判校准（第 3 节）。`mode=migrate` 且没失败 ⇒ 产出没落：把整份迁移清单（每个问题和它 `absorbs` 的老票、`attach`、`walls`）交给用户确认，他确认后 `router.py migrate-apply <run> --said "<原话>" [--skip …] [--hold …]`（第 3 节）。`mode=play` 且没失败 ⇒ 复盘结论已记到尝试上、`learned` 已进 learned.jsonl，假设没落：读 `out`。有 `escalate`（item 里也带着）⇒ 先只交重审前提那一问（≤ 100 字：哪个指标连续几次否定、问的是来的人 / 指标 / 定位哪一条），**不交假设**，等他回。没有 ⇒ 把 ≤ 3 条 `hypotheses` 交用户挑，每条一行：哪群人、改成什么玩法、数据（几个人、证据路径）、预计提升几个点、按现在的流量几天读得出、不写代码能不能先试。他挑了 ⇒ 对应已开的业务票（`ticket`）：`router.py redirect <T> "<原话>" --as-user`（有在途尝试会被拒：等判完）；没有对应票：`router.py add --business …`（他挑 = 判过真；`--title` / `--segment` / `--metric` 照那条假设写，`--want` 写这群人来要什么，`--wall` 写 `plays_observed` 里这群人「差在哪」）再 `router.py start <T>`。一条都不挑：只记原话（`router.py decide`），不重跑。`failed` ⇒ 读 `error` 和 `<home>/analyst/logs/<run>.log`：能修就修（config、claude 登录、brief 路径），修好 `router.py analyst run --mode <mode>` 重跑（daily 当天不会自动重跑）；「校准未过」拒收 weekly 是预期，不用修；被防泄漏闸整份拒收 ⇒ 重跑，不要手改它的产出再收；修不了告诉用户。daily / weekly 跑成功不进这里：判定、墙、提议 tick 已经落好（新项进 `new_queue`，单条没落的进 `errors`）。 |
 | `releases_unlabeled` | 新周报的 `release_sync.unlabeled`：自动发现、还没标 metrics 的上线（原来由分诊转，现在巡检直接交你）。转给用户：一条 ≤ 100 字，列出清单，请他补标 metrics（周报的上线对账，不在 router 内）。 |
 | `prod_ready` | 票级授权的业务票合进 staging（或零代码做完）进了 `await_prod`，每项 `{ticket}`。跑 `router.py prod-batch`（它会 fetch 并核对 staging 领先 main 的提交），按第 7 节的发版批次规则办：`router_ships` 非空 ⇒ 整批都能由你上，照项目发版流程上 prod（合 main 钉在输出的 `staging_sha`），发完照 `router_ships` 逐张 `released`（业务票带 `--rollback`），`batch` 里已停 / 接管 / 关前已撤回的票也 `released` 一次（只记 shipped_at / 跳过，见第 7 节），各记一条 decide；`router_ships` 为空 ⇒ staging 上还有待走查 / 待放行的票，合 main 会把它们一起带上去，不能自己上：prod-batch 已推一条整批 prod 项（`batch` 里每张票的状态），告诉用户（≤ 100 字）：哪几张在等、各卡在走查还是放行，要他回「Qn 放行」或先走查。之后每次 `walkthrough-done` / `released` 改了批次，都再跑一次 `prod-batch`。 |
 | `cards_for_review` | 每张卡做方向审（第 4 节），审完 submit-card 交用户确认（业务票也一样，v2.1 起不再自动确认）。执行中出的新一版方向卡（诊断卡确认后出下一道墙的卡、分期票下一期）也从这里来：票已回 kickoff、旧卡的确认作废（同一次运行里卡后面又开了 PR 也一样，确认前不合），不是卡住，照常方向审、交用户；用户确认后续跑同一个 session。 |
@@ -62,13 +62,14 @@ description: 一个 session 管全部待办：分析 agent（Fable）每天验�
 
 分析 agent 是 Fable（`claude -p --model`，缺省 `claude-fable-5-1`，config `analyst.model` 可改；走订阅，不算花钱）。它只读数据、写一个 JSON：**不写代码、不开票、不派活、不写库、不动开关**。它提的问题只经决定单的判真项到用户手里，用户回「真」才建票。router 不再从周报直接出票，v1 的分诊不再运行（不做双轨）。
 
-config `analyst`：`brief`（项目取数 brief 的路径：取数入口、口径、门槛；没配 = 分析 agent 不起）、`model`、`daily_at_utc`（缺省 `01:30`）、`maint_slots`（缺省 1）。
+config `analyst`：`brief`（项目取数 brief 的路径：取数入口、口径、门槛、漏斗阶段、「投入最深的人」怎么算；没配 = 分析 agent 不起）、`model`、`daily_at_utc`（缺省 `01:30`）、`maint_slots`（缺省 1）。模板只写通用的方法，项目特有的口径都写在 brief 里。
 
 | 模式 | 什么时候跑 | 产出去哪 |
 |---|---|---|
-| daily | tick 每天过了 `daily_at_utc` 起一次（起不来当天不再试） | 每次尝试的判定（覆盖 → 读对话 → 判定）和新墙：tick 逐条落到票上并执行动作（第 7 节）；首聊里的候选问题记在它的 `notes` |
+| daily | tick 每天过了 `daily_at_utc` 起一次（起不来当天不再试） | 每次尝试的判定（覆盖 → 读对话 → 判定，带 `experience` 他们经历了什么、`readable` 读不读得出）和新墙：tick 逐条落到票上并执行动作（第 7 节）；漏斗读数（`funnel`）存进 state 的 `analyst.funnel`（看板顶上、汇报第一段）；首聊里的候选问题记在它的 `notes` |
 | weekly | tick 发现新周报（有 `sent`）时起一次 | 新问题 → 判真项（`verify_problem`）；新墙直接挂到已开业务票；提议结束 → `close` 项；维护项 → 本周维护票（tick 自动 start，卡交用户）。校准没过整份拒收 |
 | calibrate | 你手动起，只在校准时 | 盲跑：不给票况、不给已有结论，在项目外的空目录里跑；跑完叫醒你（`analyst_done`），由你判过没过 |
+| play | 每个 ISO 周一次：weekly 跑完（收过或失败）之后的第一次巡检起（按 weekly 起跑那一周算，同一周重跑 weekly 不再起）；也可以手动 `router.py analyst run --mode play` | 玩法复盘：用户实际把产品当什么在玩、哪一刻上头、和我们设计的玩法差在哪，出最多 3 条玩法假设（或一条 `escalate` 重审前提）。整份校验过才收：只把 `refuted_review` 记到对应尝试上（`refuted`）、`learned` 追加进 learned.jsonl，然后叫醒你（`analyst_done`），由你交用户挑。不开票、不改方向、不判尝试 |
 | migrate | 你手动起，校准通过后一次 | 把现有票按「同一群人想要的同一件东西」归并成问题（`absorbs` 写并进来的老票）；已开业务票装得下的老票写进 `attach`。**不自动落**：tick 只预检一遍，然后叫醒你（`analyst_done`），整份清单交用户确认后 `router.py migrate-apply` 落 |
 
 **校准（第一次启用时，按顺序）**：
@@ -77,6 +78,8 @@ config `analyst`：`brief`（项目取数 brief 的路径：取数入口、口�
 3. `router.py analyst calibrated --pass --note "<找到了哪几个、还找到了什么>"`（没过用 `--fail`，note 写漏了哪几个）。
 4. 告诉用户：过没过、它还找到了哪些别的问题（≤ 100 字，详情给 out 路径）。
 5. 过了 ⇒ `router.py analyst run --mode migrate`。跑完 feed 交回 `analyst_done`（mode=migrate）：读它的 `out`，**先按根归并**（同一群人想要的同一件事 = 同一指标只留一条，两条同指标的给用户标出来、建议并成一条），再把整份迁移清单交给用户（≤ 100 字给要点，详情给 out 路径）：每个问题（人群、想要、墙、影响分）和它并进来的老票，`attach` 里哪些老票并进哪张已开的业务票，`walls`。用户确认后（可以去掉几条、先放着几条）：`router.py migrate-apply <run> --said "<用户原话>" [--skip <key 或业务票号>,…] [--hold <key>,…]`——问题直接建成业务票（确认 = 判真，默认 start；`--hold` 的只建票），`absorbs` / `attach` 的老票并进去，`walls` 挂上；整份校验过才落，一份 run 只落一次。被并的老票（判真时按 `absorbs`、或 `attach` / `router.py absorb` 并进已开的业务票）：已上线验过收的立即记成业务票的一次历史尝试；还在做的不打断，等它出了上线验收结论（`postlaunch-result`）时自动记一次，之后的结论更新同一条。没过 ⇒ 先修方法（模板、brief 的取数入口）再重跑 calibrate。校准通过之前：新问题只由用户直接提（`router.py add --business …`），在做的票照常做。
+
+**负向反馈不丢**（play）：每次 play 先逐条复盘上次以来判了否定（没用 / 没入口 / 有害 / 墙拆了人没留住）的尝试，写清否掉的是做法（mechanism）还是玩法本身（play）——否定机制 ≠ 否定目标；漏一条整份拒收。复盘结论记在那次尝试上（`status --json` 里 attempts 的 `refuted`），以后每次 play 的票况都带着；否掉的玩法没有新证据不许再提（再提要写 `new_evidence`，没写整份拒收）。同一指标最近连续 3 次否定：必须填 `escalate`（没填整份拒收），改成重审前提，不再出小假设；连败也不许把假设缩小。`learned`（关于用户的新事实）每行带 run / at / mode 进 `<home>/analyst/learned.jsonl`，play 和 weekly 都先读它。play 只提假设、不判结果：判定仍由 daily 做。
 
 手动重跑某个模式：`router.py analyst run --mode <模式> [--since YYYY-MM-DD] [--until YYYY-MM-DD]`（同模式已有在跑的不会起第二个）。tick 收产出失败、而产出本身没问题时（例如防泄漏闸配置坏了，已修好）：`router.py apply-daily --from <out>`（daily）/ `router.py propose --from <out>`（weekly）手动收；migrate 只走 `migrate-apply`。
 
@@ -106,7 +109,7 @@ worker 写完卡就退出，卡在 `$ROUTER_HOME/cards/<T>.md`。对 `cards_for_
 3. 否则交卡：`router.py submit-card <T> --card <卡路径> --rounds <轮数> [--codex <codex 输出>] [--overtime] [--unresolved]`，卡交用户确认。codex 与 Opus 有分歧：只有验收口径和实现细节由你裁决，在卡末尾追加 `## router 裁决` 一段写明——这一段只能写验收口径和实现细节，不能改方向、上线节奏（例如「上线即开」）、成本；分歧落在这三样上的，原样写进 `## 未解决的挑战` 交用户。
 4. 超时（25 分钟 / 2 轮）没谈拢 ⇒ 卡连同未解决的挑战一起交用户确认（不是 router 裁决后自动确认）：卡末尾追加 `## 未解决的挑战`（逐条：挑战、worker 的回应、卡在哪），注明哪部分没完成、为什么，`submit-card … --overtime --unresolved`（卡上有这一段而没加 `--unresolved` 也会被认出来；加了却没有这一段会被拒）。决定单的卡项会标「含未解决的挑战」，用户看完挑战再回「同意 / 改 / 驳回」。
 
-**方向卡先看产品诊断**（v2.1）：卡上第 1 项前有没有「产品诊断」五问，方向有没有先回答「这是产品 / 内容问题还是代码问题」。是在用代码修产品问题（他本来就不想要：内容无聊、付费墙后面没有他想要的东西）：照第 2 步打回。
+**方向卡先看玩法卡**（业务票）：卡最前面有没有半页「玩法卡」（他来要什么 / 现在让他玩什么 / 改成什么玩法 / 为什么他会因此多用 / 预计提升几个点 / 按现在的流量几天读得出 / 不写代码能不能先试）。没有玩法卡，或玩法卡其实是「换个机制修卡点」、不是改玩法 ⇒ 【方向】，照第 2 步打回；预计提升按当前流量读不出来（写的天数远超一两周，或没算）⇒ 【方向】，打回时建议更大的改动、或合并成一个更大的尝试；玩法卡的说法没有数据 ⇒ 【细节】，写进 `## router 裁决`。业务票的工程部分本来就压短（第 2、5、6 项一两行），不因为写得短挑战。**老票、维护票照旧先看产品诊断**（v2.1）：卡上第 1 项前有没有「产品诊断」五问，方向有没有先回答「这是产品 / 内容问题还是代码问题」。是在用代码修产品问题（他本来就不想要：内容无聊、付费墙后面没有他想要的东西）：照第 2 步打回。
 
 **成本测算**（v2.1）：卡上的方向涉及计费、额度、价格、免费放量、会增加每条消息模型调用的，必须有「成本测算」（prod 调用日志的 token 量 × 实际单价 → 每条消息 / 每用户每天的成本）；没有，或缺价的模型按 0 算 ⇒ 照第 2 步打回。测算齐了也不由你裁决：卡原样交用户。
 
@@ -248,10 +251,17 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 ## 8. 回复用户的规矩
 
 - 每条 ≤ 100 字；决定单要列全，**按业务影响**排序（影响分 = 人群规模 × 缺口 × 把握；看板显示「影响 0.21」；没有影响分的项排后面，再按挡住几张票排）。
-- 叫用户只有这些理由：判真、关业务票、start（老票 / 草稿）、确认方向卡（全部票）、业务票的方向 / 上线节奏 / 成本、花钱 / 撤不回的改动 / 发商店包、上 prod（老票 / 维护票；业务票和待走查 / 待放行 / 方向卡没经用户确认的票同在一个发版批次时整批交用户）、真人动手、上线验收没过（老票 / 维护票：没入口 / 没用 / 有害）、业务票有害已撤回（告知）、业务票连续 3 次没用退回。其余你自己定并 `decide`。
+- 叫用户只有这些理由：判真、挑玩法假设 / 回重审前提那一问（play）、关业务票、start（老票 / 草稿）、确认方向卡（全部票）、业务票的方向 / 上线节奏 / 成本、花钱 / 撤不回的改动 / 发商店包、上 prod（老票 / 维护票；业务票和待走查 / 待放行 / 方向卡没经用户确认的票同在一个发版批次时整批交用户）、真人动手、上线验收没过（老票 / 维护票：没入口 / 没用 / 有害）、业务票有害已撤回（告知）、业务票连续 3 次没用退回。其余你自己定并 `decide`。
 - 不复述 worker 和分析 agent 的长篇输出；给结论 + 卡 / 日志 / 产出路径。
 - **有东西要用户看就主动打开**：worker 产出图 / 视频 / 分镜 / 样片，会生成本地对照页（`cards/<T>.gallery/index.html`）并 `emit finding --tags gallery` 报路径；你收到（`slow_path_events`）就用 Bash `open <路径>` 在用户浏览器里打开，回复里写清看什么、要回什么。用户要看的东西还没生成：直接说「还没生成、要花多少钱」，不拿占位素材充样片。
 - **运维问题自动进维护票**：你顺带发现的 bug / 配置错位 / 报错率异常 ⇒ 只读查影响面（prod 只读）⇒ `router.py maint add --title … --problem "<坏在哪、影响面>" --surfaces …`（代码面名字表里没有就先加进 surfaces.json 登记，再 maint add；挡住业务票验证的加 `--unblocks`）⇒ 回复里一行告知。不问用户要不要查。
+
+### 给用户的汇报
+
+每次给用户汇报（巡检交了事、他问「现在什么情况」、一天的第一条），**第一段固定是产品读数**，然后才是要他回的事：
+1. 产品读数（一两行）：`router.py status --json` 的 `analyst.funnel_line`（漏斗各阶段本周 vs 上周）一行，加 `analyst.learned` 里最近学到的一件关于用户的事。没有漏斗读数就照实说「还没有漏斗读数」。
+2. 要他回的事：照第 2 节、上面的规矩，一条一行，写清要他回的话；play 的假设 / 重审前提那一问也在这里。
+3. 工程进度压成一行：几张在跑、几张等上 prod、几张在等判定，详情给看板路径。不逐张复述票。
 
 ## 9. 红线
 
@@ -265,6 +275,6 @@ worker 和分析 agent 自身的 Claude 用量不算花钱（用户 11-02 已同
 
 ## 10. 文件（`<项目根>/.claude/router/`，已 gitignore）
 
-`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json`（含 `proposals` 判真提议、`analyst` 分析 agent 状态和校准结果、`patrol` 最后一次巡检；业务票上的 `walls_history` 旧墙、`issue_sync` issue 正文同步哈希）· `feed.jsonl` / `feed.ack.jsonl`（事件流和 ack，只追加）· `daemon.json`（巡检常驻的 pid、最后一轮、停在哪）· `logs/daemon.log` · `decisions.md` · `answers.md`（用户原话存档；router 代答的行标「router 决定」）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `postlaunch/<T>-<检查点>.md`（上线验收报告）· `cards/<T>.config.md`（零代码票要执行的配置）· `analyst/out/<run>.json`（分析 agent 的产出）· `analyst/logs/<run>.log` · `analyst/rejected.jsonl`（用户判「不是」的问题）· `logs/<T>-<n>.log` · `board.html`。config 的 `postlaunch_brief`：项目上线验收 brief 的路径（取数方法、口径、判定标准）；config 的 `analyst.brief`：分析 agent 的项目取数 brief。
+`config.json`（项目配置）· `surfaces.json`（代码面）· `state.json`（含 `proposals` 判真提议、`analyst` 分析 agent 状态和校准结果、`analyst.funnel` 最近一份漏斗读数、`analyst.play_week` 本周 play 起过没有、`patrol` 最后一次巡检；业务票上的 `walls_history` 旧墙、`issue_sync` issue 正文同步哈希）· `feed.jsonl` / `feed.ack.jsonl`（事件流和 ack，只追加）· `daemon.json`（巡检常驻的 pid、最后一轮、停在哪）· `logs/daemon.log` · `decisions.md` · `answers.md`（用户原话存档；router 代答的行标「router 决定」）· `events/<T>.jsonl` · `inbox/<T>.jsonl` · `cards/<T>.md`（及 `<T>.codex[-rN].md`）· `backups/<T>/`（仓外票改前备份）· `review/<T>/`（review-pack 的 PROMPT、pack、codex.sh）· `review/canary.json`（按 codex 版本记的金丝雀结果）· `postlaunch/<T>-<检查点>.md`（上线验收报告）· `cards/<T>.config.md`（零代码票要执行的配置）· `analyst/out/<run>.json`（分析 agent 的产出）· `analyst/logs/<run>.log` · `analyst/rejected.jsonl`（用户判「不是」的问题）· `analyst/learned.jsonl`（分析 agent 学到的关于用户的事，每行带 run / at / mode）· `logs/<T>-<n>.log` · `board.html`。config 的 `postlaunch_brief`：项目上线验收 brief 的路径（取数方法、口径、判定标准）；config 的 `analyst.brief`：分析 agent 的项目取数 brief。
 
 🔴 这个目录必须被 git 忽略（里面有周报证据、方向卡和分析 agent 读过的真实数据摘要）。项目 `.gitignore` 没覆盖时，在 `.git/info/exclude` 加 `**/.claude/router/` 和 `**/.claude/router-inbox.md`。
