@@ -6,6 +6,7 @@ OUT=$out
 
 - 项目 brief（取数入口和口径，先读）：$brief
 - 时间范围（UTC 日期）：$since ～ $until
+- 学到过的关于用户的事：先读 $home/analyst/learned.jsonl（每行 `{"run","at","mode","text"}`，多是每周玩法复盘 play 写的）。已经知道的不再当新发现写；这周的数据和它矛盾，在 `diagnosis` 里写明。
 - 被用户否过的问题：先读 $home/analyst/rejected.jsonl（每行 `{"key","title","reason","at"}`）。同类问题不再提，除非有新证据：填 `new_evidence`，写明新在哪。
 - 本期周报目录（summary.json、上线流水都在这里）：$weekly_dir
 - 本周每日验证的产出（`notes` 里记着首聊里的候选问题，先看）：

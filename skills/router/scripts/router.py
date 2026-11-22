@@ -132,7 +132,7 @@ def render_board(env, st) -> None:
     board.write(env.home / "board.html",
                 board.render(st, store.recent_decisions(env.decisions),
                              {tid: events.read_all(env.home, tid)[-5:] for tid in st["tickets"]},
-                             env.ctx.now()))
+                             env.ctx.now(), learned=analyst.recent_learned(env.home, 3)))
 
 
 def dispatch(env, st, run=None):
@@ -2431,7 +2431,8 @@ _VERDICT_BUSY = {store.DRAFT, store.HOLD, store.QUEUED, store.KICKOFF, store.AWA
                  store.VERIFYING, store.MERGED, store.AWAIT_CHECK, store.AWAIT_PROD}
 
 
-def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, note, new_wall=None) -> list:
+def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, note, new_wall=None,
+                  experience=None, readable=None) -> list:
     t = env.ticket(st, tid)
     if store.ticket_kind(t) != "business":
         raise Fail(f"{tid} 不是业务票，没有尝试判定")
@@ -2442,7 +2443,8 @@ def _verdict_core(env, st, tid, n, verdict, *, touched, hit_wall, continued, not
         raise Fail(f"{tid} 尝试 {n} 已有最终判定（{old['verdict']}），不许重判")
     try:
         actions = store.record_verdict(st, tid, n, verdict, env.now(), touched=touched, hit_wall=hit_wall,
-                                       continued=continued, note=note, new_wall=new_wall)["actions"]
+                                       continued=continued, note=note, new_wall=new_wall,
+                                       experience=experience, readable=readable)["actions"]
     except ValueError as e:
         raise Fail(str(e))
     att = next(x for x in t["attempts"] if x.get("n") == n)
@@ -2546,24 +2548,42 @@ def _follow_up(env, st, tid, t, text) -> None:
 
 def cmd_verdict(a, env):
     guard = _guard(env)
-    if _leaks(guard, a.note, a.new_wall):
-        raise Fail("note / new-wall 里有 uid / 用户原话，拒收", hits=_leaks(guard, a.note, a.new_wall))
+    if _leaks(guard, a.note, a.new_wall, a.experience, a.readable):
+        raise Fail("note / new-wall / experience / readable 里有 uid / 用户原话，拒收",
+                   hits=_leaks(guard, a.note, a.new_wall, a.experience, a.readable))
     with env.state() as st:
         actions = _verdict_core(env, st, a.ticket, a.attempt, a.verdict, touched=a.touched, hit_wall=a.hit_wall,
-                                continued=a.continued, note=a.note, new_wall=a.new_wall)
+                                continued=a.continued, note=a.note, new_wall=a.new_wall,
+                                experience=a.experience, readable=a.readable)
     return {"ok": True, "actions": actions}
 
 
-def apply_daily(env, st, data) -> dict:
-    """daily 的判定 / 新墙逐条落（调用方持锁、负责存盘）。每条独立：非法 / 泄漏 / 找不到票 → errors，不拖垮其余。"""
+def _check_funnel(f) -> None:
+    """daily 的 funnel：{"window", "stages": [{"stage", "this_week": {"n", "pct"}, "last_week": {…}}]}；阶段照 brief。"""
+    if not isinstance(f, dict) or not isinstance(f.get("stages"), list) or not f["stages"]:
+        raise Fail("funnel 要是对象，stages 是非空列表")
+    for i, x in enumerate(f["stages"]):
+        if not isinstance(x, dict) or not str(x.get("stage") or "").strip():
+            raise Fail(f"funnel.stages[{i}] 要有 stage（阶段名）")
+        for k in ("this_week", "last_week"):
+            if x.get(k) is not None and not isinstance(x[k], dict):
+                raise Fail(f"funnel.stages[{i}].{k} 要是 {{n, pct}} 对象")
+
+
+def apply_daily(env, st, data, run=None) -> dict:
+    """daily 的判定 / 新墙逐条落（调用方持锁、负责存盘）。每条独立：非法 / 泄漏 / 找不到票 → errors，不拖垮其余。
+    判定上的 experience / readable 记到那次尝试上（缺了照收）；experience 过不了防泄漏闸只丢 experience，判定照落。
+    顶层的 funnel（漏斗读数）存到 state 的 analyst.funnel（带 run、at）；没有就不动。"""
     guard = _guard(env)
     applied, errors, offered = [], [], []
 
     def one(kind, i, item, fn):
         snap = copy.deepcopy(st)
         try:
-            fn()
+            dropped = fn()                            # 返回 (字段名, 原因) = 这条落了，只丢了这个字段：也报一条
             applied.append({"kind": kind, "index": i, "ticket": item.get("ticket")})
+            if dropped:
+                errors.append({"kind": dropped[0], "index": i, "ticket": item.get("ticket"), "error": dropped[1]})
         except Exception as e:  # noqa: BLE001 — 单条失败：回滚这条的改动，记错，继续
             st.clear(); st.update(snap)
             errors.append({"kind": kind, "index": i, "ticket": item.get("ticket") if isinstance(item, dict) else None,
@@ -2576,8 +2596,18 @@ def apply_daily(env, st, data) -> dict:
         hits = _leaks(guard, v.get("note"), v.get("new_wall"))
         if hits:
             raise Fail(f"泄漏闸命中：{hits}")
+        exp, readable = v.get("experience"), v.get("readable")
+        exp = str(exp).strip() if isinstance(exp, str) and exp.strip() else None
+        readable = readable if isinstance(readable, (dict, str)) and readable else None
+        dropped = _leaks(guard, exp, json.dumps(readable, ensure_ascii=False) if readable is not None else None)
+        if dropped:                                   # 描述性字段：丢掉这两项，判定照落（有害的撤回不能被它挡住）
+            exp = readable = None
         _verdict_core(env, st, v["ticket"], v["attempt"], v["verdict"], touched=v["touched"], hit_wall=v["hit_wall"],
-                      continued=v["continued"], note=v.get("note", ""), new_wall=v.get("new_wall"))
+                      continued=v["continued"], note=v.get("note", ""), new_wall=v.get("new_wall"),
+                      experience=exp, readable=readable)
+        if dropped:
+            return "experience", f"experience / readable 过不了防泄漏闸，只丢这两项（判定已落）：{dropped}"
+        return None
 
     def do_wall(w):
         hits = _leaks(guard, w.get("text"))
@@ -2588,10 +2618,20 @@ def apply_daily(env, st, data) -> dict:
             raise Fail(f"{w['ticket']} 不是业务票或墙文本为空")
         offered.append(_add_wall(env, st, w["ticket"], w["text"], "daily")[1])
 
+    def do_funnel(f):
+        _check_funnel(f)
+        hits = _leaks(guard, json.dumps(f, ensure_ascii=False))
+        if hits:
+            raise Fail(f"泄漏闸命中：{hits}")
+        st.setdefault("analyst", {})["funnel"] = {"window": f.get("window"), "stages": f["stages"],
+                                                  "run": run, "at": env.now()}
+
     for i, v in enumerate(data.get("verdicts", [])):
         one("verdict", i, v, lambda v=v: do_verdict(v))
     for i, w in enumerate(data.get("walls", [])):
         one("wall", i, w, lambda w=w: do_wall(w))
+    if data.get("funnel") is not None:
+        one("funnel", 0, {}, lambda: do_funnel(data["funnel"]))
     return {"ok": True, "applied": applied, "errors": errors, "notes": data.get("notes", ""),
             "next_items": [q for q in offered if q and store.in_queue(st, q)]}
 
@@ -2604,7 +2644,76 @@ def cmd_apply_daily(a, env):
     if not isinstance(data, dict):
         raise Fail("apply-daily 的输入顶层必须是对象")
     with env.state() as st:
-        return apply_daily(env, st, data)
+        return apply_daily(env, st, data, run=Path(a.source).stem)
+
+
+def _check_play(env, st, run, data) -> None:
+    """play 产出整份校验，一条不合规就整份拒（不改 st）：
+    - hypotheses 最多 3 条、字段齐；prior_refuted 里的尝试都在，其中被判「否定的是玩法」的，这条必须写 new_evidence；
+    - refuted_review 覆盖起跑时定下的 must_review（逐条：ref、killed = mechanism | play、lesson），只复盘否定的判定；
+    - 起跑时有连续否定（streaks）⇒ escalate 必须是一句话；learned 是字符串列表；整份过防泄漏闸。"""
+    for k in ("plays_observed", "hypotheses", "refuted_review", "learned"):
+        if k not in data:
+            raise Fail(f"play 产出缺 {k}")
+    hyps, review, learned, esc = data["hypotheses"], data["refuted_review"], data["learned"], data.get("escalate")
+    if not isinstance(hyps, list) or len(hyps) > analyst.MAX_HYPOTHESES:
+        raise Fail(f"hypotheses 要是列表、最多 {analyst.MAX_HYPOTHESES} 条")
+    if not isinstance(review, list) or not isinstance(learned, list) or not all(isinstance(x, str) for x in learned):
+        raise Fail("refuted_review 要是列表，learned 要是字符串列表")
+    if esc is not None and not (isinstance(esc, str) and esc.strip()):
+        raise Fail("escalate 要么 null，要么一句交用户的话")
+    killed = {}
+    for i, r in enumerate(review):
+        hit = analyst.find_attempt(st, r.get("ref")) if isinstance(r, dict) else None
+        if hit is None:
+            raise Fail(f"refuted_review[{i}] 的 ref 不是已有业务票的尝试（写成「T<n> a<k>」）：{r!r}"[:300])
+        if hit[2].get("verdict") not in analyst.NEGATIVE:
+            raise Fail(f"refuted_review[{i}]：{r['ref']} 判的是 {hit[2].get('verdict')}，不是否定，不用复盘")
+        if r.get("killed") not in analyst.KILLED or not str(r.get("lesson") or "").strip():
+            raise Fail(f"refuted_review[{i}]（{r['ref']}）：killed 只能是 mechanism / play，lesson 不能空")
+        killed[analyst.attempt_ref(hit[0], hit[2])] = r["killed"]
+    missing = [ref for ref in run.get("must_review") or [] if ref not in killed]
+    if missing:
+        raise Fail(f"refuted_review 漏了上次 play 以来判了否定的尝试：{'、'.join(missing)}")
+    if run.get("streaks") and esc is None:
+        raise Fail("指标连续 {} 次否定（{}）：escalate 必须填，改成重审前提".format(
+            analyst.STREAK_AT, "；".join(f"{x['metric']}：{'、'.join(x['refs'])}" for x in run["streaks"])))
+    for i, h in enumerate(hyps):
+        if not isinstance(h, dict):
+            raise Fail(f"hypotheses[{i}] 不是对象")
+        lack = [k for k in analyst.HYPO_KEYS if k not in h]
+        if lack:
+            raise Fail(f"hypotheses[{i}]（{h.get('key')}）缺 {'、'.join(lack)}")
+        tk = st["tickets"].get(h["ticket"]) if h["ticket"] is not None else None
+        if h["ticket"] is not None and (tk is None or store.ticket_kind(tk) != "business" or tk.get("merged_into")):
+            raise Fail(f"hypotheses[{i}]（{h['key']}）ticket {h['ticket']!r} 不是已开的业务票（没有对应票写 null）")
+        prior = h["prior_refuted"]
+        if not isinstance(prior, list):
+            raise Fail(f"hypotheses[{i}]（{h['key']}）prior_refuted 要是尝试列表（「T<n> a<k>」），没有写 []")
+        dead = []
+        for ref in prior:
+            hit = analyst.find_attempt(st, ref)
+            if hit is None:
+                raise Fail(f"hypotheses[{i}]（{h['key']}）prior_refuted 里的 {ref!r} 不是已有业务票的尝试")
+            ref = analyst.attempt_ref(hit[0], hit[2])
+            if killed.get(ref, (hit[2].get("refuted") or {}).get("killed")) == "play":
+                dead.append(ref)
+        if dead and not str(h.get("new_evidence") or "").strip():
+            raise Fail(f"hypotheses[{i}]（{h['key']}）重提了被否定的玩法（{'、'.join(dead)}）：没有新证据不许再提，"
+                       "再提要写 new_evidence")
+    _refuse_leaks(env, (data,))
+
+
+def play_apply(env, st, rid, data) -> dict:
+    """play 的产出（调用方持锁、负责存盘）：整份校验，过了只把复盘结论记到对应尝试上（refuted：killed / lesson / run / at），
+    别的一概不落——假设由 router 交用户挑。→ 摘要（几条假设、复盘了几条、有没有 escalate）。"""
+    run = st["analyst"]["runs"][rid]
+    _check_play(env, st, run, data)
+    for r in data["refuted_review"]:
+        _, _, a = analyst.find_attempt(st, r["ref"])
+        a["refuted"] = {"killed": r["killed"], "lesson": str(r["lesson"]).strip(), "run": rid, "at": env.now()}
+    return {"hypotheses": len(data["hypotheses"]), "reviewed": len(data["refuted_review"]),
+            "escalate": bool(data.get("escalate"))}
 
 
 def _day(s, name):
@@ -2824,11 +2933,15 @@ def cmd_status(a, env):
     slots = env.cfg.get("slots", {"heavy": 3, "light": 2})
     dmn = daemon.status(env.home, env.ctx.now())
     unacked = len(feed.unacked(env.home))
+    funnel, learned = (st.get("analyst") or {}).get("funnel"), analyst.recent_learned(env.home, 3)
     if a.json:
         return {"ok": True, "counts": counts, "slots": slots, "used": used, "queue": queue,
                 "tickets": _status_tickets(st), "external": st["external"], "batch": st["batch"],
-                "daemon": dmn, "feed_unacked": unacked}
-    lines = [f"批次 {st['batch']['id']}（{'已 start' if st['batch']['started'] else '未 start'}）"
+                "daemon": dmn, "feed_unacked": unacked,
+                "analyst": {"funnel": funnel, "funnel_line": analyst.funnel_line(funnel), "learned": learned}}
+    lines = [f"产品读数：{analyst.funnel_line(funnel)}"
+             + (f" · 最近学到：{learned[-1]['text']}" if learned else ""),
+             f"批次 {st['batch']['id']}（{'已 start' if st['batch']['started'] else '未 start'}）"
              f" · 重票 {used['heavy']}/{slots.get('heavy')} · 轻票 {used['light']}/{slots.get('light')}",
              f"巡检：{'daemon 在跑（pid ' + str(dmn['pid']) + '）' if dmn['running'] else 'daemon 没在跑'}"
              f" · 最后一次巡检 {dmn['last_patrol_at'] or '—'}{'（超过 3 分钟）' if dmn['stale'] else ''}"
@@ -3004,6 +3117,8 @@ def build_parser():
     s.add_argument("--touched", type=int, required=True); s.add_argument("--hit-wall", type=int, required=True)
     s.add_argument("--continued", type=int, required=True); s.add_argument("--note", required=True)
     s.add_argument("--new-wall")
+    s.add_argument("--experience", help="碰到改动的人经历了什么（聚合描述，不抄原话）")
+    s.add_argument("--readable", help="按现有样本读不读得出、能分辨的最小差别是几个点")
     s = sub.add_parser("apply-daily", help="daily 的判定 / 新墙逐条落（每条独立，坏的进 errors）")
     s.add_argument("--from", dest="source", required=True)
     s = sub.add_parser("analyst", help="分析 agent（Fable）：手动起一次 / 记校准结果")

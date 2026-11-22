@@ -1,6 +1,7 @@
 """一轮巡检。顺序写死（计划 Task 9），实现者不要改顺序：
 
-0 新周报 → 分析 agent weekly 跑（+ 转 release_sync.unlabeled）   0b 分析 agent：收尾退出的 run、每日起 daily
+0 新周报 → 分析 agent weekly 跑（+ 转 release_sync.unlabeled）   0b 分析 agent：收尾退出的 run、每日起 daily、
+  weekly 跑完起本周的 play
 1 扫外部 session，查抢锁      2 处理退出的 worker
 3 事件路由（快路径投递 / 慢路径交 router）                4 巡检：卡住 / 超时；4b 上线验收到期
 5 验收中的票：CI 全绿 → 合 staging → 放锁 → 通知下游       5b 业务票 issue 正文同步
@@ -309,7 +310,7 @@ class Run:
 
     # ---- 0b：分析 agent ----
     def step_analyst(self):
-        """先收尾退出的 run（每个只收一次），再看要不要起今天的 daily。"""
+        """先收尾退出的 run（每个只收一次），再看要不要起今天的 daily、本周的 play。"""
         for rid, run in list(((self.state.get("analyst") or {}).get("runs") or {}).items()):
             if analyst.finished(run):
                 continue
@@ -319,6 +320,31 @@ class Run:
                 self.res["errors"].append(f"分析 agent {rid}：收尾出错 {e!r}")
         if analyst.enabled(self.cfg):
             self._analyst_daily()
+            self._analyst_play()
+
+    def _analyst_play(self):
+        """玩法复盘每个 ISO 周一次：最近一次 weekly 跑完（收过或失败）之后的第一次巡检起 play，
+        按 weekly 起跑那一周记 play_week（同一周重跑 weekly 不再起；起不来也记：不每分钟重试，router 可手动 analyst run --mode play）。
+        同模式已在跑就不起第二个（analyst.start 返回在跑的那个）。"""
+        an = self.state.setdefault("analyst", {})
+        runs = an.get("runs") or {}
+        weeklies = sorted((r.get("started_at") or "", rid) for rid, r in runs.items() if r.get("mode") == "weekly")
+        if not weeklies:
+            return
+        started, wrid = weeklies[-1]
+        if not analyst.finished(runs[wrid]) or not started:
+            return
+        week = analyst.iso_week(started)
+        if an.get("play_week") == week:
+            return
+        an["play_week"] = week
+        try:
+            rid = analyst.start(self._env(), self.state, "play")
+        except Exception as e:  # noqa: BLE001
+            self._analyst_failed(None, "play", f"分析 agent play（{week}）没起来（{str(e)[:160]}）；"
+                                               "修好后跑 router.py analyst run --mode play")
+            return
+        self.state["analyst"]["runs"][rid].setdefault("after_weekly", wrid)
 
     def _analyst_daily(self):
         """UTC 过了 analyst.daily_at_utc、今天还没起过 ⇒ 起 daily。起不来也记 last_daily：当天不再试，次日才重跑。"""
@@ -371,7 +397,7 @@ class Run:
         self.state["analyst"]["runs"][rid]["ingested"] = self.now
         try:
             if mode == "daily":
-                out = router.apply_daily(self._env(), self.state, data)
+                out = router.apply_daily(self._env(), self.state, data, run=rid)
                 result = {"applied": len(out["applied"]), "errors": out["errors"], "notes": out.get("notes", "")}
                 for e in out["errors"]:
                     self.res["errors"].append(f"分析 agent {rid}：第 {e['index'] + 1} 条 {e['kind']}"
@@ -380,6 +406,12 @@ class Run:
                 out = router.propose_from(self._env(), self.state, {**data, "mode": mode})
                 result = {"proposals": [p["id"] for p in out["proposals"]], "skipped": out["skipped"],
                           "maint": out["maint"]}   # 维护票此时只是 DRAFT：start 在 step_maint_start，失败不回滚收产出
+            elif mode == "play":                   # 只记复盘结论；假设整份交 router 给用户挑方向，不自动落
+                result = router.play_apply(self._env(), self.state, rid, data)
+                run = self.state["analyst"]["runs"][rid]
+                esc = data.get("escalate")
+                self.state.setdefault("wake", {}).setdefault("analyst_done", []).append(
+                    {"run": rid, "mode": mode, "out": run["out"], **({"escalate": esc} if esc else {})})
             elif mode == "migrate":                # 不自动落：整份清单交用户确认，router 再 migrate-apply（controller 裁决）
                 router.migrate_check(self._env(), copy.deepcopy(self.state), data)       # 先验一遍：坏清单不交给用户
                 result = {"awaiting_confirm": True}
@@ -396,8 +428,36 @@ class Run:
             self.state.update(snap)
             self._analyst_fail(rid, f"产出没收进来：{str(e)[:200]}（产出在 {snap['analyst']['runs'][rid]['out']}）")
             return
+        n = self._append_learned(rid, mode, data) if mode != "calibrate" else 0   # 盲跑的不进记忆
+        if n:
+            result["learned"] = n
         self.state["analyst"]["runs"][rid]["result"] = result
         self.res["new_queue"] += [q["id"] for q in self.state["queue"] if q["id"] not in before]
+
+    def _append_learned(self, rid, mode, data) -> int:
+        """产出里的 learned（关于用户的新事实，一句一条）追加进 <home>/analyst/learned.jsonl（每行带 run / at / mode）。
+        只留本机，也过防泄漏闸：命中的那条不记、报一条错。写不了只报错，不影响已收的产出。"""
+        import router
+        items = data.get("learned")
+        if not isinstance(items, list) or not items:
+            return 0
+        try:
+            guard = router._guard(self._env())
+        except Exception as e:  # noqa: BLE001 — 闸失效：一条都不记
+            self.res["errors"].append(f"分析 agent {rid}：learned 没记（{str(e)[:160]}）")
+            return 0
+        keep = []
+        for x in items:
+            hits = router._leaks(guard, x) if isinstance(x, str) else []
+            if hits:
+                self.res["errors"].append(f"分析 agent {rid}：learned 有一条过不了防泄漏闸（{hits}），没记")
+            else:
+                keep.append(x)
+        try:
+            return analyst.append_learned(self.home, rid, mode, keep, self.now)
+        except OSError as e:
+            self.res["errors"].append(f"分析 agent {rid}：learned 写不进 {analyst.learned_path(self.home)}（{e}）")
+            return 0
 
     def step_maint_start(self):
         """DRAFT 的维护票（收产出 / maint add 留下的）：start。失败只记一条错、票留 DRAFT，下一轮重试；不回滚任何东西。"""
@@ -1337,7 +1397,7 @@ class Run:
         board.write(self.home / "board.html",
                     board.render(self.state, store.recent_decisions(self.home / "decisions.md"),
                                  {tid: events.read_all(self.home, tid)[-5:] for tid in self.state["tickets"]},
-                                 self.ctx.now(), self.cfg.get("slots")))
+                                 self.ctx.now(), self.cfg.get("slots"), learned=analyst.recent_learned(self.home, 3)))
 
 
 def _brief(run, tid):
@@ -1349,7 +1409,7 @@ def _brief(run, tid):
     biz = ""
     if kind == "business":
         import router
-        prod = router._product_line(t.get("product")) or "（分析 agent 没写：方向卡上自己先写产品诊断五问）"
+        prod = router._product_line(t.get("product")) or "（分析 agent 没写：玩法卡的「他来要什么」自己从数据里找，写清人数和证据）"
         biz = string.Template((SKILL_DIR / "templates" / "brief_business.md").read_text(encoding="utf-8")) \
             .safe_substitute(worker_md=str(SKILL_DIR / "worker.md"), product=prod)
     return tpl.safe_substitute(

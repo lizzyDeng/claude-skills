@@ -409,7 +409,10 @@ def _break_wall(t: dict, wid=None) -> None:
 
 
 def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touched: int,
-                   hit_wall: int, continued: int, note: str, new_wall: str = None) -> dict:
+                   hit_wall: int, continued: int, note: str, new_wall: str = None,
+                   experience: str = None, readable=None) -> dict:
+    """experience（碰到改动的人经历了什么，聚合描述）/ readable（这次读不读得出、能分辨的最小差别）：
+    给了才记到尝试上（旧产出没有这两项也照收）；待样本之后重判时新的覆盖旧的。"""
     if verdict not in BIZ_VERDICTS:
         raise ValueError(f"未知判定 {verdict}")
     t = state["tickets"][tid]
@@ -429,6 +432,10 @@ def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touc
             verdict = "no_entry"
             note = f"{note}（待样本满 {PENDING_CAP_DAYS} 天，碰到 {touched} 人、没人走到墙：按没入口判）"
     a.update(verdict=verdict, verdict_at=at, touched=touched, hit_wall=hit_wall, continued=continued, note=note)
+    if experience is not None:
+        a["experience"] = experience
+    if readable is not None:
+        a["readable"] = readable
     if verdict == "pending_sample":
         a.setdefault("pending_since", at)
     else:
