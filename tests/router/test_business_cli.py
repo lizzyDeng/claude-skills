@@ -1219,3 +1219,45 @@ def test_redirect_overlap_user_only_keeps_pending_attempt(proj):
     t = proj.state()["tickets"]["T1"]
     assert out["status"] == "queued" and t["status"] == "queued"
     assert t["attempts"][0]["verdict"] == "pending_sample"               # 那次尝试不动，照常等 daily 判定
+    assert t["attempts"][0].get("overlap_at")                            # 记下被提前开下一个方向盖住
+
+
+def test_overlap_released_not_blocked_and_superseded_must_judge(proj):
+    """redirect --overlap 之后：下一次 released 不再被那次待样本挡；读数窗被截止后它不许再待样本，按已有样本判。"""
+    _biz(proj, attempts=[{**_A1[0], "verdict": "pending_sample", "pending_since": "2026-11-01T00:00:00Z"}])
+    proj.run("redirect", "T1", "合成方向", "--as-user", "--overlap")
+    s = proj.state(); s["tickets"]["T1"]["status"] = "await_prod"
+    (proj.home / "state.json").write_text(json.dumps(s, ensure_ascii=False))
+    out = json.loads(_rel(proj, "--rollback", "关开关 y").stdout)
+    t = proj.state()["tickets"]["T1"]
+    assert out["ok"] and [a["n"] for a in t["attempts"]] == [1, 2]
+    assert t["attempts"][0]["verdict"] == "pending_sample"             # 那次照常等 daily 判，不被改判
+    r = _verdict(proj, "pending_sample", 1, check=False)               # 有人走到墙：按已有样本判
+    assert r.returncode == 1 and "截止" in r.stdout
+    assert json.loads(_verdict(proj, "useless", 1).stdout)["ok"]
+    assert proj.state()["tickets"]["T1"]["attempts"][0]["verdict"] == "useless"
+
+
+def test_released_still_blocked_without_overlap(proj):
+    """没走 --overlap 的待样本照旧挡下一次上线（一次只验一个尝试）。"""
+    _biz(proj, status="await_prod", attempts=[{**_A1[0], "verdict": "pending_sample"}])
+    r = _rel(proj, "--rollback", "r2", check=False)
+    assert r.returncode == 1 and "--overlap" in json.loads(r.stdout)["error"]
+
+
+def test_superseded_attempt_without_hit_wall_becomes_no_entry():
+    t = {"attempts": [{"n": 1, "overlap_at": "2026-11-02T00:00:00Z", "verdict": "pending_sample"},
+                      {"n": 2, "verdict": None}], "walls": [], "no_use_streak": 0}
+    out = _store.record_verdict({"tickets": {"T1": t}}, "T1", 1, "pending_sample", "2026-11-03T00:00:00Z",
+                                touched=4, hit_wall=0, continued=0, note="n")
+    assert out["verdict"] == "no_entry" and "截止" in t["attempts"][0]["note"]
+    assert _store.superseded_by(t, t["attempts"][1]) is None            # 最新那次没被盖住
+
+
+def test_daily_context_flags_superseded_attempt():
+    import analyst
+    t = {"kind": "business", "title": "x", "status": "postlaunch", "walls": [],
+         "attempts": [{"n": 1, "direction": "a", "at": "t", "overlap_at": "t2", "verdict": "pending_sample"},
+                      {"n": 2, "direction": "b", "at": "t3", "verdict": None}]}
+    out = analyst.state_summary({"tickets": {"T1": t}}, "daily")
+    assert "读数窗到尝试 2 上线截止" in out and "不许再判 pending_sample" in out

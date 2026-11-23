@@ -1291,6 +1291,10 @@ def _redirect_core(env, st, tid, text, who, record_answer=True, overlap=False) -
     returned = t.get("waiting_for") == RETURN_WAIT or bool(pending_return)
     early = (f"尝试 {waiting['n']} 还在等判定（开关照开、daily 照判），用户定提前开下一个方向；"
              if overlap and waiting is not None else "")
+    if overlap:                                       # 记下哪几次是被提前开下一个方向盖住的：released 不再被它们挡，
+        for x in t.get("attempts") or []:             # 下一次上线后它们的读数窗截止，daily 按已有样本判（store.superseded）
+            if not x.get("historical") and x.get("verdict") in (None, "pending_sample"):
+                x.setdefault("overlap_at", env.now())
     if who == "user":
         msg = (f"{early}换方向（尝试 {last['n']} 判定 {verdict or '待判'}）。{USER_LABEL}：{text}。"
                "先读尝试记录和没拆的墙，再从第 1 段照这个方向写新方向卡（卡交用户确认）。")
@@ -2362,8 +2366,9 @@ def cmd_released(a, env):
             if not (a.rollback or "").strip():
                 raise Fail(f"{tid} 是业务票：released 必须带 --rollback \"<撤回办法>\"")
             if any(x.get("verdict") in (None, "pending_sample") for x in st["tickets"][tid]["attempts"]
-                   if not x.get("historical")):
-                raise Fail(f"{tid} 上一次尝试还没判（判定为空或待样本）：先 verdict，再 released")
+                   if not x.get("historical") and not x.get("overlap_at")):   # 用户提前开了下一个方向的那次不挡（redirect --overlap）
+                raise Fail(f"{tid} 上一次尝试还没判（判定为空或待样本）：先 verdict，再 released"
+                           "（用户原话明确要提前开下一个方向的，换方向时加 --overlap）")
         entry = None
         if any(m != "skip" for m in mode.values()):                     # 只剩关前已撤回的票：没有东西算这次上线
             lines = json.loads(rel.read_text(encoding="utf-8")) if rel.exists() else []

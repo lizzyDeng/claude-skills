@@ -310,6 +310,16 @@ def round_note(rnd: dict, branch: str, base: str) -> str:
             "（PR 正文写 Closes）；报过 --more 后发现没有下一项：progress impl_done 退出。")
 
 
+def superseded_by(t: dict, a: dict):
+    """用户提前开了下一个方向（redirect --overlap 记 overlap_at）、下一次尝试也已上线：这次的读数窗到下一次上线截止，
+    样本不会再增 ⇒ 返回盖住它的那次尝试号；没被盖住 → None。"""
+    if not a.get("overlap_at"):
+        return None
+    later = [x.get("n") for x in t.get("attempts") or [] if not x.get("historical")
+             and isinstance(x.get("n"), int) and isinstance(a.get("n"), int) and x["n"] > a["n"]]
+    return min(later) if later else None
+
+
 def current_attempt(t: dict):
     """业务票的「当前尝试」= 最后一条非历史的尝试（历史尝试是并进来的老票，不参与判定）；没有 → None。
     daily 的票况、verdict、released 的在途检查、看板 / status 的最近判定都按它。"""
@@ -423,6 +433,12 @@ def record_verdict(state: dict, tid: str, n: int, verdict: str, at: str, *, touc
         raise ValueError(f"尝试 {n} 是历史记录，不能记判定")
     if verdict == "wall_broken_not_retained" and not new_wall:
         raise ValueError("wall_broken_not_retained 必须给 new_wall")
+    if verdict == "pending_sample" and superseded_by(t, a):   # 读数窗已被下一次上线截止：同满 7 天，按已有样本判
+        if hit_wall:
+            raise ValueError(f"尝试 {n} 的读数窗已被尝试 {superseded_by(t, a)} 截止（用户提前开了下一个方向）："
+                             "样本不会再增，走到墙的有几个按几个判")
+        verdict = "no_entry"
+        note = f"{note}（读数窗已被尝试 {superseded_by(t, a)} 截止，碰到 {touched} 人、没人走到墙：按没入口判）"
     if verdict == "pending_sample":
         since = a.get("pending_since")
         if since and _iso(at) - _iso(since) >= timedelta(days=PENDING_CAP_DAYS):

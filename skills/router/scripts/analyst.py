@@ -167,7 +167,10 @@ def state_summary(st, mode) -> str:
         more = [a for a in t.get("attempts") or [] if a is not cur and not a.get("historical")
                 and a.get("verdict") in (None, "pending_sample")]
         if more:
-            last += "；另有待判：" + "；".join(_attempt_line(a) for a in more)
+            last += "；另有待判：" + "；".join(
+                _attempt_line(a) + (f"（用户提前开了下一个方向，读数窗到尝试 {store.superseded_by(t, a)} 上线截止："
+                                    "样本不会再增，按已有样本判，不许再判 pending_sample）"
+                                    if store.superseded_by(t, a) else "") for a in more)
         if hist:
             last += f"（另有 {hist} 条老票的历史尝试，不用判）"
         lines.append(f"- {tid}｜{t.get('title', '')}｜{t.get('segment', '')}｜{t.get('status')}｜墙：{walls}｜{last}")
