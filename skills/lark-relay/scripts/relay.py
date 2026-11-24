@@ -26,6 +26,7 @@ import lark_api  # noqa: E402
 import store  # noqa: E402
 
 STALE_S = 180
+FEED_STALE_S = 30          # feed --follow 每秒写一次消费心跳；超过 30 秒没写 = 没人在收
 PREFIX = {"dispatch": "📨", "result": "✅", "stuck": "⚠️", "ask": "❓"}
 STATUSES = ("queued", "sent", "done", "stuck")
 TITLE_MAX = 20
@@ -109,8 +110,11 @@ def cmd_status(a) -> None:
     for t in store.list_tasks().values():
         if t.get("status") in counts:
             counts[t["status"]] += 1
+    feed_age = store.age(store.CONSUMER)
     out({"ok": True,
          "listener": {"alive": age is not None and age <= STALE_S, "age_s": None if age is None else round(age, 1)},
+         "feed": {"alive": feed_age is not None and feed_age <= FEED_STALE_S,
+                  "age_s": None if feed_age is None else round(feed_age, 1)},
          "owner_bound": bool(store.read_json(store.OWNER, {}).get("open_id")),
          "pending": len(store.pending()),
          "tasks": counts})
