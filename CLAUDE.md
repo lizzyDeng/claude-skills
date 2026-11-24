@@ -25,3 +25,4 @@
 - `/conductor` — 分档编排：便宜主模型指挥 dynamic workflow，推理重的叶子路由到 Opus
 - `/router` — 一个 session 管全部待办：周报分诊出派发单，用户说 start 才派 headless worker，收方向卡和决定、按代码面订阅转交事件、CI 绿后合 staging、本地看板
 - `/plan-poster` — 把方案渲成手绘感中文摘要长图供人拍板（/fastship 1.6 与 /conductor 1.5 强制调用）
+- `/lark-relay` — Lark 中转总管：用户把消息转给 Lark 机器人，总管 session 分派给对应项目的 session，结论引用原话、带标题私聊回给用户
