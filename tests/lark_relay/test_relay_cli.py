@@ -197,6 +197,14 @@ def test_feed_reports_listener_down_once():
     assert [o["kind"] for o in out].count("listener_down") == 1
 
 
+def test_status_reports_feed_consumer():
+    rc, out = run("status")
+    assert out[0]["feed"] == {"alive": False, "age_s": None}      # 没人在消费 feed
+    store.heartbeat(store.CONSUMER)
+    rc, out = run("status")
+    assert out[0]["feed"]["alive"] is True and out[0]["feed"]["age_s"] < 5
+
+
 def test_status_counts():
     store.heartbeat(store.LISTENER)
     store.append_message(msg("om_a"))

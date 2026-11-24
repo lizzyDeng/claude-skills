@@ -20,6 +20,8 @@ description: Lark 中转总管：用户在 Lark 把消息转给机器人，本 s
 4. 用 **Monitor** 挂 `relay feed --follow`：每行 stdout 是一条通知。它先补发所有没 ack 的消息，之后有新消息再发。
    - `{"kind": "feed_end"}` 或 Monitor 到期 ⇒ 重挂。
    - `{"kind": "listener_down"}` ⇒ 同第 1 步查 listener。
+   - **再挂一个心跳兜底**：`CronCreate`（`*/5 * * * *`，recurring），prompt 写「lark-relay 心跳：跑 relay status；feed.alive 是 false 或 pending > 0 ⇒ 重挂 feed Monitor（它会先补发没 ack 的消息）；listener.alive 是 false ⇒ 按第 1 步查；都正常就什么都不说」。先 `CronList` 看有没有，别挂两份。
+     原因：Monitor 最长 30 分钟，到期 / feed_end 的通知有时叫不醒空闲的 session（11-24 两次都等用户在终端打「？」才续上，期间 Lark 上的消息只收到「总管不在线」）。cron 只在 session 空闲时触发，正好补这个缺口；只活在本 session 里，30 天自动过期。
 5. 看 `~/.config/lark-relay/results/` 里有没有文件：总管不在线时目标 session 会把结果写在这里（`<R>.md`，内容同 RELAY-RESULT）。每个文件照第 4 节「收到 RELAY-RESULT」处理，处理完挪进 `results/done/`。
 6. `relay task list --open`：每个 `sent` 的任务，给目标发一句「<标题> 那件事做完了吗？做完按 RELAY-RESULT 格式回我」，带 `notify_when_idle: true`。只订阅不发消息不行：已经空着的 session 不会再发空闲通知。
 
