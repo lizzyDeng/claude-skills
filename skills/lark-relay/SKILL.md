@@ -74,6 +74,7 @@ description: Lark 中转总管：用户在 Lark 把消息转给机器人，本 s
   1. `relay task get <R>`，取 `latest`（用户最近那条追问；没有追问就是 R 本身）。
   2. `relay reply <latest> --kind result --title <任务 title> --line "结论：…" --line "可直接转给<谁>：「…」" --line "要你定：…" --line "处理方：<目标>"`。≤ 5 行；「可直接转给」没有就省掉这一行；「要你定」没有就写「要你定：无」。
      **要短**（用户 11-23：「你要不要精简一些」）：每行一句话 ≤ 50 字，「可直接转给」那行 ≤ 100 字，`reply` 会挡超长的。只写用户要拿来做决定或转发的；出处、文件行号、推测、可选的新需求一律不写，用户追问再给。目标交回来的结果再长，也由你压缩。
+     用户要「对外的、说清楚详细一些」的长文（给外部的英文说明之类）⇒ 让目标把全文写进 `~/.config/lark-relay/media/<R>-*.txt`，回报时加 `--forward-file <路径>`：帖子照常 ≤ 5 行，帖子之后单独发一条纯文本（≤ 4000 字符，方便整段复制）。只用于用户明确要的对外长文，不用来绕开精简。
      用户要看截图 ⇒ 投递时让目标把 PNG 存到 `~/.config/lark-relay/media/<R>-*.png`（宽 ≤ 1200px），回报时加 `--image <路径>`（最多 4 张、≤ 10 MB，排在文字后面）。要应用开着 `im:resource:upload` 权限。
   3. `relay task set <R> --status done`。
 - 空闲通知来了但没收到 RELAY-RESULT ⇒ 追问一次（SendMessage：「<标题> 那件事做完了吗？做完按 RELAY-RESULT 格式回我」，带 `notify_when_idle: true`）。第二次空闲还没有 ⇒ `relay reply <latest> --kind stuck --title <标题> --line "<目标> 已经空了，但没交结果，追问过一次。要换人还是你接手？"`，`relay task set <R> --status stuck`。

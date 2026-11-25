@@ -34,6 +34,7 @@ LINES_MAX = 5
 LINE_MAX = 50              # 用户 11-23「你要不要精简一些」：每行一句话
 FORWARD_LINE_MAX = 100     # 「可直接转给…」那行要能直接转发，放宽一些
 IMAGES_MAX = 4
+FORWARD_FILE_MAX = 4000     # 对外长文（用户要「说清楚详细」的英文说明等）：单独一条纯文本，方便整段复制
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 IMAGE_BYTES_MAX = 10 * 1024 * 1024     # Lark 上传图片上限
 # 内部编号不许出现在发给用户的文字里。不用 \b：中文字符也算 \w，「给R12」会漏掉
@@ -182,15 +183,32 @@ def cmd_reply(a) -> None:
             raise Fail(f"image not found: {p}")
         if f.stat().st_size > IMAGE_BYTES_MAX:
             raise Fail(f"image over 10 MB (Lark limit): {p}")
+    forward = None
+    if a.forward_file:
+        f = Path(a.forward_file).expanduser()
+        if not f.is_file():
+            raise Fail(f"forward file not found: {a.forward_file}")
+        forward = f.read_text(encoding="utf-8").strip()
+        if not forward:
+            raise Fail(f"forward file is empty: {a.forward_file}")
+        if len(forward) > FORWARD_FILE_MAX:
+            raise Fail(f"forward file over {FORWARD_FILE_MAX} chars, got {len(forward)}")
+        if INTERNAL_ID.search(forward):
+            raise Fail(f"internal id must not reach the user: {INTERNAL_ID.search(forward).group(0)}")
     e = _entry(a.rid)
     api = make_api()
+    root = store.root_of(e["id"])
     try:
         keys = [api.upload_image(str(Path(p).expanduser())) for p in images]
         sent = api.reply_post(e["message_id"], f"{PREFIX[a.kind]} {title}", lines, image_keys=keys)
+        store.add_bot_msg(root, sent)                    # 记在根任务上：回复它也算追问这件事
+        result = {"ok": True, "sent": sent}
+        if forward:
+            result["forward_sent"] = api.reply_text(e["message_id"], forward)
+            store.add_bot_msg(root, result["forward_sent"])
     except lark_api.LarkError as err:
         raise Fail(str(err))
-    store.add_bot_msg(store.root_of(e["id"]), sent)     # 记在根任务上：回复它也算追问这件事
-    out({"ok": True, "sent": sent})
+    out(result)
 
 
 def cmd_task(a) -> None:
@@ -311,6 +329,7 @@ def main(argv=None) -> int:
     r.add_argument("--title", required=True)
     r.add_argument("--line", action="append")
     r.add_argument("--image", action="append", help="png/jpg/gif/webp, ≤ 10 MB, 最多 4 张，排在文字后面")
+    r.add_argument("--forward-file", help="对外长文（≤ 4000 字符）：用户要「说清楚详细」时用，帖子之后单独发一条纯文本，方便整段复制")
     t = sub.add_parser("task")
     tsub = t.add_subparsers(dest="op", required=True)
     ts = tsub.add_parser("set")

@@ -141,6 +141,33 @@ def test_reply_with_images_uploads_then_posts(fake_http, tmp_path):
     assert post["content"][-2:] == [[{"tag": "img", "image_key": "img_a"}], [{"tag": "img", "image_key": "img_b"}]]
 
 
+def test_reply_forward_file_sends_full_text_after_post(fake_http, tmp_path):
+    store.append_message(msg("om_a"))
+    note = tmp_path / "note.txt"
+    note.write_text("Hi team,\n" + "x" * 900 + "\nThanks!", encoding="utf-8")   # 对外长文：不受每行 50 字限制
+    env = fake_http([OK_REPLY, {"code": 0, "data": {"message_id": "om_bot2"}}])
+    rc, out = run(*reply_args(), "--forward-file", str(note), env=env)
+    assert rc == 0 and out == [{"ok": True, "sent": "om_bot1", "forward_sent": "om_bot2"}]
+    calls = fake_http.calls()
+    assert [c["body"]["msg_type"] for c in calls] == ["post", "text"]
+    assert json.loads(calls[1]["body"]["content"])["text"] == note.read_text(encoding="utf-8")
+
+
+def test_reply_forward_file_rejects_bad_files(fake_http, tmp_path):
+    store.append_message(msg("om_a"))
+    env = fake_http([OK_REPLY, OK_REPLY])
+    empty = tmp_path / "empty.txt"
+    empty.write_text("  \n", encoding="utf-8")
+    leak = tmp_path / "leak.txt"
+    leak.write_text("see R12 for details", encoding="utf-8")
+    huge = tmp_path / "huge.txt"
+    huge.write_text("y" * 4001, encoding="utf-8")
+    for f in (tmp_path / "missing.txt", empty, leak, huge):
+        rc, out = run(*reply_args(), "--forward-file", str(f), env=env)
+        assert rc != 0 and out[0]["ok"] is False, f
+    assert fake_http.calls() == []                       # 校验在发之前，什么都没发出去
+
+
 def test_reply_rejects_bad_images(fake_http, tmp_path):
     store.append_message(msg("om_a"))
     env = fake_http([OK_REPLY])
