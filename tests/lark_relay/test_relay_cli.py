@@ -161,7 +161,7 @@ def test_reply_forward_file_rejects_bad_files(fake_http, tmp_path):
     leak = tmp_path / "leak.txt"
     leak.write_text("see R12 for details", encoding="utf-8")
     huge = tmp_path / "huge.txt"
-    huge.write_text("y" * 4001, encoding="utf-8")
+    huge.write_text("y" * 8001, encoding="utf-8")
     for f in (tmp_path / "missing.txt", empty, leak, huge):
         rc, out = run(*reply_args(), "--forward-file", str(f), env=env)
         assert rc != 0 and out[0]["ok"] is False, f
